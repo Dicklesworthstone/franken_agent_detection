@@ -13,23 +13,15 @@
 
 </div>
 
-Local, deterministic coding-agent installation detection via filesystem probes.
+A small Rust crate for deterministic, local detection of installed coding-agent tools.
 
 ```bash
 cargo add franken-agent-detection
 ```
 
-## TL;DR
+## What this crate does
 
-### The Problem
-
-Tooling often needs to know which coding agents are installed (`codex`, `claude`, `gemini`, etc.), but each app re-implements ad-hoc path checks with inconsistent output.
-
-### The Solution
-
-`franken-agent-detection` provides one stable report format and one probe engine, with deterministic behavior and test-friendly root overrides.
-
-### Why use this crate?
+Many tools need to answer a simple question: which coding-agent connectors are available on this machine? This crate gives you one consistent report shape, one probe flow, and test-friendly root overrides.
 
 | Capability | `franken-agent-detection` |
 |---|---|
@@ -39,7 +31,7 @@ Tooling often needs to know which coding agents are installed (`codex`, `claude`
 | Async runtime required | No |
 | Tokio dependency | No |
 
-## Quick Example
+## Example
 
 ```rust
 use franken_agent_detection::{
@@ -71,12 +63,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Design Philosophy
+## Design goals
 
-1. Deterministic output: report schema remains stable for downstream tools and snapshots.
-2. Explicit behavior: connector normalization and unknown connector errors are surfaced clearly.
-3. Local-first: probes run on local filesystem only, with no network calls.
-4. Runtime-neutral: synchronous API with no async runtime coupling.
+1. Keep output stable for downstream tooling and snapshot tests.
+2. Keep behavior explicit, including connector normalization and unknown connector errors.
+3. Keep detection local to filesystem probes, with no network dependency.
+4. Stay runtime-neutral with a synchronous API.
 
 ## Comparison
 
@@ -109,15 +101,15 @@ cd franken_agent_detection
 cargo test
 ```
 
-## Quick Start
+## Quick start
 
-1. Add dependency from crates.io.
+1. Add the dependency from crates.io.
 2. Call `detect_installed_agents(&AgentDetectOptions::default())`.
 3. Read `report.installed_agents` and `report.summary`.
-4. Use `only_connectors` to scope checks.
+4. Use `only_connectors` when you want to scope checks.
 5. Use `root_overrides` for deterministic tests.
 
-## API Reference
+## API reference
 
 | Item | Purpose |
 |---|---|
@@ -129,7 +121,7 @@ cargo test
 
 ## Configuration
 
-The crate itself is configured via function inputs, not environment variables:
+The crate is configured through function inputs, not environment variables:
 
 ```rust
 AgentDetectOptions {
@@ -139,7 +131,7 @@ AgentDetectOptions {
 }
 ```
 
-## Architecture
+## How detection works
 
 ```text
 detect_installed_agents(opts)
@@ -164,7 +156,7 @@ detect_installed_agents(opts)
 ## Limitations
 
 - Installation detection only; no session parsing or indexing.
-- Probe roots are opinionated defaults and may need overrides in custom environments.
+- Default probe roots are opinionated and can require overrides in custom environments.
 - No background watching; checks run only when called.
 
 ## FAQ
@@ -179,7 +171,7 @@ No. Detection is local filesystem probing only.
 Yes. Use `root_overrides` with temporary fixture directories.
 
 ### How stable is the report schema?
-The report is designed for stable machine consumption and versioned with `format_version`.
+The report is meant for machine consumption and versioned with `format_version`.
 
 ### Can this detect every possible agent tool?
 It detects a curated connector set and aliases. Unknown connectors return explicit errors.
