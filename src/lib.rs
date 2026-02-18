@@ -61,7 +61,11 @@ pub enum AgentDetectError {
 }
 
 const KNOWN_CONNECTORS: &[&str] = &[
+    "aider",
+    "amp",
+    "chatgpt",
     "claude",
+    "clawdbot",
     "cline",
     "codex",
     "cursor",
@@ -69,12 +73,19 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "gemini",
     "github-copilot",
     "opencode",
+    "openclaw",
+    "pi_agent",
+    "vibe",
     "windsurf",
 ];
 
 fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
     match slug {
+        "aider" | "aider-cli" => Some("aider"),
+        "amp" | "amp-cli" => Some("amp"),
+        "chatgpt" | "chat-gpt" | "chatgpt-desktop" => Some("chatgpt"),
         "claude" | "claude-code" => Some("claude"),
+        "clawdbot" | "clawd-bot" => Some("clawdbot"),
         "cline" => Some("cline"),
         "codex" | "codex-cli" => Some("codex"),
         "cursor" => Some("cursor"),
@@ -82,6 +93,9 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "gemini" | "gemini-cli" => Some("gemini"),
         "github-copilot" | "copilot" => Some("github-copilot"),
         "opencode" | "open-code" => Some("opencode"),
+        "openclaw" | "open-claw" => Some("openclaw"),
+        "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
+        "vibe" | "vibe-cli" => Some("vibe"),
         "windsurf" => Some("windsurf"),
         _ => None,
     }
@@ -114,9 +128,42 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
     };
 
     match slug {
+        "aider" => {
+            push(&[".aider.chat.history.md"]);
+            push(&[".aider"]);
+        }
+        "amp" => {
+            push(&[".local", "share", "amp"]);
+            push(&["Library", "Application Support", "amp"]);
+            push(&["AppData", "Roaming", "amp"]);
+            push(&[".config", "Code", "User", "globalStorage", "sourcegraph.amp"]);
+            push(&[
+                "Library",
+                "Application Support",
+                "Code",
+                "User",
+                "globalStorage",
+                "sourcegraph.amp",
+            ]);
+            push(&[
+                "AppData",
+                "Roaming",
+                "Code",
+                "User",
+                "globalStorage",
+                "sourcegraph.amp",
+            ]);
+        }
+        "chatgpt" => {
+            push(&["Library", "Application Support", "com.openai.chat"]);
+        }
         "claude" => {
             push(&[".claude"]);
             push(&[".config", "claude"]);
+        }
+        "clawdbot" => {
+            push(&[".clawdbot"]);
+            push(&[".clawdbot", "sessions"]);
         }
         "cline" => {
             push(&[".cline"]);
@@ -145,6 +192,18 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         "opencode" => {
             push(&[".opencode"]);
             push(&[".config", "opencode"]);
+        }
+        "openclaw" => {
+            push(&[".openclaw"]);
+            push(&[".openclaw", "agents"]);
+        }
+        "pi_agent" => {
+            push(&[".pi", "agent"]);
+            push(&[".pi", "agent", "sessions"]);
+        }
+        "vibe" => {
+            push(&[".vibe"]);
+            push(&[".vibe", "logs", "session"]);
         }
         "windsurf" => {
             push(&[".windsurf"]);
@@ -402,5 +461,104 @@ mod tests {
                 panic!("unexpected error: FeatureDisabled")
             }
         }
+    }
+
+    #[test]
+    fn cass_connectors_and_aliases_detect_via_overrides() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let aider_file = tmp.path().join("aider").join(".aider.chat.history.md");
+        std::fs::create_dir_all(aider_file.parent().expect("aider parent")).expect("mkdir aider");
+        std::fs::write(&aider_file, "stub").expect("write aider file");
+
+        let amp_root = tmp.path().join("amp-root");
+        std::fs::create_dir_all(&amp_root).expect("mkdir amp");
+
+        let chatgpt_root = tmp.path().join("chatgpt-root");
+        std::fs::create_dir_all(&chatgpt_root).expect("mkdir chatgpt");
+
+        let clawdbot_sessions = tmp.path().join("clawdbot").join("sessions");
+        std::fs::create_dir_all(&clawdbot_sessions).expect("mkdir clawdbot");
+
+        let openclaw_agents = tmp.path().join("openclaw").join("agents");
+        std::fs::create_dir_all(&openclaw_agents).expect("mkdir openclaw");
+
+        let pi_sessions = tmp.path().join("pi").join("agent").join("sessions");
+        std::fs::create_dir_all(&pi_sessions).expect("mkdir pi");
+
+        let vibe_sessions = tmp.path().join("vibe").join("logs").join("session");
+        std::fs::create_dir_all(&vibe_sessions).expect("mkdir vibe");
+
+        let report = detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec![
+                "aider".to_string(),
+                "amp".to_string(),
+                "chatgpt".to_string(),
+                "clawdbot".to_string(),
+                "open-claw".to_string(),
+                "pi-agent".to_string(),
+                "vibe".to_string(),
+            ]),
+            include_undetected: true,
+            root_overrides: vec![
+                AgentDetectRootOverride {
+                    slug: "aider-cli".to_string(),
+                    root: aider_file,
+                },
+                AgentDetectRootOverride {
+                    slug: "amp".to_string(),
+                    root: amp_root.clone(),
+                },
+                AgentDetectRootOverride {
+                    slug: "chatgpt-desktop".to_string(),
+                    root: chatgpt_root.clone(),
+                },
+                AgentDetectRootOverride {
+                    slug: "clawdbot".to_string(),
+                    root: clawdbot_sessions.clone(),
+                },
+                AgentDetectRootOverride {
+                    slug: "open-claw".to_string(),
+                    root: openclaw_agents.clone(),
+                },
+                AgentDetectRootOverride {
+                    slug: "pi-agent".to_string(),
+                    root: pi_sessions.clone(),
+                },
+                AgentDetectRootOverride {
+                    slug: "vibe-cli".to_string(),
+                    root: vibe_sessions.clone(),
+                },
+            ],
+        })
+        .expect("detect");
+
+        assert_eq!(report.summary.total_count, 7);
+        assert_eq!(report.summary.detected_count, 7);
+
+        let slugs: Vec<&str> = report
+            .installed_agents
+            .iter()
+            .map(|entry| entry.slug.as_str())
+            .collect();
+        assert_eq!(
+            slugs,
+            vec![
+                "aider",
+                "amp",
+                "chatgpt",
+                "clawdbot",
+                "openclaw",
+                "pi_agent",
+                "vibe"
+            ]
+        );
+
+        let pi = report
+            .installed_agents
+            .iter()
+            .find(|entry| entry.slug == "pi_agent")
+            .expect("pi_agent entry");
+        assert_eq!(pi.root_paths, vec![pi_sessions.display().to_string()]);
     }
 }
