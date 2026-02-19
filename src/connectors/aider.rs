@@ -58,6 +58,7 @@ impl AiderConnector {
         files
     }
 
+    #[allow(clippy::unused_self)]
     fn parse_chat_history(&self, path: &Path) -> Result<NormalizedConversation> {
         let content = fs::read_to_string(path)?;
         let mut messages = Vec::new();
@@ -86,15 +87,11 @@ impl AiderConnector {
                 // Only strip the prefix "> " (or ">") but preserve other whitespace
                 // to maintain indentation (e.g. for code blocks in prompts).
                 let trimmed_start = line.trim_start();
-                let content = if let Some(stripped) = trimmed_start.strip_prefix("> ") {
-                    stripped
-                } else if let Some(stripped) = trimmed_start.strip_prefix('>') {
-                    stripped
-                } else {
-                    trimmed_start
-                };
-                current_content.push_str(content.trim_end());
-                current_content.push('\n');
+                let stripped = trimmed_start
+                    .strip_prefix("> ")
+                    .or_else(|| trimmed_start.strip_prefix('>'))
+                    .unwrap_or(trimmed_start);
+                current_content.push_str(stripped.trim_end());
             } else {
                 if current_role == "user" && !line.trim().is_empty() && !line.starts_with('>') {
                     if !current_content.trim().is_empty() {
@@ -113,8 +110,8 @@ impl AiderConnector {
                     current_role = "assistant";
                 }
                 current_content.push_str(line);
-                current_content.push('\n');
             }
+            current_content.push('\n');
         }
 
         if !current_content.trim().is_empty() {
@@ -180,8 +177,7 @@ impl Connector for AiderConnector {
             {
                 ctx.data_dir
                     .parent()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| ctx.data_dir.clone())
+                    .map_or_else(|| ctx.data_dir.clone(), PathBuf::from)
             } else {
                 ctx.data_dir.clone()
             };
@@ -220,7 +216,7 @@ impl Connector for AiderConnector {
             return Ok(Vec::new());
         }
 
-        let root_refs: Vec<&Path> = roots.iter().map(|r| r.as_path()).collect();
+        let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
         let files = Self::find_chat_files(&root_refs);
 
         let mut conversations = Vec::new();
