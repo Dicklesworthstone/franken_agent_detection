@@ -1,4 +1,5 @@
 target/
+target_*/
 
 # Library crate: keep lockfile local.
 Cargo.lock
