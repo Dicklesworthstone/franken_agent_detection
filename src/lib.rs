@@ -36,10 +36,10 @@ pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenData
 #[cfg(feature = "connectors")]
 pub use connectors::{
     Connector, PathTrie, ScanContext, ScanRoot, WorkspaceCache, aider::AiderConnector,
-    clawdbot::ClawdbotConnector, estimate_tokens_from_content, extract_claude_code_tokens,
-    extract_codex_tokens, extract_tokens_for_agent, file_modified_since, flatten_content,
-    franken_detection_for_connector, normalize_model, parse_timestamp, token_extraction,
-    vibe::VibeConnector,
+    claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, estimate_tokens_from_content,
+    extract_claude_code_tokens, extract_codex_tokens, extract_tokens_for_agent,
+    file_modified_since, flatten_content, franken_detection_for_connector, normalize_model,
+    parse_timestamp, token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
