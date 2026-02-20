@@ -3,9 +3,15 @@
 //! Utilities, data structures, and scan primitives used by all 15 connectors.
 
 pub mod aider;
+pub mod amp;
 pub mod claude_code;
 pub mod clawdbot;
+pub mod cline;
+pub mod copilot;
+pub mod factory;
+pub mod gemini;
 pub mod path_trie;
+pub mod pi_agent;
 pub mod scan;
 pub mod token_extraction;
 pub mod utils;

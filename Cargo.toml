@@ -55,6 +55,7 @@ all-connectors = ["connectors", "chatgpt", "cursor"]
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = "*"
 
 [lints.rust]
 unsafe_code = "forbid"
