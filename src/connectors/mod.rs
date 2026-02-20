@@ -6,12 +6,17 @@ pub mod aider;
 pub mod clawdbot;
 pub mod path_trie;
 pub mod scan;
+pub mod token_extraction;
 pub mod utils;
 pub mod vibe;
 pub mod workspace_cache;
 
 pub use path_trie::PathTrie;
 pub use scan::{ScanContext, ScanRoot};
+pub use token_extraction::{
+    ExtractedTokenUsage, ModelInfo, TokenDataSource, estimate_tokens_from_content,
+    extract_claude_code_tokens, extract_codex_tokens, extract_tokens_for_agent, normalize_model,
+};
 pub use utils::{file_modified_since, flatten_content, parse_timestamp};
 pub use workspace_cache::WorkspaceCache;
 

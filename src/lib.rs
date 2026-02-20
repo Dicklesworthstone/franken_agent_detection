@@ -32,10 +32,14 @@ pub use types::{
 };
 // Re-export connector infrastructure at crate root.
 #[cfg(feature = "connectors")]
+pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenDataSource};
+#[cfg(feature = "connectors")]
 pub use connectors::{
     Connector, PathTrie, ScanContext, ScanRoot, WorkspaceCache, aider::AiderConnector,
-    clawdbot::ClawdbotConnector, file_modified_since, flatten_content,
-    franken_detection_for_connector, parse_timestamp, vibe::VibeConnector,
+    clawdbot::ClawdbotConnector, estimate_tokens_from_content, extract_claude_code_tokens,
+    extract_codex_tokens, extract_tokens_for_agent, file_modified_since, flatten_content,
+    franken_detection_for_connector, normalize_model, parse_timestamp, token_extraction,
+    vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
