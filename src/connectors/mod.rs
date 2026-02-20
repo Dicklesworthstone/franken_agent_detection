@@ -4,6 +4,8 @@
 
 pub mod aider;
 pub mod amp;
+#[cfg(feature = "chatgpt")]
+pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;

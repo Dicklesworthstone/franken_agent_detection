@@ -43,6 +43,8 @@ pub use connectors::{
     franken_detection_for_connector, gemini::GeminiConnector, normalize_model, parse_timestamp,
     pi_agent::PiAgentConnector, token_extraction, vibe::VibeConnector,
 };
+#[cfg(feature = "chatgpt")]
+pub use connectors::chatgpt::ChatGptConnector;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
