@@ -1,6 +1,6 @@
 [package]
 name = "franken-agent-detection"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -19,21 +19,21 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 
 # --- Optional: connector infrastructure ---
-anyhow = { version = "*", optional = true }
-serde_json = { version = "*", optional = true }
-walkdir = { version = "*", optional = true }
-tracing = { version = "*", optional = true }
-dotenvy = { version = "*", optional = true }
-bloomfilter = { version = "*", optional = true }
-once_cell = { version = "*", optional = true }
-urlencoding = { version = "*", optional = true }
+anyhow = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+walkdir = { version = "2", optional = true }
+tracing = { version = "0.1", optional = true }
+dotenvy = { version = "0.15", optional = true }
+bloomfilter = { version = "3", optional = true }
+once_cell = { version = "1", optional = true }
+urlencoding = { version = "2", optional = true }
 
 # --- Optional: ChatGPT encrypted conversations ---
-aes-gcm = { version = "*", optional = true }
+aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 
 # --- Optional: Cursor/OpenCode SQLite session databases ---
-rusqlite = { version = "*", optional = true, features = ["bundled", "modern_sqlite"] }
+rusqlite = { version = "0.38", optional = true, features = ["bundled", "modern_sqlite"] }
 
 [features]
 default = []
@@ -58,7 +58,7 @@ all-connectors = ["connectors", "chatgpt", "cursor", "opencode"]
 
 [dev-dependencies]
 tempfile = "3"
-serial_test = "*"
+serial_test = "3"
 
 [lints.rust]
 unsafe_code = "forbid"
