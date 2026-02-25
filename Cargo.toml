@@ -51,8 +51,8 @@ connectors = [
 chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
 # Cursor: SQLite database access for state.vscdb
 cursor = ["connectors", "dep:rusqlite", "dep:urlencoding"]
-# OpenCode connector support
-opencode = ["connectors"]
+# OpenCode: SQLite database access for v1.2+ opencode.db
+opencode = ["connectors", "dep:rusqlite"]
 # All connectors enabled
 all-connectors = ["connectors", "chatgpt", "cursor", "opencode"]
 
