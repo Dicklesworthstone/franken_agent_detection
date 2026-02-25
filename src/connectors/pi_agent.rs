@@ -161,6 +161,14 @@ impl Connector for PiAgentConnector {
                 || path
                     .file_name()
                     .is_some_and(|n| n.to_str().unwrap_or("").contains("pi"))
+                // Accept the sessions directory itself (e.g. ~/.pi/agent/sessions)
+                // which is what detection returns as root_path
+                || path
+                    .file_name()
+                    .is_some_and(|n| n == "sessions")
+                || path
+                    .to_str()
+                    .is_some_and(|s| s.contains(".pi/agent") || s.contains("pi-agent"))
         };
 
         let mut home = if ctx.use_default_detection() {
@@ -381,6 +389,7 @@ impl Connector for PiAgentConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -1390,5 +1399,51 @@ mod tests {
         let ctx = ScanContext::local_default(storage.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
+    }
+
+    // =====================================================
+    // Regression: nested subdirectory scanning via scan_roots
+    // (Issue #85 — watch/scan_roots path must find sessions
+    //  in project-scoped subdirectories)
+    // =====================================================
+
+    #[test]
+    fn scan_with_roots_finds_nested_subdirectory_sessions() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_pi_agent_storage(&dir);
+
+        // Create nested project-scoped subdirectory (like Pi-Agent does)
+        let nested = storage.join("sessions").join("--home-projects-xyz--");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("2025-12-01T10-00-00_uuid1.jsonl"),
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Hello from nested dir"}}"#,
+        )
+        .unwrap();
+
+        // Also add a second nested subdir to confirm multi-level works
+        let nested2 = storage.join("sessions").join("--home-projects-abc--");
+        fs::create_dir_all(&nested2).unwrap();
+        fs::write(
+            nested2.join("2025-12-01T10-00-00_uuid2.jsonl"),
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Hello from second nested dir"}}"#,
+        )
+        .unwrap();
+
+        let connector = PiAgentConnector::new();
+
+        // Simulate what the watch/scan_roots code path does:
+        // data_dir is the sessions directory itself (detection root_path)
+        let sessions_path = storage.join("sessions");
+        let root = ScanRoot::local(sessions_path.clone());
+        let ctx = ScanContext::with_roots(sessions_path, vec![root], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(
+            convs.len(),
+            2,
+            "expected 2 conversations from nested subdirectories, got {}",
+            convs.len()
+        );
     }
 }
