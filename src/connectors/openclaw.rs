@@ -1,7 +1,7 @@
 //! Connector for OpenClaw session logs.
 //!
 //! OpenClaw stores JSONL sessions at:
-//! - ~/.openclaw/agents/openclaw/sessions/*.jsonl
+//! - ~/.openclaw/agents/<agent-name>/sessions/*.jsonl
 //!
 //! Each line has a `type` discriminator: "session", "message", "model_change",
 //! "thinking_level_change", "custom". Messages are wrapped:
@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 
 use super::scan::ScanContext;
 use super::{
-    Connector, file_modified_since, flatten_content, franken_detection_for_connector,
+    Connector, file_modified_since, flatten_content,
     parse_timestamp,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
@@ -126,7 +126,6 @@ impl OpenClawConnector {
         session_dirs
     }
 
-    #[allow(dead_code)]
     fn detect_from_agents_root(agents_root: &Path) -> DetectionResult {
         let roots = Self::find_agent_session_dirs_at(agents_root);
         let mut evidence = vec![
@@ -277,7 +276,15 @@ impl OpenClawConnector {
 
 impl Connector for OpenClawConnector {
     fn detect(&self) -> DetectionResult {
-        franken_detection_for_connector("openclaw").unwrap_or_else(DetectionResult::not_found)
+        // Use OpenClaw-specific multi-agent detection instead of the generic
+        // franken probe, which only checks for directory existence and doesn't
+        // walk the agents/<name>/sessions/ layout.
+        match Self::agents_root() {
+            Some(agents_root) if agents_root.exists() => {
+                Self::detect_from_agents_root(&agents_root)
+            }
+            _ => DetectionResult::not_found(),
+        }
     }
 
     #[allow(clippy::too_many_lines)]

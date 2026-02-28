@@ -509,7 +509,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 ],
                 "goose" => vec![tilde(&[".goose", "sessions"])],
                 "opencode" => vec![tilde(&[".local", "share", "opencode"])],
-                "openclaw" => vec![tilde(&[".openclaw", "agents", "openclaw", "sessions"])],
+                "openclaw" => vec![tilde(&[".openclaw", "agents"])],
                 "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
                 "vibe" => vec![tilde(&[".vibe", "logs", "session"])],
                 "windsurf" => vec![tilde(&[".windsurf"])],
