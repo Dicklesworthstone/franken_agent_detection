@@ -115,10 +115,12 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "clawdbot",
     "cline",
     "codex",
+    "continue",
     "cursor",
     "factory",
     "gemini",
     "github-copilot",
+    "goose",
     "opencode",
     "openclaw",
     "pi_agent",
@@ -135,10 +137,12 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "clawdbot" | "clawd-bot" => Some("clawdbot"),
         "cline" => Some("cline"),
         "codex" | "codex-cli" => Some("codex"),
+        "continue" | "continue-dev" => Some("continue"),
         "cursor" => Some("cursor"),
         "factory" | "factory-droid" => Some("factory"),
         "gemini" | "gemini-cli" => Some("gemini"),
         "github-copilot" | "copilot" => Some("github-copilot"),
+        "goose" | "goose-ai" => Some("goose"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
         "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
@@ -265,6 +269,10 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         "codex" => {
             push(&[".codex", "sessions"]);
         }
+        "continue" => {
+            push(&[".continue", "sessions"]);
+            push(&[".continue"]);
+        }
         "cursor" => {
             push(&[".cursor"]);
             push(&[".config", "Cursor"]);
@@ -280,6 +288,10 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         "github-copilot" => {
             push(&[".github-copilot"]);
             push(&[".config", "github-copilot"]);
+        }
+        "goose" => {
+            push(&[".goose", "sessions"]);
+            push(&[".goose"]);
         }
         "opencode" => {
             push(&[".opencode"]);
@@ -391,6 +403,121 @@ fn validate_known_connectors(
     Err(AgentDetectError::UnknownConnectors {
         connectors: unknown,
     })
+}
+
+/// Returns default probe paths for all known connectors using tilde-relative paths.
+///
+/// These paths use `~/` prefix instead of resolved home directories, making them
+/// suitable for SSH probe scripts where the remote home directory is unknown.
+/// Each entry is `(slug, paths)` where `paths` are bash-friendly strings like
+/// `~/.claude/projects`.
+pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
+    fn tilde(parts: &[&str]) -> String {
+        let mut path = String::from("~/");
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                path.push('/');
+            }
+            path.push_str(part);
+        }
+        path
+    }
+
+    KNOWN_CONNECTORS
+        .iter()
+        .map(|&slug| {
+            let paths: Vec<String> = match slug {
+                "aider" => vec![tilde(&[".aider.chat.history.md"]), tilde(&[".aider"])],
+                "amp" => vec![
+                    tilde(&[".local", "share", "amp"]),
+                    tilde(&[
+                        ".config", "Code", "User", "globalStorage", "sourcegraph.amp",
+                    ]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ]),
+                ],
+                "chatgpt" => vec![tilde(&[
+                    "Library",
+                    "Application Support",
+                    "com.openai.chat",
+                ])],
+                "claude" => vec![tilde(&[".claude", "projects"]), tilde(&[".claude"])],
+                "clawdbot" => vec![
+                    tilde(&[".clawdbot", "sessions"]),
+                    tilde(&[".clawdbot"]),
+                ],
+                "cline" => vec![
+                    tilde(&[
+                        ".config",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "saoudrizwan.claude-dev",
+                    ]),
+                    tilde(&[
+                        ".config",
+                        "Cursor",
+                        "User",
+                        "globalStorage",
+                        "saoudrizwan.claude-dev",
+                    ]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "saoudrizwan.claude-dev",
+                    ]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "Cursor",
+                        "User",
+                        "globalStorage",
+                        "saoudrizwan.claude-dev",
+                    ]),
+                ],
+                "codex" => vec![tilde(&[".codex", "sessions"])],
+                "continue" => vec![tilde(&[".continue", "sessions"])],
+                "cursor" => vec![tilde(&[".cursor"])],
+                "factory" => vec![tilde(&[".factory", "sessions"])],
+                "gemini" => vec![tilde(&[".gemini", "tmp"]), tilde(&[".gemini"])],
+                "github-copilot" => vec![
+                    tilde(&[
+                        ".config",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ]),
+                    tilde(&[".config", "gh-copilot"]),
+                ],
+                "goose" => vec![tilde(&[".goose", "sessions"])],
+                "opencode" => vec![tilde(&[".local", "share", "opencode"])],
+                "openclaw" => vec![tilde(&[".openclaw", "agents", "openclaw", "sessions"])],
+                "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
+                "vibe" => vec![tilde(&[".vibe", "logs", "session"])],
+                "windsurf" => vec![tilde(&[".windsurf"])],
+                _ => vec![],
+            };
+            (slug, paths)
+        })
+        .collect()
 }
 
 /// Detect installed/available coding agents by running local filesystem probes.
