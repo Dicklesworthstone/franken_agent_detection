@@ -305,6 +305,7 @@ impl CopilotConnector {
                             content,
                             extra: request.clone(),
                             snippets: Vec::new(),
+                    invocations: Vec::new(),
                         });
                     }
                 }
@@ -332,6 +333,7 @@ impl CopilotConnector {
                             content,
                             extra: response.clone(),
                             snippets: Vec::new(),
+                    invocations: Vec::new(),
                         });
                     }
                 }
@@ -378,6 +380,7 @@ impl CopilotConnector {
                     content,
                     extra: msg.clone(),
                     snippets: Vec::new(),
+                    invocations: Vec::new(),
                 });
             }
         }
@@ -561,6 +564,7 @@ impl CopilotConnector {
                 content,
                 extra: event,
                 snippets: Vec::new(),
+                    invocations: Vec::new(),
             });
         }
 
@@ -681,6 +685,7 @@ impl CopilotConnector {
                 content,
                 extra: event.clone(),
                 snippets: Vec::new(),
+                    invocations: Vec::new(),
             });
         }
 

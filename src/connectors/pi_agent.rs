@@ -309,6 +309,36 @@ impl Connector for PiAgentConnector {
                                 None
                             };
 
+                            let invocations = msg
+                                .get("content")
+                                .and_then(|c| c.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter(|item| {
+                                            item.get("type").and_then(|t| t.as_str())
+                                                == Some("toolCall")
+                                        })
+                                        .map(|item| {
+                                            let name = item
+                                                .get("name")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("unknown")
+                                                .to_string();
+                                            crate::types::NormalizedInvocation {
+                                                kind: "tool".to_string(),
+                                                name,
+                                                raw_name: None,
+                                                call_id: item
+                                                    .get("id")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(String::from),
+                                                arguments: item.get("arguments").cloned(),
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+
                             messages.push(NormalizedMessage {
                                 idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
                                 role: normalized_role.to_string(),
@@ -317,6 +347,7 @@ impl Connector for PiAgentConnector {
                                 content: content_str,
                                 extra: val.clone(),
                                 snippets: Vec::new(),
+                                invocations,
                             });
                         }
                     }

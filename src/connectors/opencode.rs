@@ -283,6 +283,7 @@ impl OpenCodeConnector {
                         "session_id": session_id,
                     }),
                     snippets: Vec::new(),
+                    invocations: Vec::new(),
                 },
             ));
         }
@@ -837,6 +838,7 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
                     "session_id": msg_info.session_id,
                 }),
                 snippets: Vec::new(),
+                    invocations: Vec::new(),
             },
         ));
     }

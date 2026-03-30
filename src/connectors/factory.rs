@@ -20,8 +20,8 @@ use walkdir::WalkDir;
 
 use super::scan::ScanContext;
 use super::{
-    Connector, file_modified_since, flatten_content, franken_detection_for_connector,
-    parse_timestamp,
+    Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
+    franken_detection_for_connector, parse_timestamp,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -224,6 +224,8 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
                     .and_then(|v| v.as_str())
                     .map(String::from);
 
+                let invocations = content_val
+                    .map_or_else(Vec::new, extract_invocations_from_content_blocks);
                 messages.push(NormalizedMessage {
                     idx: 0, // Will be reassigned after collection
                     role: role.to_string(),
@@ -231,6 +233,7 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
                     created_at: created,
                     content: content_str,
                     extra: val,
+                    invocations,
                     snippets: Vec::new(),
                 });
             }

@@ -22,6 +22,7 @@ pub use types::{
     // Scan & provenance types
     LOCAL_SOURCE_ID,
     NormalizedConversation,
+    NormalizedInvocation,
     NormalizedMessage,
     NormalizedSnippet,
     Origin,
@@ -48,7 +49,8 @@ pub use connectors::{
     cline::ClineConnector, codex::CodexConnector, copilot::CopilotConnector,
     copilot_cli::CopilotCliConnector, estimate_tokens_from_content, extract_claude_code_tokens,
     extract_codex_tokens, extract_tokens_for_agent, factory::FactoryConnector, file_modified_since,
-    flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
+    extract_invocations_from_content_blocks, flatten_content,
+    franken_detection_for_connector, gemini::GeminiConnector,
     get_connector_factories, kimi::KimiConnector, normalize_model, openclaw::OpenClawConnector,
     parse_timestamp, pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction,
     vibe::VibeConnector,

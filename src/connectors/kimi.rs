@@ -314,46 +314,70 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
                             content,
                             extra: val.clone(),
                             snippets: Vec::new(),
+                            invocations: Vec::new(),
                         });
-                    }
-                }
+                        }
+                        }
 
-                // After a user TurnBegin, subsequent ContentParts are assistant responses
-                if is_user {
-                    current_role = "assistant".to_string();
-                }
-            }
-            (Some("ContentPart"), _) => {
-                let payload = msg.and_then(|m| m.get("payload"));
-                let content = payload.map(extract_content_part_text).unwrap_or_default();
+                        // After a user TurnBegin, subsequent ContentParts are assistant responses
+                        if is_user {
+                        current_role = "assistant".to_string();
+                        }
+                        }
+                        (Some("ContentPart"), _) => {
+                        let payload = msg.and_then(|m| m.get("payload"));
+                        let content = payload.map(extract_content_part_text).unwrap_or_default();
 
-                if !content.trim().is_empty() {
-                    messages.push(NormalizedMessage {
+                        if !content.trim().is_empty() {
+                        messages.push(NormalizedMessage {
+                            idx: 0,
+                            role: current_role.clone(),
+                            author: None,
+                            created_at: created,
+                            content,
+                            extra: val,
+                            snippets: Vec::new(),
+                            invocations: Vec::new(),
+                        });
+                        }
+                        }
+                        (Some("ToolCall"), _) => {
+                        let payload = msg.and_then(|m| m.get("payload"));
+                        let content = payload
+                        .map(extract_tool_call_text)
+                        .unwrap_or_else(|| "[Tool: unknown]".to_string());
+
+                        let invocations = if let Some(p) = payload {
+                        let tool_name = p
+                            .get("name")
+                            .or_else(|| p.get("toolName"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        vec![crate::types::NormalizedInvocation {
+                            kind: "tool".to_string(),
+                            name: tool_name.to_string(),
+                            raw_name: None,
+                            call_id: None,
+                            arguments: p
+                                .get("input")
+                                .or_else(|| p.get("arguments"))
+                                .or_else(|| p.get("parameters"))
+                                .cloned(),
+                        }]
+                        } else {
+                        Vec::new()
+                        };
+
+                        messages.push(NormalizedMessage {
                         idx: 0,
-                        role: current_role.clone(),
+                        role: "assistant".to_string(),
                         author: None,
                         created_at: created,
                         content,
                         extra: val,
                         snippets: Vec::new(),
-                    });
-                }
-            }
-            (Some("ToolCall"), _) => {
-                let payload = msg.and_then(|m| m.get("payload"));
-                let content = payload
-                    .map(extract_tool_call_text)
-                    .unwrap_or_else(|| "[Tool: unknown]".to_string());
-
-                messages.push(NormalizedMessage {
-                    idx: 0,
-                    role: "assistant".to_string(),
-                    author: None,
-                    created_at: created,
-                    content,
-                    extra: val,
-                    snippets: Vec::new(),
-                });
+                        invocations,
+                        });
             }
             // Skip metadata, StepBegin, and other non-content types
             _ => {}

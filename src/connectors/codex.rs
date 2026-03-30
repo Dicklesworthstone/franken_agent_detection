@@ -7,8 +7,8 @@ use walkdir::WalkDir;
 
 use super::scan::ScanContext;
 use super::{
-    Connector, file_modified_since, flatten_content, franken_detection_for_connector,
-    parse_timestamp,
+    Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
+    franken_detection_for_connector, parse_timestamp,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -320,6 +320,9 @@ fn scan_codex_with_callback(
                                 }
 
                                 update_time_bounds(&mut started_at, &mut ended_at, created);
+                                let invocations = payload
+                                    .get("content")
+                                    .map_or_else(Vec::new, extract_invocations_from_content_blocks);
 
                                 messages.push(NormalizedMessage {
                                     idx: 0,
@@ -332,6 +335,7 @@ fn scan_codex_with_callback(
                                     } else {
                                         val
                                     },
+                                    invocations,
                                     snippets: Vec::new(),
                                 });
                             }
@@ -363,6 +367,7 @@ fn scan_codex_with_callback(
                                                 } else {
                                                     val
                                                 },
+                                                invocations: Vec::new(),
                                                 snippets: Vec::new(),
                                             });
                                         }
@@ -389,6 +394,7 @@ fn scan_codex_with_callback(
                                                 } else {
                                                     val
                                                 },
+                                                invocations: Vec::new(),
                                                 snippets: Vec::new(),
                                             });
                                         }
@@ -457,6 +463,9 @@ fn scan_codex_with_callback(
                             } else {
                                 item.clone()
                             },
+                            invocations: item
+                                .get("content")
+                                .map_or_else(Vec::new, extract_invocations_from_content_blocks),
                             snippets: Vec::new(),
                         });
                     }

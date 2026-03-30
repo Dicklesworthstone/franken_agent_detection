@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use super::scan::ScanContext;
 use super::{
-    Connector, file_modified_since, flatten_content, franken_detection_for_connector,
-    parse_timestamp,
+    Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
+    franken_detection_for_connector, parse_timestamp,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -216,6 +216,10 @@ impl Connector for ClineConnector {
                             continue;
                         }
 
+                        let content_val = item
+                            .get("content")
+                            .or_else(|| item.get("text"))
+                            .or_else(|| item.get("message"));
                         messages.push(NormalizedMessage {
                             idx: i64::try_from(messages.len()).unwrap_or(i64::MAX), // preserve original order for stable sorting
                             role: role.to_string(),
@@ -223,6 +227,8 @@ impl Connector for ClineConnector {
                             created_at: created,
                             content,
                             extra: item.clone(),
+                            invocations: content_val
+                                .map_or_else(Vec::new, extract_invocations_from_content_blocks),
                             snippets: Vec::new(),
                         });
                     }

@@ -5,7 +5,10 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::ScanContext;
-use super::{Connector, flatten_content, franken_detection_for_connector, parse_timestamp};
+use super::{
+    Connector, extract_invocations_from_content_blocks, flatten_content,
+    franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
+};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
 pub struct AmpConnector;
@@ -261,6 +264,13 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
             created_at,
             content,
             extra: m.clone(),
+            invocations: {
+                let mut inv = m
+                    .get("content")
+                    .map_or_else(Vec::new, extract_invocations_from_content_blocks);
+                unwrap_skill_invocations(&mut inv);
+                inv
+            },
             snippets: Vec::new(),
         });
     }

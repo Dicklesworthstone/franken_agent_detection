@@ -186,6 +186,7 @@ impl Connector for ClawdbotConnector {
                         content,
                         extra: val,
                         snippets: Vec::new(),
+                    invocations: Vec::new(),
                     });
                 }
 

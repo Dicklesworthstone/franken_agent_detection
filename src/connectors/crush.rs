@@ -251,6 +251,7 @@ fn group_rows_into_conversations(rows: &[CrushRow], db_path: &Path) -> Vec<Norma
                 "provider": row.provider,
             }),
             snippets: Vec::new(),
+                    invocations: Vec::new(),
         });
 
         if current_session_id != Some(&row.session_id) {

@@ -220,6 +220,7 @@ impl CopilotCliConnector {
                 content,
                 extra: event,
                 snippets: Vec::new(),
+                    invocations: Vec::new(),
             });
         }
 
@@ -331,6 +332,7 @@ impl CopilotCliConnector {
                 content,
                 extra: event.clone(),
                 snippets: Vec::new(),
+                    invocations: Vec::new(),
             });
         }
 

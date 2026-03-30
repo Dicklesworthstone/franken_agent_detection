@@ -387,6 +387,7 @@ fn scan_gemini_with_callback(
                     item
                 },
                 snippets: Vec::new(),
+                    invocations: Vec::new(),
             });
         }
 
@@ -609,6 +610,7 @@ mod tests {
             content: "# AGENTS.md instructions for /data/projects/myapp\nHello".into(),
             extra: serde_json::Value::Null,
             snippets: vec![],
+            invocations: vec![],
         }];
         let result = extract_workspace_from_content(&messages);
         assert_eq!(result, Some(PathBuf::from("/data/projects/myapp")));
@@ -624,6 +626,7 @@ mod tests {
             content: "Working directory: /home/user/project\nLet me help.".into(),
             extra: serde_json::Value::Null,
             snippets: vec![],
+            invocations: vec![],
         }];
         let result = extract_workspace_from_content(&messages);
         assert_eq!(result, Some(PathBuf::from("/home/user/project")));
@@ -639,6 +642,7 @@ mod tests {
             content: "Check the file at /data/projects/foo/src/main.rs".into(),
             extra: serde_json::Value::Null,
             snippets: vec![],
+            invocations: vec![],
         }];
         let result = extract_workspace_from_content(&messages);
         assert_eq!(result, Some(PathBuf::from("/data/projects/foo")));
@@ -654,6 +658,7 @@ mod tests {
             content: "Hello, how are you?".into(),
             extra: serde_json::Value::Null,
             snippets: vec![],
+            invocations: vec![],
         }];
         let result = extract_workspace_from_content(&messages);
         assert_eq!(result, None);
@@ -671,6 +676,7 @@ mod tests {
                     .into(),
             extra: serde_json::Value::Null,
             snippets: vec![],
+            invocations: vec![],
         }];
         // AGENTS.md pattern should be found first
         let result = extract_workspace_from_content(&messages);

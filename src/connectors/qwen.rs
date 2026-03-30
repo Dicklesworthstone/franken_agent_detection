@@ -192,6 +192,7 @@ fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
             content: content_str,
             extra: raw_msg.clone(),
             snippets: Vec::new(),
+                    invocations: Vec::new(),
         });
     }
 

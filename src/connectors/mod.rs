@@ -37,7 +37,10 @@ pub use token_extraction::{
     ExtractedTokenUsage, ModelInfo, TokenDataSource, estimate_tokens_from_content,
     extract_claude_code_tokens, extract_codex_tokens, extract_tokens_for_agent, normalize_model,
 };
-pub use utils::{file_modified_since, flatten_content, parse_timestamp};
+pub use utils::{
+    extract_invocations_from_content_blocks, file_modified_since, flatten_content, parse_timestamp,
+    unwrap_skill_invocations,
+};
 pub use workspace_cache::WorkspaceCache;
 
 use std::path::PathBuf;

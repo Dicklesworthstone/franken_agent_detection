@@ -144,6 +144,83 @@ fn extract_content_part(item: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Extract structured invocations from a Claude API-style content block array.
+///
+/// Emits every `tool_use` block as `kind: "tool"`. Connector-specific
+/// unwrapping (e.g. Amp's skill wrapper) should be applied separately via
+/// [`unwrap_skill_invocations`].
+///
+/// Works for any connector that stores content as an array of typed blocks:
+/// amp, claude_code, codex, cline, factory.
+#[must_use]
+pub fn extract_invocations_from_content_blocks(
+    val: &serde_json::Value,
+) -> Vec<crate::types::NormalizedInvocation> {
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+
+    let mut invocations = Vec::new();
+    for item in arr {
+        let item_type = item.get("type").and_then(|v| v.as_str());
+        if item_type != Some("tool_use") {
+            continue;
+        }
+
+        let Some(raw_name) = item.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let call_id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(std::string::ToString::to_string);
+        let input = item.get("input");
+
+        invocations.push(crate::types::NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: raw_name.to_string(),
+            raw_name: None,
+            call_id,
+            arguments: input.cloned(),
+        });
+    }
+
+    invocations
+}
+
+/// Amp-specific wrapper tools that should be unwrapped to their inner name.
+const AMP_SKILL_WRAPPERS: &[(&str, &str)] = &[
+    // (tool_name, input_key_for_real_name)
+    ("skill", "name"),
+    ("load_skill", "name"),
+];
+
+/// Unwrap Amp skill-wrapper invocations in place.
+///
+/// Tools like `skill` and `load_skill` are Amp-specific wrappers whose real
+/// name lives inside the `input` object. This rewrites matching invocations
+/// to `kind: "skill"` with the inner name, preserving `raw_name` for
+/// traceability. Non-matching invocations are left unchanged.
+pub fn unwrap_skill_invocations(invocations: &mut Vec<crate::types::NormalizedInvocation>) {
+    for inv in invocations.iter_mut() {
+        if let Some((_, key)) = AMP_SKILL_WRAPPERS
+            .iter()
+            .find(|(name, _)| *name == inv.name)
+        {
+            if let Some(inner_name) = inv
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get(*key))
+                .and_then(|v| v.as_str())
+            {
+                inv.raw_name = Some(inv.name.clone());
+                inv.name = inner_name.to_string();
+                inv.kind = "skill".to_string();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +387,157 @@ mod tests {
     fn flatten_content_whitespace_only() {
         let val = json!("   ");
         assert_eq!(flatten_content(&val), "   ");
+    }
+
+    // --- extract_invocations_from_content_blocks tests ---
+
+    #[test]
+    fn extract_invocations_plain_tool_use() {
+        let val = json!([
+            {"type": "text", "text": "Let me read that file."},
+            {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"path": "/src/main.rs"}}
+        ]);
+        let invocations = extract_invocations_from_content_blocks(&val);
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].kind, "tool");
+        assert_eq!(invocations[0].name, "Read");
+        assert!(invocations[0].raw_name.is_none());
+        assert_eq!(invocations[0].call_id.as_deref(), Some("toolu_1"));
+        assert_eq!(invocations[0].arguments.as_ref().unwrap()["path"], "/src/main.rs");
+    }
+
+    #[test]
+    fn extract_invocations_skill_not_unwrapped_by_shared_helper() {
+        // The shared helper should NOT unwrap skill wrappers — that's Amp-specific.
+        let val = json!([
+            {"type": "tool_use", "id": "toolu_2", "name": "skill", "input": {"name": "github-prs"}}
+        ]);
+        let invocations = extract_invocations_from_content_blocks(&val);
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].kind, "tool");
+        assert_eq!(invocations[0].name, "skill");
+        assert!(invocations[0].raw_name.is_none());
+    }
+
+    #[test]
+    fn extract_invocations_skill_without_inner_name_falls_back() {
+        let val = json!([
+            {"type": "tool_use", "name": "skill", "input": {"arguments": "something"}}
+        ]);
+        let invocations = extract_invocations_from_content_blocks(&val);
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].kind, "tool");
+        assert_eq!(invocations[0].name, "skill");
+        assert!(invocations[0].raw_name.is_none());
+    }
+
+    #[test]
+    fn extract_invocations_multiple_tools() {
+        let val = json!([
+            {"type": "tool_use", "name": "Read", "input": {"path": "a.rs"}},
+            {"type": "text", "text": "Now editing..."},
+            {"type": "tool_use", "name": "edit_file", "input": {"path": "a.rs", "old_str": "x", "new_str": "y"}},
+            {"type": "tool_use", "name": "skill", "input": {"name": "git"}}
+        ]);
+        let invocations = extract_invocations_from_content_blocks(&val);
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[0].name, "Read");
+        assert_eq!(invocations[0].kind, "tool");
+        assert_eq!(invocations[1].name, "edit_file");
+        assert_eq!(invocations[1].kind, "tool");
+        // Shared helper does NOT unwrap skill — emits as plain tool
+        assert_eq!(invocations[2].name, "skill");
+        assert_eq!(invocations[2].kind, "tool");
+    }
+
+    // --- unwrap_skill_invocations tests ---
+
+    #[test]
+    fn unwrap_skill_invocations_rewrites_skill_wrapper() {
+        let mut invocations = vec![crate::types::NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: "skill".to_string(),
+            raw_name: None,
+            call_id: Some("toolu_1".to_string()),
+            arguments: Some(json!({"name": "github-prs"})),
+        }];
+        unwrap_skill_invocations(&mut invocations);
+        assert_eq!(invocations[0].kind, "skill");
+        assert_eq!(invocations[0].name, "github-prs");
+        assert_eq!(invocations[0].raw_name.as_deref(), Some("skill"));
+    }
+
+    #[test]
+    fn unwrap_skill_invocations_rewrites_load_skill_wrapper() {
+        let mut invocations = vec![crate::types::NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: "load_skill".to_string(),
+            raw_name: None,
+            call_id: None,
+            arguments: Some(json!({"name": "git"})),
+        }];
+        unwrap_skill_invocations(&mut invocations);
+        assert_eq!(invocations[0].kind, "skill");
+        assert_eq!(invocations[0].name, "git");
+        assert_eq!(invocations[0].raw_name.as_deref(), Some("load_skill"));
+    }
+
+    #[test]
+    fn unwrap_skill_invocations_leaves_non_wrappers_unchanged() {
+        let mut invocations = vec![crate::types::NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: "Read".to_string(),
+            raw_name: None,
+            call_id: None,
+            arguments: Some(json!({"path": "/src/main.rs"})),
+        }];
+        unwrap_skill_invocations(&mut invocations);
+        assert_eq!(invocations[0].kind, "tool");
+        assert_eq!(invocations[0].name, "Read");
+        assert!(invocations[0].raw_name.is_none());
+    }
+
+    #[test]
+    fn unwrap_skill_invocations_no_inner_name_leaves_unchanged() {
+        let mut invocations = vec![crate::types::NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: "skill".to_string(),
+            raw_name: None,
+            call_id: None,
+            arguments: Some(json!({"arguments": "something"})),
+        }];
+        unwrap_skill_invocations(&mut invocations);
+        // No "name" key in arguments — should remain as tool "skill"
+        assert_eq!(invocations[0].kind, "tool");
+        assert_eq!(invocations[0].name, "skill");
+        assert!(invocations[0].raw_name.is_none());
+    }
+
+    #[test]
+    fn extract_invocations_no_tool_use_blocks() {
+        let val = json!([
+            {"type": "text", "text": "Just plain text."}
+        ]);
+        assert!(extract_invocations_from_content_blocks(&val).is_empty());
+    }
+
+    #[test]
+    fn extract_invocations_string_content_returns_empty() {
+        let val = json!("plain string");
+        assert!(extract_invocations_from_content_blocks(&val).is_empty());
+    }
+
+    #[test]
+    fn extract_invocations_null_returns_empty() {
+        let val = json!(null);
+        assert!(extract_invocations_from_content_blocks(&val).is_empty());
+    }
+
+    #[test]
+    fn extract_invocations_tool_use_missing_name_skipped() {
+        let val = json!([
+            {"type": "tool_use", "input": {"path": "a.rs"}}
+        ]);
+        assert!(extract_invocations_from_content_blocks(&val).is_empty());
     }
 }

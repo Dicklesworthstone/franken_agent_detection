@@ -50,6 +50,31 @@ pub struct NormalizedMessage {
     pub content: String,
     pub extra: serde_json::Value,
     pub snippets: Vec<NormalizedSnippet>,
+    /// Structured tool/skill invocations extracted from this message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invocations: Vec<NormalizedInvocation>,
+}
+
+/// A single tool or skill invocation within a message.
+#[cfg(feature = "connectors")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedInvocation {
+    /// Classification: `"tool"` or `"skill"`.
+    pub kind: String,
+    /// Canonical searchable name (e.g. `"github-prs"`, `"Read"`, `"bash"`).
+    /// For wrapper tools like Amp's `skill("github-prs")`, this is the
+    /// unwrapped semantic name, not `"skill"`.
+    pub name: String,
+    /// Original tool name when different from `name` (e.g. `"skill"` for
+    /// Amp skill wrapper calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_name: Option<String>,
+    /// Provider-assigned call ID, useful for joining with tool results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    /// Raw input/arguments passed to the tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Value>,
 }
 
 #[cfg(feature = "connectors")]
