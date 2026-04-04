@@ -193,6 +193,39 @@ fn cwd_join(parts: &[&str]) -> Option<PathBuf> {
     Some(path)
 }
 
+fn amp_xdg_probe_root_from_env_value(xdg_data_home: &str) -> Option<PathBuf> {
+    let trimmed = xdg_data_home.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed).join("amp"))
+}
+
+fn amp_xdg_probe_root_from_env() -> Option<PathBuf> {
+    std::env::var("XDG_DATA_HOME")
+        .ok()
+        .and_then(|value| amp_xdg_probe_root_from_env_value(&value))
+}
+
+fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for ext in ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"] {
+        roots.push(home.join(".config/Code/User/globalStorage").join(ext));
+        roots.push(home.join(".config/Cursor/User/globalStorage").join(ext));
+        roots.push(
+            home.join("Library/Application Support/Code/User/globalStorage")
+                .join(ext),
+        );
+        roots.push(
+            home.join("Library/Application Support/Cursor/User/globalStorage")
+                .join(ext),
+        );
+        roots.push(home.join("AppData/Roaming/Code/User/globalStorage").join(ext));
+        roots.push(home.join("AppData/Roaming/Cursor/User/globalStorage").join(ext));
+    }
+    roots
+}
+
 fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
     let read = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string());
 
@@ -231,131 +264,139 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
 
 #[allow(clippy::too_many_lines)]
 fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut push = |parts: &[&str]| {
+    fn maybe_push(out: &mut Vec<PathBuf>, parts: &[&str]) {
         if let Some(path) = home_join(parts) {
             out.push(path);
         }
-    };
+    }
+
+    let mut out = Vec::new();
 
     match slug {
         "aider" => {
-            push(&[".aider.chat.history.md"]);
-            push(&[".aider"]);
+            maybe_push(&mut out, &[".aider.chat.history.md"]);
+            maybe_push(&mut out, &[".aider"]);
             if let Some(cwd_marker) = cwd_join(&[".aider.chat.history.md"]) {
                 out.push(cwd_marker);
             }
         }
         "amp" => {
-            push(&[".local", "share", "amp"]);
-            push(&["Library", "Application Support", "amp"]);
-            push(&["AppData", "Roaming", "amp"]);
-            push(&[
-                ".config",
-                "Code",
-                "User",
-                "globalStorage",
-                "sourcegraph.amp",
-            ]);
-            push(&[
-                "Library",
-                "Application Support",
-                "Code",
-                "User",
-                "globalStorage",
-                "sourcegraph.amp",
-            ]);
-            push(&[
-                "AppData",
-                "Roaming",
-                "Code",
-                "User",
-                "globalStorage",
-                "sourcegraph.amp",
-            ]);
+            if let Some(path) = amp_xdg_probe_root_from_env() {
+                out.push(path);
+            }
+            maybe_push(&mut out, &[".local", "share", "amp"]);
+            maybe_push(&mut out, &["Library", "Application Support", "amp"]);
+            maybe_push(&mut out, &["AppData", "Roaming", "amp"]);
+            maybe_push(
+                &mut out,
+                &[".config", "Code", "User", "globalStorage", "sourcegraph.amp"],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "Code",
+                    "User",
+                    "globalStorage",
+                    "sourcegraph.amp",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "AppData",
+                    "Roaming",
+                    "Code",
+                    "User",
+                    "globalStorage",
+                    "sourcegraph.amp",
+                ],
+            );
         }
         "chatgpt" => {
-            push(&["Library", "Application Support", "com.openai.chat"]);
+            maybe_push(&mut out, &["Library", "Application Support", "com.openai.chat"]);
         }
         "claude" => {
-            push(&[".claude"]);
-            push(&[".config", "claude"]);
+            maybe_push(&mut out, &[".claude"]);
+            maybe_push(&mut out, &[".config", "claude"]);
         }
         "clawdbot" => {
-            push(&[".clawdbot"]);
-            push(&[".clawdbot", "sessions"]);
+            maybe_push(&mut out, &[".clawdbot"]);
+            maybe_push(&mut out, &[".clawdbot", "sessions"]);
         }
         "cline" => {
-            push(&[".cline"]);
-            push(&[".config", "cline"]);
+            if let Some(home) = dirs::home_dir() {
+                out.extend(cline_storage_probe_roots_from_home(&home));
+            }
         }
         "codex" => {
-            push(&[".codex", "sessions"]);
+            maybe_push(&mut out, &[".codex", "sessions"]);
         }
         "continue" => {
-            push(&[".continue", "sessions"]);
-            push(&[".continue"]);
+            maybe_push(&mut out, &[".continue", "sessions"]);
+            maybe_push(&mut out, &[".continue"]);
         }
         "copilot_cli" => {
-            push(&[".copilot", "session-state"]);
-            push(&[".copilot", "history-session-state"]);
-            push(&[".config", "gh-copilot"]);
-            push(&[".config", "gh", "copilot"]);
-            push(&[".local", "share", "github-copilot"]);
+            maybe_push(&mut out, &[".copilot", "session-state"]);
+            maybe_push(&mut out, &[".copilot", "history-session-state"]);
+            maybe_push(&mut out, &[".config", "gh-copilot"]);
+            maybe_push(&mut out, &[".config", "gh", "copilot"]);
+            maybe_push(&mut out, &[".local", "share", "github-copilot"]);
         }
         "crush" => {
-            push(&[".crush"]);
-            push(&[".crush", "crush.db"]);
+            maybe_push(&mut out, &[".crush"]);
+            maybe_push(&mut out, &[".crush", "crush.db"]);
         }
         "cursor" => {
-            push(&[".cursor"]);
-            push(&[".config", "Cursor"]);
+            maybe_push(&mut out, &[".cursor"]);
+            maybe_push(&mut out, &[".config", "Cursor"]);
         }
         "factory" => {
-            push(&[".factory-droid"]);
-            push(&[".config", "factory-droid"]);
+            maybe_push(&mut out, &[".factory-droid"]);
+            maybe_push(&mut out, &[".config", "factory-droid"]);
         }
         "gemini" => {
-            push(&[".gemini"]);
-            push(&[".config", "gemini"]);
+            maybe_push(&mut out, &[".gemini"]);
+            maybe_push(&mut out, &[".config", "gemini"]);
         }
         "github-copilot" => {
-            push(&[".github-copilot"]);
-            push(&[".config", "github-copilot"]);
-            push(&[".copilot", "session-state"]);
-            push(&[".copilot", "history-session-state"]);
+            maybe_push(&mut out, &[".github-copilot"]);
+            maybe_push(&mut out, &[".config", "github-copilot"]);
+            maybe_push(&mut out, &[".copilot", "session-state"]);
+            maybe_push(&mut out, &[".copilot", "history-session-state"]);
         }
         "goose" => {
-            push(&[".local", "share", "goose", "sessions"]);
-            push(&[".goose", "sessions"]);
-            push(&[".goose"]);
+            maybe_push(&mut out, &[".local", "share", "goose", "sessions"]);
+            maybe_push(&mut out, &[".goose", "sessions"]);
+            maybe_push(&mut out, &[".goose"]);
         }
         "kimi" => {
-            push(&[".kimi", "sessions"]);
-            push(&[".kimi"]);
+            maybe_push(&mut out, &[".kimi", "sessions"]);
+            maybe_push(&mut out, &[".kimi"]);
         }
         "opencode" => {
-            push(&[".opencode"]);
-            push(&[".config", "opencode"]);
+            maybe_push(&mut out, &[".opencode"]);
+            maybe_push(&mut out, &[".config", "opencode"]);
         }
         "openclaw" => {
-            push(&[".openclaw"]);
-            push(&[".openclaw", "agents"]);
+            maybe_push(&mut out, &[".openclaw"]);
+            maybe_push(&mut out, &[".openclaw", "agents"]);
         }
         "pi_agent" => {
-            push(&[".pi", "agent", "sessions"]);
+            maybe_push(&mut out, &[".pi", "agent", "sessions"]);
         }
         "qwen" => {
-            push(&[".qwen", "tmp"]);
-            push(&[".qwen"]);
+            maybe_push(&mut out, &[".qwen", "tmp"]);
+            maybe_push(&mut out, &[".qwen"]);
         }
         "vibe" => {
-            push(&[".vibe"]);
-            push(&[".vibe", "logs", "session"]);
+            maybe_push(&mut out, &[".vibe"]);
+            maybe_push(&mut out, &[".vibe", "logs", "session"]);
         }
         "windsurf" => {
-            push(&[".windsurf"]);
-            push(&[".config", "windsurf"]);
+            maybe_push(&mut out, &[".windsurf"]);
+            maybe_push(&mut out, &[".config", "windsurf"]);
         }
         _ => {}
     }
@@ -500,38 +541,42 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 ])],
                 "claude" => vec![tilde(&[".claude", "projects"]), tilde(&[".claude"])],
                 "clawdbot" => vec![tilde(&[".clawdbot", "sessions"]), tilde(&[".clawdbot"])],
-                "cline" => vec![
-                    tilde(&[
-                        ".config",
-                        "Code",
-                        "User",
-                        "globalStorage",
-                        "saoudrizwan.claude-dev",
-                    ]),
-                    tilde(&[
-                        ".config",
-                        "Cursor",
-                        "User",
-                        "globalStorage",
-                        "saoudrizwan.claude-dev",
-                    ]),
-                    tilde(&[
-                        "Library",
-                        "Application Support",
-                        "Code",
-                        "User",
-                        "globalStorage",
-                        "saoudrizwan.claude-dev",
-                    ]),
-                    tilde(&[
-                        "Library",
-                        "Application Support",
-                        "Cursor",
-                        "User",
-                        "globalStorage",
-                        "saoudrizwan.claude-dev",
-                    ]),
-                ],
+                "cline" => {
+                    let mut paths = Vec::new();
+                    for ext in ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"] {
+                        paths.push(tilde(&[
+                            ".config",
+                            "Code",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
+                        paths.push(tilde(&[
+                            ".config",
+                            "Cursor",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
+                        paths.push(tilde(&[
+                            "Library",
+                            "Application Support",
+                            "Code",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
+                        paths.push(tilde(&[
+                            "Library",
+                            "Application Support",
+                            "Cursor",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
+                    }
+                    paths
+                }
                 "codex" => vec![tilde(&[".codex", "sessions"])],
                 "continue" => vec![tilde(&[".continue", "sessions"])],
                 "copilot_cli" => vec![
@@ -840,5 +885,38 @@ mod tests {
             .find(|entry| entry.slug == "pi_agent")
             .expect("pi_agent entry");
         assert_eq!(pi.root_paths, vec![pi_sessions.display().to_string()]);
+    }
+
+    #[test]
+    fn amp_xdg_probe_root_uses_trimmed_env_value() {
+        let root = amp_xdg_probe_root_from_env_value("  /tmp/cass-xdg  ")
+            .expect("amp xdg root");
+        assert_eq!(root, PathBuf::from("/tmp/cass-xdg").join("amp"));
+    }
+
+    #[test]
+    fn amp_xdg_probe_root_rejects_blank_env_value() {
+        assert!(amp_xdg_probe_root_from_env_value("   ").is_none());
+    }
+
+    #[test]
+    fn cline_storage_probe_roots_cover_vscode_and_cursor_layouts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let roots = cline_storage_probe_roots_from_home(tmp.path());
+
+        assert!(
+            roots.contains(
+                &tmp.path()
+                    .join(".config/Code/User/globalStorage/saoudrizwan.claude-dev")
+            ),
+            "expected VS Code Cline storage root in {roots:?}"
+        );
+        assert!(
+            roots.contains(
+                &tmp.path()
+                    .join(".config/Cursor/User/globalStorage/rooveterinaryinc.roo-cline")
+            ),
+            "expected Cursor Roo-Cline storage root in {roots:?}"
+        );
     }
 }
