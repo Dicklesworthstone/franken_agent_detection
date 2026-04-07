@@ -54,11 +54,26 @@ impl OpenCodeConnector {
             }
         }
 
+        // XDG config path — on macOS dirs::data_local_dir() returns
+        // ~/Library/Application Support which misses XDG-style installs
+        // that place data under ~/.config/opencode/ (#146).
+        if let Some(config) = dirs::config_dir() {
+            let storage_dir = config.join("opencode/storage");
+            if storage_dir.exists() {
+                return Some(storage_dir);
+            }
+        }
+
         // Fallback: ~/.local/share/opencode/storage
         if let Some(home) = dirs::home_dir() {
             let storage_dir = home.join(".local/share/opencode/storage");
             if storage_dir.exists() {
                 return Some(storage_dir);
+            }
+            // Also check ~/.config/opencode/storage for XDG-style installs
+            let xdg_storage = home.join(".config/opencode/storage");
+            if xdg_storage.exists() {
+                return Some(xdg_storage);
             }
         }
 
@@ -84,11 +99,26 @@ impl OpenCodeConnector {
             }
         }
 
+        // XDG config path — on macOS dirs::data_local_dir() returns
+        // ~/Library/Application Support which misses XDG-style installs
+        // that place the DB under ~/.config/opencode/ (#146).
+        if let Some(config) = dirs::config_dir() {
+            let db = config.join("opencode/opencode.db");
+            if db.exists() {
+                return Some(db);
+            }
+        }
+
         // Fallback: ~/.local/share/opencode/opencode.db
         if let Some(home) = dirs::home_dir() {
             let db = home.join(".local/share/opencode/opencode.db");
             if db.exists() {
                 return Some(db);
+            }
+            // Also check ~/.config/opencode/opencode.db for XDG-style installs
+            let xdg_db = home.join(".config/opencode/opencode.db");
+            if xdg_db.exists() {
+                return Some(xdg_db);
             }
         }
 
