@@ -368,6 +368,7 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         }
         "goose" => {
             maybe_push(&mut out, &[".local", "share", "goose", "sessions"]);
+            maybe_push(&mut out, &[".config", "goose"]);
             maybe_push(&mut out, &[".goose", "sessions"]);
             maybe_push(&mut out, &[".goose"]);
         }
@@ -614,7 +615,9 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 ],
                 "goose" => vec![
                     tilde(&[".local", "share", "goose", "sessions"]),
+                    tilde(&[".config", "goose"]),
                     tilde(&[".goose", "sessions"]),
+                    tilde(&[".goose"]),
                 ],
                 "kimi" => vec![tilde(&[".kimi", "sessions"])],
                 "opencode" => vec![tilde(&[".local", "share", "opencode"])],
