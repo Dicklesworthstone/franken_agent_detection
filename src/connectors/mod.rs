@@ -20,6 +20,8 @@ pub mod factory;
 pub mod gemini;
 #[cfg(feature = "goose")]
 pub mod goose;
+#[cfg(feature = "hermes")]
+pub mod hermes;
 pub mod kimi;
 pub mod openclaw;
 #[cfg(feature = "opencode")]
@@ -181,5 +183,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
     v.push(("goose", || Box::new(goose::GooseConnector::new())));
     #[cfg(feature = "crush")]
     v.push(("crush", || Box::new(crush::CrushConnector::new())));
+    #[cfg(feature = "hermes")]
+    v.push(("hermes", || Box::new(hermes::HermesConnector::new())));
     v
 }

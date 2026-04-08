@@ -58,10 +58,12 @@ cursor = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 opencode = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # Goose: SQLite database access for Goose sessions.db
 goose = ["connectors", "dep:rusqlite", "dep:urlencoding"]
+# Hermes: SQLite database access for Hermes Agent state.db
+hermes = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # Crush: SQLite database access for Charm's Crush agent (uses frankensqlite)
 crush = ["connectors", "dep:frankensqlite"]
 # All connectors enabled
-all-connectors = ["connectors", "chatgpt", "cursor", "opencode", "goose", "crush"]
+all-connectors = ["connectors", "chatgpt", "cursor", "opencode", "goose", "hermes", "crush"]
 
 [dev-dependencies]
 tempfile = "3"
