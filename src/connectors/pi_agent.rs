@@ -209,8 +209,24 @@ impl Connector for PiAgentConnector {
             } else {
                 homes.extend(Self::default_homes());
             }
-        } else if looks_like_root(&ctx.data_dir) {
-            homes.push(ctx.data_dir.clone());
+        } else {
+            if looks_like_root(&ctx.data_dir) {
+                homes.push(ctx.data_dir.clone());
+            }
+            for scan_root in &ctx.scan_roots {
+                let candidates = [
+                    scan_root.path.clone(),
+                    scan_root.path.join(".pi/agent"),
+                    scan_root.path.join(".pi/agent/sessions"),
+                    scan_root.path.join(".omp/agent"),
+                    scan_root.path.join(".omp/agent/sessions"),
+                ];
+                for candidate in candidates {
+                    if looks_like_root(&candidate) {
+                        homes.push(candidate);
+                    }
+                }
+            }
         }
         // Normalize file-shaped homes (e.g. pointing directly at a .jsonl)
         // to their parent directory, matching the legacy single-home behavior.

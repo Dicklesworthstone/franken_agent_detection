@@ -321,7 +321,8 @@ impl PathMapping {
     #[must_use]
     pub fn applies_to_agent(&self, agent: Option<&str>) -> bool {
         match (&self.agents, agent) {
-            (None, _) | (Some(_), None) => true,
+            (None, _) => true,
+            (Some(_), None) => false,
             (Some(agents), Some(a)) => agents
                 .iter()
                 .any(|allowed| agent_name_matches_filter(allowed, a)),

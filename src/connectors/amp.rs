@@ -48,10 +48,24 @@ impl AmpConnector {
         let mut roots = Vec::new();
         if let Some(home) = dirs::home_dir() {
             roots.push(home.join(".config/Code/User/globalStorage/sourcegraph.amp"));
+            roots.push(home.join(".config/Code - Insiders/User/globalStorage/sourcegraph.amp"));
+            roots.push(home.join(".config/VSCodium/User/globalStorage/sourcegraph.amp"));
             roots.push(
                 home.join("Library/Application Support/Code/User/globalStorage/sourcegraph.amp"),
             );
+            roots.push(
+                home.join(
+                    "Library/Application Support/Code - Insiders/User/globalStorage/sourcegraph.amp",
+                ),
+            );
+            roots.push(
+                home.join("Library/Application Support/VSCodium/User/globalStorage/sourcegraph.amp"),
+            );
             roots.push(home.join("AppData/Roaming/Code/User/globalStorage/sourcegraph.amp"));
+            roots.push(
+                home.join("AppData/Roaming/Code - Insiders/User/globalStorage/sourcegraph.amp"),
+            );
+            roots.push(home.join("AppData/Roaming/VSCodium/User/globalStorage/sourcegraph.amp"));
         }
         roots
     }
@@ -93,11 +107,56 @@ impl Connector for AmpConnector {
                 Self::candidate_roots()
             }
         } else {
-            if !looks_like_root(&ctx.data_dir) {
+            let mut explicit_roots: Vec<PathBuf> = Vec::new();
+            for scan_root in &ctx.scan_roots {
+                let candidates = [
+                    scan_root.path.clone(),
+                    scan_root.path.join(".local/share/amp"),
+                    scan_root.path.join("Library/Application Support/amp"),
+                    scan_root.path.join("AppData/Roaming/amp"),
+                    scan_root
+                        .path
+                        .join(".config/Code/User/globalStorage/sourcegraph.amp"),
+                    scan_root
+                        .path
+                        .join(".config/Code - Insiders/User/globalStorage/sourcegraph.amp"),
+                    scan_root
+                        .path
+                        .join(".config/VSCodium/User/globalStorage/sourcegraph.amp"),
+                    scan_root.path.join(
+                        "Library/Application Support/Code/User/globalStorage/sourcegraph.amp",
+                    ),
+                    scan_root.path.join(
+                        "Library/Application Support/Code - Insiders/User/globalStorage/sourcegraph.amp",
+                    ),
+                    scan_root
+                        .path
+                        .join("Library/Application Support/VSCodium/User/globalStorage/sourcegraph.amp"),
+                    scan_root
+                        .path
+                        .join("AppData/Roaming/Code/User/globalStorage/sourcegraph.amp"),
+                    scan_root.path.join(
+                        "AppData/Roaming/Code - Insiders/User/globalStorage/sourcegraph.amp",
+                    ),
+                    scan_root
+                        .path
+                        .join("AppData/Roaming/VSCodium/User/globalStorage/sourcegraph.amp"),
+                ];
+                for candidate in candidates {
+                    if looks_like_root(&candidate) {
+                        explicit_roots.push(candidate);
+                    }
+                }
+            }
+            if explicit_roots.is_empty() {
                 return Ok(Vec::new());
             }
-            vec![ctx.data_dir.clone()]
+            explicit_roots
         };
+
+        let mut roots = roots;
+        roots.sort();
+        roots.dedup();
 
         for root in roots {
             if !root.exists() {

@@ -320,37 +320,58 @@ impl Connector for HermesConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let db_path =
-            if ctx.data_dir.exists() && ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
-                Some(ctx.data_dir.clone())
-            } else if ctx.use_default_detection() {
-                Self::sqlite_db_path()
-            } else {
-                let candidate = ctx.data_dir.join("state.db");
-                if candidate.exists() {
-                    Some(candidate)
-                } else {
-                    None
-                }
-            };
+        let mut db_paths: Vec<PathBuf> = Vec::new();
+        if ctx
+            .data_dir
+            .extension()
+            .is_some_and(|ext| ext == "db")
+        {
+            db_paths.push(ctx.data_dir.clone());
+        } else if !ctx.data_dir.as_os_str().is_empty() {
+            db_paths.push(ctx.data_dir.join("state.db"));
+        }
 
-        match db_path {
-            Some(db) => match Self::extract_from_sqlite(&db, ctx.since_ts) {
-                Ok(convs) => {
+        if ctx.use_default_detection() {
+            if let Some(db) = Self::sqlite_db_path() {
+                db_paths.push(db);
+            }
+        } else {
+            for scan_root in &ctx.scan_roots {
+                if scan_root.path.extension().is_some_and(|ext| ext == "db") {
+                    db_paths.push(scan_root.path.clone());
+                }
+                db_paths.push(scan_root.path.join("state.db"));
+                db_paths.push(scan_root.path.join(".hermes/state.db"));
+            }
+        }
+
+        {
+            let mut seen = HashSet::new();
+            db_paths.retain(|p| seen.insert(p.clone()));
+        }
+
+        let mut convs = Vec::new();
+
+        for db in db_paths {
+            if !db.exists() {
+                continue;
+            }
+            match Self::extract_from_sqlite(&db, ctx.since_ts) {
+                Ok(db_convs) => {
                     tracing::debug!(
                         "hermes sqlite: found {} sessions in {}",
-                        convs.len(),
+                        db_convs.len(),
                         db.display()
                     );
-                    Ok(convs)
+                    convs.extend(db_convs);
                 }
                 Err(e) => {
                     tracing::debug!("hermes sqlite: failed to read {}: {e}", db.display());
-                    Ok(Vec::new())
                 }
-            },
-            None => Ok(Vec::new()),
+            }
         }
+
+        Ok(convs)
     }
 }
 
