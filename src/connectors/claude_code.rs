@@ -304,8 +304,8 @@ fn scan_claude_with_callback(
                         .and_then(|m| m.get("model"))
                         .and_then(|v| v.as_str())
                         .map(String::from);
-                    let invocations = content_val
-                        .map_or_else(Vec::new, extract_invocations_from_content_blocks);
+                    let invocations =
+                        content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
 
                     messages.push(NormalizedMessage {
                         idx: 0,
@@ -371,12 +371,8 @@ fn scan_claude_with_callback(
                             (None, None) => None,
                         };
 
-                        let content_val = item
-                            .get("content")
-                            .or_else(|| item.get("text"));
-                        let content_str = content_val
-                            .map(flatten_content)
-                            .unwrap_or_default();
+                        let content_val = item.get("content").or_else(|| item.get("text"));
+                        let content_str = content_val.map(flatten_content).unwrap_or_default();
 
                         if content_str.trim().is_empty() {
                             continue;

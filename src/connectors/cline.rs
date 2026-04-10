@@ -209,9 +209,7 @@ impl Connector for ClineConnector {
                             .get("content")
                             .or_else(|| item.get("text"))
                             .or_else(|| item.get("message"));
-                        let content = content_val
-                            .map(flatten_content)
-                            .unwrap_or_default();
+                        let content = content_val.map(flatten_content).unwrap_or_default();
 
                         if content.trim().is_empty() {
                             continue;

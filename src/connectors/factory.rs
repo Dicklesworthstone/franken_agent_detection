@@ -224,8 +224,8 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
                     .and_then(|v| v.as_str())
                     .map(String::from);
 
-                let invocations = content_val
-                    .map_or_else(Vec::new, extract_invocations_from_content_blocks);
+                let invocations =
+                    content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
                 messages.push(NormalizedMessage {
                     idx: 0, // Will be reassigned after collection
                     role: role.to_string(),

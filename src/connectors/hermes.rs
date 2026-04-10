@@ -335,22 +335,20 @@ impl Connector for HermesConnector {
             };
 
         match db_path {
-            Some(db) => {
-                match Self::extract_from_sqlite(&db, ctx.since_ts) {
-                    Ok(convs) => {
-                        tracing::debug!(
-                            "hermes sqlite: found {} sessions in {}",
-                            convs.len(),
-                            db.display()
-                        );
-                        Ok(convs)
-                    }
-                    Err(e) => {
-                        tracing::debug!("hermes sqlite: failed to read {}: {e}", db.display());
-                        Ok(Vec::new())
-                    }
+            Some(db) => match Self::extract_from_sqlite(&db, ctx.since_ts) {
+                Ok(convs) => {
+                    tracing::debug!(
+                        "hermes sqlite: found {} sessions in {}",
+                        convs.len(),
+                        db.display()
+                    );
+                    Ok(convs)
                 }
-            }
+                Err(e) => {
+                    tracing::debug!("hermes sqlite: failed to read {}: {e}", db.display());
+                    Ok(Vec::new())
+                }
+            },
             None => Ok(Vec::new()),
         }
     }
@@ -443,10 +441,7 @@ mod tests {
 
     #[test]
     fn real_to_millis_passes_through_epoch_millis() {
-        assert_eq!(
-            real_to_millis(1_700_000_000_000.0),
-            Some(1_700_000_000_000)
-        );
+        assert_eq!(real_to_millis(1_700_000_000_000.0), Some(1_700_000_000_000));
     }
 
     #[test]
@@ -488,7 +483,9 @@ mod tests {
                 name: "terminal".into(),
                 raw_name: None,
                 call_id: None,
-                arguments: Some(serde_json::json!({"command": "ls", "workdir": "/home/user/project"})),
+                arguments: Some(
+                    serde_json::json!({"command": "ls", "workdir": "/home/user/project"}),
+                ),
             }],
         }];
         assert_eq!(

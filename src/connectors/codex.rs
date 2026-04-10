@@ -10,7 +10,9 @@ use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct CodexConnector;
 
@@ -418,11 +420,7 @@ fn scan_codex_with_callback(
                                             .map(String::from);
 
                                         let content_text = format!("[Tool: {}]", tool_name);
-                                        update_time_bounds(
-                                            &mut started_at,
-                                            &mut ended_at,
-                                            created,
-                                        );
+                                        update_time_bounds(&mut started_at, &mut ended_at, created);
                                         messages.push(NormalizedMessage {
                                             idx: 0,
                                             role: "assistant".to_string(),

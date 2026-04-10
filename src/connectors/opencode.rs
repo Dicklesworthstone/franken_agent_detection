@@ -499,13 +499,22 @@ impl Connector for OpenCodeConnector {
 
         // --- Phase 1: Try SQLite database(s) (v1.2+) ---
         // Collect candidate database paths in priority order:
-        //   1. If ctx.data_dir points directly at an opencode.db file, use it.
-        //   2. If ctx.data_dir is a directory, check for data_dir/opencode.db.
+        //   1. If ctx.data_dir looks like a path to `opencode.db` itself
+        //      (has a `.db` extension), use it as-is.
+        //   2. Otherwise, if ctx.data_dir is non-empty, treat it as a
+        //      directory and check for `<data_dir>/opencode.db`.
         //   3. Always add the built-in default search list. This ensures
         //      we find the canonical XDG location even when explicit scan
         //      roots or a stale detection path were passed in (see issue #174).
+        //
+        // Non-existence of any candidate is filtered at iteration time
+        // (`if !db.exists() { continue; }` below), so we do not gate the
+        // `extension == "db"` branch on `.exists()` — otherwise a
+        // user-supplied .db path that doesn't exist yet would silently
+        // fall through to the "join opencode.db" branch and produce a
+        // nonsense `/path/to/file.db/opencode.db` candidate.
         let mut db_candidates: Vec<PathBuf> = Vec::new();
-        if ctx.data_dir.exists() && ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
+        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             db_candidates.push(ctx.data_dir.clone());
         } else if !ctx.data_dir.as_os_str().is_empty() {
             db_candidates.push(ctx.data_dir.join("opencode.db"));
@@ -3059,5 +3068,78 @@ mod tests {
             "explicit scan_roots must still check ctx.data_dir for opencode.db"
         );
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-roots"));
+    }
+
+    /// Regression: when `ctx.data_dir` points directly at an
+    /// `opencode.db` FILE (not the parent directory), the scanner must
+    /// use it as-is — without trying to join `opencode.db` onto it
+    /// again (which would produce a nonsense candidate like
+    /// `/path/to/opencode.db/opencode.db`).
+    #[test]
+    fn scan_accepts_data_dir_as_direct_db_file() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            [
+                "sess-direct",
+                "proj-direct",
+                "Direct Session",
+                "/home/user/direct",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            [
+                "msg-direct",
+                "sess-direct",
+                r#"{"role":"user","time":{"created":1700000000000}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            [
+                "part-direct",
+                "msg-direct",
+                "sess-direct",
+                r#"{"type":"text","text":"Direct content"}"#,
+            ],
+        )
+        .unwrap();
+
+        let connector = OpenCodeConnector::new();
+        // Pass the db file itself as data_dir.
+        let ctx = ScanContext::local_default(db_path.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-direct"));
+    }
+
+    /// Regression: a nonexistent `.db` path passed as `ctx.data_dir`
+    /// must not be silently treated as a directory (which would have
+    /// produced a bogus `/path/to/missing.db/opencode.db` candidate in
+    /// an earlier draft). The scanner simply finds nothing.
+    #[test]
+    fn scan_handles_nonexistent_db_path_in_data_dir() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing.db");
+        // No file on disk at `missing`.
+
+        let connector = OpenCodeConnector::new();
+        let ctx = ScanContext::with_roots(
+            missing,
+            vec![crate::connectors::scan::ScanRoot::local(
+                dir.path().to_path_buf(),
+            )],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+        assert!(
+            convs.is_empty(),
+            "nonexistent .db path should not produce sessions"
+        );
     }
 }

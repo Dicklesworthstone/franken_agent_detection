@@ -44,8 +44,13 @@ impl PiAgentConnector {
     ///
     /// Explicit `PI_CODING_AGENT_DIR` overrides and becomes the sole
     /// candidate so CI and isolated setups can pin a single location.
+    /// An empty override (`PI_CODING_AGENT_DIR=""`) is treated as unset
+    /// so scans don't silently fall through to the process's working
+    /// directory via `PathBuf::new().join("sessions")`.
     fn default_homes() -> Vec<PathBuf> {
-        if let Ok(explicit) = dotenvy::var("PI_CODING_AGENT_DIR") {
+        if let Ok(explicit) = dotenvy::var("PI_CODING_AGENT_DIR")
+            && !explicit.is_empty()
+        {
             return vec![PathBuf::from(explicit)];
         }
         Self::default_homes_from(dirs::home_dir().as_deref())
@@ -232,12 +237,15 @@ impl Connector for PiAgentConnector {
             if files.is_empty() {
                 continue;
             }
+            // Hoisted out of the per-file loop so we compute the
+            // sessions_dir filesystem stat exactly once per home
+            // instead of once per session file.
+            let sessions_dir = Self::sessions_dir(&home);
 
             for file in files {
                 // Guard against the same session file being reached through
                 // two homes (e.g. a symlink from ~/.pi/agent → ~/.omp/agent).
-                let dedupe_key =
-                    std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+                let dedupe_key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
                 if !seen_session_paths.insert(dedupe_key) {
                     continue;
                 }
@@ -246,209 +254,209 @@ impl Connector for PiAgentConnector {
                     continue;
                 }
 
-            let source_path = file.clone();
+                let source_path = file.clone();
 
-            // Use the parent directory name + filename as external_id
-            // e.g., "--Users-foo-project--/2024-01-15T10-30-00_uuid.jsonl"
-            let sessions_dir = Self::sessions_dir(&home);
-            let external_id = source_path
-                .strip_prefix(&sessions_dir)
-                .ok()
-                .and_then(|rel| rel.to_str().map(String::from))
-                .or_else(|| {
-                    source_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(String::from)
-                });
+                // Use the parent directory name + filename as external_id
+                // e.g., "--Users-foo-project--/2024-01-15T10-30-00_uuid.jsonl"
+                let external_id = source_path
+                    .strip_prefix(&sessions_dir)
+                    .ok()
+                    .and_then(|rel| rel.to_str().map(String::from))
+                    .or_else(|| {
+                        source_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(String::from)
+                    });
 
-            let content = match fs::read_to_string(&file) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(path = %file.display(), error = %e, "pi-agent: skipping unreadable session");
-                    continue;
-                }
-            };
-
-            let mut messages = Vec::new();
-            let mut started_at: Option<i64> = None;
-            let mut ended_at: Option<i64> = None;
-            let mut session_cwd: Option<PathBuf> = None;
-            let mut session_id: Option<String> = None;
-            let mut provider: Option<String> = None;
-            let mut model_id: Option<String> = None;
-
-            for line in content.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let val: Value = match serde_json::from_str(line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
+                let content = match fs::read_to_string(&file) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(path = %file.display(), error = %e, "pi-agent: skipping unreadable session");
+                        continue;
+                    }
                 };
 
-                let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let mut messages = Vec::new();
+                let mut started_at: Option<i64> = None;
+                let mut ended_at: Option<i64> = None;
+                let mut session_cwd: Option<PathBuf> = None;
+                let mut session_id: Option<String> = None;
+                let mut provider: Option<String> = None;
+                let mut model_id: Option<String> = None;
 
-                match entry_type {
-                    "session" => {
-                        // Session header - extract metadata
-                        session_id = val.get("id").and_then(|v| v.as_str()).map(String::from);
-                        session_cwd = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-                        provider = val
-                            .get("provider")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                        model_id = val
-                            .get("modelId")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-
-                        // Parse timestamp
-                        if let Some(ts_val) = val.get("timestamp") {
-                            started_at = parse_timestamp(ts_val);
-                        }
+                for line in content.lines() {
+                    if line.trim().is_empty() {
+                        continue;
                     }
-                    "message" => {
-                        // Message entry - extract the nested message object
-                        let created = val.get("timestamp").and_then(parse_timestamp);
+                    let val: Value = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
 
-                        if let Some(msg) = val.get("message") {
-                            let role = msg
-                                .get("role")
+                    let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                    match entry_type {
+                        "session" => {
+                            // Session header - extract metadata
+                            session_id = val.get("id").and_then(|v| v.as_str()).map(String::from);
+                            session_cwd =
+                                val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+                            provider = val
+                                .get("provider")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
+                                .map(String::from);
+                            model_id = val
+                                .get("modelId")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
 
-                            // Normalize role names
-                            let normalized_role = match role {
-                                "user" => "user",
-                                "assistant" => "assistant",
-                                "toolResult" => "tool",
-                                _ => role,
-                            };
-
-                            // Extract content
-                            let content_str = msg
-                                .get("content")
-                                .map(Self::flatten_message_content)
-                                .unwrap_or_default();
-
-                            if content_str.trim().is_empty() {
-                                continue;
+                            // Parse timestamp
+                            if let Some(ts_val) = val.get("timestamp") {
+                                started_at = parse_timestamp(ts_val);
                             }
-
-                            // Update timestamps
-                            started_at = match (started_at, created) {
-                                (Some(curr), Some(ts)) => Some(curr.min(ts)),
-                                (None, Some(ts)) => Some(ts),
-                                (other, None) => other,
-                            };
-                            ended_at = match (ended_at, created) {
-                                (Some(curr), Some(ts)) => Some(curr.max(ts)),
-                                (None, Some(ts)) => Some(ts),
-                                (other, None) => other,
-                            };
-
-                            // Extract author (model) for assistant messages
-                            // Check message.model first, fall back to tracked model_id
-                            let author = if normalized_role == "assistant" {
-                                msg.get("model")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from)
-                                    .or_else(|| model_id.clone())
-                            } else {
-                                None
-                            };
-
-                            let invocations = msg
-                                .get("content")
-                                .and_then(|c| c.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter(|item| {
-                                            item.get("type").and_then(|t| t.as_str())
-                                                == Some("toolCall")
-                                        })
-                                        .map(|item| {
-                                            let name = item
-                                                .get("name")
-                                                .and_then(|n| n.as_str())
-                                                .unwrap_or("unknown")
-                                                .to_string();
-                                            crate::types::NormalizedInvocation {
-                                                kind: "tool".to_string(),
-                                                name,
-                                                raw_name: None,
-                                                call_id: item
-                                                    .get("id")
-                                                    .and_then(|v| v.as_str())
-                                                    .map(String::from),
-                                                arguments: item.get("arguments").cloned(),
-                                            }
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
-
-                            messages.push(NormalizedMessage {
-                                idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
-                                role: normalized_role.to_string(),
-                                author,
-                                created_at: created,
-                                content: content_str,
-                                extra: val.clone(),
-                                invocations,
-                                snippets: Vec::new(),
-                            });
                         }
-                    }
-                    "model_change" => {
-                        // Track model changes (useful metadata)
-                        provider = val
-                            .get("provider")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                        model_id = val
-                            .get("modelId")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                    }
-                    _ => {
-                        // Skip thinking_level_change and unknown types
+                        "message" => {
+                            // Message entry - extract the nested message object
+                            let created = val.get("timestamp").and_then(parse_timestamp);
+
+                            if let Some(msg) = val.get("message") {
+                                let role = msg
+                                    .get("role")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+
+                                // Normalize role names
+                                let normalized_role = match role {
+                                    "user" => "user",
+                                    "assistant" => "assistant",
+                                    "toolResult" => "tool",
+                                    _ => role,
+                                };
+
+                                // Extract content
+                                let content_str = msg
+                                    .get("content")
+                                    .map(Self::flatten_message_content)
+                                    .unwrap_or_default();
+
+                                if content_str.trim().is_empty() {
+                                    continue;
+                                }
+
+                                // Update timestamps
+                                started_at = match (started_at, created) {
+                                    (Some(curr), Some(ts)) => Some(curr.min(ts)),
+                                    (None, Some(ts)) => Some(ts),
+                                    (other, None) => other,
+                                };
+                                ended_at = match (ended_at, created) {
+                                    (Some(curr), Some(ts)) => Some(curr.max(ts)),
+                                    (None, Some(ts)) => Some(ts),
+                                    (other, None) => other,
+                                };
+
+                                // Extract author (model) for assistant messages
+                                // Check message.model first, fall back to tracked model_id
+                                let author = if normalized_role == "assistant" {
+                                    msg.get("model")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from)
+                                        .or_else(|| model_id.clone())
+                                } else {
+                                    None
+                                };
+
+                                let invocations = msg
+                                    .get("content")
+                                    .and_then(|c| c.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter(|item| {
+                                                item.get("type").and_then(|t| t.as_str())
+                                                    == Some("toolCall")
+                                            })
+                                            .map(|item| {
+                                                let name = item
+                                                    .get("name")
+                                                    .and_then(|n| n.as_str())
+                                                    .unwrap_or("unknown")
+                                                    .to_string();
+                                                crate::types::NormalizedInvocation {
+                                                    kind: "tool".to_string(),
+                                                    name,
+                                                    raw_name: None,
+                                                    call_id: item
+                                                        .get("id")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(String::from),
+                                                    arguments: item.get("arguments").cloned(),
+                                                }
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+
+                                messages.push(NormalizedMessage {
+                                    idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
+                                    role: normalized_role.to_string(),
+                                    author,
+                                    created_at: created,
+                                    content: content_str,
+                                    extra: val.clone(),
+                                    invocations,
+                                    snippets: Vec::new(),
+                                });
+                            }
+                        }
+                        "model_change" => {
+                            // Track model changes (useful metadata)
+                            provider = val
+                                .get("provider")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            model_id = val
+                                .get("modelId")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                        }
+                        _ => {
+                            // Skip thinking_level_change and unknown types
+                        }
                     }
                 }
-            }
 
-            if messages.is_empty() {
-                continue;
-            }
+                if messages.is_empty() {
+                    continue;
+                }
 
-            // Extract title from first user message
-            let title = messages
-                .iter()
-                .find(|m| m.role == "user")
-                .map(|m| {
-                    m.content
-                        .lines()
-                        .next()
-                        .unwrap_or(&m.content)
-                        .chars()
-                        .take(100)
-                        .collect::<String>()
-                })
-                .or_else(|| {
-                    messages
-                        .first()
-                        .and_then(|m| m.content.lines().next())
-                        .map(|s| s.chars().take(100).collect())
+                // Extract title from first user message
+                let title = messages
+                    .iter()
+                    .find(|m| m.role == "user")
+                    .map(|m| {
+                        m.content
+                            .lines()
+                            .next()
+                            .unwrap_or(&m.content)
+                            .chars()
+                            .take(100)
+                            .collect::<String>()
+                    })
+                    .or_else(|| {
+                        messages
+                            .first()
+                            .and_then(|m| m.content.lines().next())
+                            .map(|s| s.chars().take(100).collect())
+                    });
+
+                // Build metadata
+                let metadata = serde_json::json!({
+                    "source": "pi_agent",
+                    "session_id": session_id,
+                    "provider": provider,
+                    "model_id": model_id,
                 });
-
-            // Build metadata
-            let metadata = serde_json::json!({
-                "source": "pi_agent",
-                "session_id": session_id,
-                "provider": provider,
-                "model_id": model_id,
-            });
 
                 convs.push(NormalizedConversation {
                     agent_slug: "pi_agent".to_string(),
@@ -1589,16 +1597,9 @@ mod tests {
         // Each root is scanned independently (matching build_scan_roots).
         let pi_root = sandbox_home.join(".pi/agent");
         let omp_root = sandbox_home.join(".omp/agent");
-        let ctx_pi = ScanContext::with_roots(
-            pi_root.clone(),
-            vec![ScanRoot::local(pi_root)],
-            None,
-        );
-        let ctx_omp = ScanContext::with_roots(
-            omp_root.clone(),
-            vec![ScanRoot::local(omp_root)],
-            None,
-        );
+        let ctx_pi = ScanContext::with_roots(pi_root.clone(), vec![ScanRoot::local(pi_root)], None);
+        let ctx_omp =
+            ScanContext::with_roots(omp_root.clone(), vec![ScanRoot::local(omp_root)], None);
 
         let mut convs = connector.scan(&ctx_pi).unwrap();
         convs.extend(connector.scan(&ctx_omp).unwrap());
@@ -1621,5 +1622,35 @@ mod tests {
             sources.contains("From Oh My Pi"),
             "must include ~/.omp/agent session, found: {sources:?}"
         );
+    }
+
+    /// Regression: `default_homes_from(None)` must return an empty vec
+    /// rather than synthesizing relative paths from an empty PathBuf,
+    /// which would cause `session_files()` to walk the process's
+    /// current working directory via `PathBuf::new().join("sessions")`.
+    #[test]
+    fn default_homes_from_none_is_empty() {
+        let homes = PiAgentConnector::default_homes_from(None);
+        assert!(
+            homes.is_empty(),
+            "no home → no candidates; got: {homes:?}"
+        );
+    }
+
+    /// Regression: `default_homes_from(Some(empty_path))` joins a
+    /// relative ".pi/agent" etc. onto the empty path, which
+    /// `PathBuf::join` treats as a relative path. This is the closest
+    /// we can get to exercising the empty-home branch without mutating
+    /// process env. The returned paths are relative — callers further
+    /// upstream decide whether to trust them (real pi-agent lookups
+    /// always come from `dirs::home_dir()`, so an empty HOME is
+    /// handled at that layer).
+    #[test]
+    fn default_homes_from_empty_path_yields_relative_candidates() {
+        let empty = PathBuf::new();
+        let homes = PiAgentConnector::default_homes_from(Some(&empty));
+        assert_eq!(homes.len(), 2);
+        assert_eq!(homes[0], PathBuf::from(".pi/agent"));
+        assert_eq!(homes[1], PathBuf::from(".omp/agent"));
     }
 }

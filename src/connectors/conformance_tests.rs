@@ -248,10 +248,7 @@ mod conformance {
             let factories = get_connector_factories();
 
             for (slug, _) in factories {
-                assert!(
-                    !slug.is_empty(),
-                    "connector slug should not be empty"
-                );
+                assert!(!slug.is_empty(), "connector slug should not be empty");
                 assert!(
                     slug.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
                     "connector slug '{}' should be lowercase with underscores only",
@@ -312,7 +309,9 @@ mod conformance {
                 assert!(
                     start <= end,
                     "connector {} has started_at ({}) > ended_at ({})",
-                    connector_slug, start, end
+                    connector_slug,
+                    start,
+                    end
                 );
             }
         }
@@ -324,7 +323,8 @@ mod conformance {
             assert!(
                 valid_roles.contains(&msg.role.as_str()),
                 "connector {} produced message with non-standard role: {}",
-                connector_slug, msg.role
+                connector_slug,
+                msg.role
             );
 
             // idx must be non-negative
@@ -339,7 +339,8 @@ mod conformance {
                 assert!(
                     inv.kind == "tool" || inv.kind == "skill",
                     "connector {} produced invocation with invalid kind: {}",
-                    connector_slug, inv.kind
+                    connector_slug,
+                    inv.kind
                 );
                 assert!(
                     !inv.name.is_empty(),
@@ -387,12 +388,18 @@ mod conformance {
 
             // Should serialize to valid JSON
             let json_str = serde_json::to_string(&conv);
-            assert!(json_str.is_ok(), "NormalizedConversation should serialize to JSON");
+            assert!(
+                json_str.is_ok(),
+                "NormalizedConversation should serialize to JSON"
+            );
 
             // Should deserialize back
             let parsed: Result<NormalizedConversation, _> =
                 serde_json::from_str(&json_str.unwrap());
-            assert!(parsed.is_ok(), "NormalizedConversation should deserialize from JSON");
+            assert!(
+                parsed.is_ok(),
+                "NormalizedConversation should deserialize from JSON"
+            );
         }
     }
 
@@ -488,10 +495,7 @@ mod conformance {
 
             for result in &results[1..] {
                 let slugs: Vec<_> = result.installed_agents.iter().map(|a| &a.slug).collect();
-                assert_eq!(
-                    slugs, first_slugs,
-                    "agent order should be deterministic"
-                );
+                assert_eq!(slugs, first_slugs, "agent order should be deterministic");
             }
         }
     }
@@ -538,8 +542,7 @@ mod conformance {
             let root = ScanRoot::local(PathBuf::from("/test"));
             let mut root_with_mappings = root;
             for mapping in &mappings {
-                root_with_mappings = root_with_mappings
-                    .with_rewrite(&mapping.from, &mapping.to);
+                root_with_mappings = root_with_mappings.with_rewrite(&mapping.from, &mapping.to);
             }
 
             for path in generate_test_paths() {
@@ -561,7 +564,7 @@ mod conformance {
                 ("/a", "/b", "/a", Some("/b")),
                 ("/a", "/b", "/a/", Some("/b/")),
                 ("/a", "/b", "/a/file", Some("/b/file")),
-                ("/a", "/b", "/ab", None),          // no match (not a prefix boundary)
+                ("/a", "/b", "/ab", None), // no match (not a prefix boundary)
                 ("/a/", "/b/", "/a/file", Some("/b/file")),
             ];
 
@@ -570,9 +573,14 @@ mod conformance {
                 let result = mapping.apply(input);
 
                 assert_eq!(
-                    result.as_deref(), expected,
+                    result.as_deref(),
+                    expected,
                     "PathMapping({:?} -> {:?}).apply({:?}) = {:?}, expected {:?}",
-                    from, to, input, result, expected
+                    from,
+                    to,
+                    input,
+                    result,
+                    expected
                 );
             }
         }

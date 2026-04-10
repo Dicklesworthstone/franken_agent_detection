@@ -403,7 +403,10 @@ mod tests {
         assert_eq!(invocations[0].name, "Read");
         assert!(invocations[0].raw_name.is_none());
         assert_eq!(invocations[0].call_id.as_deref(), Some("toolu_1"));
-        assert_eq!(invocations[0].arguments.as_ref().unwrap()["path"], "/src/main.rs");
+        assert_eq!(
+            invocations[0].arguments.as_ref().unwrap()["path"],
+            "/src/main.rs"
+        );
     }
 
     #[test]

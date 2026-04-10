@@ -50,12 +50,11 @@ pub use connectors::{
     amp::AmpConnector, claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector,
     cline::ClineConnector, codex::CodexConnector, copilot::CopilotConnector,
     copilot_cli::CopilotCliConnector, estimate_tokens_from_content, extract_claude_code_tokens,
-    extract_codex_tokens, extract_tokens_for_agent, factory::FactoryConnector, file_modified_since,
-    extract_invocations_from_content_blocks, flatten_content,
-    franken_detection_for_connector, gemini::GeminiConnector,
-    get_connector_factories, kimi::KimiConnector, normalize_model, openclaw::OpenClawConnector,
-    parse_timestamp, pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction,
-    vibe::VibeConnector,
+    extract_codex_tokens, extract_invocations_from_content_blocks, extract_tokens_for_agent,
+    factory::FactoryConnector, file_modified_since, flatten_content,
+    franken_detection_for_connector, gemini::GeminiConnector, get_connector_factories,
+    kimi::KimiConnector, normalize_model, openclaw::OpenClawConnector, parse_timestamp,
+    pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -220,8 +219,14 @@ fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
             home.join("Library/Application Support/Cursor/User/globalStorage")
                 .join(ext),
         );
-        roots.push(home.join("AppData/Roaming/Code/User/globalStorage").join(ext));
-        roots.push(home.join("AppData/Roaming/Cursor/User/globalStorage").join(ext));
+        roots.push(
+            home.join("AppData/Roaming/Code/User/globalStorage")
+                .join(ext),
+        );
+        roots.push(
+            home.join("AppData/Roaming/Cursor/User/globalStorage")
+                .join(ext),
+        );
     }
     roots
 }
@@ -289,7 +294,13 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &["AppData", "Roaming", "amp"]);
             maybe_push(
                 &mut out,
-                &[".config", "Code", "User", "globalStorage", "sourcegraph.amp"],
+                &[
+                    ".config",
+                    "Code",
+                    "User",
+                    "globalStorage",
+                    "sourcegraph.amp",
+                ],
             );
             maybe_push(
                 &mut out,
@@ -315,7 +326,10 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             );
         }
         "chatgpt" => {
-            maybe_push(&mut out, &["Library", "Application Support", "com.openai.chat"]);
+            maybe_push(
+                &mut out,
+                &["Library", "Application Support", "com.openai.chat"],
+            );
         }
         "claude" => {
             maybe_push(&mut out, &[".claude"]);
@@ -369,7 +383,13 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".copilot", "history-session-state"]);
             maybe_push(
                 &mut out,
-                &[".config", "Code", "User", "globalStorage", "github.copilot-chat"],
+                &[
+                    ".config",
+                    "Code",
+                    "User",
+                    "globalStorage",
+                    "github.copilot-chat",
+                ],
             );
             maybe_push(
                 &mut out,
@@ -651,20 +671,8 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 "cline" => {
                     let mut paths = Vec::new();
                     for ext in ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"] {
-                        paths.push(tilde(&[
-                            ".config",
-                            "Code",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
-                        paths.push(tilde(&[
-                            ".config",
-                            "Cursor",
-                            "User",
-                            "globalStorage",
-                            ext,
-                        ]));
+                        paths.push(tilde(&[".config", "Code", "User", "globalStorage", ext]));
+                        paths.push(tilde(&[".config", "Cursor", "User", "globalStorage", ext]));
                         paths.push(tilde(&[
                             "Library",
                             "Application Support",
@@ -1082,8 +1090,7 @@ mod tests {
 
     #[test]
     fn amp_xdg_probe_root_uses_trimmed_env_value() {
-        let root = amp_xdg_probe_root_from_env_value("  /tmp/cass-xdg  ")
-            .expect("amp xdg root");
+        let root = amp_xdg_probe_root_from_env_value("  /tmp/cass-xdg  ").expect("amp xdg root");
         assert_eq!(root, PathBuf::from("/tmp/cass-xdg").join("amp"));
     }
 
@@ -1131,16 +1138,16 @@ mod tests {
         assert!(opencode.contains(&"~/.local/share/opencode".to_string()));
         assert!(opencode.contains(&"~/.config/opencode".to_string()));
 
-        let copilot = by_slug
-            .get("github-copilot")
-            .expect("github-copilot paths");
-        assert!(copilot.contains(
-            &"~/.config/Code/User/globalStorage/github.copilot-chat".to_string()
-        ));
-        assert!(copilot.contains(
-            &"~/Library/Application Support/Code/User/globalStorage/github.copilot-chat"
-                .to_string()
-        ));
+        let copilot = by_slug.get("github-copilot").expect("github-copilot paths");
+        assert!(
+            copilot.contains(&"~/.config/Code/User/globalStorage/github.copilot-chat".to_string())
+        );
+        assert!(
+            copilot.contains(
+                &"~/Library/Application Support/Code/User/globalStorage/github.copilot-chat"
+                    .to_string()
+            )
+        );
         assert!(copilot.contains(
             &"~/AppData/Roaming/Code/User/globalStorage/github.copilot-chat".to_string()
         ));
@@ -1154,12 +1161,11 @@ mod tests {
         assert!(windsurf.contains(&"~/.config/windsurf".to_string()));
 
         let cline = by_slug.get("cline").expect("cline paths");
+        assert!(
+            cline.contains(&"~/.config/Code/User/globalStorage/saoudrizwan.claude-dev".to_string())
+        );
         assert!(cline.contains(
-            &"~/.config/Code/User/globalStorage/saoudrizwan.claude-dev".to_string()
-        ));
-        assert!(cline.contains(
-            &"~/AppData/Roaming/Cursor/User/globalStorage/rooveterinaryinc.roo-cline"
-                .to_string()
+            &"~/AppData/Roaming/Cursor/User/globalStorage/rooveterinaryinc.roo-cline".to_string()
         ));
     }
 }

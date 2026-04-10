@@ -110,10 +110,7 @@ impl GooseConnector {
 
         // XDG default: ~/.local/share/goose/sessions/sessions.db
         if let Some(data) = dirs::data_local_dir() {
-            let db = data
-                .join("goose")
-                .join("sessions")
-                .join("sessions.db");
+            let db = data.join("goose").join("sessions").join("sessions.db");
             if db.exists() {
                 return Some(db);
             }
@@ -213,9 +210,7 @@ impl GooseConnector {
 
             // Filter by since_ts
             if let Some(since) = since_ts {
-                let latest = session_updated_ms
-                    .or(session_created_ms)
-                    .unwrap_or(0);
+                let latest = session_updated_ms.or(session_created_ms).unwrap_or(0);
                 if latest < since {
                     continue;
                 }
@@ -245,9 +240,7 @@ impl GooseConnector {
             let model_name = session
                 .model_config_json
                 .as_deref()
-                .and_then(|json_str| {
-                    serde_json::from_str::<serde_json::Value>(json_str).ok()
-                })
+                .and_then(|json_str| serde_json::from_str::<serde_json::Value>(json_str).ok())
                 .and_then(|v| {
                     v.get("model")
                         .or_else(|| v.get("model_name"))
@@ -278,10 +271,7 @@ impl GooseConnector {
     }
 
     /// Load messages for a session from SQLite.
-    fn load_messages_sqlite(
-        conn: &Connection,
-        session_id: &str,
-    ) -> Result<Vec<NormalizedMessage>> {
+    fn load_messages_sqlite(conn: &Connection, session_id: &str) -> Result<Vec<NormalizedMessage>> {
         let mut stmt = conn.prepare(
             "SELECT message_id, role, content_json, created_timestamp, tokens, metadata_json \
              FROM messages WHERE session_id = ? ORDER BY created_timestamp ASC",
@@ -320,9 +310,8 @@ impl GooseConnector {
                 .and_then(normalize_goose_ts_value);
 
             // Parse content_json to extract text and tool invocations
-            let (content_text, invocations) = parse_goose_content_json(
-                row.content_json.as_deref().unwrap_or("[]"),
-            );
+            let (content_text, invocations) =
+                parse_goose_content_json(row.content_json.as_deref().unwrap_or("[]"));
 
             if content_text.trim().is_empty() && invocations.is_empty() {
                 continue;
@@ -485,11 +474,7 @@ impl Connector for GooseConnector {
             .into_iter()
             .flatten()
             .filter(|e| e.file_type().is_file())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "jsonl")
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
             .map(|e| e.path().to_path_buf())
             .collect();
 
@@ -516,10 +501,7 @@ impl Connector for GooseConnector {
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(
-                        "goose jsonl: failed to parse {}: {e}",
-                        jsonl_file.display()
-                    );
+                    tracing::debug!("goose jsonl: failed to parse {}: {e}", jsonl_file.display());
                 }
             }
         }
@@ -538,11 +520,7 @@ fn looks_like_goose_sessions(path: &Path) -> bool {
     // Check for at least one .jsonl file
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
-            if entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "jsonl")
-            {
+            if entry.path().extension().is_some_and(|ext| ext == "jsonl") {
                 return true;
             }
         }
@@ -575,16 +553,12 @@ fn normalize_goose_ts_value(val: &rusqlite::types::Value) -> Option<i64> {
             // Try common datetime formats
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
                 Some(dt.and_utc().timestamp_millis())
-            } else if let Ok(dt) =
-                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+            } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
             {
                 Some(dt.and_utc().timestamp_millis())
-            } else if let Ok(dt) =
-                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-            {
+            } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
                 Some(dt.and_utc().timestamp_millis())
-            } else if let Ok(dt) =
-                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+            } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
             {
                 Some(dt.and_utc().timestamp_millis())
             } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
@@ -645,9 +619,7 @@ fn parse_goose_content_json(json_str: &str) -> (String, Vec<NormalizedInvocation
             Some("toolRequest") => {
                 // Extract tool call: {"toolCall": {"value": {"name": "...", "arguments": {...}}}}
                 if let Some(tool_call) = item.get("toolCall") {
-                    let value = tool_call
-                        .get("value")
-                        .unwrap_or(tool_call);
+                    let value = tool_call.get("value").unwrap_or(tool_call);
 
                     let name = value
                         .get("name")
@@ -811,8 +783,7 @@ fn parse_goose_jsonl(path: &Path, session_id: &str) -> Result<NormalizedConversa
         let b_ts = b.0.unwrap_or(i64::MAX);
         a_ts.cmp(&b_ts).then_with(|| a.1.cmp(&b.1))
     });
-    let mut messages: Vec<NormalizedMessage> =
-        pending.into_iter().map(|(_, _, msg)| msg).collect();
+    let mut messages: Vec<NormalizedMessage> = pending.into_iter().map(|(_, _, msg)| msg).collect();
     crate::types::reindex_messages(&mut messages);
 
     let started_at = messages.iter().filter_map(|m| m.created_at).min();
@@ -1197,10 +1168,7 @@ mod tests {
         );
         assert_eq!(convs[0].messages.len(), 1);
         assert!(convs[0].messages[0].content.contains("Hello from Goose!"));
-        assert_eq!(
-            convs[0].messages[0].author.as_deref(),
-            Some("gpt-4o")
-        );
+        assert_eq!(convs[0].messages[0].author.as_deref(), Some("gpt-4o"));
         assert_eq!(
             convs[0].metadata.get("source").and_then(|v| v.as_str()),
             Some("sqlite")
@@ -1317,7 +1285,13 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (session_id, role, content_json, created_timestamp, message_id) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["old", "user", r#"[{"type":"text","text":"old"}]"#, 1_600_000_050, "old_msg"],
+            rusqlite::params![
+                "old",
+                "user",
+                r#"[{"type":"text","text":"old"}]"#,
+                1_600_000_050,
+                "old_msg"
+            ],
         )
         .unwrap();
 
@@ -1330,7 +1304,13 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (session_id, role, content_json, created_timestamp, message_id) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["new", "user", r#"[{"type":"text","text":"new"}]"#, 1_700_000_050, "new_msg"],
+            rusqlite::params![
+                "new",
+                "user",
+                r#"[{"type":"text","text":"new"}]"#,
+                1_700_000_050,
+                "new_msg"
+            ],
         )
         .unwrap();
 
