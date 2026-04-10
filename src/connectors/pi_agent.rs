@@ -35,13 +35,37 @@ impl PiAgentConnector {
         Self
     }
 
-    /// Get the pi-agent home directory.
-    /// Checks PI_CODING_AGENT_DIR env var, falls back to ~/.pi/agent/
+    /// Get the primary pi-agent home directory.
+    ///
+    /// Checks `PI_CODING_AGENT_DIR` env var, falls back to `~/.pi/agent/`.
+    /// Prefer [`Self::default_homes`] when scanning so that both
+    /// pi-mono (`~/.pi/agent`) and Oh My Pi (`~/.omp/agent`) installations
+    /// are discovered (issue #174).
     fn home() -> PathBuf {
         dotenvy::var("PI_CODING_AGENT_DIR").map_or_else(
             |_| dirs::home_dir().unwrap_or_default().join(".pi/agent"),
             PathBuf::from,
         )
+    }
+
+    /// All candidate pi-agent home directories in priority order.
+    ///
+    /// Covers both known distributions:
+    /// - **pi-mono** (`badlogic/pi-mono`) stores at `~/.pi/agent/`.
+    /// - **Oh My Pi** (`omp` CLI) stores at `~/.omp/agent/`.
+    ///
+    /// Explicit `PI_CODING_AGENT_DIR` overrides and becomes the sole
+    /// candidate, matching the single-home behavior of [`Self::home`].
+    fn default_homes() -> Vec<PathBuf> {
+        if let Ok(explicit) = dotenvy::var("PI_CODING_AGENT_DIR") {
+            return vec![PathBuf::from(explicit)];
+        }
+        let mut out = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            out.push(home.join(".pi/agent"));
+            out.push(home.join(".omp/agent"));
+        }
+        out
     }
 
     fn sessions_dir(home: &Path) -> PathBuf {
@@ -153,7 +177,10 @@ impl Connector for PiAgentConnector {
             .data_dir
             .to_str()
             .map(|s| {
-                s.contains(".pi/agent") || s.ends_with("/pi-agent") || s.ends_with("\\pi-agent")
+                s.contains(".pi/agent")
+                    || s.contains(".omp/agent")
+                    || s.ends_with("/pi-agent")
+                    || s.ends_with("\\pi-agent")
             })
             .unwrap_or(false);
         let looks_like_root = |path: &PathBuf| {
@@ -166,35 +193,63 @@ impl Connector for PiAgentConnector {
                 || path
                     .file_name()
                     .is_some_and(|n| n == "sessions")
-                || path
-                    .to_str()
-                    .is_some_and(|s| s.contains(".pi/agent") || s.contains("pi-agent"))
+                || path.to_str().is_some_and(|s| {
+                    s.contains(".pi/agent") || s.contains(".omp/agent") || s.contains("pi-agent")
+                })
         };
 
-        let mut home = if ctx.use_default_detection() {
+        // Build the candidate list of home directories to scan. Default
+        // detection walks both `~/.pi/agent` (pi-mono) and `~/.omp/agent`
+        // (Oh My Pi), so users with either (or both) installations get
+        // complete discovery without additional configuration (#174).
+        let mut homes: Vec<PathBuf> = Vec::new();
+        if ctx.use_default_detection() {
             if is_pi_agent_dir {
-                ctx.data_dir.clone()
+                homes.push(ctx.data_dir.clone());
             } else {
-                Self::home()
+                homes.extend(Self::default_homes());
             }
-        } else {
-            if !looks_like_root(&ctx.data_dir) {
-                return Ok(Vec::new());
+        } else if looks_like_root(&ctx.data_dir) {
+            homes.push(ctx.data_dir.clone());
+        }
+        // Normalize file-shaped homes (e.g. pointing directly at a .jsonl)
+        // to their parent directory, matching the legacy single-home behavior.
+        for home in &mut homes {
+            if home.is_file() {
+                *home = home.parent().unwrap_or(home).to_path_buf();
             }
-            ctx.data_dir.clone()
-        };
-        if home.is_file() {
-            home = home.parent().unwrap_or(&home).to_path_buf();
+        }
+        // Deduplicate homes preserving order (important when the same path
+        // appears via both `ctx.data_dir` and `default_homes()`).
+        {
+            let mut seen = HashSet::new();
+            homes.retain(|p| {
+                let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                seen.insert(canonical)
+            });
         }
 
-        let files = Self::session_files(&home);
         let mut convs = Vec::new();
+        let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
 
-        for file in files {
-            // Skip files not modified since last scan
-            if !file_modified_since(&file, ctx.since_ts) {
+        for home in homes {
+            let files = Self::session_files(&home);
+            if files.is_empty() {
                 continue;
             }
+
+            for file in files {
+                // Guard against the same session file being reached through
+                // two homes (e.g. a symlink from ~/.pi/agent → ~/.omp/agent).
+                let dedupe_key =
+                    std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+                if !seen_session_paths.insert(dedupe_key) {
+                    continue;
+                }
+                // Skip files not modified since last scan
+                if !file_modified_since(&file, ctx.since_ts) {
+                    continue;
+                }
 
             let source_path = file.clone();
 
@@ -400,17 +455,18 @@ impl Connector for PiAgentConnector {
                 "model_id": model_id,
             });
 
-            convs.push(NormalizedConversation {
-                agent_slug: "pi_agent".to_string(),
-                external_id,
-                title,
-                workspace: session_cwd,
-                source_path: source_path.clone(),
-                started_at,
-                ended_at,
-                metadata,
-                messages,
-            });
+                convs.push(NormalizedConversation {
+                    agent_slug: "pi_agent".to_string(),
+                    external_id,
+                    title,
+                    workspace: session_cwd,
+                    source_path: source_path.clone(),
+                    started_at,
+                    ended_at,
+                    metadata,
+                    messages,
+                });
+            }
         }
 
         Ok(convs)

@@ -82,47 +82,56 @@ impl OpenCodeConnector {
 
     /// Find the OpenCode SQLite database (v1.2+).
     /// Returns the path to `opencode.db` if it exists.
+    ///
+    /// OpenCode uses XDG-style paths on all platforms (including macOS),
+    /// so `~/.local/share/opencode/opencode.db` is the canonical location
+    /// and must be checked before `dirs::data_local_dir()` which maps to
+    /// `~/Library/Application Support` on macOS (see issue #174).
     fn sqlite_db_path() -> Option<PathBuf> {
-        // Check for env override first (useful for testing)
-        if let Ok(path) = dotenvy::var("OPENCODE_SQLITE_DB") {
-            let p = PathBuf::from(path);
-            if p.exists() {
-                return Some(p);
+        for candidate in Self::sqlite_db_candidates() {
+            if candidate.exists() {
+                return Some(candidate);
             }
         }
-
-        // Primary location: XDG data directory (Linux/macOS)
-        if let Some(data) = dirs::data_local_dir() {
-            let db = data.join("opencode/opencode.db");
-            if db.exists() {
-                return Some(db);
-            }
-        }
-
-        // XDG config path — on macOS dirs::data_local_dir() returns
-        // ~/Library/Application Support which misses XDG-style installs
-        // that place the DB under ~/.config/opencode/ (#146).
-        if let Some(config) = dirs::config_dir() {
-            let db = config.join("opencode/opencode.db");
-            if db.exists() {
-                return Some(db);
-            }
-        }
-
-        // Fallback: ~/.local/share/opencode/opencode.db
-        if let Some(home) = dirs::home_dir() {
-            let db = home.join(".local/share/opencode/opencode.db");
-            if db.exists() {
-                return Some(db);
-            }
-            // Also check ~/.config/opencode/opencode.db for XDG-style installs
-            let xdg_db = home.join(".config/opencode/opencode.db");
-            if xdg_db.exists() {
-                return Some(xdg_db);
-            }
-        }
-
         None
+    }
+
+    /// All known locations where OpenCode may store its SQLite database,
+    /// in priority order. Exposed so that scan paths can fall back through
+    /// them even when the caller provided an explicit (non-matching)
+    /// `data_dir`.
+    fn sqlite_db_candidates() -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+
+        // 1. Explicit override for tests / custom installs.
+        if let Ok(path) = dotenvy::var("OPENCODE_SQLITE_DB") {
+            out.push(PathBuf::from(path));
+        }
+
+        // 2. XDG data dir via $HOME. OpenCode uses this on every platform,
+        //    including macOS. This MUST be tried before dirs::data_local_dir()
+        //    because on macOS the latter resolves to ~/Library/Application
+        //    Support which OpenCode does not use.
+        if let Some(home) = dirs::home_dir() {
+            out.push(home.join(".local/share/opencode/opencode.db"));
+            out.push(home.join(".config/opencode/opencode.db"));
+        }
+
+        // 3. Platform-native data/config dirs (for users who have moved
+        //    OpenCode into non-XDG locations).
+        if let Some(data) = dirs::data_local_dir() {
+            out.push(data.join("opencode/opencode.db"));
+        }
+        if let Some(config) = dirs::config_dir() {
+            out.push(config.join("opencode/opencode.db"));
+        }
+
+        // Deduplicate preserving order — multiple dirs helpers may resolve
+        // to the same path on a given platform (e.g. macOS config_dir ==
+        // data_local_dir).
+        let mut seen = HashSet::new();
+        out.retain(|p| seen.insert(p.clone()));
+        out
     }
 
     /// Extract sessions from OpenCode's SQLite database (v1.2+).
@@ -485,25 +494,39 @@ impl Connector for OpenCodeConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
+        let mut scanned_dbs: HashSet<PathBuf> = HashSet::new();
 
-        // --- Phase 1: Try SQLite database (v1.2+) ---
-        // Check for explicit db path override, then default locations.
-        let db_path =
-            if ctx.data_dir.exists() && ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
-                Some(ctx.data_dir.clone())
-            } else if ctx.use_default_detection() {
-                Self::sqlite_db_path()
-            } else {
-                // data_dir might be the parent containing opencode.db
-                let candidate = ctx.data_dir.join("opencode.db");
-                if candidate.exists() {
-                    Some(candidate)
-                } else {
-                    None
-                }
-            };
+        // --- Phase 1: Try SQLite database(s) (v1.2+) ---
+        // Collect candidate database paths in priority order:
+        //   1. If ctx.data_dir points directly at an opencode.db file, use it.
+        //   2. If ctx.data_dir is a directory, check for data_dir/opencode.db.
+        //   3. Always add the built-in default search list. This ensures
+        //      we find the canonical XDG location even when explicit scan
+        //      roots or a stale detection path were passed in (see issue #174).
+        let mut db_candidates: Vec<PathBuf> = Vec::new();
+        if ctx.data_dir.exists() && ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
+            db_candidates.push(ctx.data_dir.clone());
+        } else if !ctx.data_dir.as_os_str().is_empty() {
+            db_candidates.push(ctx.data_dir.join("opencode.db"));
+        }
+        db_candidates.extend(Self::sqlite_db_candidates());
 
-        if let Some(db) = db_path {
+        // Deduplicate while preserving priority order.
+        {
+            let mut seen = HashSet::new();
+            db_candidates.retain(|p| seen.insert(p.clone()));
+        }
+
+        for db in db_candidates {
+            if !db.exists() {
+                continue;
+            }
+            // Canonicalize if possible so two routes to the same file are
+            // still deduplicated (e.g. via symlink or `./`-prefixed path).
+            let canonical = std::fs::canonicalize(&db).unwrap_or_else(|_| db.clone());
+            if !scanned_dbs.insert(canonical) {
+                continue;
+            }
             match Self::extract_from_sqlite(&db, ctx.since_ts) {
                 Ok(sqlite_convs) => {
                     tracing::debug!(
