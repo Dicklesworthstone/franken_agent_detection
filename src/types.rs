@@ -302,16 +302,17 @@ impl PathMapping {
                 None
             };
 
-            let needs_sep = from_sep.is_some()
-                && !self.to.ends_with('/')
-                && !self.to.ends_with('\\')
-                && !rest.starts_with(['/', '\\']);
+            if let Some(sep) = from_sep {
+                let needs_sep = !self.to.ends_with('/')
+                    && !self.to.ends_with('\\')
+                    && !rest.starts_with(['/', '\\']);
 
-            if needs_sep {
-                Some(format!("{}{}{}", self.to, from_sep.unwrap(), rest))
-            } else {
-                Some(format!("{}{}", self.to, rest))
+                if needs_sep {
+                    return Some(format!("{}{}{}", self.to, sep, rest));
+                }
             }
+
+            Some(format!("{}{}", self.to, rest))
         } else {
             None
         }

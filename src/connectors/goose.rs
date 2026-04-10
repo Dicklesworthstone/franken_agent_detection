@@ -417,11 +417,7 @@ impl Connector for GooseConnector {
 
         // --- Phase 1: Try SQLite database (v1.20+) ---
         let mut db_paths: Vec<PathBuf> = Vec::new();
-        if ctx
-            .data_dir
-            .extension()
-            .is_some_and(|ext| ext == "db")
-        {
+        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             db_paths.push(ctx.data_dir.clone());
         } else if !ctx.data_dir.as_os_str().is_empty() {
             db_paths.push(ctx.data_dir.join("sessions.db"));
@@ -437,7 +433,11 @@ impl Connector for GooseConnector {
                     db_paths.push(scan_root.path.clone());
                 }
                 db_paths.push(scan_root.path.join("sessions.db"));
-                db_paths.push(scan_root.path.join(".local/share/goose/sessions/sessions.db"));
+                db_paths.push(
+                    scan_root
+                        .path
+                        .join(".local/share/goose/sessions/sessions.db"),
+                );
                 db_paths.push(scan_root.path.join(".goose/sessions/sessions.db"));
             }
         }
@@ -518,8 +518,8 @@ impl Connector for GooseConnector {
                 .collect();
 
             for jsonl_file in jsonl_files {
-                let canonical = std::fs::canonicalize(&jsonl_file)
-                    .unwrap_or_else(|_| jsonl_file.clone());
+                let canonical =
+                    std::fs::canonicalize(&jsonl_file).unwrap_or_else(|_| jsonl_file.clone());
                 if !seen_files.insert(canonical) {
                     continue;
                 }

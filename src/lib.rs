@@ -210,7 +210,10 @@ fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for ext in ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"] {
         roots.push(home.join(".config/Code/User/globalStorage").join(ext));
-        roots.push(home.join(".config/Code - Insiders/User/globalStorage").join(ext));
+        roots.push(
+            home.join(".config/Code - Insiders/User/globalStorage")
+                .join(ext),
+        );
         roots.push(home.join(".config/VSCodium/User/globalStorage").join(ext));
         roots.push(home.join(".config/Cursor/User/globalStorage").join(ext));
         roots.push(
@@ -237,7 +240,10 @@ fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
             home.join("AppData/Roaming/Code - Insiders/User/globalStorage")
                 .join(ext),
         );
-        roots.push(home.join("AppData/Roaming/VSCodium/User/globalStorage").join(ext));
+        roots.push(
+            home.join("AppData/Roaming/VSCodium/User/globalStorage")
+                .join(ext),
+        );
         roots.push(
             home.join("AppData/Roaming/Cursor/User/globalStorage")
                 .join(ext),
@@ -1145,14 +1151,15 @@ mod tests {
         })
         .expect_err("should error");
 
-        match err {
-            AgentDetectError::UnknownConnectors { connectors } => {
-                assert_eq!(connectors, vec!["not-a-real-connector".to_string()]);
-            }
-            AgentDetectError::FeatureDisabled => {
-                panic!("unexpected error: FeatureDisabled")
-            }
-        }
+        let err_msg = err.to_string();
+        assert!(
+            matches!(
+                err,
+                AgentDetectError::UnknownConnectors { connectors }
+                    if connectors == vec!["not-a-real-connector".to_string()]
+            ),
+            "unexpected error: {err_msg}"
+        );
     }
 
     #[test]
@@ -1168,14 +1175,15 @@ mod tests {
         })
         .expect_err("should error");
 
-        match err {
-            AgentDetectError::UnknownConnectors { connectors } => {
-                assert_eq!(connectors, vec!["definitely-unknown".to_string()]);
-            }
-            AgentDetectError::FeatureDisabled => {
-                panic!("unexpected error: FeatureDisabled")
-            }
-        }
+        let err_msg = err.to_string();
+        assert!(
+            matches!(
+                err,
+                AgentDetectError::UnknownConnectors { connectors }
+                    if connectors == vec!["definitely-unknown".to_string()]
+            ),
+            "unexpected error: {err_msg}"
+        );
     }
 
     #[test]
@@ -1332,13 +1340,17 @@ mod tests {
         assert!(factory.contains(&"~/.config/factory-droid".to_string()));
 
         let amp = by_slug.get("amp").expect("amp paths");
-        assert!(amp.contains(
-            &"~/.config/Code - Insiders/User/globalStorage/sourcegraph.amp".to_string()
-        ));
-        assert!(amp.contains(
-            &"~/Library/Application Support/VSCodium/User/globalStorage/sourcegraph.amp"
-                .to_string()
-        ));
+        assert!(
+            amp.contains(
+                &"~/.config/Code - Insiders/User/globalStorage/sourcegraph.amp".to_string()
+            )
+        );
+        assert!(
+            amp.contains(
+                &"~/Library/Application Support/VSCodium/User/globalStorage/sourcegraph.amp"
+                    .to_string()
+            )
+        );
 
         let opencode = by_slug.get("opencode").expect("opencode paths");
         assert!(opencode.contains(&"~/.local/share/opencode".to_string()));
@@ -1363,9 +1375,7 @@ mod tests {
         let cursor = by_slug.get("cursor").expect("cursor paths");
         assert!(cursor.contains(&"~/.config/Cursor".to_string()));
         assert!(cursor.contains(&"~/.config/Cursor/User".to_string()));
-        assert!(
-            cursor.contains(&"~/Library/Application Support/Cursor/User".to_string())
-        );
+        assert!(cursor.contains(&"~/Library/Application Support/Cursor/User".to_string()));
         assert!(cursor.contains(&"~/AppData/Roaming/Cursor/User".to_string()));
 
         let windsurf = by_slug.get("windsurf").expect("windsurf paths");
@@ -1378,9 +1388,11 @@ mod tests {
         assert!(cline.contains(
             &"~/.config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev".to_string()
         ));
-        assert!(cline.contains(
-            &"~/.config/VSCodium/User/globalStorage/saoudrizwan.claude-dev".to_string()
-        ));
+        assert!(
+            cline.contains(
+                &"~/.config/VSCodium/User/globalStorage/saoudrizwan.claude-dev".to_string()
+            )
+        );
         assert!(cline.contains(
             &"~/AppData/Roaming/Cursor/User/globalStorage/rooveterinaryinc.roo-cline".to_string()
         ));

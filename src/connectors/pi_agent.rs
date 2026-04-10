@@ -1647,10 +1647,7 @@ mod tests {
     #[test]
     fn default_homes_from_none_is_empty() {
         let homes = PiAgentConnector::default_homes_from(None);
-        assert!(
-            homes.is_empty(),
-            "no home → no candidates; got: {homes:?}"
-        );
+        assert!(homes.is_empty(), "no home → no candidates; got: {homes:?}");
     }
 
     /// Regression: `default_homes_from(Some(empty_path))` joins a

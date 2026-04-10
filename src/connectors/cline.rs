@@ -306,8 +306,8 @@ impl Connector for ClineConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::scan::ScanRoot;
+    use super::*;
     use serde_json::json;
     use std::fs;
     use std::path::Path;

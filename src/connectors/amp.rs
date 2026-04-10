@@ -53,13 +53,13 @@ impl AmpConnector {
             roots.push(
                 home.join("Library/Application Support/Code/User/globalStorage/sourcegraph.amp"),
             );
+            roots.push(home.join(
+                "Library/Application Support/Code - Insiders/User/globalStorage/sourcegraph.amp",
+            ));
             roots.push(
                 home.join(
-                    "Library/Application Support/Code - Insiders/User/globalStorage/sourcegraph.amp",
+                    "Library/Application Support/VSCodium/User/globalStorage/sourcegraph.amp",
                 ),
-            );
-            roots.push(
-                home.join("Library/Application Support/VSCodium/User/globalStorage/sourcegraph.amp"),
             );
             roots.push(home.join("AppData/Roaming/Code/User/globalStorage/sourcegraph.amp"));
             roots.push(

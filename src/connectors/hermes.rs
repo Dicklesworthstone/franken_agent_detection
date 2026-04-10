@@ -321,11 +321,7 @@ impl Connector for HermesConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut db_paths: Vec<PathBuf> = Vec::new();
-        if ctx
-            .data_dir
-            .extension()
-            .is_some_and(|ext| ext == "db")
-        {
+        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             db_paths.push(ctx.data_dir.clone());
         } else if !ctx.data_dir.as_os_str().is_empty() {
             db_paths.push(ctx.data_dir.join("state.db"));

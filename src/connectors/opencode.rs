@@ -635,8 +635,8 @@ impl Connector for OpenCodeConnector {
                 .collect();
 
             for session_file in session_files {
-                let canonical = std::fs::canonicalize(&session_file)
-                    .unwrap_or_else(|_| session_file.clone());
+                let canonical =
+                    std::fs::canonicalize(&session_file).unwrap_or_else(|_| session_file.clone());
                 if !seen_session_files.insert(canonical) {
                     continue;
                 }

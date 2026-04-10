@@ -295,172 +295,172 @@ fn scan_gemini_with_callback(
         let files = GeminiConnector::session_files(&root);
 
         for file in files {
-        // Skip files not modified since last scan (incremental indexing)
-        if !file_modified_since(&file, ctx.since_ts) {
-            continue;
-        }
-        let file_size_bytes = fs::metadata(&file).ok().map(|metadata| metadata.len());
-        let compact_message_extra =
-            GeminiConnector::should_compact_large_message_extra(file_size_bytes);
-        if compact_message_extra {
-            tracing::debug!(
-                path = %file.display(),
-                size_bytes = file_size_bytes.unwrap_or_default(),
-                "gemini compacting per-message extra payloads for large session"
-            );
-        }
-
-        let file_handle = match std::fs::File::open(&file) {
-            Ok(handle) => handle,
-            Err(e) => {
-                tracing::warn!("failed to open session {}: {}", file.display(), e);
+            // Skip files not modified since last scan (incremental indexing)
+            if !file_modified_since(&file, ctx.since_ts) {
                 continue;
             }
-        };
-        let reader = std::io::BufReader::new(file_handle);
-        let mut val: Value = match serde_json::from_reader(reader) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("failed to parse session {}: {}", file.display(), e);
-                continue;
-            }
-        };
-
-        // Extract session metadata
-        let session_id = val
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let project_hash = val
-            .get("projectHash")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        // Parse session-level timestamps
-        let start_time = val.get("startTime").and_then(parse_timestamp);
-        let last_updated = val.get("lastUpdated").and_then(parse_timestamp);
-
-        // Parse messages array
-        let Some(messages_value) = val
-            .as_object_mut()
-            .and_then(|object| object.remove("messages"))
-        else {
-            continue;
-        };
-        let Value::Array(messages_arr) = messages_value else {
-            continue;
-        };
-
-        let mut messages = Vec::new();
-        let mut started_at = start_time;
-        let mut ended_at = last_updated;
-
-        for item in messages_arr {
-            // Role from "type" field - Gemini uses "user" and "model"
-            let msg_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("model");
-            let role = if msg_type == "model" {
-                "assistant"
-            } else {
-                msg_type
-            };
-
-            // Parse timestamp using shared utility
-            let created = item.get("timestamp").and_then(parse_timestamp);
-
-            // NOTE: Do NOT filter individual messages by timestamp here!
-            // The file-level check in file_modified_since() is sufficient.
-            // Filtering messages would cause older messages to be lost when
-            // the file is re-indexed after new messages are added.
-
-            started_at = match (started_at, created) {
-                (Some(curr), Some(ts)) => Some(curr.min(ts)),
-                (None, Some(ts)) => Some(ts),
-                (other, None) => other,
-            };
-            ended_at = match (ended_at, created) {
-                (Some(current), Some(ts)) => Some(current.max(ts)),
-                (None, Some(ts)) => Some(ts),
-                (Some(current), None) => Some(current),
-                (None, None) => None,
-            };
-
-            // Extract content using flatten_content for consistency
-            let content_str = item.get("content").map(flatten_content).unwrap_or_default();
-
-            // Skip entries with empty content
-            if content_str.trim().is_empty() {
-                continue;
+            let file_size_bytes = fs::metadata(&file).ok().map(|metadata| metadata.len());
+            let compact_message_extra =
+                GeminiConnector::should_compact_large_message_extra(file_size_bytes);
+            if compact_message_extra {
+                tracing::debug!(
+                    path = %file.display(),
+                    size_bytes = file_size_bytes.unwrap_or_default(),
+                    "gemini compacting per-message extra payloads for large session"
+                );
             }
 
-            messages.push(NormalizedMessage {
-                idx: 0, // will be re-assigned after filtering
-                role: role.to_string(),
-                author: None,
-                created_at: created,
-                content: content_str,
-                extra: if compact_message_extra {
-                    GeminiConnector::compact_message_extra(&item)
+            let file_handle = match std::fs::File::open(&file) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    tracing::warn!("failed to open session {}: {}", file.display(), e);
+                    continue;
+                }
+            };
+            let reader = std::io::BufReader::new(file_handle);
+            let mut val: Value = match serde_json::from_reader(reader) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("failed to parse session {}: {}", file.display(), e);
+                    continue;
+                }
+            };
+
+            // Extract session metadata
+            let session_id = val
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let project_hash = val
+                .get("projectHash")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            // Parse session-level timestamps
+            let start_time = val.get("startTime").and_then(parse_timestamp);
+            let last_updated = val.get("lastUpdated").and_then(parse_timestamp);
+
+            // Parse messages array
+            let Some(messages_value) = val
+                .as_object_mut()
+                .and_then(|object| object.remove("messages"))
+            else {
+                continue;
+            };
+            let Value::Array(messages_arr) = messages_value else {
+                continue;
+            };
+
+            let mut messages = Vec::new();
+            let mut started_at = start_time;
+            let mut ended_at = last_updated;
+
+            for item in messages_arr {
+                // Role from "type" field - Gemini uses "user" and "model"
+                let msg_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("model");
+                let role = if msg_type == "model" {
+                    "assistant"
                 } else {
-                    item
-                },
-                invocations: Vec::new(),
-                snippets: Vec::new(),
+                    msg_type
+                };
+
+                // Parse timestamp using shared utility
+                let created = item.get("timestamp").and_then(parse_timestamp);
+
+                // NOTE: Do NOT filter individual messages by timestamp here!
+                // The file-level check in file_modified_since() is sufficient.
+                // Filtering messages would cause older messages to be lost when
+                // the file is re-indexed after new messages are added.
+
+                started_at = match (started_at, created) {
+                    (Some(curr), Some(ts)) => Some(curr.min(ts)),
+                    (None, Some(ts)) => Some(ts),
+                    (other, None) => other,
+                };
+                ended_at = match (ended_at, created) {
+                    (Some(current), Some(ts)) => Some(current.max(ts)),
+                    (None, Some(ts)) => Some(ts),
+                    (Some(current), None) => Some(current),
+                    (None, None) => None,
+                };
+
+                // Extract content using flatten_content for consistency
+                let content_str = item.get("content").map(flatten_content).unwrap_or_default();
+
+                // Skip entries with empty content
+                if content_str.trim().is_empty() {
+                    continue;
+                }
+
+                messages.push(NormalizedMessage {
+                    idx: 0, // will be re-assigned after filtering
+                    role: role.to_string(),
+                    author: None,
+                    created_at: created,
+                    content: content_str,
+                    extra: if compact_message_extra {
+                        GeminiConnector::compact_message_extra(&item)
+                    } else {
+                        item
+                    },
+                    invocations: Vec::new(),
+                    snippets: Vec::new(),
+                });
+            }
+
+            // Re-assign sequential indices after filtering
+            crate::types::reindex_messages(&mut messages);
+
+            if messages.is_empty() {
+                continue;
+            }
+
+            // Extract title from first user message
+            let title = messages
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| {
+                    m.content
+                        .lines()
+                        .next()
+                        .unwrap_or(&m.content)
+                        .chars()
+                        .take(100)
+                        .collect::<String>()
+                })
+                .or_else(|| {
+                    messages
+                        .first()
+                        .and_then(|m| m.content.lines().next())
+                        .map(|s| s.chars().take(100).collect())
+                });
+
+            // Try to extract actual workspace from message content first
+            // Gemini stores by hash, but messages often contain the real project path
+            let workspace = extract_workspace_from_content(&messages).or_else(|| {
+                // Fallback to parent directory structure
+                // Structure: ~/.gemini/tmp/<hash>/chats/session-*.json
+                file.parent() // chats/
+                    .and_then(|p| p.parent()) // <hash>/
+                    .map(std::path::Path::to_path_buf)
             });
+
+            on_conversation(NormalizedConversation {
+                agent_slug: "gemini".into(),
+                external_id: session_id
+                    .or_else(|| file.file_stem().and_then(|s| s.to_str()).map(String::from)),
+                title,
+                workspace,
+                source_path: file.clone(),
+                started_at,
+                ended_at,
+                metadata: serde_json::json!({
+                    "source": "gemini",
+                    "project_hash": project_hash
+                }),
+                messages,
+            })?;
         }
-
-        // Re-assign sequential indices after filtering
-        crate::types::reindex_messages(&mut messages);
-
-        if messages.is_empty() {
-            continue;
-        }
-
-        // Extract title from first user message
-        let title = messages
-            .iter()
-            .find(|m| m.role == "user")
-            .map(|m| {
-                m.content
-                    .lines()
-                    .next()
-                    .unwrap_or(&m.content)
-                    .chars()
-                    .take(100)
-                    .collect::<String>()
-            })
-            .or_else(|| {
-                messages
-                    .first()
-                    .and_then(|m| m.content.lines().next())
-                    .map(|s| s.chars().take(100).collect())
-            });
-
-        // Try to extract actual workspace from message content first
-        // Gemini stores by hash, but messages often contain the real project path
-        let workspace = extract_workspace_from_content(&messages).or_else(|| {
-            // Fallback to parent directory structure
-            // Structure: ~/.gemini/tmp/<hash>/chats/session-*.json
-            file.parent() // chats/
-                .and_then(|p| p.parent()) // <hash>/
-                .map(std::path::Path::to_path_buf)
-        });
-
-        on_conversation(NormalizedConversation {
-            agent_slug: "gemini".into(),
-            external_id: session_id
-                .or_else(|| file.file_stem().and_then(|s| s.to_str()).map(String::from)),
-            title,
-            workspace,
-            source_path: file.clone(),
-            started_at,
-            ended_at,
-            metadata: serde_json::json!({
-                "source": "gemini",
-                "project_hash": project_hash
-            }),
-            messages,
-        })?;
-    }
     }
 
     Ok(())
