@@ -234,14 +234,14 @@ impl Default for Origin {
     }
 }
 
-/// A single path mapping rule for rewriting paths.
-#[cfg(feature = "connectors")]
 #[cfg(feature = "connectors")]
 pub(crate) fn agent_name_matches_filter(allowed: &str, actual: &str) -> bool {
     let normalize = |value: &str| value.trim().to_ascii_lowercase().replace('-', "_");
     normalize(allowed) == normalize(actual)
 }
 
+/// A single path mapping rule for rewriting paths.
+#[cfg(feature = "connectors")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PathMapping {
     /// Source path prefix to match.

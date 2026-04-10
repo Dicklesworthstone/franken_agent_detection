@@ -35,6 +35,9 @@ pub mod utils;
 pub mod vibe;
 pub mod workspace_cache;
 
+#[cfg(test)]
+mod conformance_tests;
+
 pub use path_trie::PathTrie;
 pub use scan::{ScanContext, ScanRoot};
 pub use token_extraction::{
@@ -150,6 +153,7 @@ pub fn franken_detection_for_connector(connector_slug: &str) -> Option<Detection
 /// Returns a vec of (slug, constructor) pairs for every connector compiled into
 /// this build. Feature-gated connectors (chatgpt, cursor) are conditionally
 /// included based on the enabled Cargo features.
+#[must_use]
 #[allow(clippy::type_complexity)]
 pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> {
     let mut v: Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> = vec![

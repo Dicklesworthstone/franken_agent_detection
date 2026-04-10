@@ -201,7 +201,7 @@ const AMP_SKILL_WRAPPERS: &[(&str, &str)] = &[
 /// name lives inside the `input` object. This rewrites matching invocations
 /// to `kind: "skill"` with the inner name, preserving `raw_name` for
 /// traceability. Non-matching invocations are left unchanged.
-pub fn unwrap_skill_invocations(invocations: &mut Vec<crate::types::NormalizedInvocation>) {
+pub fn unwrap_skill_invocations(invocations: &mut [crate::types::NormalizedInvocation]) {
     for inv in invocations.iter_mut() {
         if let Some((_, key)) = AMP_SKILL_WRAPPERS
             .iter()

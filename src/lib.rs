@@ -353,6 +353,8 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".config", "Cursor"]);
         }
         "factory" => {
+            maybe_push(&mut out, &[".factory"]);
+            maybe_push(&mut out, &[".factory", "sessions"]);
             maybe_push(&mut out, &[".factory-droid"]);
             maybe_push(&mut out, &[".config", "factory-droid"]);
         }
@@ -365,6 +367,96 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".config", "github-copilot"]);
             maybe_push(&mut out, &[".copilot", "session-state"]);
             maybe_push(&mut out, &[".copilot", "history-session-state"]);
+            maybe_push(
+                &mut out,
+                &[".config", "Code", "User", "globalStorage", "github.copilot-chat"],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    ".config",
+                    "Code - Insiders",
+                    "User",
+                    "globalStorage",
+                    "github.copilot-chat",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    ".config",
+                    "VSCodium",
+                    "User",
+                    "globalStorage",
+                    "github.copilot-chat",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "Code",
+                    "User",
+                    "globalStorage",
+                    "github.copilot-chat",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "Code - Insiders",
+                    "User",
+                    "globalStorage",
+                    "github.copilot-chat",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "VSCodium",
+                    "User",
+                    "globalStorage",
+                    "github.copilot-chat",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "AppData",
+                    "Roaming",
+                    "Code",
+                    "User",
+                    "globalStorage",
+                    "github.copilot-chat",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "AppData",
+                    "Roaming",
+                    "Code - Insiders",
+                    "User",
+                    "globalStorage",
+                    "github.copilot-chat",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "AppData",
+                    "Roaming",
+                    "VSCodium",
+                    "User",
+                    "globalStorage",
+                    "github.copilot-chat",
+                ],
+            );
         }
         "goose" => {
             maybe_push(&mut out, &[".local", "share", "goose", "sessions"]);
@@ -377,7 +469,7 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".kimi"]);
         }
         "opencode" => {
-            maybe_push(&mut out, &[".opencode"]);
+            maybe_push(&mut out, &[".local", "share", "opencode"]);
             maybe_push(&mut out, &[".config", "opencode"]);
         }
         "openclaw" => {
@@ -519,6 +611,8 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 "aider" => vec![tilde(&[".aider.chat.history.md"]), tilde(&[".aider"])],
                 "amp" => vec![
                     tilde(&[".local", "share", "amp"]),
+                    tilde(&["Library", "Application Support", "amp"]),
+                    tilde(&["AppData", "Roaming", "amp"]),
                     tilde(&[
                         ".config",
                         "Code",
@@ -534,13 +628,25 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                         "globalStorage",
                         "sourcegraph.amp",
                     ]),
+                    tilde(&[
+                        "AppData",
+                        "Roaming",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ]),
                 ],
                 "chatgpt" => vec![tilde(&[
                     "Library",
                     "Application Support",
                     "com.openai.chat",
                 ])],
-                "claude" => vec![tilde(&[".claude", "projects"]), tilde(&[".claude"])],
+                "claude" => vec![
+                    tilde(&[".claude", "projects"]),
+                    tilde(&[".claude"]),
+                    tilde(&[".config", "claude"]),
+                ],
                 "clawdbot" => vec![tilde(&[".clawdbot", "sessions"]), tilde(&[".clawdbot"])],
                 "cline" => {
                     let mut paths = Vec::new();
@@ -575,11 +681,27 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                             "globalStorage",
                             ext,
                         ]));
+                        paths.push(tilde(&[
+                            "AppData",
+                            "Roaming",
+                            "Code",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
+                        paths.push(tilde(&[
+                            "AppData",
+                            "Roaming",
+                            "Cursor",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
                     }
                     paths
                 }
                 "codex" => vec![tilde(&[".codex", "sessions"])],
-                "continue" => vec![tilde(&[".continue", "sessions"])],
+                "continue" => vec![tilde(&[".continue", "sessions"]), tilde(&[".continue"])],
                 "copilot_cli" => vec![
                     tilde(&[".copilot", "session-state"]),
                     tilde(&[".copilot", "history-session-state"]),
@@ -588,10 +710,21 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".local", "share", "github-copilot"]),
                 ],
                 "crush" => vec![tilde(&[".crush", "crush.db"]), tilde(&[".crush"])],
-                "cursor" => vec![tilde(&[".cursor"])],
-                "factory" => vec![tilde(&[".factory", "sessions"])],
-                "gemini" => vec![tilde(&[".gemini", "tmp"]), tilde(&[".gemini"])],
+                "cursor" => vec![tilde(&[".cursor"]), tilde(&[".config", "Cursor"])],
+                "factory" => vec![
+                    tilde(&[".factory"]),
+                    tilde(&[".factory", "sessions"]),
+                    tilde(&[".factory-droid"]),
+                    tilde(&[".config", "factory-droid"]),
+                ],
+                "gemini" => vec![
+                    tilde(&[".gemini", "tmp"]),
+                    tilde(&[".gemini"]),
+                    tilde(&[".config", "gemini"]),
+                ],
                 "github-copilot" => vec![
+                    tilde(&[".github-copilot"]),
+                    tilde(&[".config", "github-copilot"]),
                     tilde(&[
                         ".config",
                         "Code",
@@ -600,9 +733,63 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                         "github.copilot-chat",
                     ]),
                     tilde(&[
+                        ".config",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ]),
+                    tilde(&[
+                        ".config",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ]),
+                    tilde(&[
                         "Library",
                         "Application Support",
                         "Code",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ]),
+                    tilde(&[
+                        "AppData",
+                        "Roaming",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ]),
+                    tilde(&[
+                        "AppData",
+                        "Roaming",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ]),
+                    tilde(&[
+                        "AppData",
+                        "Roaming",
+                        "VSCodium",
                         "User",
                         "globalStorage",
                         "github.copilot-chat",
@@ -619,13 +806,16 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".goose", "sessions"]),
                     tilde(&[".goose"]),
                 ],
-                "kimi" => vec![tilde(&[".kimi", "sessions"])],
-                "opencode" => vec![tilde(&[".local", "share", "opencode"])],
-                "openclaw" => vec![tilde(&[".openclaw", "agents"])],
+                "kimi" => vec![tilde(&[".kimi", "sessions"]), tilde(&[".kimi"])],
+                "opencode" => vec![
+                    tilde(&[".local", "share", "opencode"]),
+                    tilde(&[".config", "opencode"]),
+                ],
+                "openclaw" => vec![tilde(&[".openclaw", "agents"]), tilde(&[".openclaw"])],
                 "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
-                "qwen" => vec![tilde(&[".qwen", "tmp"])],
-                "vibe" => vec![tilde(&[".vibe", "logs", "session"])],
-                "windsurf" => vec![tilde(&[".windsurf"])],
+                "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],
+                "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],
+                "windsurf" => vec![tilde(&[".windsurf"]), tilde(&[".config", "windsurf"])],
                 _ => vec![],
             };
             (slug, paths)
@@ -921,5 +1111,55 @@ mod tests {
             ),
             "expected Cursor Roo-Cline storage root in {roots:?}"
         );
+    }
+
+    #[test]
+    fn default_probe_paths_tilde_covers_expected_roots() {
+        let mut by_slug: std::collections::HashMap<&'static str, Vec<String>> =
+            std::collections::HashMap::new();
+        for (slug, paths) in default_probe_paths_tilde() {
+            by_slug.insert(slug, paths);
+        }
+
+        let factory = by_slug.get("factory").expect("factory paths");
+        assert!(factory.contains(&"~/.factory".to_string()));
+        assert!(factory.contains(&"~/.factory/sessions".to_string()));
+        assert!(factory.contains(&"~/.factory-droid".to_string()));
+        assert!(factory.contains(&"~/.config/factory-droid".to_string()));
+
+        let opencode = by_slug.get("opencode").expect("opencode paths");
+        assert!(opencode.contains(&"~/.local/share/opencode".to_string()));
+        assert!(opencode.contains(&"~/.config/opencode".to_string()));
+
+        let copilot = by_slug
+            .get("github-copilot")
+            .expect("github-copilot paths");
+        assert!(copilot.contains(
+            &"~/.config/Code/User/globalStorage/github.copilot-chat".to_string()
+        ));
+        assert!(copilot.contains(
+            &"~/Library/Application Support/Code/User/globalStorage/github.copilot-chat"
+                .to_string()
+        ));
+        assert!(copilot.contains(
+            &"~/AppData/Roaming/Code/User/globalStorage/github.copilot-chat".to_string()
+        ));
+        assert!(copilot.contains(&"~/.github-copilot".to_string()));
+        assert!(copilot.contains(&"~/.config/github-copilot".to_string()));
+
+        let cursor = by_slug.get("cursor").expect("cursor paths");
+        assert!(cursor.contains(&"~/.config/Cursor".to_string()));
+
+        let windsurf = by_slug.get("windsurf").expect("windsurf paths");
+        assert!(windsurf.contains(&"~/.config/windsurf".to_string()));
+
+        let cline = by_slug.get("cline").expect("cline paths");
+        assert!(cline.contains(
+            &"~/.config/Code/User/globalStorage/saoudrizwan.claude-dev".to_string()
+        ));
+        assert!(cline.contains(
+            &"~/AppData/Roaming/Cursor/User/globalStorage/rooveterinaryinc.roo-cline"
+                .to_string()
+        ));
     }
 }

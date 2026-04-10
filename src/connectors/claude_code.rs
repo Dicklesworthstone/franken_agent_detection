@@ -1320,7 +1320,7 @@ mod tests {
     fn scan_with_explicit_file_only_reads_that_file_and_keeps_projects_relative_external_id() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
-        let project_dir = claude_dir.join("project-a");
+        let project_dir = claude_dir.join("projects").join("project-a");
         fs::create_dir_all(project_dir.join("subagents")).unwrap();
 
         let target_file = project_dir.join("target.jsonl");
