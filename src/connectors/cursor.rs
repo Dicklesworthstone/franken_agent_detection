@@ -115,12 +115,17 @@ impl CursorConnector {
             .args(["/c", "echo %USERNAME%"])
             .output()
         {
-            let username = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !username.is_empty() {
-                let user_path = mnt_c_users.join(&username);
-                let cursor_path = user_path.join("AppData/Roaming/Cursor/User");
-                if cursor_path.exists() {
-                    return Some(cursor_path);
+            if output.status.success() {
+                let username = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let is_safe = !username.is_empty()
+                    && !username.contains(['/', '\\'])
+                    && !username.contains(':');
+                if is_safe {
+                    let user_path = mnt_c_users.join(&username);
+                    let cursor_path = user_path.join("AppData/Roaming/Cursor/User");
+                    if cursor_path.exists() {
+                        return Some(cursor_path);
+                    }
                 }
             }
         }
