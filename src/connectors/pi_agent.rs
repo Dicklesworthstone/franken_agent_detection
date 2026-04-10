@@ -10,6 +10,7 @@
 //! - `thinking_level_change`: Records thinking level changes
 //! - `model_change`: Records model/provider changes
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -35,19 +36,6 @@ impl PiAgentConnector {
         Self
     }
 
-    /// Get the primary pi-agent home directory.
-    ///
-    /// Checks `PI_CODING_AGENT_DIR` env var, falls back to `~/.pi/agent/`.
-    /// Prefer [`Self::default_homes`] when scanning so that both
-    /// pi-mono (`~/.pi/agent`) and Oh My Pi (`~/.omp/agent`) installations
-    /// are discovered (issue #174).
-    fn home() -> PathBuf {
-        dotenvy::var("PI_CODING_AGENT_DIR").map_or_else(
-            |_| dirs::home_dir().unwrap_or_default().join(".pi/agent"),
-            PathBuf::from,
-        )
-    }
-
     /// All candidate pi-agent home directories in priority order.
     ///
     /// Covers both known distributions:
@@ -55,13 +43,20 @@ impl PiAgentConnector {
     /// - **Oh My Pi** (`omp` CLI) stores at `~/.omp/agent/`.
     ///
     /// Explicit `PI_CODING_AGENT_DIR` overrides and becomes the sole
-    /// candidate, matching the single-home behavior of [`Self::home`].
+    /// candidate so CI and isolated setups can pin a single location.
     fn default_homes() -> Vec<PathBuf> {
         if let Ok(explicit) = dotenvy::var("PI_CODING_AGENT_DIR") {
             return vec![PathBuf::from(explicit)];
         }
+        Self::default_homes_from(dirs::home_dir().as_deref())
+    }
+
+    /// Test-accessible variant of [`Self::default_homes`] that takes an
+    /// explicit home directory override. Returns the same list of candidate
+    /// pi-agent homes but without touching process environment.
+    fn default_homes_from(home: Option<&Path>) -> Vec<PathBuf> {
         let mut out = Vec::new();
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = home {
             out.push(home.join(".pi/agent"));
             out.push(home.join(".omp/agent"));
         }
@@ -1531,6 +1526,100 @@ mod tests {
             2,
             "expected 2 conversations from nested subdirectories, got {}",
             convs.len()
+        );
+    }
+
+    // =====================================================
+    // Regression: issue #174 — discover Oh My Pi at ~/.omp/agent
+    // in addition to pi-mono at ~/.pi/agent
+    // =====================================================
+
+    /// Regression for issue #174: `default_homes_from` must return BOTH
+    /// `~/.pi/agent` (pi-mono) and `~/.omp/agent` (Oh My Pi), so the
+    /// scan loop can walk both distributions without additional config.
+    ///
+    /// This test targets the pure function so it does not need to mutate
+    /// process environment (std::env::set_var is `unsafe` and `forbid`den
+    /// at the crate level).
+    #[test]
+    fn default_homes_from_includes_both_pi_and_omp() {
+        let sandbox = TempDir::new().unwrap();
+        let home = sandbox.path();
+        let homes = PiAgentConnector::default_homes_from(Some(home));
+        assert_eq!(
+            homes,
+            vec![home.join(".pi/agent"), home.join(".omp/agent")],
+            "default_homes_from must return pi-mono + Oh My Pi candidates"
+        );
+    }
+
+    /// End-to-end regression for issue #174: populate a sandboxed home
+    /// with both `~/.pi/agent/sessions/<file>` and
+    /// `~/.omp/agent/sessions/<file>`, point the scanner at each root
+    /// explicitly via `ScanContext::with_roots`, and verify both sets
+    /// of conversations surface in a single scan result.
+    ///
+    /// This exercises the same discovery path the real scanner takes
+    /// under `build_scan_roots` without touching process environment.
+    #[test]
+    fn scan_discovers_both_pi_and_omp_sessions_via_explicit_roots() {
+        let sandbox = TempDir::new().unwrap();
+        let sandbox_home = sandbox.path().to_path_buf();
+
+        let pi_sessions = sandbox_home.join(".pi/agent/sessions");
+        fs::create_dir_all(&pi_sessions).unwrap();
+        fs::write(
+            pi_sessions.join("2025-12-01T10-00-00_pi-uuid.jsonl"),
+            r#"{"type":"session","id":"sess-pi","timestamp":"2025-12-01T10:00:00Z","cwd":"/home/user/pi-proj","provider":"anthropic","modelId":"claude-3-opus"}
+{"type":"message","timestamp":"2025-12-01T10:00:01Z","message":{"role":"user","content":"From pi-mono"}}"#,
+        )
+        .unwrap();
+
+        let omp_sessions = sandbox_home.join(".omp/agent/sessions");
+        fs::create_dir_all(&omp_sessions).unwrap();
+        fs::write(
+            omp_sessions.join("2025-12-02T11-00-00_omp-uuid.jsonl"),
+            r#"{"type":"session","id":"sess-omp","timestamp":"2025-12-02T11:00:00Z","cwd":"/home/user/omp-proj","provider":"anthropic","modelId":"claude-3-opus"}
+{"type":"message","timestamp":"2025-12-02T11:00:01Z","message":{"role":"user","content":"From Oh My Pi"}}"#,
+        )
+        .unwrap();
+
+        let connector = PiAgentConnector::new();
+
+        // Each root is scanned independently (matching build_scan_roots).
+        let pi_root = sandbox_home.join(".pi/agent");
+        let omp_root = sandbox_home.join(".omp/agent");
+        let ctx_pi = ScanContext::with_roots(
+            pi_root.clone(),
+            vec![ScanRoot::local(pi_root)],
+            None,
+        );
+        let ctx_omp = ScanContext::with_roots(
+            omp_root.clone(),
+            vec![ScanRoot::local(omp_root)],
+            None,
+        );
+
+        let mut convs = connector.scan(&ctx_pi).unwrap();
+        convs.extend(connector.scan(&ctx_omp).unwrap());
+
+        assert_eq!(
+            convs.len(),
+            2,
+            "expected 2 conversations (one per home), got {}",
+            convs.len()
+        );
+        let sources: std::collections::HashSet<_> = convs
+            .iter()
+            .map(|c| c.messages[0].content.clone())
+            .collect();
+        assert!(
+            sources.contains("From pi-mono"),
+            "must include ~/.pi/agent session, found: {sources:?}"
+        );
+        assert!(
+            sources.contains("From Oh My Pi"),
+            "must include ~/.omp/agent session, found: {sources:?}"
         );
     }
 }

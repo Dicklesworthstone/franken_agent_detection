@@ -80,49 +80,50 @@ impl OpenCodeConnector {
         None
     }
 
-    /// Find the OpenCode SQLite database (v1.2+).
-    /// Returns the path to `opencode.db` if it exists.
-    ///
-    /// OpenCode uses XDG-style paths on all platforms (including macOS),
-    /// so `~/.local/share/opencode/opencode.db` is the canonical location
-    /// and must be checked before `dirs::data_local_dir()` which maps to
-    /// `~/Library/Application Support` on macOS (see issue #174).
-    fn sqlite_db_path() -> Option<PathBuf> {
-        for candidate in Self::sqlite_db_candidates() {
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-        None
-    }
-
     /// All known locations where OpenCode may store its SQLite database,
     /// in priority order. Exposed so that scan paths can fall back through
     /// them even when the caller provided an explicit (non-matching)
     /// `data_dir`.
     fn sqlite_db_candidates() -> Vec<PathBuf> {
+        Self::sqlite_db_candidates_from(
+            dotenvy::var("OPENCODE_SQLITE_DB").ok().map(PathBuf::from),
+            dirs::home_dir().as_deref(),
+            dirs::data_local_dir().as_deref(),
+            dirs::config_dir().as_deref(),
+        )
+    }
+
+    /// Pure, env-free variant of [`Self::sqlite_db_candidates`] for tests.
+    /// Every environment-dependent input is passed in explicitly so the
+    /// resulting list is fully deterministic.
+    fn sqlite_db_candidates_from(
+        explicit_override: Option<PathBuf>,
+        home: Option<&Path>,
+        xdg_data: Option<&Path>,
+        xdg_config: Option<&Path>,
+    ) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
 
         // 1. Explicit override for tests / custom installs.
-        if let Ok(path) = dotenvy::var("OPENCODE_SQLITE_DB") {
-            out.push(PathBuf::from(path));
+        if let Some(path) = explicit_override {
+            out.push(path);
         }
 
         // 2. XDG data dir via $HOME. OpenCode uses this on every platform,
-        //    including macOS. This MUST be tried before dirs::data_local_dir()
-        //    because on macOS the latter resolves to ~/Library/Application
-        //    Support which OpenCode does not use.
-        if let Some(home) = dirs::home_dir() {
+        //    including macOS. This MUST be tried before
+        //    dirs::data_local_dir() because on macOS the latter resolves
+        //    to ~/Library/Application Support which OpenCode does not use.
+        if let Some(home) = home {
             out.push(home.join(".local/share/opencode/opencode.db"));
             out.push(home.join(".config/opencode/opencode.db"));
         }
 
         // 3. Platform-native data/config dirs (for users who have moved
         //    OpenCode into non-XDG locations).
-        if let Some(data) = dirs::data_local_dir() {
+        if let Some(data) = xdg_data {
             out.push(data.join("opencode/opencode.db"));
         }
-        if let Some(config) = dirs::config_dir() {
+        if let Some(config) = xdg_config {
             out.push(config.join("opencode/opencode.db"));
         }
 
@@ -2895,5 +2896,168 @@ mod tests {
     fn normalize_sqlite_ts_value_real() {
         let val = rusqlite::types::Value::Real(1_700_000_000.5);
         assert_eq!(normalize_sqlite_ts_value(&val), Some(1_700_000_000_000));
+    }
+
+    // =====================================================
+    // Regression: issue #174 — SQLite DB discovery
+    // =====================================================
+
+    /// Regression for issue #174: the candidate list must put XDG paths
+    /// reachable from `$HOME` ahead of `dirs::data_local_dir()` so macOS
+    /// users (where `data_local_dir()` resolves to `~/Library/Application
+    /// Support`) still have their canonical `~/.local/share/opencode/
+    /// opencode.db` found. The explicit override must always win.
+    #[test]
+    fn sqlite_db_candidates_from_orders_home_xdg_before_platform_dirs() {
+        let home = PathBuf::from("/home/testuser");
+        let xdg_data = PathBuf::from("/var/lib/xdg");
+        let xdg_config = PathBuf::from("/etc/xdg");
+
+        // No override → home-XDG paths must come first.
+        let list = OpenCodeConnector::sqlite_db_candidates_from(
+            None,
+            Some(&home),
+            Some(&xdg_data),
+            Some(&xdg_config),
+        );
+        assert_eq!(list.len(), 4);
+        assert_eq!(list[0], home.join(".local/share/opencode/opencode.db"));
+        assert_eq!(list[1], home.join(".config/opencode/opencode.db"));
+        assert_eq!(list[2], xdg_data.join("opencode/opencode.db"));
+        assert_eq!(list[3], xdg_config.join("opencode/opencode.db"));
+
+        // Explicit override always wins.
+        let override_path = PathBuf::from("/custom/opencode.db");
+        let list = OpenCodeConnector::sqlite_db_candidates_from(
+            Some(override_path.clone()),
+            Some(&home),
+            Some(&xdg_data),
+            Some(&xdg_config),
+        );
+        assert_eq!(list[0], override_path);
+        assert_eq!(list.len(), 5);
+    }
+
+    /// Regression for issue #174: when two dirs helpers resolve to the
+    /// same path (common on macOS where config_dir == data_local_dir),
+    /// the candidate list must deduplicate while preserving priority.
+    #[test]
+    fn sqlite_db_candidates_from_deduplicates_overlapping_roots() {
+        let home = PathBuf::from("/Users/testuser");
+        // On macOS, both of these map to ~/Library/Application Support.
+        let overlap = PathBuf::from("/Users/testuser/Library/Application Support");
+        let list = OpenCodeConnector::sqlite_db_candidates_from(
+            None,
+            Some(&home),
+            Some(&overlap),
+            Some(&overlap),
+        );
+        // 2 home-XDG paths + 1 overlap path (deduplicated) = 3.
+        assert_eq!(list.len(), 3, "list = {list:?}");
+        assert_eq!(list[0], home.join(".local/share/opencode/opencode.db"));
+        assert_eq!(list[1], home.join(".config/opencode/opencode.db"));
+        assert_eq!(list[2], overlap.join("opencode/opencode.db"));
+    }
+
+    /// Regression for issue #174: when the caller passes an explicit
+    /// directory that contains `opencode.db`, the scanner must discover
+    /// it. This is the ctx.data_dir-as-parent path.
+    #[test]
+    fn scan_finds_sqlite_db_when_data_dir_is_db_parent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            [
+                "sess-parent",
+                "proj-p",
+                "Parent Session",
+                "/home/user/parent",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            [
+                "msg-parent",
+                "sess-parent",
+                r#"{"role":"user","time":{"created":1700000000000}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            [
+                "part-parent",
+                "msg-parent",
+                "sess-parent",
+                r#"{"type":"text","text":"Parent content"}"#,
+            ],
+        )
+        .unwrap();
+
+        // Pass the parent directory (not the .db file itself).
+        let connector = OpenCodeConnector::new();
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-parent"));
+    }
+
+    /// Regression for issue #174: when the caller passes an explicit
+    /// scan root (use_default_detection() == false) that does NOT
+    /// contain opencode.db, the scanner must still find a DB via the
+    /// ctx.data_dir-as-parent candidate if one is present.
+    #[test]
+    fn scan_finds_sqlite_db_via_data_dir_even_with_explicit_scan_roots() {
+        use crate::connectors::scan::ScanRoot;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            [
+                "sess-roots",
+                "proj-roots",
+                "Roots Session",
+                "/home/user/roots",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            [
+                "msg-roots",
+                "sess-roots",
+                r#"{"role":"user","time":{"created":1700000000000}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            [
+                "part-roots",
+                "msg-roots",
+                "sess-roots",
+                r#"{"type":"text","text":"Roots content"}"#,
+            ],
+        )
+        .unwrap();
+
+        let connector = OpenCodeConnector::new();
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(
+            convs.len(),
+            1,
+            "explicit scan_roots must still check ctx.data_dir for opencode.db"
+        );
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-roots"));
     }
 }
