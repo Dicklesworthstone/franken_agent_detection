@@ -416,22 +416,41 @@ impl Connector for GooseConnector {
         let mut convs = Vec::new();
 
         // --- Phase 1: Try SQLite database (v1.20+) ---
-        let db_path =
-            if ctx.data_dir.exists() && ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
-                Some(ctx.data_dir.clone())
-            } else if ctx.use_default_detection() {
-                Self::sqlite_db_path()
-            } else {
-                // data_dir might be the parent containing sessions.db
-                let candidate = ctx.data_dir.join("sessions.db");
-                if candidate.exists() {
-                    Some(candidate)
-                } else {
-                    None
-                }
-            };
+        let mut db_paths: Vec<PathBuf> = Vec::new();
+        if ctx
+            .data_dir
+            .extension()
+            .is_some_and(|ext| ext == "db")
+        {
+            db_paths.push(ctx.data_dir.clone());
+        } else if !ctx.data_dir.as_os_str().is_empty() {
+            db_paths.push(ctx.data_dir.join("sessions.db"));
+        }
 
-        if let Some(db) = db_path {
+        if ctx.use_default_detection() {
+            if let Some(db) = Self::sqlite_db_path() {
+                db_paths.push(db);
+            }
+        } else {
+            for scan_root in &ctx.scan_roots {
+                if scan_root.path.extension().is_some_and(|ext| ext == "db") {
+                    db_paths.push(scan_root.path.clone());
+                }
+                db_paths.push(scan_root.path.join("sessions.db"));
+                db_paths.push(scan_root.path.join(".local/share/goose/sessions/sessions.db"));
+                db_paths.push(scan_root.path.join(".goose/sessions/sessions.db"));
+            }
+        }
+
+        {
+            let mut seen = HashSet::new();
+            db_paths.retain(|p| seen.insert(p.clone()));
+        }
+
+        for db in db_paths {
+            if !db.exists() {
+                continue;
+            }
             match Self::extract_from_sqlite(&db, ctx.since_ts) {
                 Ok(sqlite_convs) => {
                     tracing::debug!(
@@ -452,56 +471,85 @@ impl Connector for GooseConnector {
             convs.iter().filter_map(|c| c.external_id.clone()).collect();
 
         // --- Phase 2: Fall back to JSONL file scanning (pre-v1.20) ---
-        let sessions_dir = if ctx.use_default_detection() {
+        let mut session_roots: Vec<PathBuf> = Vec::new();
+        if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_goose_sessions(&ctx.data_dir) {
-                Some(ctx.data_dir.clone())
-            } else {
-                Self::sessions_dir()
+                session_roots.push(ctx.data_dir.clone());
+            } else if let Some(dir) = Self::sessions_dir() {
+                session_roots.push(dir);
             }
-        } else if ctx.data_dir.exists() && looks_like_goose_sessions(&ctx.data_dir) {
-            Some(ctx.data_dir.clone())
         } else {
-            None
-        };
-
-        let Some(sessions_dir) = sessions_dir else {
-            return Ok(convs);
-        };
-
-        // Collect all .jsonl files
-        let jsonl_files: Vec<PathBuf> = WalkDir::new(&sessions_dir)
-            .max_depth(2)
-            .into_iter()
-            .flatten()
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-            .map(|e| e.path().to_path_buf())
-            .collect();
-
-        for jsonl_file in jsonl_files {
-            if !file_modified_since(&jsonl_file, ctx.since_ts) {
-                continue;
+            if ctx.data_dir.exists() && looks_like_goose_sessions(&ctx.data_dir) {
+                session_roots.push(ctx.data_dir.clone());
             }
-
-            // Use filename stem as session ID
-            let session_id = jsonl_file
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            if !seen_ids.insert(session_id.clone()) {
-                continue;
-            }
-
-            match parse_goose_jsonl(&jsonl_file, &session_id) {
-                Ok(conv) => {
-                    if !conv.messages.is_empty() {
-                        convs.push(conv);
+            for scan_root in &ctx.scan_roots {
+                let candidates = [
+                    scan_root.path.clone(),
+                    scan_root.path.join(".local/share/goose/sessions"),
+                    scan_root.path.join(".goose/sessions"),
+                    scan_root.path.join(".goose"),
+                ];
+                for candidate in candidates {
+                    if candidate.exists() && looks_like_goose_sessions(&candidate) {
+                        session_roots.push(candidate);
                     }
                 }
-                Err(e) => {
-                    tracing::debug!("goose jsonl: failed to parse {}: {e}", jsonl_file.display());
+            }
+        }
+
+        if session_roots.is_empty() {
+            return Ok(convs);
+        }
+
+        session_roots.sort();
+        session_roots.dedup();
+
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+
+        for sessions_dir in session_roots {
+            // Collect all .jsonl files
+            let jsonl_files: Vec<PathBuf> = WalkDir::new(&sessions_dir)
+                .max_depth(2)
+                .into_iter()
+                .flatten()
+                .filter(|e| e.file_type().is_file())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+                .map(|e| e.path().to_path_buf())
+                .collect();
+
+            for jsonl_file in jsonl_files {
+                let canonical = std::fs::canonicalize(&jsonl_file)
+                    .unwrap_or_else(|_| jsonl_file.clone());
+                if !seen_files.insert(canonical) {
+                    continue;
+                }
+                if !file_modified_since(&jsonl_file, ctx.since_ts) {
+                    continue;
+                }
+
+                // Use filename stem as session ID
+                let session_id = jsonl_file
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                if !seen_ids.insert(session_id.clone()) {
+                    continue;
+                }
+
+                match parse_goose_jsonl(&jsonl_file, &session_id) {
+                    Ok(conv) => {
+                        if !conv.messages.is_empty() {
+                            convs.push(conv);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "goose jsonl: failed to parse {}: {e}",
+                            jsonl_file.display()
+                        );
+                    }
                 }
             }
         }

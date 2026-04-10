@@ -16,7 +16,8 @@ struct TrieMapping {
 impl TrieMapping {
     fn applies_to_agent(&self, agent: Option<&str>) -> bool {
         match (&self.agents, agent) {
-            (None, _) | (Some(_), None) => true,
+            (None, _) => true,
+            (Some(_), None) => false,
             (Some(agents), Some(a)) => agents
                 .iter()
                 .any(|allowed| agent_name_matches_filter(allowed, a)),
@@ -229,10 +230,10 @@ mod tests {
             trie.lookup("/remote/home/project", Some("copilot")),
             "/local/copilot/project"
         );
-        // None agent matches the last applicable mapping
+        // None agent should not match agent-specific mappings
         assert_eq!(
             trie.lookup("/remote/home/project", None),
-            "/local/copilot/project"
+            "/remote/home/project"
         );
     }
 

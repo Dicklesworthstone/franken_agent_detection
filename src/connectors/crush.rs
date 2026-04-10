@@ -136,7 +136,7 @@ impl Connector for CrushConnector {
         // Determine database paths to scan.
         let mut db_paths: Vec<PathBuf> = Vec::new();
 
-        if ctx.data_dir.exists() && ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
+        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             // Explicit db path override.
             db_paths.push(ctx.data_dir.clone());
         } else if ctx.use_default_detection() {
@@ -145,18 +145,38 @@ impl Connector for CrushConnector {
                 db_paths.push(global);
             }
             db_paths.extend(Self::discover_project_dbs());
+            let candidate = ctx.data_dir.join("crush.db");
+            if candidate.exists() {
+                db_paths.push(candidate);
+            }
         } else {
             // data_dir might be the parent containing crush.db
             let candidate = ctx.data_dir.join("crush.db");
             if candidate.exists() {
                 db_paths.push(candidate);
             }
+            for scan_root in &ctx.scan_roots {
+                if scan_root.path.extension().is_some_and(|ext| ext == "db") {
+                    db_paths.push(scan_root.path.clone());
+                }
+                db_paths.push(scan_root.path.join("crush.db"));
+                db_paths.push(scan_root.path.join(".crush/crush.db"));
+            }
+        }
+
+        // Deduplicate while preserving priority order.
+        {
+            let mut seen = HashSet::new();
+            db_paths.retain(|p| seen.insert(p.clone()));
         }
 
         // Track seen session IDs to dedup across global + per-project databases.
         let mut seen_ids: HashSet<String> = HashSet::new();
 
         for db in &db_paths {
+            if !db.exists() {
+                continue;
+            }
             match Self::extract_from_sqlite(db, ctx.since_ts) {
                 Ok(db_convs) => {
                     tracing::debug!(

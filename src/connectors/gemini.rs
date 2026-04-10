@@ -257,27 +257,44 @@ fn scan_gemini_with_callback(
                 .map(|mut d| d.any(|e| e.ok().is_some_and(|e| e.path().join("chats").exists())))
                 .unwrap_or(false)
     };
-    let root = if ctx.use_default_detection() {
+    let roots: Vec<PathBuf> = if ctx.use_default_detection() {
         if looks_like_root(&ctx.data_dir) {
-            ctx.data_dir.clone()
+            vec![ctx.data_dir.clone()]
         } else {
-            GeminiConnector::root()
+            vec![GeminiConnector::root()]
         }
     } else {
-        ctx.data_dir.clone()
+        let mut explicit = Vec::new();
+        for scan_root in &ctx.scan_roots {
+            let candidate = scan_root.path.join(".gemini/tmp");
+            if looks_like_root(&candidate) {
+                explicit.push(candidate);
+            }
+            if looks_like_root(&scan_root.path) {
+                explicit.push(scan_root.path.clone());
+            }
+        }
+        if looks_like_root(&ctx.data_dir) {
+            explicit.push(ctx.data_dir.clone());
+        }
+        if explicit.is_empty() {
+            return Ok(());
+        }
+        explicit
     };
 
-    if !ctx.use_default_detection() && !looks_like_root(&root) {
-        return Ok(());
-    }
+    let mut roots = roots;
+    roots.sort();
+    roots.dedup();
 
-    if !root.exists() {
-        return Ok(());
-    }
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
 
-    let files = GeminiConnector::session_files(&root);
+        let files = GeminiConnector::session_files(&root);
 
-    for file in files {
+        for file in files {
         // Skip files not modified since last scan (incremental indexing)
         if !file_modified_since(&file, ctx.since_ts) {
             continue;
@@ -443,6 +460,7 @@ fn scan_gemini_with_callback(
             }),
             messages,
         })?;
+    }
     }
 
     Ok(())

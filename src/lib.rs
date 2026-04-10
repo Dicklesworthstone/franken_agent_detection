@@ -210,9 +210,19 @@ fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for ext in ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"] {
         roots.push(home.join(".config/Code/User/globalStorage").join(ext));
+        roots.push(home.join(".config/Code - Insiders/User/globalStorage").join(ext));
+        roots.push(home.join(".config/VSCodium/User/globalStorage").join(ext));
         roots.push(home.join(".config/Cursor/User/globalStorage").join(ext));
         roots.push(
             home.join("Library/Application Support/Code/User/globalStorage")
+                .join(ext),
+        );
+        roots.push(
+            home.join("Library/Application Support/Code - Insiders/User/globalStorage")
+                .join(ext),
+        );
+        roots.push(
+            home.join("Library/Application Support/VSCodium/User/globalStorage")
                 .join(ext),
         );
         roots.push(
@@ -223,6 +233,11 @@ fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
             home.join("AppData/Roaming/Code/User/globalStorage")
                 .join(ext),
         );
+        roots.push(
+            home.join("AppData/Roaming/Code - Insiders/User/globalStorage")
+                .join(ext),
+        );
+        roots.push(home.join("AppData/Roaming/VSCodium/User/globalStorage").join(ext));
         roots.push(
             home.join("AppData/Roaming/Cursor/User/globalStorage")
                 .join(ext),
@@ -305,6 +320,26 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(
                 &mut out,
                 &[
+                    ".config",
+                    "Code - Insiders",
+                    "User",
+                    "globalStorage",
+                    "sourcegraph.amp",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    ".config",
+                    "VSCodium",
+                    "User",
+                    "globalStorage",
+                    "sourcegraph.amp",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
                     "Library",
                     "Application Support",
                     "Code",
@@ -316,9 +351,53 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(
                 &mut out,
                 &[
+                    "Library",
+                    "Application Support",
+                    "Code - Insiders",
+                    "User",
+                    "globalStorage",
+                    "sourcegraph.amp",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "VSCodium",
+                    "User",
+                    "globalStorage",
+                    "sourcegraph.amp",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
                     "AppData",
                     "Roaming",
                     "Code",
+                    "User",
+                    "globalStorage",
+                    "sourcegraph.amp",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "AppData",
+                    "Roaming",
+                    "Code - Insiders",
+                    "User",
+                    "globalStorage",
+                    "sourcegraph.amp",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "AppData",
+                    "Roaming",
+                    "VSCodium",
                     "User",
                     "globalStorage",
                     "sourcegraph.amp",
@@ -365,6 +444,12 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         "cursor" => {
             maybe_push(&mut out, &[".cursor"]);
             maybe_push(&mut out, &[".config", "Cursor"]);
+            maybe_push(&mut out, &[".config", "Cursor", "User"]);
+            maybe_push(
+                &mut out,
+                &["Library", "Application Support", "Cursor", "User"],
+            );
+            maybe_push(&mut out, &["AppData", "Roaming", "Cursor", "User"]);
         }
         "factory" => {
             maybe_push(&mut out, &[".factory"]);
@@ -641,6 +726,20 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                         "sourcegraph.amp",
                     ]),
                     tilde(&[
+                        ".config",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ]),
+                    tilde(&[
+                        ".config",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ]),
+                    tilde(&[
                         "Library",
                         "Application Support",
                         "Code",
@@ -649,9 +748,41 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                         "sourcegraph.amp",
                     ]),
                     tilde(&[
+                        "Library",
+                        "Application Support",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ]),
+                    tilde(&[
                         "AppData",
                         "Roaming",
                         "Code",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ]),
+                    tilde(&[
+                        "AppData",
+                        "Roaming",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ]),
+                    tilde(&[
+                        "AppData",
+                        "Roaming",
+                        "VSCodium",
                         "User",
                         "globalStorage",
                         "sourcegraph.amp",
@@ -672,11 +803,41 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     let mut paths = Vec::new();
                     for ext in ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"] {
                         paths.push(tilde(&[".config", "Code", "User", "globalStorage", ext]));
+                        paths.push(tilde(&[
+                            ".config",
+                            "Code - Insiders",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
+                        paths.push(tilde(&[
+                            ".config",
+                            "VSCodium",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
                         paths.push(tilde(&[".config", "Cursor", "User", "globalStorage", ext]));
                         paths.push(tilde(&[
                             "Library",
                             "Application Support",
                             "Code",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
+                        paths.push(tilde(&[
+                            "Library",
+                            "Application Support",
+                            "Code - Insiders",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
+                        paths.push(tilde(&[
+                            "Library",
+                            "Application Support",
+                            "VSCodium",
                             "User",
                             "globalStorage",
                             ext,
@@ -693,6 +854,22 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                             "AppData",
                             "Roaming",
                             "Code",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
+                        paths.push(tilde(&[
+                            "AppData",
+                            "Roaming",
+                            "Code - Insiders",
+                            "User",
+                            "globalStorage",
+                            ext,
+                        ]));
+                        paths.push(tilde(&[
+                            "AppData",
+                            "Roaming",
+                            "VSCodium",
                             "User",
                             "globalStorage",
                             ext,
@@ -718,7 +895,13 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".local", "share", "github-copilot"]),
                 ],
                 "crush" => vec![tilde(&[".crush", "crush.db"]), tilde(&[".crush"])],
-                "cursor" => vec![tilde(&[".cursor"]), tilde(&[".config", "Cursor"])],
+                "cursor" => vec![
+                    tilde(&[".cursor"]),
+                    tilde(&[".config", "Cursor"]),
+                    tilde(&[".config", "Cursor", "User"]),
+                    tilde(&["Library", "Application Support", "Cursor", "User"]),
+                    tilde(&["AppData", "Roaming", "Cursor", "User"]),
+                ],
                 "factory" => vec![
                     tilde(&[".factory"]),
                     tilde(&[".factory", "sessions"]),
@@ -1114,6 +1297,20 @@ mod tests {
         assert!(
             roots.contains(
                 &tmp.path()
+                    .join(".config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev")
+            ),
+            "expected VS Code Insiders Cline storage root in {roots:?}"
+        );
+        assert!(
+            roots.contains(
+                &tmp.path()
+                    .join(".config/VSCodium/User/globalStorage/saoudrizwan.claude-dev")
+            ),
+            "expected VSCodium Cline storage root in {roots:?}"
+        );
+        assert!(
+            roots.contains(
+                &tmp.path()
                     .join(".config/Cursor/User/globalStorage/rooveterinaryinc.roo-cline")
             ),
             "expected Cursor Roo-Cline storage root in {roots:?}"
@@ -1133,6 +1330,15 @@ mod tests {
         assert!(factory.contains(&"~/.factory/sessions".to_string()));
         assert!(factory.contains(&"~/.factory-droid".to_string()));
         assert!(factory.contains(&"~/.config/factory-droid".to_string()));
+
+        let amp = by_slug.get("amp").expect("amp paths");
+        assert!(amp.contains(
+            &"~/.config/Code - Insiders/User/globalStorage/sourcegraph.amp".to_string()
+        ));
+        assert!(amp.contains(
+            &"~/Library/Application Support/VSCodium/User/globalStorage/sourcegraph.amp"
+                .to_string()
+        ));
 
         let opencode = by_slug.get("opencode").expect("opencode paths");
         assert!(opencode.contains(&"~/.local/share/opencode".to_string()));
@@ -1156,6 +1362,11 @@ mod tests {
 
         let cursor = by_slug.get("cursor").expect("cursor paths");
         assert!(cursor.contains(&"~/.config/Cursor".to_string()));
+        assert!(cursor.contains(&"~/.config/Cursor/User".to_string()));
+        assert!(
+            cursor.contains(&"~/Library/Application Support/Cursor/User".to_string())
+        );
+        assert!(cursor.contains(&"~/AppData/Roaming/Cursor/User".to_string()));
 
         let windsurf = by_slug.get("windsurf").expect("windsurf paths");
         assert!(windsurf.contains(&"~/.config/windsurf".to_string()));
@@ -1164,6 +1375,12 @@ mod tests {
         assert!(
             cline.contains(&"~/.config/Code/User/globalStorage/saoudrizwan.claude-dev".to_string())
         );
+        assert!(cline.contains(
+            &"~/.config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev".to_string()
+        ));
+        assert!(cline.contains(
+            &"~/.config/VSCodium/User/globalStorage/saoudrizwan.claude-dev".to_string()
+        ));
         assert!(cline.contains(
             &"~/AppData/Roaming/Cursor/User/globalStorage/rooveterinaryinc.roo-cline".to_string()
         ));

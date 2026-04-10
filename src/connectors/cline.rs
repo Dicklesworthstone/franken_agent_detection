@@ -32,8 +32,14 @@ impl ClineConnector {
 
         let code_roots = [
             base.join(".config/Code/User/globalStorage"),
+            base.join(".config/Code - Insiders/User/globalStorage"),
+            base.join(".config/VSCodium/User/globalStorage"),
             base.join("Library/Application Support/Code/User/globalStorage"),
+            base.join("Library/Application Support/Code - Insiders/User/globalStorage"),
+            base.join("Library/Application Support/VSCodium/User/globalStorage"),
             base.join("AppData/Roaming/Code/User/globalStorage"),
+            base.join("AppData/Roaming/Code - Insiders/User/globalStorage"),
+            base.join("AppData/Roaming/VSCodium/User/globalStorage"),
         ];
         let cursor_roots = [
             base.join(".config/Cursor/User/globalStorage"),
@@ -110,10 +116,17 @@ impl Connector for ClineConnector {
             } else {
                 Self::storage_roots()
             }
-        } else if Self::looks_like_storage(&override_root) {
-            vec![override_root]
         } else {
-            return Ok(Vec::new());
+            let explicit: Vec<PathBuf> = ctx
+                .scan_roots
+                .iter()
+                .map(|r| Self::normalize_root_path(&r.path))
+                .filter(|p| Self::looks_like_storage(p))
+                .collect();
+            if explicit.is_empty() {
+                return Ok(Vec::new());
+            }
+            explicit
         };
 
         if roots.is_empty() {
@@ -294,6 +307,7 @@ impl Connector for ClineConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::scan::ScanRoot;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -356,6 +370,30 @@ mod tests {
         assert_eq!(convs[0].messages[0].role, "user");
         assert_eq!(convs[0].messages[0].content, "Hello Cline!");
         assert_eq!(convs[0].messages[1].role, "assistant");
+    }
+
+    #[test]
+    fn scan_with_explicit_roots_uses_scan_roots() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_cline_storage(&dir);
+        let task_dir = create_task_dir(&storage, "task-explicit");
+
+        let messages = json!([
+            {"role": "user", "content": "Explicit root", "timestamp": 1733000000}
+        ]);
+        fs::write(task_dir.join("ui_messages.json"), messages.to_string()).unwrap();
+
+        let connector = ClineConnector::new();
+        let ctx = ScanContext::with_roots(
+            dir.path().join("not-cline"),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "Explicit root");
     }
 
     #[test]

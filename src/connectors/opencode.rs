@@ -519,6 +519,23 @@ impl Connector for OpenCodeConnector {
         } else if !ctx.data_dir.as_os_str().is_empty() {
             db_candidates.push(ctx.data_dir.join("opencode.db"));
         }
+
+        if !ctx.use_default_detection() {
+            for scan_root in &ctx.scan_roots {
+                if scan_root.path.extension().is_some_and(|ext| ext == "db") {
+                    db_candidates.push(scan_root.path.clone());
+                }
+                db_candidates.push(scan_root.path.join("opencode.db"));
+                db_candidates.push(scan_root.path.join(".local/share/opencode/opencode.db"));
+                db_candidates.push(scan_root.path.join(".config/opencode/opencode.db"));
+                db_candidates.push(
+                    scan_root
+                        .path
+                        .join("Library/Application Support/opencode/opencode.db"),
+                );
+            }
+        }
+
         db_candidates.extend(Self::sqlite_db_candidates());
 
         // Deduplicate while preserving priority order.
@@ -557,116 +574,144 @@ impl Connector for OpenCodeConnector {
             convs.iter().filter_map(|c| c.external_id.clone()).collect();
 
         // --- Phase 2: Fall back to JSON file storage (pre-v1.2) ---
-        let storage_root = if ctx.use_default_detection() {
+        let mut storage_roots: Vec<PathBuf> = Vec::new();
+        if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
-                Some(ctx.data_dir.clone())
-            } else {
-                Self::storage_root()
+                storage_roots.push(ctx.data_dir.clone());
+            } else if let Some(root) = Self::storage_root() {
+                storage_roots.push(root);
             }
-        } else if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
-            Some(ctx.data_dir.clone())
         } else {
-            None
-        };
+            if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
+                storage_roots.push(ctx.data_dir.clone());
+            }
+            for scan_root in &ctx.scan_roots {
+                let candidates = [
+                    scan_root.path.clone(),
+                    scan_root.path.join(".local/share/opencode/storage"),
+                    scan_root.path.join(".config/opencode/storage"),
+                    scan_root
+                        .path
+                        .join("Library/Application Support/opencode/storage"),
+                ];
+                for candidate in candidates {
+                    if candidate.exists() && looks_like_opencode_storage(&candidate) {
+                        storage_roots.push(candidate);
+                    }
+                }
+            }
+        }
 
-        let Some(storage_root) = storage_root else {
-            return Ok(convs);
-        };
-
-        let session_dir = storage_root.join("session");
-        let message_dir = storage_root.join("message");
-        let part_dir = storage_root.join("part");
-
-        if !session_dir.exists() {
+        if storage_roots.is_empty() {
             return Ok(convs);
         }
 
-        // Collect all session files
-        let session_files: Vec<PathBuf> = WalkDir::new(&session_dir)
-            .into_iter()
-            .flatten()
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|ext| ext == "json")
-                    .unwrap_or(false)
-            })
-            .map(|e| e.path().to_path_buf())
-            .collect();
+        storage_roots.sort();
+        storage_roots.dedup();
 
-        for session_file in session_files {
-            if !session_has_updates(&session_file, &message_dir, &part_dir, ctx.since_ts) {
+        let mut seen_session_files: HashSet<PathBuf> = HashSet::new();
+
+        for storage_root in storage_roots {
+            let session_dir = storage_root.join("session");
+            let message_dir = storage_root.join("message");
+            let part_dir = storage_root.join("part");
+
+            if !session_dir.exists() {
                 continue;
             }
 
-            // Parse session
-            let session = match parse_session_file(&session_file) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::debug!(
-                        "opencode: failed to parse session {}: {e}",
-                        session_file.display()
-                    );
+            // Collect all session files
+            let session_files: Vec<PathBuf> = WalkDir::new(&session_dir)
+                .into_iter()
+                .flatten()
+                .filter(|e| e.file_type().is_file())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map(|ext| ext == "json")
+                        .unwrap_or(false)
+                })
+                .map(|e| e.path().to_path_buf())
+                .collect();
+
+            for session_file in session_files {
+                let canonical = std::fs::canonicalize(&session_file)
+                    .unwrap_or_else(|_| session_file.clone());
+                if !seen_session_files.insert(canonical) {
                     continue;
                 }
-            };
+                if !session_has_updates(&session_file, &message_dir, &part_dir, ctx.since_ts) {
+                    continue;
+                }
 
-            // Deduplicate by session ID
-            if !seen_ids.insert(session.id.clone()) {
-                continue;
+                // Parse session
+                let session = match parse_session_file(&session_file) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(
+                            "opencode: failed to parse session {}: {e}",
+                            session_file.display()
+                        );
+                        continue;
+                    }
+                };
+
+                // Deduplicate by session ID
+                if !seen_ids.insert(session.id.clone()) {
+                    continue;
+                }
+
+                // Load messages for this session
+                let session_msg_dir = message_dir.join(&session.id);
+                let messages = if session_msg_dir.exists() {
+                    load_messages(&session_msg_dir, &part_dir)?
+                } else {
+                    Vec::new()
+                };
+
+                if messages.is_empty() {
+                    continue;
+                }
+
+                // Build normalized conversation
+                let msg_started_at = messages.iter().filter_map(|m| m.created_at).min();
+                let msg_ended_at = messages.iter().filter_map(|m| m.created_at).max();
+
+                let started_at = session
+                    .time
+                    .as_ref()
+                    .and_then(|t| normalize_opencode_timestamp(t.created))
+                    .or(msg_started_at);
+                let ended_at = session
+                    .time
+                    .as_ref()
+                    .and_then(|t| normalize_opencode_timestamp(t.updated))
+                    .or(msg_ended_at)
+                    .or(started_at);
+
+                let workspace = session.directory.map(PathBuf::from);
+                let title = session.title.or_else(|| {
+                    messages
+                        .first()
+                        .and_then(|m| m.content.lines().next())
+                        .map(|s| s.chars().take(100).collect())
+                });
+
+                convs.push(NormalizedConversation {
+                    agent_slug: "opencode".into(),
+                    external_id: Some(session.id.clone()),
+                    title,
+                    workspace,
+                    source_path: session_file.clone(),
+                    started_at,
+                    ended_at,
+                    metadata: serde_json::json!({
+                        "session_id": session.id,
+                        "project_id": session.project_id,
+                    }),
+                    messages,
+                });
             }
-
-            // Load messages for this session
-            let session_msg_dir = message_dir.join(&session.id);
-            let messages = if session_msg_dir.exists() {
-                load_messages(&session_msg_dir, &part_dir)?
-            } else {
-                Vec::new()
-            };
-
-            if messages.is_empty() {
-                continue;
-            }
-
-            // Build normalized conversation
-            let msg_started_at = messages.iter().filter_map(|m| m.created_at).min();
-            let msg_ended_at = messages.iter().filter_map(|m| m.created_at).max();
-
-            let started_at = session
-                .time
-                .as_ref()
-                .and_then(|t| normalize_opencode_timestamp(t.created))
-                .or(msg_started_at);
-            let ended_at = session
-                .time
-                .as_ref()
-                .and_then(|t| normalize_opencode_timestamp(t.updated))
-                .or(msg_ended_at)
-                .or(started_at);
-
-            let workspace = session.directory.map(PathBuf::from);
-            let title = session.title.or_else(|| {
-                messages
-                    .first()
-                    .and_then(|m| m.content.lines().next())
-                    .map(|s| s.chars().take(100).collect())
-            });
-
-            convs.push(NormalizedConversation {
-                agent_slug: "opencode".into(),
-                external_id: Some(session.id.clone()),
-                title,
-                workspace,
-                source_path: session_file.clone(),
-                started_at,
-                ended_at,
-                metadata: serde_json::json!({
-                    "session_id": session.id,
-                    "project_id": session.project_id,
-                }),
-                messages,
-            });
         }
 
         Ok(convs)
