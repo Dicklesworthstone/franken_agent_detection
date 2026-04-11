@@ -190,6 +190,48 @@ impl ChatGptConnector {
         dirs
     }
 
+    fn looks_like_base(path: &Path) -> bool {
+        if !path.is_dir() {
+            return false;
+        }
+
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("conversations-"))
+        {
+            return true;
+        }
+
+        fs::read_dir(path)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry.file_name().to_str().is_some_and(|name| {
+                        name.starts_with("conversations-") && entry.path().is_dir()
+                    })
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if Self::looks_like_base(base) {
+            roots.push(base.to_path_buf());
+        }
+
+        let candidates = [
+            base.join("com.openai.chat"),
+            base.join("Library/Application Support/com.openai.chat"),
+            base.join("AppData/Roaming/com.openai.chat"),
+        ];
+
+        for candidate in candidates {
+            if Self::looks_like_base(&candidate) {
+                roots.push(candidate);
+            }
+        }
+    }
+
     fn conversation_files(dir_path: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for entry in WalkDir::new(dir_path).max_depth(1).into_iter().flatten() {
@@ -480,23 +522,8 @@ impl Connector for ChatGptConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        // Helper to check for conversation dirs
-        let has_conversation_dirs = |path: &PathBuf| {
-            fs::read_dir(path)
-                .map(|entries| {
-                    entries.flatten().any(|entry| {
-                        entry.file_name().to_str().is_some_and(|name| {
-                            name.starts_with("conversations-") && entry.path().is_dir()
-                        })
-                    })
-                })
-                .unwrap_or(false)
-        };
-
-        let looks_like_base = |path: &PathBuf| has_conversation_dirs(path);
-
         let roots: Vec<PathBuf> = if ctx.use_default_detection() {
-            if looks_like_base(&ctx.data_dir) {
+            if Self::looks_like_base(&ctx.data_dir) {
                 vec![ctx.data_dir.clone()]
             } else if let Some(default_base) = Self::app_support_dir() {
                 vec![default_base]
@@ -505,8 +532,19 @@ impl Connector for ChatGptConnector {
             }
         } else {
             // Explicit roots
-            ctx.scan_roots.iter().map(|r| r.path.clone()).collect()
+            let mut explicit = Vec::new();
+            for root in &ctx.scan_roots {
+                Self::append_explicit_roots(&mut explicit, &root.path);
+            }
+            if explicit.is_empty() {
+                return Ok(Vec::new());
+            }
+            explicit
         };
+
+        let mut roots = roots;
+        roots.sort();
+        roots.dedup();
 
         let mut all_convs = Vec::new();
 
@@ -576,6 +614,7 @@ impl Connector for ChatGptConnector {
 
 #[cfg(test)]
 mod tests {
+    use super::scan::ScanRoot;
     use super::*;
     use serde_json::json;
     use std::fs;
@@ -1419,6 +1458,42 @@ mod tests {
         let convs = result.unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].title, Some("Direct Base".to_string()));
+    }
+
+    #[test]
+    fn scan_with_application_support_scan_root() {
+        let dir = TempDir::new().unwrap();
+        let app_support = dir.path().join("Library").join("Application Support");
+        let openai_dir = app_support.join("com.openai.chat");
+        let conv_dir = openai_dir.join("conversations-uuid123");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        let conv_json = json!({
+            "id": "test-conv",
+            "title": "App Support",
+            "mapping": {
+                "node1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Hello!"]},
+                        "create_time": 1700000000.0
+                    }
+                }
+            }
+        });
+        fs::write(conv_dir.join("conv.json"), conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+
+        let ctx = ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(app_support)], None);
+        let result = connector.scan(&ctx);
+
+        assert!(result.is_ok());
+        let convs = result.unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title, Some("App Support".to_string()));
     }
 
     // =========================================================================
