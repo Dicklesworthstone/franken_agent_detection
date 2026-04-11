@@ -141,26 +141,66 @@ impl GooseConnector {
     }
 
     fn append_db_candidates(db_paths: &mut Vec<PathBuf>, base: &Path) {
+        let file_name = base.file_name().and_then(|n| n.to_str());
+        let is_local = file_name.is_some_and(|n| n == ".local");
+        let is_share = file_name.is_some_and(|n| n == "share")
+            && base
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".local"));
+        let is_goose_root = file_name.is_some_and(|n| n == ".goose");
+
         if base.extension().is_some_and(|ext| ext == "db") {
             db_paths.push(base.to_path_buf());
         }
 
         db_paths.push(base.join("sessions.db"));
         db_paths.push(base.join("sessions").join("sessions.db"));
-        db_paths.push(base.join(".local/share/goose/sessions/sessions.db"));
-        db_paths.push(base.join(".goose/sessions/sessions.db"));
+
+        if is_local {
+            db_paths.push(base.join("share/goose/sessions/sessions.db"));
+        }
+        if is_share {
+            db_paths.push(base.join("goose/sessions/sessions.db"));
+        }
+        if is_goose_root {
+            db_paths.push(base.join("sessions/sessions.db"));
+        }
+
+        if !(is_local || is_share || is_goose_root) {
+            db_paths.push(base.join(".local/share/goose/sessions/sessions.db"));
+            db_paths.push(base.join(".goose/sessions/sessions.db"));
+        }
     }
 
     fn append_session_roots(session_roots: &mut Vec<PathBuf>, base: &Path) {
+        let file_name = base.file_name().and_then(|n| n.to_str());
+        let is_local = file_name.is_some_and(|n| n == ".local");
+        let is_share = file_name.is_some_and(|n| n == "share")
+            && base
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".local"));
+        let is_goose_root = file_name.is_some_and(|n| n == ".goose");
+
         if looks_like_goose_sessions(base) {
             session_roots.push(base.to_path_buf());
         }
 
-        let candidates = [
-            base.join("sessions"),
-            base.join(".local/share/goose/sessions"),
-            base.join(".goose/sessions"),
-        ];
+        let mut candidates = Vec::new();
+        candidates.push(base.join("sessions"));
+
+        if is_local {
+            candidates.push(base.join("share/goose/sessions"));
+        }
+        if is_share {
+            candidates.push(base.join("goose/sessions"));
+        }
+        if is_goose_root {
+            candidates.push(base.join("sessions"));
+        }
+        if !(is_local || is_share || is_goose_root) {
+            candidates.push(base.join(".local/share/goose/sessions"));
+            candidates.push(base.join(".goose/sessions"));
+        }
 
         for candidate in candidates {
             if candidate.exists() && looks_like_goose_sessions(&candidate) {
@@ -939,6 +979,78 @@ mod tests {
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("session1"));
+    }
+
+    #[test]
+    fn scan_with_explicit_local_share_root_finds_sqlite_db() {
+        let dir = TempDir::new().unwrap();
+        let local_share = dir.path().join(".local/share");
+        let sessions_dir = local_share.join("goose/sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let db_path = sessions_dir.join("sessions.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                description TEXT,
+                working_dir TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                provider_name TEXT,
+                model_config_json TEXT,
+                session_type TEXT
+            );
+            CREATE TABLE messages (
+                session_id TEXT,
+                role TEXT,
+                content_json TEXT,
+                created_timestamp INTEGER,
+                tokens INTEGER,
+                metadata_json TEXT,
+                message_id TEXT PRIMARY KEY
+            );",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO sessions (id, description, working_dir, created_at, updated_at, provider_name) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "sess-share",
+                "Share session",
+                "/home/user/share",
+                1_700_000_000,
+                1_700_000_100,
+                "openai"
+            ],
+        )
+        .unwrap();
+
+        let content_json = json!([
+            {"type": "text", "text": "Hello from share!"}
+        ]);
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content_json, created_timestamp, tokens, metadata_json, message_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "sess-share",
+                "assistant",
+                content_json.to_string(),
+                1_700_000_050,
+                7,
+                r#"{"model": "gpt-4o"}"#,
+                "msg-share"
+            ],
+        )
+        .unwrap();
+
+        let connector = GooseConnector::new();
+        let ctx = ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(local_share)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-share"));
     }
 
     // =====================================================
