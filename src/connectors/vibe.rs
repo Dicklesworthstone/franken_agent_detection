@@ -186,23 +186,26 @@ impl Connector for VibeConnector {
                     continue;
                 }
 
-                let source_path = file.clone();
-                let external_id = source_path
+                let external_id = file
                     .parent()
                     .and_then(|parent| parent.strip_prefix(&root).ok())
                     .and_then(|rel| rel.to_str().map(str::to_string))
                     .or_else(|| {
-                        source_path
-                            .parent()
+                        file.parent()
                             .and_then(|p| p.file_name())
                             .and_then(|s| s.to_str())
                             .map(str::to_string)
                     });
 
-                let file_handle = match fs::File::open(&file) {
+                let source_path = file;
+                let file_handle = match fs::File::open(&source_path) {
                     Ok(f) => f,
                     Err(e) => {
-                        tracing::debug!(path = %file.display(), error = %e, "vibe: skipping unreadable session");
+                        tracing::debug!(
+                            path = %source_path.display(),
+                            error = %e,
+                            "vibe: skipping unreadable session"
+                        );
                         continue;
                     }
                 };
@@ -303,8 +306,8 @@ impl Connector for VibeConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::scan::ScanRoot;
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use tempfile::TempDir;
 
     fn write_session(root: &Path, session_id: &str, lines: &[&str]) -> PathBuf {
@@ -332,7 +335,7 @@ mod tests {
         );
 
         let connector = VibeConnector::new();
-        let ctx = ScanContext::local_default(sessions.clone(), None);
+        let ctx = ScanContext::local_default(sessions, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -368,7 +371,7 @@ mod tests {
         );
 
         let connector = VibeConnector::new();
-        let ctx = ScanContext::local_default(sessions.clone(), None);
+        let ctx = ScanContext::local_default(sessions, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);

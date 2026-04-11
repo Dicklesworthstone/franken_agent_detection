@@ -249,8 +249,8 @@ impl Connector for ClawdbotConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::scan::ScanRoot;
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use tempfile::TempDir;
 
     fn write_session(root: &Path, name: &str, lines: &[&str]) -> PathBuf {

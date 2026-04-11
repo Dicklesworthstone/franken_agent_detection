@@ -10,6 +10,7 @@
 //!   — available with the `connectors` feature
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::uninlined_format_args, clippy::redundant_clone))]
 
 #[cfg(feature = "connectors")]
 pub mod connectors;

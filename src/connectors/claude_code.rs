@@ -23,7 +23,8 @@ impl Default for ClaudeCodeConnector {
 }
 
 impl ClaudeCodeConnector {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 
@@ -78,19 +79,19 @@ impl ClaudeCodeConnector {
         let mut token_usage = serde_json::Map::new();
         if let Some(input_tokens) = usage
             .and_then(|value| value.get("input_tokens"))
-            .and_then(|value| value.as_i64())
+            .and_then(Value::as_i64)
         {
             token_usage.insert("input_tokens".to_string(), Value::from(input_tokens));
         }
         if let Some(output_tokens) = usage
             .and_then(|value| value.get("output_tokens"))
-            .and_then(|value| value.as_i64())
+            .and_then(Value::as_i64)
         {
             token_usage.insert("output_tokens".to_string(), Value::from(output_tokens));
         }
         if let Some(cache_read_tokens) = usage
             .and_then(|value| value.get("cache_read_input_tokens"))
-            .and_then(|value| value.as_i64())
+            .and_then(Value::as_i64)
         {
             token_usage.insert(
                 "cache_read_tokens".to_string(),
@@ -99,7 +100,7 @@ impl ClaudeCodeConnector {
         }
         if let Some(cache_creation_tokens) = usage
             .and_then(|value| value.get("cache_creation_input_tokens"))
-            .and_then(|value| value.as_i64())
+            .and_then(Value::as_i64)
         {
             token_usage.insert(
                 "cache_creation_tokens".to_string(),
@@ -124,15 +125,14 @@ impl ClaudeCodeConnector {
         let tool_call_count = raw
             .pointer("/message/content")
             .and_then(|value| value.as_array())
-            .map(|items| {
+            .map_or(0, |items| {
                 items
                     .iter()
                     .filter(|item| {
                         item.get("type").and_then(|kind| kind.as_str()) == Some("tool_use")
                     })
                     .count()
-            })
-            .unwrap_or(0);
+            });
         if tool_call_count > 0 {
             cass.insert("tool_call_count".to_string(), Value::from(tool_call_count));
         }
@@ -157,6 +157,7 @@ impl ClaudeCodeConnector {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn scan_claude_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
@@ -177,11 +178,7 @@ fn scan_claude_with_callback(
 
     for root in roots {
         let explicit_file_root = root.is_file();
-        let scan_target = if explicit_file_root {
-            root.clone()
-        } else {
-            root.clone()
-        };
+        let scan_target = root.clone();
         let external_id_root = if explicit_file_root {
             ClaudeCodeConnector::projects_root_for_explicit_file(&root)
                 .or_else(|| root.parent().map(Path::to_path_buf))
@@ -233,16 +230,14 @@ fn scan_claude_with_callback(
                 let reader = std::io::BufReader::new(file);
 
                 for line_res in std::io::BufRead::lines(reader) {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(_) => continue,
+                    let Ok(line) = line_res else {
+                        continue;
                     };
                     if line.trim().is_empty() {
                         continue;
                     }
-                    let val: Value = match serde_json::from_str(&line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                    let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                        continue;
                     };
 
                     if workspace.is_none() {
@@ -725,7 +720,7 @@ mod tests {
         assert!(convs[0].messages[0].created_at.is_some());
         let ts = convs[0].messages[0].created_at.unwrap();
         // Should be around 2025-11-15 in milliseconds
-        assert!(ts > 1700000000000);
+        assert!(ts > 1_700_000_000_000);
     }
 
     #[test]
@@ -832,8 +827,8 @@ mod tests {
         let content = json!({
             "title": "Test Session",
             "messages": [
-                {"role": "user", "content": "Hello", "timestamp": 1700000000000i64},
-                {"role": "assistant", "content": "Hi there!", "timestamp": 1700000001000i64}
+                {"role": "user", "content": "Hello", "timestamp": 1_700_000_000_000_i64},
+                {"role": "assistant", "content": "Hi there!", "timestamp": 1_700_000_001_000_i64}
             ]
         })
         .to_string();
@@ -921,7 +916,7 @@ mod tests {
         let session_file = claude_dir.join("session.json");
         let content = json!({
             "messages": [
-                {"role": "user", "content": "Test", "time": 1700000000000i64}
+                {"role": "user", "content": "Test", "time": 1_700_000_000_000i64}
             ]
         })
         .to_string();
@@ -931,7 +926,7 @@ mod tests {
         let ctx = ScanContext::local_default(claude_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs[0].messages[0].created_at, Some(1700000000000));
+        assert_eq!(convs[0].messages[0].created_at, Some(1_700_000_000_000));
     }
 
     // =========================================================================

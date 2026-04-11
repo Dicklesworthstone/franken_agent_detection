@@ -1,6 +1,6 @@
 //! Factory Droid connector for JSONL session files.
 //!
-//! Factory (https://factory.ai) is an AI coding assistant that stores sessions
+//! Factory (<https://factory.ai>) is an AI coding assistant that stores sessions
 //! at `~/.factory/sessions/` using a JSONL format similar to Claude Code.
 //!
 //! Directory structure:
@@ -169,7 +169,8 @@ fn update_time_bounds(started_at: &mut Option<i64>, ended_at: &mut Option<i64>, 
     }
 }
 
-/// Parse a Factory session JSONL file into a NormalizedConversation.
+/// Parse a Factory session JSONL file into a `NormalizedConversation`.
+#[allow(clippy::too_many_lines)]
 fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> {
     let file =
         fs::File::open(path).with_context(|| format!("open session file {}", path.display()))?;
@@ -190,18 +191,16 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
         .and_then(|n| n.to_str());
 
     for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(l) => l,
-            Err(_) => continue,
+        let Ok(line) = line_res else {
+            continue;
         };
 
         if line.trim().is_empty() {
             continue;
         }
 
-        let val: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+            continue;
         };
 
         let entry_type = val.get("type").and_then(|v| v.as_str());
@@ -338,8 +337,8 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
 
 #[cfg(test)]
 mod tests {
-    use super::scan::ScanRoot;
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;

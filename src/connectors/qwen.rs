@@ -84,7 +84,13 @@ impl QwenConnector {
             }
 
             let name = entry.file_name().to_str().unwrap_or("");
-            if name.starts_with("session-") && name.ends_with(".json") {
+            if name.starts_with("session-")
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            {
                 out.push(entry.path().to_path_buf());
             }
         }
@@ -164,7 +170,7 @@ impl Connector for QwenConnector {
     }
 }
 
-/// Parse a Qwen session JSON file into a NormalizedConversation.
+/// Parse a Qwen session JSON file into a `NormalizedConversation`.
 fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("read qwen session {}", path.display()))?;
@@ -184,9 +190,8 @@ fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
     let started_at = val.get("startTime").and_then(parse_timestamp);
     let ended_at = val.get("lastUpdated").and_then(parse_timestamp);
 
-    let raw_messages = match val.get("messages").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return Ok(None),
+    let Some(raw_messages) = val.get("messages").and_then(|v| v.as_array()) else {
+        return Ok(None);
     };
 
     let mut messages = Vec::new();
@@ -249,19 +254,21 @@ fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
             .collect::<String>()
     });
 
+    let metadata = serde_json::json!({
+        "source": "qwen",
+        "sessionId": session_id.as_deref(),
+        "projectHash": project_hash.as_deref(),
+    });
+
     Ok(Some(NormalizedConversation {
         agent_slug: "qwen".into(),
-        external_id: session_id.clone(),
+        external_id: session_id,
         title,
         workspace,
         source_path: path.to_path_buf(),
         started_at,
         ended_at,
-        metadata: serde_json::json!({
-            "source": "qwen",
-            "sessionId": session_id,
-            "projectHash": project_hash,
-        }),
+        metadata,
         messages,
     }))
 }
@@ -292,8 +299,8 @@ fn infer_workspace(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::scan::ScanRoot;
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -310,7 +317,7 @@ mod tests {
 
     #[test]
     fn default_creates_connector() {
-        let connector = QwenConnector::default();
+        let connector = QwenConnector;
         let _ = connector;
     }
 
@@ -379,7 +386,7 @@ mod tests {
         );
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -496,7 +503,7 @@ mod tests {
         );
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].metadata["sessionId"], "sess-meta");
@@ -538,7 +545,7 @@ mod tests {
         );
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(
@@ -583,7 +590,7 @@ mod tests {
         .unwrap();
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(
@@ -623,7 +630,7 @@ mod tests {
         }
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 3);
@@ -653,7 +660,7 @@ mod tests {
         );
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert!(convs.is_empty());
@@ -676,7 +683,7 @@ mod tests {
         );
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert!(convs.is_empty());
@@ -721,7 +728,7 @@ mod tests {
         );
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -743,7 +750,7 @@ mod tests {
         .unwrap();
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         // Should not propagate error, just skip
         let convs = connector.scan(&ctx).unwrap();
         assert!(convs.is_empty());
@@ -776,7 +783,7 @@ mod tests {
         );
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -829,7 +836,7 @@ mod tests {
         );
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -874,7 +881,7 @@ mod tests {
         .unwrap();
 
         let connector = QwenConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);

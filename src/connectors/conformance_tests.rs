@@ -1,18 +1,19 @@
-//! Conformance test harness for franken-agent-detection.
+//! Conformance test harness for `franken-agent-detection`.
 //!
 //! This module contains systematic tests that verify the implementation
 //! against its documented behavioral contracts:
 //!
 //! 1. **Timestamp Parsing**: All documented timestamp formats must parse correctly
 //! 2. **Connector Factory**: All factories must produce valid, functioning connectors
-//! 3. **Schema Conformance**: All connectors must produce valid NormalizedConversation
+//! 3. **Schema Conformance**: All connectors must produce valid `NormalizedConversation`
 //! 4. **Detection Determinism**: Detection must be deterministic with fixture overrides
-//! 5. **Path Mapping Equivalence**: Trie and linear algorithms must produce identical results
+//! 5. **Path Mapping Equivalence**: `PathTrie` and linear algorithms must produce identical results
 
 #[cfg(test)]
+#[allow(clippy::too_many_lines)]
 mod conformance {
     use crate::connectors::{
-        Connector, PathTrie, ScanContext, ScanRoot, get_connector_factories, parse_timestamp,
+        PathTrie, ScanContext, ScanRoot, get_connector_factories, parse_timestamp,
     };
     use crate::types::{NormalizedConversation, NormalizedMessage, PathMapping};
     use crate::{AgentDetectOptions, AgentDetectRootOverride, detect_installed_agents};
@@ -281,17 +282,18 @@ mod conformance {
 
             // source_path must be set (even if synthetic)
             assert!(
-                conv.source_path.as_os_str().len() > 0,
+                !conv.source_path.as_os_str().is_empty(),
                 "connector {} produced conversation with empty source_path",
                 connector_slug
             );
 
             // Messages must have sequential indices
             for (i, msg) in conv.messages.iter().enumerate() {
+                let expected_idx = i64::try_from(i).expect("message index should fit in i64");
                 assert_eq!(
-                    msg.idx as usize, i,
+                    msg.idx, expected_idx,
                     "connector {} message at position {} has idx {}, expected {}",
-                    connector_slug, i, msg.idx, i
+                    connector_slug, i, msg.idx, expected_idx
                 );
             }
 
@@ -472,7 +474,7 @@ mod conformance {
             }
 
             let opts = AgentDetectOptions {
-                only_connectors: Some(connectors.iter().map(|s| s.to_string()).collect()),
+                only_connectors: Some(connectors.iter().map(ToString::to_string).collect()),
                 include_undetected: true,
                 root_overrides: connectors
                     .iter()
@@ -621,18 +623,13 @@ mod conformance {
                 let result = connector.scan(&ctx);
 
                 // Should not panic - may return Ok(empty) or Err
-                match result {
-                    Ok(convs) => {
-                        // Empty result is expected for nonexistent explicit root
-                        assert!(
-                            convs.is_empty(),
-                            "connector {} returned conversations for nonexistent explicit root",
-                            slug
-                        );
-                    }
-                    Err(_) => {
-                        // Error is acceptable for some connectors
-                    }
+                if let Ok(convs) = result {
+                    // Empty result is expected for nonexistent explicit root
+                    assert!(
+                        convs.is_empty(),
+                        "connector {} returned conversations for nonexistent explicit root",
+                        slug
+                    );
                 }
             }
         }
@@ -649,17 +646,12 @@ mod conformance {
                 let connector = factory();
                 let result = connector.scan(&ctx);
 
-                match result {
-                    Ok(convs) => {
-                        assert!(
-                            convs.is_empty(),
-                            "connector {} returned conversations for empty explicit root",
-                            slug
-                        );
-                    }
-                    Err(_) => {
-                        // Error is acceptable
-                    }
+                if let Ok(convs) = result {
+                    assert!(
+                        convs.is_empty(),
+                        "connector {} returned conversations for empty explicit root",
+                        slug
+                    );
                 }
             }
         }
@@ -667,12 +659,10 @@ mod conformance {
         #[test]
         fn scan_does_not_panic_on_permission_denied_path() {
             // Use a path that exists but likely has no agent data
-            let system_path = if cfg!(target_os = "linux") {
-                PathBuf::from("/etc")
-            } else if cfg!(target_os = "macos") {
-                PathBuf::from("/etc")
-            } else {
+            let system_path = if cfg!(target_os = "windows") {
                 PathBuf::from("C:\\Windows\\System32")
+            } else {
+                PathBuf::from("/etc")
             };
 
             if !system_path.exists() {
@@ -682,7 +672,7 @@ mod conformance {
             let roots = vec![ScanRoot::local(system_path.clone())];
             let ctx = ScanContext::with_roots(system_path, roots, None);
 
-            for (slug, factory) in get_connector_factories() {
+            for (_slug, factory) in get_connector_factories() {
                 let connector = factory();
                 // Should not panic, regardless of result
                 let _ = connector.scan(&ctx);

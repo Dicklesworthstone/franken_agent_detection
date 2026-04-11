@@ -1,4 +1,4 @@
-//! Connector for pi-mono coding-agent (https://github.com/badlogic/pi-mono)
+//! Connector for pi-mono coding-agent (<https://github.com/badlogic/pi-mono>)
 //!
 //! Pi-Agent stores sessions in JSONL files under:
 //! - `~/.pi/agent/sessions/<safe-path>/` where safe-path is derived from the working directory
@@ -88,7 +88,12 @@ impl PiAgentConnector {
             if entry.file_type().is_file() {
                 let name = entry.file_name().to_str().unwrap_or("");
                 // Pi-agent session files are named <timestamp>_<uuid>.jsonl
-                if name.ends_with(".jsonl") && name.contains('_') {
+                if Path::new(name)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+                    && name.contains('_')
+                {
                     out.push(entry.path().to_path_buf());
                 }
             }
@@ -128,10 +133,10 @@ impl PiAgentConnector {
 
     /// Flatten pi-agent message content to a searchable string.
     /// Handles the message.content array which can contain:
-    /// - TextContent: {type: "text", text: "..."}
-    /// - ThinkingContent: {type: "thinking", thinking: "..."}
-    /// - ToolCall: {type: "toolCall", name: "...", arguments: {...}}
-    /// - ImageContent: {type: "image", ...} (skip for text extraction)
+    /// - `TextContent`: {type: "text", text: "..."}
+    /// - `ThinkingContent`: {type: "thinking", thinking: "..."}
+    /// - `ToolCall`: {type: "toolCall", name: "...", arguments: {...}}
+    /// - `ImageContent`: {type: "image", ...} (skip for text extraction)
     fn flatten_message_content(content: &Value) -> String {
         // Direct string content (simple user messages)
         if let Some(s) = content.as_str() {
@@ -163,7 +168,7 @@ impl PiAgentConnector {
                                 .get("arguments")
                                 .map(|a| {
                                     // Extract key argument values for context
-                                    if let Some(obj) = a.as_object() {
+                                    a.as_object().map_or_else(String::new, |obj| {
                                         obj.iter()
                                             .filter_map(|(k, v)| {
                                                 v.as_str().map(|s| format!("{k}={s}"))
@@ -171,9 +176,7 @@ impl PiAgentConnector {
                                             .take(3) // Limit to avoid huge strings
                                             .collect::<Vec<_>>()
                                             .join(", ")
-                                    } else {
-                                        String::new()
-                                    }
+                                    })
                                 })
                                 .unwrap_or_default();
                             if args.is_empty() {
@@ -182,8 +185,7 @@ impl PiAgentConnector {
                                 Some(format!("[Tool: {name}] {args}"))
                             }
                         }
-                        Some("image") => None, // Skip image content
-                        _ => None,
+                        _ => None, // Skip image and unknown content
                     }
                 })
                 .collect();
@@ -199,18 +201,15 @@ impl Connector for PiAgentConnector {
         franken_detection_for_connector("pi_agent").unwrap_or_else(DetectionResult::not_found)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         // Use data_root if it looks like a pi-agent directory (for testing)
-        let is_pi_agent_dir = ctx
-            .data_dir
-            .to_str()
-            .map(|s| {
-                s.contains(".pi/agent")
-                    || s.contains(".omp/agent")
-                    || s.ends_with("/pi-agent")
-                    || s.ends_with("\\pi-agent")
-            })
-            .unwrap_or(false);
+        let is_pi_agent_dir = ctx.data_dir.to_str().is_some_and(|s| {
+            s.contains(".pi/agent")
+                || s.contains(".omp/agent")
+                || s.ends_with("/pi-agent")
+                || s.ends_with("\\pi-agent")
+        });
         let looks_like_root = |path: &PathBuf| {
             path.join("sessions").exists()
                 || path
@@ -846,7 +845,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &[&line]);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert!(convs[0].messages[0].content.contains("Part 1"));
@@ -866,7 +865,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         // Only the valid message should be included
@@ -891,7 +890,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         // After model_change, assistant should have new model as author
@@ -917,7 +916,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         // Should still work, just skip the thinking_level_change
@@ -941,7 +940,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].title, Some("This is the title".to_string()));
@@ -960,7 +959,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &[&line]);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].title.as_ref().unwrap().len(), 100);
@@ -977,7 +976,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].title, Some("First line".to_string()));
@@ -995,7 +994,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].title, Some("Assistant speaks first".to_string()));
@@ -1018,7 +1017,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert!(convs[0].started_at.is_some());
@@ -1041,7 +1040,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].agent_slug, "pi_agent");
@@ -1064,7 +1063,7 @@ mod tests {
         .unwrap();
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         // External ID should include the path structure
@@ -1088,7 +1087,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].metadata["source"], "pi_agent");
@@ -1106,7 +1105,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].metadata["session_id"], "unique-session-id-123");
@@ -1122,7 +1121,7 @@ mod tests {
         let storage = create_pi_agent_storage(&dir);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -1141,7 +1140,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -1162,7 +1161,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].messages.len(), 2);
@@ -1178,7 +1177,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -1199,7 +1198,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T11-00-00_uuid2.jsonl", &lines2);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 2);
@@ -1218,7 +1217,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].messages[0].idx, 0);
@@ -1259,7 +1258,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].messages[0].author, Some("gpt-4-turbo".to_string()));
@@ -1276,7 +1275,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &[""]);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -1292,7 +1291,7 @@ mod tests {
         );
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -1308,7 +1307,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages.len(), 1);
@@ -1326,7 +1325,7 @@ mod tests {
         std::fs::write(&file_path, b"\xff\xfe invalid utf8 line").unwrap();
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         // Invalid UTF-8 files are gracefully skipped (not fatal)
         let result = connector.scan(&ctx).unwrap();
         assert!(result.is_empty(), "invalid UTF-8 file should be skipped");
@@ -1347,7 +1346,7 @@ mod tests {
         std::fs::write(&file_path, &data).unwrap();
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         // BOM may cause first line parse failure; subsequent lines should still work
         // With only one line, may get 0 conversations
@@ -1367,7 +1366,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages.len(), 1);
@@ -1393,7 +1392,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &[&nested]);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         // Should not stack overflow
         let result = connector.scan(&ctx);
         assert!(result.is_ok());
@@ -1411,7 +1410,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &[&line]);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages[0].content.len(), 1_000_000);
@@ -1427,7 +1426,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.contains("hello"));
@@ -1448,7 +1447,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages.len(), 1);
@@ -1467,7 +1466,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages[0].content, "Still works");
@@ -1485,7 +1484,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &lines);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         // Should use the latest model_change
@@ -1509,7 +1508,7 @@ mod tests {
         write_session_file(&storage, "2025-12-01T10-00-00_uuid1.jsonl", &[&line]);
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         let msg = &convs[0].messages[0].content;
@@ -1532,7 +1531,7 @@ mod tests {
         .unwrap();
 
         let connector = PiAgentConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::local_default(storage, None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -1593,7 +1592,7 @@ mod tests {
     /// scan loop can walk both distributions without additional config.
     ///
     /// This test targets the pure function so it does not need to mutate
-    /// process environment (std::env::set_var is `unsafe` and `forbid`den
+    /// process environment (`std::env::set_var` is `unsafe` and `forbid`den
     /// at the crate level).
     #[test]
     fn default_homes_from_includes_both_pi_and_omp() {
@@ -1692,7 +1691,7 @@ mod tests {
     }
 
     /// Regression: `default_homes_from(None)` must return an empty vec
-    /// rather than synthesizing relative paths from an empty PathBuf,
+    /// rather than synthesizing relative paths from an empty `PathBuf`,
     /// which would cause `session_files()` to walk the process's
     /// current working directory via `PathBuf::new().join("sessions")`.
     #[test]

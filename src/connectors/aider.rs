@@ -241,6 +241,7 @@ impl Connector for AiderConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -406,11 +407,7 @@ mod tests {
     fn parse_chat_history_handles_conversation_flow() {
         let dir = TempDir::new().unwrap();
         let history_file = dir.path().join(".aider.chat.history.md");
-        let content = r#"> First user message
-First assistant response
-
-> Second user message
-Second assistant response"#;
+        let content = "> First user message\nFirst assistant response\n\n> Second user message\nSecond assistant response";
         fs::write(&history_file, content).unwrap();
 
         let connector = AiderConnector::new();
@@ -653,13 +650,7 @@ Second assistant response"#;
     fn parse_chat_history_handles_code_blocks() {
         let dir = TempDir::new().unwrap();
         let history_file = dir.path().join(".aider.chat.history.md");
-        let content = r#"> Add a function
-Here's the code:
-```python
-def hello():
-    print("Hello")
-```
-Done!"#;
+        let content = "> Add a function\nHere's the code:\n```python\ndef hello():\n    print(\"Hello\")\n```\nDone!";
         fs::write(&history_file, content).unwrap();
 
         let connector = AiderConnector::new();
@@ -708,8 +699,8 @@ Done!"#;
         // Create a 1MB file with repeated user/assistant exchanges
         let mut content = String::new();
         for i in 0..1000 {
-            content.push_str(&format!("> User message number {i}\n"));
-            content.push_str(&format!("Assistant response number {i}\n\n"));
+            let _ = writeln!(content, "> User message number {i}");
+            let _ = writeln!(content, "Assistant response number {i}\n");
         }
         fs::write(&history_file, &content).unwrap();
 

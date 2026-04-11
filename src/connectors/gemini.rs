@@ -64,28 +64,29 @@ fn extract_path_from_position(content: &str, start: usize) -> Option<PathBuf> {
     let rest = rest.trim_start();
 
     // Handle quoted paths
-    let (rest, delimiter) = if let Some(stripped) = rest.strip_prefix('"') {
-        (stripped, Some('"'))
-    } else if let Some(stripped) = rest.strip_prefix('\'') {
-        (stripped, Some('\''))
-    } else {
-        (rest, None)
-    };
+    let (rest, delimiter) = rest.strip_prefix('"').map_or_else(
+        || {
+            rest.strip_prefix('\'')
+                .map_or((rest, None), |stripped| (stripped, Some('\'')))
+        },
+        |stripped| (stripped, Some('"')),
+    );
 
     // Find the end of the path
     let end = rest
         .find(|c: char| {
-            if let Some(d) = delimiter {
-                c == d
-            } else {
-                c.is_whitespace()
-                    || c == '>'
-                    || c == '"'
-                    || c == '\''
-                    || c == ')'
-                    || c == ']'
-                    || c == ','
-            }
+            delimiter.map_or_else(
+                || {
+                    c.is_whitespace()
+                        || c == '>'
+                        || c == '"'
+                        || c == '\''
+                        || c == ')'
+                        || c == ']'
+                        || c == ','
+                },
+                |d| c == d,
+            )
         })
         .unwrap_or(rest.len());
 
@@ -129,8 +130,7 @@ fn extract_path_from_position(content: &str, start: usize) -> Option<PathBuf> {
     };
 
     // For /data/projects/X/... paths, return just /data/projects/X
-    let components: Vec<_> = path.components().collect();
-    if components.len() >= 4 {
+    if path.components().count() >= 4 {
         let path_str = path.to_string_lossy();
         if path_str.starts_with("/data/projects/") {
             // Return just /data/projects/project_name
@@ -158,7 +158,8 @@ impl Default for GeminiConnector {
 }
 
 impl GeminiConnector {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 
@@ -172,7 +173,10 @@ impl GeminiConnector {
     fn is_session_file(path: &Path) -> bool {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         name.starts_with("session-")
-            && name.ends_with(".json")
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
             && path
                 .parent()
                 .and_then(|p| p.file_name())
@@ -237,6 +241,7 @@ impl GeminiConnector {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn scan_gemini_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
@@ -246,17 +251,15 @@ fn scan_gemini_with_callback(
     let looks_like_root = |path: &PathBuf| {
         GeminiConnector::is_session_file(path)
             || path.join("chats").exists()
-            || fs::read_dir(path)
-                .map(|mut d| {
-                    d.any(|e| {
-                        e.ok()
-                            .is_some_and(|e| GeminiConnector::is_session_file(&e.path()))
-                    })
+            || fs::read_dir(path).is_ok_and(|mut d| {
+                d.any(|e| {
+                    e.ok()
+                        .is_some_and(|e| GeminiConnector::is_session_file(&e.path()))
                 })
-                .unwrap_or(false)
-            || fs::read_dir(path)
-                .map(|mut d| d.any(|e| e.ok().is_some_and(|e| e.path().join("chats").exists())))
-                .unwrap_or(false)
+            })
+            || fs::read_dir(path).is_ok_and(|mut d| {
+                d.any(|e| e.ok().is_some_and(|e| e.path().join("chats").exists()))
+            })
     };
     let roots: Vec<PathBuf> = if ctx.use_default_detection() {
         if looks_like_root(&ctx.data_dir) {
@@ -266,7 +269,7 @@ fn scan_gemini_with_callback(
         }
     } else {
         let mut explicit = Vec::new();
-        let mut add_explicit = |path: &PathBuf| {
+        let add_explicit = |path: &PathBuf, explicit: &mut Vec<PathBuf>| {
             if looks_like_root(path) {
                 explicit.push(path.clone());
             }
@@ -283,9 +286,9 @@ fn scan_gemini_with_callback(
             if looks_like_root(&candidate) {
                 explicit.push(candidate);
             }
-            add_explicit(&scan_root.path);
+            add_explicit(&scan_root.path, &mut explicit);
         }
-        add_explicit(&ctx.data_dir);
+        add_explicit(&ctx.data_dir, &mut explicit);
         if explicit.is_empty() {
             return Ok(());
         }
@@ -1073,7 +1076,7 @@ mod tests {
         let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs[0].title.as_ref().map(|t| t.len()), Some(100));
+        assert_eq!(convs[0].title.as_ref().map(String::len), Some(100));
     }
 
     #[test]

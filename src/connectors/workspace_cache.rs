@@ -173,6 +173,7 @@ impl WorkspaceCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hash::DefaultHasher;
 
     #[test]
     fn workspace_cache_empty() {
@@ -211,7 +212,7 @@ mod tests {
         let paths: Vec<PathBuf> = (0..100)
             .map(|i| PathBuf::from(format!("/workspace/{i}")))
             .collect();
-        let cache = WorkspaceCache::new(paths.clone());
+        let cache = WorkspaceCache::new(paths.iter().cloned());
         for path in &paths {
             assert!(
                 cache.contains(path),
@@ -294,10 +295,9 @@ mod tests {
     fn workspace_cache_pathkey_hash_consistency() {
         let path = PathBuf::from("/home/user/project");
         let key1 = PathKey::from(&path);
-        let key2 = PathKey::from(path.clone());
+        let key2 = PathKey::from(path);
 
         // Hash should be consistent
-        use std::hash::DefaultHasher;
         let hash1 = {
             let mut h = DefaultHasher::new();
             key1.hash(&mut h);

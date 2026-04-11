@@ -70,6 +70,7 @@ impl AmpConnector {
         roots
     }
 
+    #[must_use]
     pub fn candidate_roots() -> Vec<PathBuf> {
         let mut roots = Vec::new();
         if let Some(root) = Self::cache_root() {
@@ -85,8 +86,7 @@ impl AmpConnector {
                 .file_name()
                 .is_some_and(|n| n.to_str().unwrap_or("").contains("amp"))
             || std::fs::read_dir(path)
-                .map(|mut d| d.any(|e| e.ok().is_some_and(|e| is_amp_log_file(&e.path()))))
-                .unwrap_or(false)
+                .is_ok_and(|mut d| d.any(|e| e.ok().is_some_and(|e| is_amp_log_file(&e.path()))))
     }
 
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
@@ -204,6 +204,7 @@ impl Connector for AmpConnector {
         franken_detection_for_connector("amp").unwrap_or_else(DetectionResult::not_found)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
@@ -247,9 +248,8 @@ impl Connector for AmpConnector {
                 // Amp does not update file mtime when new messages are added to a thread,
                 // so mtime-based incremental indexing would miss new messages.
                 // This means Amp files are always re-read, but correctness is preserved.
-                let text = match std::fs::read_to_string(path) {
-                    Ok(t) => t,
-                    Err(_) => continue,
+                let Ok(text) = std::fs::read_to_string(path) else {
+                    continue;
                 };
                 let val: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -413,7 +413,7 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
 }
 
 /// Extract text content from a value that may be a string or an array of content blocks.
-/// Uses the shared flatten_content helper for consistent handling across all connectors.
+/// Uses the shared `flatten_content` helper for consistent handling across all connectors.
 fn extract_content_value(val: Option<&Value>) -> Option<String> {
     let val = val?;
     let result = flatten_content(val);
@@ -509,8 +509,8 @@ fn looks_like_uuid(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::scan::ScanRoot;
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
@@ -628,7 +628,7 @@ mod tests {
 
         let log = json!({
             "messages": [
-                {"role": "user", "content": "Hello Amp", "created_at": 1700000000000_i64}
+                {"role": "user", "content": "Hello Amp", "created_at": 1_700_000_000_000_i64}
             ]
         });
         fs::write(amp_root.join("conversation.json"), log.to_string()).unwrap();
@@ -804,37 +804,37 @@ mod tests {
     #[test]
     fn extract_messages_parses_created_at() {
         let val = json!({
-            "messages": [{"role": "user", "content": "Test", "created_at": 1733000000}]
+            "messages": [{"role": "user", "content": "Test", "created_at": 1_733_000_000}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].created_at, Some(1733000000000));
+        assert_eq!(msgs[0].created_at, Some(1_733_000_000_000));
     }
 
     #[test]
     fn extract_messages_parses_created_at_camel_case() {
         let val = json!({
-            "messages": [{"role": "user", "content": "Test", "createdAt": 1733000001}]
+            "messages": [{"role": "user", "content": "Test", "createdAt": 1_733_000_001}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].created_at, Some(1733000001000));
+        assert_eq!(msgs[0].created_at, Some(1_733_000_001_000));
     }
 
     #[test]
     fn extract_messages_parses_timestamp() {
         let val = json!({
-            "messages": [{"role": "user", "content": "Test", "timestamp": 1733000002}]
+            "messages": [{"role": "user", "content": "Test", "timestamp": 1_733_000_002}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].created_at, Some(1733000002000));
+        assert_eq!(msgs[0].created_at, Some(1_733_000_002_000));
     }
 
     #[test]
     fn extract_messages_parses_ts() {
         let val = json!({
-            "messages": [{"role": "user", "content": "Test", "ts": 1733000003}]
+            "messages": [{"role": "user", "content": "Test", "ts": 1_733_000_003}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].created_at, Some(1733000003000));
+        assert_eq!(msgs[0].created_at, Some(1_733_000_003_000));
     }
 
     #[test]
@@ -928,10 +928,10 @@ mod tests {
     fn extract_messages_parses_sent_at() {
         // Amp uses sentAt for message timestamps
         let val = json!({
-            "messages": [{"role": "user", "content": "Test", "sentAt": 1733000005}]
+            "messages": [{"role": "user", "content": "Test", "sentAt": 1_733_000_005}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].created_at, Some(1733000005000));
+        assert_eq!(msgs[0].created_at, Some(1_733_000_005_000));
     }
 
     // =====================================================
@@ -1080,8 +1080,8 @@ mod tests {
 
         let content = json!({
             "messages": [
-                {"role": "user", "content": "First", "timestamp": 1733000000},
-                {"role": "assistant", "content": "Last", "timestamp": 1733000100}
+                {"role": "user", "content": "First", "timestamp": 1_733_000_000},
+                {"role": "assistant", "content": "Last", "timestamp": 1_733_000_100}
             ]
         });
         fs::write(amp_dir.join("thread.json"), content.to_string()).unwrap();
@@ -1090,8 +1090,8 @@ mod tests {
         let ctx = ScanContext::local_default(amp_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs[0].started_at, Some(1733000000000));
-        assert_eq!(convs[0].ended_at, Some(1733000100000));
+        assert_eq!(convs[0].started_at, Some(1_733_000_000_000));
+        assert_eq!(convs[0].ended_at, Some(1_733_000_100_000));
     }
 
     #[test]

@@ -1,10 +1,10 @@
-//! Connector for OpenClaw session logs.
+//! Connector for `OpenClaw` session logs.
 //!
-//! OpenClaw stores JSONL sessions at:
+//! `OpenClaw` stores JSONL sessions at:
 //! - ~/.openclaw/agents/<agent-name>/sessions/*.jsonl
 //!
-//! Each line has a `type` discriminator: "session", "message", "model_change",
-//! "thinking_level_change", "custom". Messages are wrapped:
+//! Each line has a `type` discriminator: "session", "message", "`model_change`",
+//! "`thinking_level_change`", "custom". Messages are wrapped:
 //! {"type":"message","id":"...","message":{"role":"user","content":[...],...}}
 
 use std::fs;
@@ -42,10 +42,9 @@ impl OpenClawConnector {
     }
 
     fn find_agent_session_dirs() -> Vec<PathBuf> {
-        match Self::agents_root() {
-            Some(agents_root) => Self::find_agent_session_dirs_at(&agents_root),
-            None => Vec::new(),
-        }
+        Self::agents_root().map_or_else(Vec::new, |agents_root| {
+            Self::find_agent_session_dirs_at(&agents_root)
+        })
     }
 
     fn find_agent_session_dirs_at(agents_root: &Path) -> Vec<PathBuf> {
@@ -238,7 +237,7 @@ impl OpenClawConnector {
         out
     }
 
-    /// Flatten OpenClaw content blocks into a single string.
+    /// Flatten `OpenClaw` content blocks into a single string.
     /// Content is an array of blocks: text, toolCall, thinking.
     fn flatten_openclaw_content(content: &Value) -> String {
         match content {
@@ -478,7 +477,7 @@ impl Connector for OpenClawConnector {
                             });
                         }
                         // Skip model_change, thinking_level_change, custom, etc.
-                        _ => continue,
+                        _ => {}
                     }
                 }
 

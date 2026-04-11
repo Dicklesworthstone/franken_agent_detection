@@ -184,7 +184,7 @@ mod tests {
         let origin = Origin::remote("laptop");
         let root = ScanRoot::remote(
             PathBuf::from("/data/remotes/laptop/mirror/.claude"),
-            origin.clone(),
+            origin,
             Some(Platform::Linux),
         );
         assert_eq!(

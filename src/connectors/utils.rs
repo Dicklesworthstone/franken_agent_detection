@@ -170,7 +170,7 @@ fn extract_content_part(item: &serde_json::Value) -> Option<String> {
 /// [`unwrap_skill_invocations`].
 ///
 /// Works for any connector that stores content as an array of typed blocks:
-/// amp, claude_code, codex, cline, factory.
+/// amp, `claude_code`, codex, cline, factory.
 #[must_use]
 pub fn extract_invocations_from_content_blocks(
     val: &serde_json::Value,

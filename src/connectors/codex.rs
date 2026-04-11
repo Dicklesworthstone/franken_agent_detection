@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,8 +27,31 @@ impl Default for CodexConnector {
 }
 
 impl CodexConnector {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
+    }
+
+    fn is_under_codex_dir(path: &Path) -> bool {
+        path.ancestors().any(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == ".codex")
+        })
+    }
+
+    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if base.is_file() {
+            roots.push(base.to_path_buf());
+            return;
+        }
+
+        roots.push(base.to_path_buf());
+
+        if !Self::is_under_codex_dir(base) {
+            roots.push(base.join(".codex"));
+        }
     }
 
     fn home() -> PathBuf {
@@ -47,11 +71,16 @@ impl CodexConnector {
     }
 
     fn is_rollout_file(path: &Path) -> bool {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.starts_with("rollout-")
-                    && (name.ends_with(".jsonl") || name.ends_with(".json"))
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if !name.starts_with("rollout-") {
+            return false;
+        }
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("jsonl") || ext.eq_ignore_ascii_case("json")
             })
     }
 
@@ -74,7 +103,13 @@ impl CodexConnector {
                 let name = entry.file_name().to_str().unwrap_or("");
                 // Match both modern .jsonl and legacy .json formats
                 if name.starts_with("rollout-")
-                    && (name.ends_with(".jsonl") || name.ends_with(".json"))
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| {
+                            ext.eq_ignore_ascii_case("jsonl") || ext.eq_ignore_ascii_case("json")
+                        })
                 {
                     out.push(entry.path().to_path_buf());
                 }
@@ -92,11 +127,11 @@ impl CodexConnector {
     }
 
     fn token_usage_from_payload(payload: &Value) -> Option<Value> {
-        let input_tokens = payload.get("input_tokens").and_then(|v| v.as_i64());
+        let input_tokens = payload.get("input_tokens").and_then(Value::as_i64);
         let output_tokens = payload
             .get("output_tokens")
-            .and_then(|v| v.as_i64())
-            .or_else(|| payload.get("tokens").and_then(|v| v.as_i64()));
+            .and_then(Value::as_i64)
+            .or_else(|| payload.get("tokens").and_then(Value::as_i64));
 
         if input_tokens.is_none() && output_tokens.is_none() {
             return None;
@@ -194,16 +229,15 @@ fn update_time_bounds(started_at: &mut Option<i64>, ended_at: &mut Option<i64>, 
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn scan_codex_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    let is_codex_dir = ctx
-        .data_dir
-        .to_str()
-        .map(|s| s.contains(".codex") || s.ends_with("/codex") || s.ends_with("\\codex"))
-        .unwrap_or(false)
-        && ctx.data_dir.join("sessions").exists();
+    let is_codex_dir =
+        ctx.data_dir.to_str().is_some_and(|s| {
+            s.contains(".codex") || s.ends_with("/codex") || s.ends_with("\\codex")
+        }) && ctx.data_dir.join("sessions").exists();
 
     let roots: Vec<PathBuf> = if ctx.use_default_detection() {
         if is_codex_dir {
@@ -212,12 +246,22 @@ fn scan_codex_with_callback(
             vec![CodexConnector::home()]
         }
     } else {
-        ctx.scan_roots.iter().map(|r| r.path.clone()).collect()
+        let mut explicit = Vec::new();
+        for scan_root in &ctx.scan_roots {
+            CodexConnector::append_explicit_roots(&mut explicit, &scan_root.path);
+        }
+        explicit
     };
+
+    let mut roots = roots;
+    roots.sort();
+    roots.dedup();
 
     if roots.is_empty() {
         return Ok(());
     }
+
+    let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
     for root in roots {
         let explicit_file = root
@@ -227,7 +271,7 @@ fn scan_codex_with_callback(
         let home = explicit_file
             .as_ref()
             .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or(root.clone());
+            .unwrap_or_else(|| root.clone());
         if !home.exists() {
             continue;
         }
@@ -241,6 +285,10 @@ fn scan_codex_with_callback(
             .unwrap_or_else(|| CodexConnector::sessions_dir(&home));
 
         for file in files {
+            let canonical = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+            if !seen_files.insert(canonical) {
+                continue;
+            }
             let source_path = file.clone();
             if !file_modified_since(&file, ctx.since_ts) {
                 continue;
@@ -281,16 +329,14 @@ fn scan_codex_with_callback(
                 let reader = std::io::BufReader::new(f);
 
                 for (line_idx, line_res) in std::io::BufRead::lines(reader).enumerate() {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(_) => continue,
+                    let Ok(line) = line_res else {
+                        continue;
                     };
                     if line.trim().is_empty() {
                         continue;
                     }
-                    let val: Value = match serde_json::from_str(&line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                    let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                        continue;
                     };
 
                     let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -420,7 +466,7 @@ fn scan_codex_with_callback(
                                             .and_then(|v| v.as_str())
                                             .map(String::from);
 
-                                        let content_text = format!("[Tool: {}]", tool_name);
+                                        let content_text = format!("[Tool: {tool_name}]");
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
                                         messages.push(NormalizedMessage {
                                             idx: 0,
@@ -621,8 +667,14 @@ mod tests {
         let home = CodexConnector::home();
         // Either the env var is set (ends with some path) or default (ends with .codex)
         let path_str = home.to_str().unwrap();
+        let has_codex_dir = home
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case(".codex") || name.eq_ignore_ascii_case("codex")
+            });
         assert!(
-            path_str.ends_with(".codex") || path_str.contains("codex"),
+            has_codex_dir || path_str.to_ascii_lowercase().contains("codex"),
             "home() should return a path related to codex, got: {}",
             path_str
         );
@@ -673,6 +725,30 @@ mod tests {
 
         let files = CodexConnector::rollout_files(dir.path());
         assert_eq!(files.len(), 0);
+    }
+
+    #[test]
+    fn scan_with_explicit_home_root_finds_codex_sessions() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let sessions = home.join(".codex").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"Hello Codex"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"assistant","content":"Hi there!"}}
+"#;
+        let rollout = sessions.join("rollout-home.jsonl");
+        fs::write(&rollout, content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx =
+            ScanContext::with_roots(dir.path().join("cass"), vec![ScanRoot::local(home)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        assert_eq!(convs[0].messages[0].content, "Hello Codex");
+        assert_eq!(convs[0].messages[1].content, "Hi there!");
     }
 
     #[test]
@@ -1069,14 +1145,14 @@ not valid json at all
             first
                 .extra
                 .pointer("/cass/token_usage/input_tokens")
-                .and_then(|v| v.as_i64()),
+                .and_then(Value::as_i64),
             Some(10)
         );
         assert_eq!(
             first
                 .extra
                 .pointer("/cass/token_usage/output_tokens")
-                .and_then(|v| v.as_i64()),
+                .and_then(Value::as_i64),
             Some(20)
         );
 
@@ -1086,14 +1162,14 @@ not valid json at all
             second
                 .extra
                 .pointer("/cass/token_usage/input_tokens")
-                .and_then(|v| v.as_i64()),
+                .and_then(Value::as_i64),
             Some(30)
         );
         assert_eq!(
             second
                 .extra
                 .pointer("/cass/token_usage/output_tokens")
-                .and_then(|v| v.as_i64()),
+                .and_then(Value::as_i64),
             Some(40)
         );
         assert_eq!(
@@ -1158,14 +1234,14 @@ not valid json at all
             assistant
                 .extra
                 .pointer("/cass/token_usage/input_tokens")
-                .and_then(|v| v.as_i64()),
+                .and_then(Value::as_i64),
             Some(7)
         );
         assert_eq!(
             assistant
                 .extra
                 .pointer("/cass/token_usage/output_tokens")
-                .and_then(|v| v.as_i64()),
+                .and_then(Value::as_i64),
             Some(14)
         );
     }

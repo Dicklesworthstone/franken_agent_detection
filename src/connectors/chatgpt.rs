@@ -614,8 +614,8 @@ impl Connector for ChatGptConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::scan::ScanRoot;
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;

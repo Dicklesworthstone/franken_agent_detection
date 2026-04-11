@@ -191,6 +191,7 @@ impl CopilotCliConnector {
     /// Each line is a JSON event. We extract events with message-like types
     /// (`user.message`, `assistant.message`, or events with `role`+`content`
     /// fields) and assemble them into a single conversation per session file.
+    #[allow(clippy::too_many_lines)]
     fn parse_event_log(&self, path: &Path) -> Result<Vec<NormalizedConversation>> {
         let content = fs::read_to_string(path)?;
 
@@ -198,7 +199,7 @@ impl CopilotCliConnector {
         let trimmed = content.trim_start();
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
             if let Ok(val) = serde_json::from_str::<Value>(&content) {
-                return self.parse_session_json(&val, path);
+                return Ok(self.parse_session_json(&val, path));
             }
         }
 
@@ -211,18 +212,16 @@ impl CopilotCliConnector {
         let mut workspace: Option<PathBuf> = None;
 
         for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
+            let Ok(line) = line else {
+                continue;
             };
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
 
-            let event: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                continue;
             };
 
             if session_id.is_none() {
@@ -325,7 +324,7 @@ impl CopilotCliConnector {
     }
 
     /// Parse a legacy CLI session-state JSON file (single JSON document).
-    fn parse_session_json(&self, val: &Value, path: &Path) -> Result<Vec<NormalizedConversation>> {
+    fn parse_session_json(&self, val: &Value, path: &Path) -> Vec<NormalizedConversation> {
         // Try extracting messages from "events" or "history" arrays.
         let events = val
             .get("events")
@@ -338,15 +337,12 @@ impl CopilotCliConnector {
         // Also check for "conversation" array wrapper.
         let events = events.or_else(|| val.get("conversation").and_then(|v| v.as_array()));
 
-        let events = match events {
-            Some(e) => e,
-            None => {
-                // If there's a top-level array, try each element.
-                if let Some(arr) = val.as_array() {
-                    return self.parse_session_array(arr, path);
-                }
-                return Ok(Vec::new());
+        let Some(events) = events else {
+            // If there's a top-level array, try each element.
+            if let Some(arr) = val.as_array() {
+                return self.parse_session_array(arr, path);
             }
+            return Vec::new();
         };
 
         let mut messages = Vec::new();
@@ -390,7 +386,7 @@ impl CopilotCliConnector {
         }
 
         if messages.is_empty() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
 
         let session_id = val
@@ -429,7 +425,7 @@ impl CopilotCliConnector {
             "source": "copilot-cli",
         });
 
-        Ok(vec![NormalizedConversation {
+        vec![NormalizedConversation {
             agent_slug: "copilot_cli".to_string(),
             external_id: session_id,
             title,
@@ -439,33 +435,31 @@ impl CopilotCliConnector {
             ended_at,
             metadata,
             messages,
-        }])
+        }]
     }
 
     /// Parse a top-level JSON array where each element may be a conversation.
-    fn parse_session_array(
-        &self,
-        arr: &[Value],
-        path: &Path,
-    ) -> Result<Vec<NormalizedConversation>> {
+    fn parse_session_array(&self, arr: &[Value], path: &Path) -> Vec<NormalizedConversation> {
         let mut conversations = Vec::new();
         for (i, element) in arr.iter().enumerate() {
-            if let Ok(mut convs) = self.parse_session_json(element, path) {
-                // Assign external_id from array index if not set.
-                for conv in &mut convs {
-                    if conv.external_id.is_none() {
-                        conv.external_id = Some(format!(
-                            "{}-{i}",
-                            path.file_stem()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("session")
-                        ));
-                    }
-                }
-                conversations.extend(convs);
+            let mut convs = self.parse_session_json(element, path);
+            if convs.is_empty() {
+                continue;
             }
+            // Assign external_id from array index if not set.
+            for conv in &mut convs {
+                if conv.external_id.is_none() {
+                    conv.external_id = Some(format!(
+                        "{}-{i}",
+                        path.file_stem()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("session")
+                    ));
+                }
+            }
+            conversations.extend(convs);
         }
-        Ok(conversations)
+        conversations
     }
 
     /// Extract role and content from a CLI event log entry.
@@ -500,9 +494,8 @@ impl CopilotCliConnector {
             })
             .or(role_from_type);
 
-        let role = match role {
-            Some(r) => r,
-            None => return (String::new(), String::new()),
+        let Some(role) = role else {
+            return (String::new(), String::new());
         };
 
         let content = Self::extract_content(event);
@@ -992,7 +985,7 @@ mod tests {
 
     #[test]
     fn default_impl() {
-        let _connector = CopilotCliConnector::default();
+        let _ = CopilotCliConnector;
     }
 
     #[test]

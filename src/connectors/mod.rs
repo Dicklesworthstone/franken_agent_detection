@@ -155,6 +155,7 @@ pub fn franken_detection_for_connector(connector_slug: &str) -> Option<Detection
 /// included based on the enabled Cargo features.
 #[must_use]
 #[allow(clippy::type_complexity)]
+#[allow(unused_mut)]
 pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> {
     let mut v: Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> = vec![
         ("codex", || Box::new(codex::CodexConnector::new())),

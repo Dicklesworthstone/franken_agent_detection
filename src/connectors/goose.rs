@@ -910,8 +910,8 @@ fn parse_goose_jsonl(path: &Path, session_id: &str) -> Result<NormalizedConversa
 
 #[cfg(test)]
 mod tests {
-    use super::scan::{ScanContext, ScanRoot};
     use super::*;
+    use crate::connectors::scan::{ScanContext, ScanRoot};
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;

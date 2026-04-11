@@ -165,18 +165,16 @@ impl ClineConnector {
         }
 
         if path.is_dir() {
-            return fs::read_dir(path)
-                .map(|mut d| {
-                    d.any(|e| {
-                        e.ok().is_some_and(|e| {
-                            let p = e.path();
-                            p.is_dir()
-                                && (p.join("ui_messages.json").exists()
-                                    || p.join("api_conversation_history.json").exists())
-                        })
+            return fs::read_dir(path).is_ok_and(|mut d| {
+                d.any(|e| {
+                    e.ok().is_some_and(|e| {
+                        let p = e.path();
+                        p.is_dir()
+                            && (p.join("ui_messages.json").exists()
+                                || p.join("api_conversation_history.json").exists())
                     })
                 })
-                .unwrap_or(false);
+            });
         }
 
         false
@@ -188,6 +186,7 @@ impl Connector for ClineConnector {
         franken_detection_for_connector("cline").unwrap_or_else(DetectionResult::not_found)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let override_root = Self::normalize_root_path(&ctx.data_dir);
         let roots = if ctx.use_default_detection() {
@@ -336,27 +335,27 @@ impl Connector for ClineConnector {
                 // Re-index
                 crate::types::reindex_messages(&mut messages);
 
-                let mut title = None;
-                let mut workspace = None;
-
-                if meta_path.exists()
+                let (mut title, workspace) = if meta_path.exists()
                     && let Ok(s) = fs::read_to_string(&meta_path)
                     && let Ok(v) = serde_json::from_str::<Value>(&s)
                 {
-                    title = v
+                    let title = v
                         .get("title")
                         .and_then(|t| t.as_str())
                         .map(std::string::ToString::to_string);
                     // Try to find workspace path
                     // Cline doesn't standardize this in metadata, but sometimes it's there or in state.
                     // We check common keys.
-                    workspace = v
+                    let workspace = v
                         .get("rootPath")
                         .or_else(|| v.get("cwd"))
                         .or_else(|| v.get("workspace"))
                         .and_then(|s| s.as_str())
                         .map(PathBuf::from);
-                }
+                    (title, workspace)
+                } else {
+                    (None, None)
+                };
 
                 // Fallback title from first message
                 if title.is_none() {
@@ -386,8 +385,8 @@ impl Connector for ClineConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::scan::ScanRoot;
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -436,8 +435,8 @@ mod tests {
         let task_dir = create_task_dir(&storage, "task-001");
 
         let messages = json!([
-            {"role": "user", "content": "Hello Cline!", "timestamp": 1733000000},
-            {"role": "assistant", "content": "Hello! How can I help?", "timestamp": 1733000001}
+            {"role": "user", "content": "Hello Cline!", "timestamp": 1_733_000_000},
+            {"role": "assistant", "content": "Hello! How can I help?", "timestamp": 1_733_000_001}
         ]);
         fs::write(task_dir.join("ui_messages.json"), messages.to_string()).unwrap();
 
@@ -459,7 +458,7 @@ mod tests {
         let task_dir = create_task_dir(&storage, "task-explicit");
 
         let messages = json!([
-            {"role": "user", "content": "Explicit root", "timestamp": 1733000000}
+            {"role": "user", "content": "Explicit root", "timestamp": 1_733_000_000}
         ]);
         fs::write(task_dir.join("ui_messages.json"), messages.to_string()).unwrap();
 
@@ -704,14 +703,14 @@ mod tests {
         let storage = create_cline_storage(&dir);
         let task_dir = create_task_dir(&storage, "task-ts");
 
-        let messages = json!([{"role": "user", "content": "Test", "timestamp": 1733000000}]);
+        let messages = json!([{"role": "user", "content": "Test", "timestamp": 1_733_000_000}]);
         fs::write(task_dir.join("ui_messages.json"), messages.to_string()).unwrap();
 
         let connector = ClineConnector::new();
         let ctx = ScanContext::local_default(storage.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs[0].messages[0].created_at, Some(1733000000000));
+        assert_eq!(convs[0].messages[0].created_at, Some(1_733_000_000_000));
     }
 
     #[test]
@@ -720,14 +719,14 @@ mod tests {
         let storage = create_cline_storage(&dir);
         let task_dir = create_task_dir(&storage, "task-created");
 
-        let messages = json!([{"role": "user", "content": "Test", "created_at": 1733000001}]);
+        let messages = json!([{"role": "user", "content": "Test", "created_at": 1_733_000_001}]);
         fs::write(task_dir.join("ui_messages.json"), messages.to_string()).unwrap();
 
         let connector = ClineConnector::new();
         let ctx = ScanContext::local_default(storage.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs[0].messages[0].created_at, Some(1733000001000));
+        assert_eq!(convs[0].messages[0].created_at, Some(1_733_000_001_000));
     }
 
     #[test]
@@ -736,14 +735,14 @@ mod tests {
         let storage = create_cline_storage(&dir);
         let task_dir = create_task_dir(&storage, "task-ts-field");
 
-        let messages = json!([{"role": "user", "content": "Test", "ts": 1733000002}]);
+        let messages = json!([{"role": "user", "content": "Test", "ts": 1_733_000_002}]);
         fs::write(task_dir.join("ui_messages.json"), messages.to_string()).unwrap();
 
         let connector = ClineConnector::new();
         let ctx = ScanContext::local_default(storage.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs[0].messages[0].created_at, Some(1733000002000));
+        assert_eq!(convs[0].messages[0].created_at, Some(1_733_000_002_000));
     }
 
     #[test]
@@ -774,8 +773,8 @@ mod tests {
 
         // Messages out of order
         let messages = json!([
-            {"role": "assistant", "content": "Later", "timestamp": 1733000100},
-            {"role": "user", "content": "Earlier", "timestamp": 1733000000}
+            {"role": "assistant", "content": "Later", "timestamp": 1_733_000_100},
+            {"role": "user", "content": "Earlier", "timestamp": 1_733_000_000}
         ]);
         fs::write(task_dir.join("ui_messages.json"), messages.to_string()).unwrap();
 
@@ -912,8 +911,8 @@ mod tests {
         let task_dir = create_task_dir(&storage, "task-start");
 
         let messages = json!([
-            {"role": "user", "content": "First", "timestamp": 1733000000},
-            {"role": "assistant", "content": "Last", "timestamp": 1733000100}
+            {"role": "user", "content": "First", "timestamp": 1_733_000_000},
+            {"role": "assistant", "content": "Last", "timestamp": 1_733_000_100}
         ]);
         fs::write(task_dir.join("ui_messages.json"), messages.to_string()).unwrap();
 
@@ -921,8 +920,8 @@ mod tests {
         let ctx = ScanContext::local_default(storage.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs[0].started_at, Some(1733000000000));
-        assert_eq!(convs[0].ended_at, Some(1733000100000));
+        assert_eq!(convs[0].started_at, Some(1_733_000_000_000));
+        assert_eq!(convs[0].ended_at, Some(1_733_000_100_000));
     }
 
     // =====================================================

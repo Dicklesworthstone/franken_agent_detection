@@ -72,7 +72,7 @@ impl KimiConnector {
     }
 
     fn append_kimi_roots(roots: &mut Vec<PathBuf>, base: &Path) {
-        if looks_like_kimi_storage(base) {
+        if Self::looks_like_kimi_storage(base) {
             roots.push(base.to_path_buf());
             return;
         }
@@ -225,7 +225,7 @@ fn infer_session_id(wire_path: &Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Extract text content from a Kimi ContentPart payload.
+/// Extract text content from a Kimi `ContentPart` payload.
 fn extract_content_part_text(payload: &Value) -> String {
     // Try payload.content (string or array)
     if let Some(content) = payload.get("content") {
@@ -252,7 +252,7 @@ fn extract_content_part_text(payload: &Value) -> String {
     String::new()
 }
 
-/// Extract tool call description from a ToolCall payload.
+/// Extract tool call description from a `ToolCall` payload.
 fn extract_tool_call_text(payload: &Value) -> String {
     let tool_name = payload
         .get("name")
@@ -283,7 +283,8 @@ fn extract_tool_call_text(payload: &Value) -> String {
     }
 }
 
-/// Parse a Kimi wire.jsonl session file into a NormalizedConversation.
+/// Parse a Kimi wire.jsonl session file into a `NormalizedConversation`.
+#[allow(clippy::too_many_lines)]
 fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
     let file =
         fs::File::open(path).with_context(|| format!("open kimi wire file {}", path.display()))?;
@@ -295,21 +296,17 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
     let mut current_role = String::from("assistant");
 
     for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::debug!("skipping unreadable JSONL line: {e}");
-                continue;
-            }
+        let Ok(line) = line_res else {
+            tracing::debug!("skipping unreadable JSONL line");
+            continue;
         };
 
         if line.trim().is_empty() {
             continue;
         }
 
-        let val: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+            continue;
         };
 
         // Parse timestamp (floating-point seconds or ISO string)
@@ -377,11 +374,10 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
             }
             (Some("ToolCall"), _) => {
                 let payload = msg.and_then(|m| m.get("payload"));
-                let content = payload
-                    .map(extract_tool_call_text)
-                    .unwrap_or_else(|| "[Tool: unknown]".to_string());
+                let content =
+                    payload.map_or_else(|| "[Tool: unknown]".to_string(), extract_tool_call_text);
 
-                let invocations = if let Some(p) = payload {
+                let invocations = payload.map_or_else(Vec::new, |p| {
                     let tool_name = p
                         .get("name")
                         .or_else(|| p.get("toolName"))
@@ -398,9 +394,7 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
                             .or_else(|| p.get("parameters"))
                             .cloned(),
                     }]
-                } else {
-                    Vec::new()
-                };
+                });
 
                 messages.push(NormalizedMessage {
                     idx: 0,
@@ -455,8 +449,8 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
 
 #[cfg(test)]
 mod tests {
-    use super::scan::ScanRoot;
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -473,7 +467,7 @@ mod tests {
 
     #[test]
     fn default_creates_connector() {
-        let connector = KimiConnector::default();
+        let connector = KimiConnector;
         let _ = connector;
     }
 

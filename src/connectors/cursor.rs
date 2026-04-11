@@ -862,8 +862,8 @@ impl Connector for CursorConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::scan::ScanRoot;
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use rusqlite::Connection;
     use serde_json::json;
     use std::collections::HashSet;

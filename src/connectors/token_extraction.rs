@@ -61,7 +61,7 @@ impl ExtractedTokenUsage {
 
     /// Whether this extraction has any meaningful token data.
     #[must_use]
-    pub fn has_token_data(&self) -> bool {
+    pub const fn has_token_data(&self) -> bool {
         self.input_tokens.is_some()
             || self.output_tokens.is_some()
             || self.cache_read_tokens.is_some()
@@ -162,22 +162,22 @@ pub fn extract_claude_code_tokens(extra: &Value) -> ExtractedTokenUsage {
     let usage_block = compact_usage.or_else(|| extra.pointer("/message/usage"));
     let input_tokens = usage_block
         .and_then(|u| u.get("input_tokens"))
-        .and_then(|v| v.as_i64());
+        .and_then(Value::as_i64);
     let output_tokens = usage_block
         .and_then(|u| u.get("output_tokens"))
-        .and_then(|v| v.as_i64());
+        .and_then(Value::as_i64);
     let cache_read_tokens = usage_block
         .and_then(|u| {
             u.get("cache_read_tokens")
                 .or_else(|| u.get("cache_read_input_tokens"))
         })
-        .and_then(|v| v.as_i64());
+        .and_then(Value::as_i64);
     let cache_creation_tokens = usage_block
         .and_then(|u| {
             u.get("cache_creation_tokens")
                 .or_else(|| u.get("cache_creation_input_tokens"))
         })
-        .and_then(|v| v.as_i64());
+        .and_then(Value::as_i64);
     let service_tier = usage_block
         .and_then(|u| u.get("service_tier"))
         .and_then(|v| v.as_str())
@@ -194,19 +194,26 @@ pub fn extract_claude_code_tokens(extra: &Value) -> ExtractedTokenUsage {
 
     let compact_tool_call_count = extra
         .pointer("/cass/tool_call_count")
-        .and_then(|v| v.as_u64())
-        .map(|count| count as u32);
-    let (has_tool_calls, tool_call_count) = if let Some(count) = compact_tool_call_count {
-        (count > 0, count)
-    } else if let Some(content_arr) = extra.pointer("/message/content").and_then(|v| v.as_array()) {
-        let count = content_arr
-            .iter()
-            .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-            .count() as u32;
-        (count > 0, count)
-    } else {
-        (false, 0)
-    };
+        .and_then(Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok());
+    let (has_tool_calls, tool_call_count) = compact_tool_call_count.map_or_else(
+        || {
+            extra
+                .pointer("/message/content")
+                .and_then(|v| v.as_array())
+                .map_or((false, 0), |content_arr| {
+                    let count = content_arr
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                        })
+                        .count();
+                    let count = u32::try_from(count).unwrap_or(u32::MAX);
+                    (count > 0, count)
+                })
+        },
+        |count| (count > 0, count),
+    );
 
     ExtractedTokenUsage {
         model_name,
@@ -235,11 +242,11 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
     let mut data_source = TokenDataSource::Estimated;
 
     if let Some(attached) = extra.pointer("/cass/token_usage") {
-        input_tokens = attached.get("input_tokens").and_then(|v| v.as_i64());
+        input_tokens = attached.get("input_tokens").and_then(Value::as_i64);
         output_tokens = attached
             .get("output_tokens")
-            .and_then(|v| v.as_i64())
-            .or_else(|| attached.get("tokens").and_then(|v| v.as_i64()));
+            .and_then(Value::as_i64)
+            .or_else(|| attached.get("tokens").and_then(Value::as_i64));
 
         let source = attached.get("data_source").and_then(|v| v.as_str());
         if source == Some("api") || input_tokens.is_some() || output_tokens.is_some() {
@@ -253,11 +260,11 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
         && let Some(payload) = extra.get("payload")
         && payload.get("type").and_then(|v| v.as_str()) == Some("token_count")
     {
-        input_tokens = payload.get("input_tokens").and_then(|v| v.as_i64());
+        input_tokens = payload.get("input_tokens").and_then(Value::as_i64);
         output_tokens = payload
             .get("output_tokens")
-            .and_then(|v| v.as_i64())
-            .or_else(|| payload.get("tokens").and_then(|v| v.as_i64()));
+            .and_then(Value::as_i64)
+            .or_else(|| payload.get("tokens").and_then(Value::as_i64));
         data_source = TokenDataSource::Api;
     }
 
@@ -285,7 +292,7 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
 /// Estimate tokens from content length for agents that do not provide token data.
 #[must_use]
 pub fn estimate_tokens_from_content(content: &str, role: &str) -> ExtractedTokenUsage {
-    let char_count = content.len() as i64;
+    let char_count = i64::try_from(content.len()).unwrap_or(i64::MAX);
     let estimated = char_count / 4;
 
     let mut usage = ExtractedTokenUsage {
@@ -293,10 +300,10 @@ pub fn estimate_tokens_from_content(content: &str, role: &str) -> ExtractedToken
         ..Default::default()
     };
 
-    match role {
-        "user" => usage.input_tokens = Some(estimated),
-        "assistant" | "agent" => usage.output_tokens = Some(estimated),
-        _ => usage.output_tokens = Some(estimated),
+    if role == "user" {
+        usage.input_tokens = Some(estimated);
+    } else {
+        usage.output_tokens = Some(estimated);
     }
 
     usage

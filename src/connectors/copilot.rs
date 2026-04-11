@@ -323,7 +323,7 @@ impl CopilotConnector {
     /// 1. Array of conversation objects at top level
     /// 2. Single conversation object
     /// 3. Object with a "conversations" key containing an array
-    fn parse_conversation_file(&self, path: &Path) -> Result<Vec<NormalizedConversation>> {
+    fn parse_conversation_file(path: &Path) -> Result<Vec<NormalizedConversation>> {
         let content = fs::read_to_string(path)?;
         let val: Value = serde_json::from_str(&content)?;
         let mut conversations = Vec::new();
@@ -587,15 +587,20 @@ impl CopilotConnector {
     /// with message-like types (`user.message`, `assistant.message`, or
     /// events containing `role`+`content` fields) and assemble them into
     /// a single conversation per session file.
-    fn parse_cli_event_log(&self, path: &Path) -> Result<Vec<NormalizedConversation>> {
+    #[allow(clippy::too_many_lines)]
+    fn parse_cli_event_log(path: &Path) -> Result<Vec<NormalizedConversation>> {
         let content = fs::read_to_string(path)?;
 
         // If it looks like a single JSON document (not JSONL), try the legacy
         // CLI session-state format: a JSON object with a messages/conversation array.
+        let is_jsonl = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
         let trimmed = content.trim_start();
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if !is_jsonl && (trimmed.starts_with('{') || trimmed.starts_with('[')) {
             if let Ok(val) = serde_json::from_str::<Value>(&content) {
-                return self.parse_cli_session_json(&val, path);
+                return Ok(Self::parse_cli_session_json(&val, path));
             }
         }
 
@@ -608,18 +613,16 @@ impl CopilotConnector {
         let mut workspace: Option<PathBuf> = None;
 
         for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
+            let Ok(line) = line else {
+                continue;
             };
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
 
-            let event: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                continue;
             };
 
             // Extract session ID from any event if we haven't found one yet.
@@ -733,18 +736,14 @@ impl CopilotConnector {
     /// These are used by Copilot CLI v1 (`history-session-state/{id}.json`)
     /// and checkpoint files. The format is a JSON object containing conversation
     /// data, potentially with `messages`, `conversation`, or `events` arrays.
-    fn parse_cli_session_json(
-        &self,
-        val: &Value,
-        path: &Path,
-    ) -> Result<Vec<NormalizedConversation>> {
+    fn parse_cli_session_json(val: &Value, path: &Path) -> Vec<NormalizedConversation> {
         // If the document has a top-level "messages" or "conversation" array,
         // treat it as a chat-style conversation and delegate to the existing parser.
         if val.get("turns").is_some()
             || val.get("messages").is_some()
             || val.get("conversations").is_some()
         {
-            return self.parse_conversation_file_from_value(val, path);
+            return Self::parse_conversation_file_from_value(val, path);
         }
 
         // Try extracting messages from "events" array (session-state checkpoint format).
@@ -753,12 +752,9 @@ impl CopilotConnector {
             .and_then(|v| v.as_array())
             .or_else(|| val.get("history").and_then(|v| v.as_array()));
 
-        let events = match events {
-            Some(e) => e,
-            None => {
-                // Fall back to treating the entire JSON as a single-conversation document.
-                return self.parse_conversation_file_from_value(val, path);
-            }
+        let Some(events) = events else {
+            // Fall back to treating the entire JSON as a single-conversation document.
+            return Self::parse_conversation_file_from_value(val, path);
         };
 
         let mut messages = Vec::new();
@@ -802,7 +798,7 @@ impl CopilotConnector {
         }
 
         if messages.is_empty() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
 
         let session_id = val
@@ -841,7 +837,7 @@ impl CopilotConnector {
             "source": "copilot-cli",
         });
 
-        Ok(vec![NormalizedConversation {
+        vec![NormalizedConversation {
             agent_slug: "copilot".to_string(),
             external_id: session_id,
             title,
@@ -851,15 +847,11 @@ impl CopilotConnector {
             ended_at,
             metadata,
             messages,
-        }])
+        }]
     }
 
     /// Parse a JSON value through the existing VS Code conversation parser.
-    fn parse_conversation_file_from_value(
-        &self,
-        val: &Value,
-        path: &Path,
-    ) -> Result<Vec<NormalizedConversation>> {
+    fn parse_conversation_file_from_value(val: &Value, path: &Path) -> Vec<NormalizedConversation> {
         let mut conversations = Vec::new();
 
         let conv_array = if let Some(arr) = val.as_array() {
@@ -876,7 +868,7 @@ impl CopilotConnector {
         {
             vec![val.clone()]
         } else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
 
         for conv_val in &conv_array {
@@ -885,7 +877,7 @@ impl CopilotConnector {
             }
         }
 
-        Ok(conversations)
+        conversations
     }
 
     /// Extract role and content from a CLI event log entry.
@@ -926,9 +918,8 @@ impl CopilotConnector {
             })
             .or(role_from_type);
 
-        let role = match role {
-            Some(r) => r,
-            None => return (String::new(), String::new()),
+        let Some(role) = role else {
+            return (String::new(), String::new());
         };
 
         // Extract content from various fields.
@@ -1055,9 +1046,9 @@ impl Connector for CopilotConnector {
 
                 // Dispatch to the appropriate parser based on file type.
                 let result = if Self::is_cli_event_log(&file) {
-                    self.parse_cli_event_log(&file)
+                    Self::parse_cli_event_log(&file)
                 } else {
-                    self.parse_conversation_file(&file)
+                    Self::parse_conversation_file(&file)
                 };
 
                 match result {
