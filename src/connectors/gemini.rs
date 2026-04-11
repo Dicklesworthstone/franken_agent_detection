@@ -6,6 +6,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::ScanContext;
+use super::utils::env_path_nonempty;
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -162,10 +163,10 @@ impl GeminiConnector {
     }
 
     fn root() -> PathBuf {
-        dotenvy::var("GEMINI_HOME").map_or_else(
-            |_| dirs::home_dir().unwrap_or_default().join(".gemini/tmp"),
-            PathBuf::from,
-        )
+        if let Some(explicit) = env_path_nonempty("GEMINI_HOME") {
+            return explicit;
+        }
+        dirs::home_dir().unwrap_or_default().join(".gemini/tmp")
     }
 
     fn is_session_file(path: &Path) -> bool {

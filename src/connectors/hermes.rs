@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use super::scan::ScanContext;
+use super::utils::env_path_nonempty;
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -46,9 +47,8 @@ impl HermesConnector {
     /// 2. `HERMES_HOME` env — `$HERMES_HOME/state.db`
     /// 3. Default: `~/.hermes/state.db`
     fn sqlite_db_path() -> Option<PathBuf> {
-        if let Ok(path) = dotenvy::var("HERMES_SQLITE_DB") {
-            let p = PathBuf::from(path);
-            if p.exists() {
+        if let Some(p) = env_path_nonempty("HERMES_SQLITE_DB") {
+            if p.is_file() {
                 return Some(p);
             }
         }
@@ -57,7 +57,7 @@ impl HermesConnector {
             let home = home.trim().to_string();
             if !home.is_empty() {
                 let db = PathBuf::from(&home).join("state.db");
-                if db.exists() {
+                if db.is_file() {
                     return Some(db);
                 }
             }
@@ -65,7 +65,7 @@ impl HermesConnector {
 
         if let Some(home) = dirs::home_dir() {
             let db = home.join(".hermes").join("state.db");
-            if db.exists() {
+            if db.is_file() {
                 return Some(db);
             }
         }

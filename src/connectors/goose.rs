@@ -16,6 +16,7 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use super::scan::ScanContext;
+use super::utils::env_path_nonempty;
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -46,7 +47,7 @@ impl GooseConnector {
             let root = root.trim().to_string();
             if !root.is_empty() {
                 let p = PathBuf::from(&root).join("data").join("sessions");
-                if p.exists() {
+                if p.is_dir() {
                     return Some(p);
                 }
             }
@@ -55,7 +56,7 @@ impl GooseConnector {
         // XDG default: ~/.local/share/goose/sessions/
         if let Some(data) = dirs::data_local_dir() {
             let sessions = data.join("goose").join("sessions");
-            if sessions.exists() {
+            if sessions.is_dir() {
                 return Some(sessions);
             }
         }
@@ -67,7 +68,7 @@ impl GooseConnector {
                 .join("share")
                 .join("goose")
                 .join("sessions");
-            if sessions.exists() {
+            if sessions.is_dir() {
                 return Some(sessions);
             }
         }
@@ -75,7 +76,7 @@ impl GooseConnector {
         // Legacy: ~/.goose/sessions/
         if let Some(home) = dirs::home_dir() {
             let sessions = home.join(".goose").join("sessions");
-            if sessions.exists() {
+            if sessions.is_dir() {
                 return Some(sessions);
             }
         }
@@ -87,9 +88,8 @@ impl GooseConnector {
     /// Returns the path to `sessions.db` if it exists.
     fn sqlite_db_path() -> Option<PathBuf> {
         // Check for env override first
-        if let Ok(path) = dotenvy::var("GOOSE_SQLITE_DB") {
-            let p = PathBuf::from(path);
-            if p.exists() {
+        if let Some(p) = env_path_nonempty("GOOSE_SQLITE_DB") {
+            if p.is_file() {
                 return Some(p);
             }
         }
@@ -102,7 +102,7 @@ impl GooseConnector {
                     .join("data")
                     .join("sessions")
                     .join("sessions.db");
-                if db.exists() {
+                if db.is_file() {
                     return Some(db);
                 }
             }
@@ -111,7 +111,7 @@ impl GooseConnector {
         // XDG default: ~/.local/share/goose/sessions/sessions.db
         if let Some(data) = dirs::data_local_dir() {
             let db = data.join("goose").join("sessions").join("sessions.db");
-            if db.exists() {
+            if db.is_file() {
                 return Some(db);
             }
         }
@@ -124,7 +124,7 @@ impl GooseConnector {
                 .join("goose")
                 .join("sessions")
                 .join("sessions.db");
-            if db.exists() {
+            if db.is_file() {
                 return Some(db);
             }
         }

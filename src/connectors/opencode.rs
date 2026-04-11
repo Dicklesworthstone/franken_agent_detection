@@ -19,6 +19,7 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use super::scan::ScanContext;
+use super::utils::env_path_nonempty;
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -39,9 +40,8 @@ impl OpenCodeConnector {
     /// OpenCode stores sessions in ~/.local/share/opencode/storage/
     fn storage_root() -> Option<PathBuf> {
         // Check for env override first (useful for testing)
-        if let Ok(path) = dotenvy::var("OPENCODE_STORAGE_ROOT") {
-            let p = PathBuf::from(path);
-            if p.exists() {
+        if let Some(p) = env_path_nonempty("OPENCODE_STORAGE_ROOT") {
+            if p.is_dir() {
                 return Some(p);
             }
         }
@@ -49,7 +49,7 @@ impl OpenCodeConnector {
         // Primary location: XDG data directory (Linux/macOS)
         if let Some(data) = dirs::data_local_dir() {
             let storage_dir = data.join("opencode/storage");
-            if storage_dir.exists() {
+            if storage_dir.is_dir() {
                 return Some(storage_dir);
             }
         }
@@ -59,7 +59,7 @@ impl OpenCodeConnector {
         // that place data under ~/.config/opencode/ (#146).
         if let Some(config) = dirs::config_dir() {
             let storage_dir = config.join("opencode/storage");
-            if storage_dir.exists() {
+            if storage_dir.is_dir() {
                 return Some(storage_dir);
             }
         }
@@ -67,12 +67,12 @@ impl OpenCodeConnector {
         // Fallback: ~/.local/share/opencode/storage
         if let Some(home) = dirs::home_dir() {
             let storage_dir = home.join(".local/share/opencode/storage");
-            if storage_dir.exists() {
+            if storage_dir.is_dir() {
                 return Some(storage_dir);
             }
             // Also check ~/.config/opencode/storage for XDG-style installs
             let xdg_storage = home.join(".config/opencode/storage");
-            if xdg_storage.exists() {
+            if xdg_storage.is_dir() {
                 return Some(xdg_storage);
             }
         }
@@ -86,7 +86,7 @@ impl OpenCodeConnector {
     /// `data_dir`.
     fn sqlite_db_candidates() -> Vec<PathBuf> {
         Self::sqlite_db_candidates_from(
-            dotenvy::var("OPENCODE_SQLITE_DB").ok().map(PathBuf::from),
+            env_path_nonempty("OPENCODE_SQLITE_DB"),
             dirs::home_dir().as_deref(),
             dirs::data_local_dir().as_deref(),
             dirs::config_dir().as_deref(),
@@ -545,7 +545,7 @@ impl Connector for OpenCodeConnector {
         }
 
         for db in db_candidates {
-            if !db.exists() {
+            if !db.is_file() {
                 continue;
             }
             // Canonicalize if possible so two routes to the same file are

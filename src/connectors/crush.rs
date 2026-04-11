@@ -21,6 +21,7 @@ use frankensqlite::compat::{ConnectionExt, OpenFlags, ParamValue, RowExt, open_w
 use serde::Deserialize;
 
 use super::scan::ScanContext;
+use super::utils::env_path_nonempty;
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -40,15 +41,14 @@ impl CrushConnector {
 
     /// Locate the global Crush database at `~/.crush/crush.db`.
     fn global_db_path() -> Option<PathBuf> {
-        if let Ok(path) = dotenvy::var("CRUSH_SQLITE_DB") {
-            let p = PathBuf::from(path);
-            if p.exists() {
+        if let Some(p) = env_path_nonempty("CRUSH_SQLITE_DB") {
+            if p.is_file() {
                 return Some(p);
             }
         }
 
         let db = dirs::home_dir()?.join(".crush").join("crush.db");
-        if db.exists() { Some(db) } else { None }
+        if db.is_file() { Some(db) } else { None }
     }
 
     /// Discover per-project `.crush/crush.db` files by scanning common project roots.

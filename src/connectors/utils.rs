@@ -1,5 +1,24 @@
 //! Shared utility functions used by all connectors.
 
+use std::path::PathBuf;
+
+/// Read an environment variable, trimming whitespace and treating empty strings as unset.
+pub(crate) fn env_var_nonempty(key: &str) -> Option<String> {
+    dotenvy::var(key).ok().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+/// Read an environment variable as a filesystem path, ignoring empty strings.
+pub(crate) fn env_path_nonempty(key: &str) -> Option<PathBuf> {
+    env_var_nonempty(key).map(PathBuf::from)
+}
+
 /// Check if a file was modified since the given timestamp.
 /// Returns true if the file should be processed (modified since timestamp or no timestamp given).
 #[must_use]

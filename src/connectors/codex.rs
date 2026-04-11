@@ -6,6 +6,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::ScanContext;
+use super::utils::env_path_nonempty;
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -30,10 +31,10 @@ impl CodexConnector {
     }
 
     fn home() -> PathBuf {
-        dotenvy::var("CODEX_HOME").map_or_else(
-            |_| dirs::home_dir().unwrap_or_default().join(".codex"),
-            PathBuf::from,
-        )
+        if let Some(explicit) = env_path_nonempty("CODEX_HOME") {
+            return explicit;
+        }
+        dirs::home_dir().unwrap_or_default().join(".codex")
     }
 
     fn sessions_dir(home: &Path) -> PathBuf {
