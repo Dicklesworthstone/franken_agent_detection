@@ -9,6 +9,7 @@
 //!
 //! Message types: `user`, `qwen` (assistant)
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -79,50 +80,68 @@ impl Connector for QwenConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let root = if ctx.use_default_detection() {
+        let mut roots: Vec<PathBuf> = Vec::new();
+
+        if ctx.use_default_detection() {
             if Self::looks_like_qwen_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                ctx.data_dir.clone()
-            } else {
-                let r = Self::tmp_root();
-                if r.exists() {
-                    r
-                } else {
-                    return Ok(Vec::new());
-                }
+                roots.push(ctx.data_dir.clone());
+            }
+            let root = Self::tmp_root();
+            if root.exists() {
+                roots.push(root);
             }
         } else {
-            let qwen_root = ctx.scan_roots.iter().find_map(|sr| {
-                let qwen_path = sr.path.join(".qwen/tmp");
+            for scan_root in &ctx.scan_roots {
+                let qwen_path = scan_root.path.join(".qwen/tmp");
                 if qwen_path.exists() {
-                    Some(qwen_path)
-                } else if Self::looks_like_qwen_storage(&sr.path) {
-                    Some(sr.path.clone())
-                } else {
-                    None
+                    roots.push(qwen_path);
                 }
-            });
-            match qwen_root {
-                Some(r) => r,
-                None => return Ok(Vec::new()),
+                if Self::looks_like_qwen_storage(&scan_root.path) {
+                    roots.push(scan_root.path.clone());
+                }
             }
-        };
 
-        if !root.exists() {
+            if Self::looks_like_qwen_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+                roots.push(ctx.data_dir.clone());
+            }
+        }
+
+        if roots.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut convs = Vec::new();
+        roots.sort();
+        roots.dedup();
 
-        for session_path in Self::session_files(&root) {
-            if !file_modified_since(&session_path, ctx.since_ts) {
+        let mut convs = Vec::new();
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+
+        for root in roots {
+            if !root.exists() {
                 continue;
             }
 
-            match parse_qwen_session(&session_path) {
-                Ok(Some(conv)) => convs.push(conv),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!(path = %session_path.display(), error = %e, "qwen parse error");
+            for session_path in Self::session_files(&root) {
+                let canonical =
+                    std::fs::canonicalize(&session_path).unwrap_or_else(|_| session_path.clone());
+                if !seen_files.insert(canonical) {
+                    continue;
+                }
+
+                if !file_modified_since(&session_path, ctx.since_ts) {
+                    continue;
+                }
+
+                match parse_qwen_session(&session_path) {
+                    Ok(Some(conv)) => convs.push(conv),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            path = %session_path.display(),
+                            error = %e,
+                            "qwen parse error"
+                        );
+                    }
                 }
             }
         }
@@ -259,8 +278,10 @@ fn infer_workspace(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::scan::ScanRoot;
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     // =========================================================================
@@ -358,6 +379,54 @@ mod tests {
         assert_eq!(convs[0].messages[0].content, "Hello Qwen");
         assert_eq!(convs[0].messages[1].role, "assistant");
         assert!(convs[0].messages[1].content.contains("How can I help"));
+    }
+
+    #[test]
+    fn scan_with_explicit_roots_scans_all_roots() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let storage_a = create_qwen_storage(&dir_a);
+        let storage_b = create_qwen_storage(&dir_b);
+
+        let session_a = r#"{
+            "sessionId": "sess-a",
+            "projectHash": "hash-a",
+            "startTime": "2025-11-08T23:19:10.138Z",
+            "lastUpdated": "2025-11-08T23:19:13.706Z",
+            "messages": [
+                { "id": "msg-a", "timestamp": "2025-11-08T23:19:10.138Z", "type": "user", "content": "Hi A" }
+            ]
+        }"#;
+        let session_b = r#"{
+            "sessionId": "sess-b",
+            "projectHash": "hash-b",
+            "startTime": "2025-11-08T23:19:10.138Z",
+            "lastUpdated": "2025-11-08T23:19:13.706Z",
+            "messages": [
+                { "id": "msg-b", "timestamp": "2025-11-08T23:19:10.138Z", "type": "user", "content": "Hi B" }
+            ]
+        }"#;
+
+        write_session_file(&storage_a, "hash-a", "session-a.json", session_a);
+        write_session_file(&storage_b, "hash-b", "session-b.json", session_b);
+
+        let connector = QwenConnector::new();
+        let ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![
+                ScanRoot::local(dir_a.path().to_path_buf()),
+                ScanRoot::local(dir_b.path().to_path_buf()),
+            ],
+            None,
+        );
+
+        let mut convs = connector.scan(&ctx).unwrap();
+        convs.sort_by(|a, b| a.external_id.cmp(&b.external_id));
+        let ids: Vec<_> = convs
+            .iter()
+            .filter_map(|c| c.external_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec!["sess-a", "sess-b"]);
     }
 
     #[test]

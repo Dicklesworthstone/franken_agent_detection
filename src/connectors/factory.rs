@@ -10,6 +10,7 @@
 //! The workspace path slug encodes the original working directory path,
 //! e.g., `-Users-alice-Dev-myproject` for `/Users/alice/Dev/myproject`.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -64,63 +65,75 @@ impl Connector for FactoryConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        // Determine scan root
-        let root = if ctx.use_default_detection() {
-            // First check if data_dir looks like factory storage (for testing)
+        let mut roots: Vec<PathBuf> = Vec::new();
+
+        if ctx.use_default_detection() {
             if looks_like_factory_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                ctx.data_dir.clone()
-            } else {
-                // Fall back to default sessions root
-                match Self::sessions_root() {
-                    Some(r) if r.exists() => r,
-                    _ => return Ok(Vec::new()),
+                roots.push(ctx.data_dir.clone());
+            }
+            if let Some(root) = Self::sessions_root() {
+                if root.exists() {
+                    roots.push(root);
                 }
             }
         } else {
-            // Check scan_roots for factory sessions
-            let factory_root = ctx.scan_roots.iter().find_map(|sr| {
-                let factory_path = sr.path.join(".factory/sessions");
+            for scan_root in &ctx.scan_roots {
+                let factory_path = scan_root.path.join(".factory/sessions");
                 if factory_path.exists() {
-                    Some(factory_path)
-                } else if looks_like_factory_storage(&sr.path) {
-                    Some(sr.path.clone())
-                } else {
-                    None
+                    roots.push(factory_path);
                 }
-            });
-            match factory_root {
-                Some(r) => r,
-                None => return Ok(Vec::new()),
+                if looks_like_factory_storage(&scan_root.path) {
+                    roots.push(scan_root.path.clone());
+                }
             }
-        };
 
-        if !root.exists() {
+            if looks_like_factory_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+                roots.push(ctx.data_dir.clone());
+            }
+        }
+
+        if roots.is_empty() {
             return Ok(Vec::new());
         }
 
+        roots.sort();
+        roots.dedup();
+
         let mut convs = Vec::new();
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
-        for entry in WalkDir::new(&root).into_iter().flatten() {
-            if !entry.file_type().is_file() {
+        for root in roots {
+            if !root.exists() {
                 continue;
             }
 
-            // Only process .jsonl files (skip .settings.json)
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                continue;
-            }
+            for entry in WalkDir::new(&root).into_iter().flatten() {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
 
-            // Skip files not modified since last scan (incremental indexing)
-            if !file_modified_since(path, ctx.since_ts) {
-                continue;
-            }
+                // Only process .jsonl files (skip .settings.json)
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
 
-            match parse_factory_session(path) {
-                Ok(Some(conv)) => convs.push(conv),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!(path = %path.display(), error = %e, "factory parse error");
+                let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                if !seen_files.insert(canonical) {
+                    continue;
+                }
+
+                // Skip files not modified since last scan (incremental indexing)
+                if !file_modified_since(path, ctx.since_ts) {
+                    continue;
+                }
+
+                match parse_factory_session(path) {
+                    Ok(Some(conv)) => convs.push(conv),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(path = %path.display(), error = %e, "factory parse error");
+                    }
                 }
             }
         }
@@ -311,8 +324,10 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
 
 #[cfg(test)]
 mod tests {
+    use super::scan::ScanRoot;
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     // =========================================================================
@@ -424,6 +439,44 @@ mod tests {
         assert_eq!(convs[0].messages[0].role, "user");
         assert_eq!(convs[0].messages[0].content, "Hello Factory");
         assert_eq!(convs[0].messages[1].role, "assistant");
+    }
+
+    #[test]
+    fn scan_with_explicit_roots_scans_all_roots() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let storage_a = create_factory_storage(&dir_a);
+        let storage_b = create_factory_storage(&dir_b);
+
+        let lines_a = vec![
+            r#"{"type":"session_start","id":"sess-a","title":"A","owner":"test","cwd":"/home/user/a"}"#,
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Hello A"}}"#,
+        ];
+        let lines_b = vec![
+            r#"{"type":"session_start","id":"sess-b","title":"B","owner":"test","cwd":"/home/user/b"}"#,
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Hello B"}}"#,
+        ];
+
+        write_session_file(&storage_a, "-home-user-a", "sess-a", &lines_a);
+        write_session_file(&storage_b, "-home-user-b", "sess-b", &lines_b);
+
+        let connector = FactoryConnector::new();
+        let ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![
+                ScanRoot::local(dir_a.path().to_path_buf()),
+                ScanRoot::local(dir_b.path().to_path_buf()),
+            ],
+            None,
+        );
+
+        let mut convs = connector.scan(&ctx).unwrap();
+        convs.sort_by(|a, b| a.external_id.cmp(&b.external_id));
+        let ids: Vec<_> = convs
+            .iter()
+            .filter_map(|c| c.external_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec!["sess-a", "sess-b"]);
     }
 
     #[test]
