@@ -332,13 +332,9 @@ impl CopilotConnector {
         let conv_array = if let Some(arr) = val.as_array() {
             // Top-level array of conversations
             arr.clone()
-        } else if val
-            .get("conversations")
-            .and_then(|v| v.as_array())
-            .is_some()
-        {
+        } else if let Some(arr) = val.get("conversations").and_then(|v| v.as_array()) {
             // Object with "conversations" key
-            val["conversations"].as_array().unwrap().clone()
+            arr.clone()
         } else if val.get("id").is_some() || val.get("turns").is_some() {
             // Single conversation object
             vec![val]
@@ -856,12 +852,8 @@ impl CopilotConnector {
 
         let conv_array = if let Some(arr) = val.as_array() {
             arr.clone()
-        } else if val
-            .get("conversations")
-            .and_then(|v| v.as_array())
-            .is_some()
-        {
-            val["conversations"].as_array().unwrap().clone()
+        } else if let Some(arr) = val.get("conversations").and_then(|v| v.as_array()) {
+            arr.clone()
         } else if val.get("id").is_some()
             || val.get("turns").is_some()
             || val.get("messages").is_some()
