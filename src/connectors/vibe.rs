@@ -48,6 +48,30 @@ impl VibeConnector {
         path_str.contains(".vibe") && path_str.contains("logs") && path_str.contains("session")
     }
 
+    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if base.exists() && Self::looks_like_vibe_storage(base) {
+            roots.push(base.to_path_buf());
+        }
+
+        if base.file_name().is_some_and(|n| n == ".vibe") {
+            let sessions = base.join("logs").join("session");
+            if sessions.exists() {
+                roots.push(sessions);
+            }
+        }
+
+        if base.file_name().is_some_and(|n| n == "logs")
+            && base
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".vibe"))
+        {
+            let sessions = base.join("session");
+            if sessions.exists() {
+                roots.push(sessions);
+            }
+        }
+    }
+
     pub(crate) fn session_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         if !root.exists() {
@@ -139,9 +163,9 @@ impl Connector for VibeConnector {
                 let candidate = root.path.join(".vibe/logs/session");
                 if candidate.exists() {
                     roots.push(candidate);
-                } else if Self::looks_like_vibe_storage(&root.path) && root.path.exists() {
-                    roots.push(root.path.clone());
                 }
+
+                Self::append_explicit_roots(&mut roots, &root.path);
             }
         }
 
@@ -279,6 +303,7 @@ impl Connector for VibeConnector {
 
 #[cfg(test)]
 mod tests {
+    use super::scan::ScanRoot;
     use super::*;
     use tempfile::TempDir;
 
@@ -349,6 +374,28 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].role, "user");
+    }
+
+    #[test]
+    fn scan_with_vibe_root_scan_root() {
+        let tmp = TempDir::new().unwrap();
+        let vibe_root = tmp.path().join(".vibe");
+        let sessions = vibe_root.join("logs").join("session");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "sess-root",
+            &[r#"{"role":"user","content":"Root scan","timestamp":1700000000000}"#],
+        );
+
+        let connector = VibeConnector::new();
+        let ctx = ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(vibe_root)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "Root scan");
     }
 
     #[test]

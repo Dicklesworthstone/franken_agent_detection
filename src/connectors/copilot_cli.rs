@@ -98,6 +98,59 @@ impl CopilotCliConnector {
         false
     }
 
+    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if base.exists() && Self::looks_like_cli_storage(base) {
+            roots.push(base.to_path_buf());
+        }
+
+        if base.file_name().is_some_and(|n| n == ".copilot") {
+            let session_state = base.join("session-state");
+            if session_state.exists() {
+                roots.push(session_state);
+            }
+            let history_state = base.join("history-session-state");
+            if history_state.exists() {
+                roots.push(history_state);
+            }
+        }
+
+        if base.file_name().is_some_and(|n| n == ".config") {
+            let gh_copilot = base.join("gh-copilot");
+            if gh_copilot.exists() {
+                roots.push(gh_copilot);
+            }
+            let gh_copilot_nested = base.join("gh").join("copilot");
+            if gh_copilot_nested.exists() {
+                roots.push(gh_copilot_nested);
+            }
+        }
+
+        if base.file_name().is_some_and(|n| n == "gh") {
+            let gh_copilot = base.join("copilot");
+            if gh_copilot.exists() {
+                roots.push(gh_copilot);
+            }
+        }
+
+        if base.file_name().is_some_and(|n| n == ".local") {
+            let github_copilot = base.join("share").join("github-copilot");
+            if github_copilot.exists() {
+                roots.push(github_copilot);
+            }
+        }
+
+        if base.file_name().is_some_and(|n| n == "share")
+            && base
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".local"))
+        {
+            let github_copilot = base.join("github-copilot");
+            if github_copilot.exists() {
+                roots.push(github_copilot);
+            }
+        }
+    }
+
     /// Find JSON and JSONL files that may contain CLI session data.
     fn find_event_files(root: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -563,9 +616,7 @@ impl Connector for CopilotCliConnector {
                     }
                 }
 
-                if Self::looks_like_cli_storage(&scan_root.path) && scan_root.path.exists() {
-                    roots.push(scan_root.path.clone());
-                }
+                Self::append_explicit_roots(&mut roots, &scan_root.path);
             }
         }
 
@@ -888,6 +939,28 @@ mod tests {
 
         let connector = CopilotCliConnector::new();
         let scan_root = crate::connectors::ScanRoot::local(home);
+        let ctx = ScanContext::with_roots(tmp.path().to_path_buf(), vec![scan_root], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn scan_with_copilot_root_scan_root() {
+        let tmp = TempDir::new().unwrap();
+        let copilot_root = tmp.path().join(".copilot");
+        let session_dir = copilot_root.join("session-state/root-sess");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let events = r#"{"type":"user.message","content":"root msg","timestamp":1700000060000}
+{"type":"assistant.message","content":"root ack","timestamp":1700000061000}
+"#;
+
+        write_file(&session_dir, "events.jsonl", events);
+
+        let connector = CopilotCliConnector::new();
+        let scan_root = crate::connectors::ScanRoot::local(copilot_root);
         let ctx = ScanContext::with_roots(tmp.path().to_path_buf(), vec![scan_root], None);
         let convs = connector.scan(&ctx).unwrap();
 
