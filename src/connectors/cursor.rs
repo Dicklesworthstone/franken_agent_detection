@@ -93,6 +93,34 @@ impl CursorConnector {
         }
     }
 
+    fn looks_like_base(path: &Path) -> bool {
+        path.join("globalStorage").exists()
+            || path.join("workspaceStorage").exists()
+            || path
+                .file_name()
+                .is_some_and(|n| n == "globalStorage" || n == "workspaceStorage")
+            || (path.is_file() && path.file_name().is_some_and(|n| n == "state.vscdb"))
+    }
+
+    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if Self::looks_like_base(base) {
+            roots.push(base.to_path_buf());
+        }
+
+        let candidates = [
+            base.join(".config/Cursor/User"),
+            base.join("Library/Application Support/Cursor/User"),
+            base.join("AppData/Roaming/Cursor/User"),
+            base.join("Cursor/User"),
+        ];
+
+        for candidate in candidates {
+            if Self::looks_like_base(&candidate) {
+                roots.push(candidate);
+            }
+        }
+    }
+
     /// Check if running inside Windows Subsystem for Linux
     #[cfg(target_os = "linux")]
     fn is_wsl() -> bool {
@@ -774,14 +802,10 @@ impl Connector for CursorConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         // Determine base directories to scan
-        let looks_like_base = |path: &PathBuf| {
-            path.join("globalStorage").exists() || path.join("workspaceStorage").exists()
-        };
-
         let mut roots: Vec<PathBuf> = Vec::new();
 
         if ctx.use_default_detection() {
-            if looks_like_base(&ctx.data_dir) {
+            if Self::looks_like_base(&ctx.data_dir) {
                 roots.push(ctx.data_dir.clone());
             } else if let Some(default_base) = Self::app_support_dir() {
                 roots.push(default_base);
@@ -789,7 +813,7 @@ impl Connector for CursorConnector {
         } else {
             // Explicit roots provided - use them all
             for r in &ctx.scan_roots {
-                roots.push(r.path.clone());
+                Self::append_explicit_roots(&mut roots, &r.path);
             }
         }
 
@@ -838,6 +862,7 @@ impl Connector for CursorConnector {
 
 #[cfg(test)]
 mod tests {
+    use super::scan::ScanRoot;
     use super::*;
     use rusqlite::Connection;
     use serde_json::json;
@@ -1578,6 +1603,37 @@ mod tests {
 
         let connector = CursorConnector::new();
         let ctx = ScanContext::local_default(cursor_dir.clone(), None);
+        let result = connector.scan(&ctx);
+
+        assert!(result.is_ok());
+        let convs = result.unwrap();
+        assert_eq!(convs.len(), 1);
+    }
+
+    #[test]
+    fn scan_with_home_scan_root_finds_cursor_storage() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let global_dir = home.join(".config/Cursor/User/globalStorage");
+        fs::create_dir_all(&global_dir).unwrap();
+
+        let db_path = global_dir.join("state.vscdb");
+        let conn = create_test_db(&db_path);
+        let value = json!({ "text": "Explicit root" }).to_string();
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            ["composerData:explicit-123", &value],
+        )
+        .unwrap();
+        drop(conn);
+
+        let connector = CursorConnector::new();
+        let ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![ScanRoot::local(home.to_path_buf())],
+            None,
+        );
         let result = connector.scan(&ctx);
 
         assert!(result.is_ok());
