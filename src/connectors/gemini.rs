@@ -269,26 +269,30 @@ fn scan_gemini_with_callback(
         }
     } else {
         let mut explicit = Vec::new();
-        let add_explicit = |path: &PathBuf, explicit: &mut Vec<PathBuf>| {
-            if looks_like_root(path) {
-                explicit.push(path.clone());
-            }
-            if path.file_name().is_some_and(|n| n == ".gemini") {
-                let candidate = path.join("tmp");
-                if looks_like_root(&candidate) {
-                    explicit.push(candidate);
-                }
-            }
-        };
-
         for scan_root in &ctx.scan_roots {
             let candidate = scan_root.path.join(".gemini/tmp");
             if looks_like_root(&candidate) {
                 explicit.push(candidate);
             }
-            add_explicit(&scan_root.path, &mut explicit);
+            if looks_like_root(&scan_root.path) {
+                explicit.push(scan_root.path.clone());
+            }
+            if scan_root.path.file_name().is_some_and(|n| n == ".gemini") {
+                let candidate = scan_root.path.join("tmp");
+                if looks_like_root(&candidate) {
+                    explicit.push(candidate);
+                }
+            }
         }
-        add_explicit(&ctx.data_dir, &mut explicit);
+        if looks_like_root(&ctx.data_dir) {
+            explicit.push(ctx.data_dir.clone());
+        }
+        if ctx.data_dir.file_name().is_some_and(|n| n == ".gemini") {
+            let candidate = ctx.data_dir.join("tmp");
+            if looks_like_root(&candidate) {
+                explicit.push(candidate);
+            }
+        }
         if explicit.is_empty() {
             return Ok(());
         }
