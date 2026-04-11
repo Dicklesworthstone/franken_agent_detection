@@ -77,13 +77,77 @@ impl ClineConnector {
 
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
         let base = Self::normalize_root_path(base);
+        let file_name = base.file_name().and_then(|n| n.to_str());
+        let is_config = file_name.is_some_and(|n| n == ".config");
+        let is_app_support = file_name.is_some_and(|n| n == "Application Support");
+        let is_appdata_roaming = file_name.is_some_and(|n| n == "Roaming")
+            && base
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == "AppData"));
+        let is_code_variant =
+            file_name.is_some_and(|n| n == "Code" || n == "Code - Insiders" || n == "VSCodium");
+        let is_user = file_name.is_some_and(|n| n == "User");
+        let is_global_storage = file_name.is_some_and(|n| n == "globalStorage");
+
         if Self::looks_like_storage(&base) {
             roots.push(base.clone());
         }
 
-        if base.file_name().is_some_and(|n| n == "globalStorage") {
+        let mut storage_roots: Vec<PathBuf> = Vec::new();
+
+        if is_global_storage {
+            storage_roots.push(base.clone());
+        }
+
+        if is_config {
+            storage_roots.push(base.join("Code/User/globalStorage"));
+            storage_roots.push(base.join("Code - Insiders/User/globalStorage"));
+            storage_roots.push(base.join("VSCodium/User/globalStorage"));
+        }
+
+        if is_app_support {
+            storage_roots.push(base.join("Code/User/globalStorage"));
+            storage_roots.push(base.join("Code - Insiders/User/globalStorage"));
+            storage_roots.push(base.join("VSCodium/User/globalStorage"));
+        }
+
+        if is_appdata_roaming {
+            storage_roots.push(base.join("Code/User/globalStorage"));
+            storage_roots.push(base.join("Code - Insiders/User/globalStorage"));
+            storage_roots.push(base.join("VSCodium/User/globalStorage"));
+        }
+
+        if is_code_variant {
+            storage_roots.push(base.join("User/globalStorage"));
+        }
+
+        if is_user {
+            storage_roots.push(base.join("globalStorage"));
+        }
+
+        if !(is_config
+            || is_app_support
+            || is_appdata_roaming
+            || is_code_variant
+            || is_user
+            || is_global_storage)
+        {
+            storage_roots.push(base.join(".config/Code/User/globalStorage"));
+            storage_roots.push(base.join(".config/Code - Insiders/User/globalStorage"));
+            storage_roots.push(base.join(".config/VSCodium/User/globalStorage"));
+            storage_roots.push(base.join("Library/Application Support/Code/User/globalStorage"));
+            storage_roots
+                .push(base.join("Library/Application Support/Code - Insiders/User/globalStorage"));
+            storage_roots
+                .push(base.join("Library/Application Support/VSCodium/User/globalStorage"));
+            storage_roots.push(base.join("AppData/Roaming/Code/User/globalStorage"));
+            storage_roots.push(base.join("AppData/Roaming/Code - Insiders/User/globalStorage"));
+            storage_roots.push(base.join("AppData/Roaming/VSCodium/User/globalStorage"));
+        }
+
+        for root in storage_roots {
             for ext in &CLINE_EXTENSIONS {
-                let candidate = base.join(ext);
+                let candidate = root.join(ext);
                 if candidate.exists() && Self::looks_like_storage(&candidate) {
                     roots.push(candidate);
                 }
@@ -432,6 +496,28 @@ mod tests {
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages[0].content, "From globalStorage");
+    }
+
+    #[test]
+    fn scan_with_explicit_config_root_finds_storage() {
+        let dir = TempDir::new().unwrap();
+        let config_root = dir.path().join(".config");
+        let storage = config_root.join("Code/User/globalStorage/saoudrizwan.claude-dev");
+        let task_dir = create_task_dir(&storage, "task-config");
+
+        let messages = json!([{"role": "user", "content": "From .config"}]);
+        fs::write(task_dir.join("ui_messages.json"), messages.to_string()).unwrap();
+
+        let connector = ClineConnector::new();
+        let ctx = ScanContext::with_roots(
+            dir.path().join("not-cline"),
+            vec![ScanRoot::local(config_root)],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "From .config");
     }
 
     #[test]

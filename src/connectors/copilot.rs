@@ -169,11 +169,23 @@ impl CopilotConnector {
     }
 
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        let file_name = base.file_name().and_then(|n| n.to_str());
+        let is_config = file_name.is_some_and(|n| n == ".config");
+        let is_app_support = file_name.is_some_and(|n| n == "Application Support");
+        let is_appdata_roaming = file_name.is_some_and(|n| n == "Roaming")
+            && base
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == "AppData"));
+        let is_code_variant =
+            file_name.is_some_and(|n| n == "Code" || n == "Code - Insiders" || n == "VSCodium");
+        let is_user = file_name.is_some_and(|n| n == "User");
+        let is_global_storage = file_name.is_some_and(|n| n == "globalStorage");
+
         if base.exists() && Self::looks_like_copilot_storage(base) {
             roots.push(base.to_path_buf());
         }
 
-        if base.file_name().is_some_and(|n| n == ".copilot") {
+        if file_name.is_some_and(|n| n == ".copilot") {
             let session_state = base.join("session-state");
             if session_state.exists() {
                 roots.push(session_state);
@@ -184,17 +196,86 @@ impl CopilotConnector {
             }
         }
 
-        if base.file_name().is_some_and(|n| n == "globalStorage") {
+        if is_global_storage {
             let copilot_chat = base.join("github.copilot-chat");
             if copilot_chat.exists() {
                 roots.push(copilot_chat);
             }
         }
 
-        if base.file_name().is_some_and(|n| n == "gh") {
+        if file_name.is_some_and(|n| n == "gh") {
             let gh_copilot = base.join("copilot");
             if gh_copilot.exists() {
                 roots.push(gh_copilot);
+            }
+        }
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+
+        if is_config {
+            candidates.push(base.join("Code/User/globalStorage/github.copilot-chat"));
+            candidates.push(base.join("Code - Insiders/User/globalStorage/github.copilot-chat"));
+            candidates.push(base.join("VSCodium/User/globalStorage/github.copilot-chat"));
+            candidates.push(base.join("gh-copilot"));
+            candidates.push(base.join("gh/copilot"));
+        }
+
+        if is_app_support {
+            candidates.push(base.join("Code/User/globalStorage/github.copilot-chat"));
+            candidates.push(base.join("Code - Insiders/User/globalStorage/github.copilot-chat"));
+            candidates.push(base.join("VSCodium/User/globalStorage/github.copilot-chat"));
+        }
+        if is_appdata_roaming {
+            candidates.push(base.join("Code/User/globalStorage/github.copilot-chat"));
+            candidates.push(base.join("Code - Insiders/User/globalStorage/github.copilot-chat"));
+            candidates.push(base.join("VSCodium/User/globalStorage/github.copilot-chat"));
+        }
+
+        if is_code_variant {
+            candidates.push(base.join("User/globalStorage/github.copilot-chat"));
+        }
+        if is_user {
+            candidates.push(base.join("globalStorage/github.copilot-chat"));
+        }
+
+        if !(is_config
+            || is_app_support
+            || is_appdata_roaming
+            || is_code_variant
+            || is_user
+            || is_global_storage)
+        {
+            candidates.push(base.join(".config/Code/User/globalStorage/github.copilot-chat"));
+            candidates
+                .push(base.join(".config/Code - Insiders/User/globalStorage/github.copilot-chat"));
+            candidates.push(base.join(".config/VSCodium/User/globalStorage/github.copilot-chat"));
+            candidates.push(
+                base.join(
+                    "Library/Application Support/Code/User/globalStorage/github.copilot-chat",
+                ),
+            );
+            candidates.push(base.join(
+                "Library/Application Support/Code - Insiders/User/globalStorage/github.copilot-chat",
+            ));
+            candidates.push(base.join(
+                "Library/Application Support/VSCodium/User/globalStorage/github.copilot-chat",
+            ));
+            candidates
+                .push(base.join("AppData/Roaming/Code/User/globalStorage/github.copilot-chat"));
+            candidates.push(
+                base.join("AppData/Roaming/Code - Insiders/User/globalStorage/github.copilot-chat"),
+            );
+            candidates
+                .push(base.join("AppData/Roaming/VSCodium/User/globalStorage/github.copilot-chat"));
+            candidates.push(base.join(".config/gh-copilot"));
+            candidates.push(base.join(".config/gh/copilot"));
+            candidates.push(base.join(".copilot/session-state"));
+            candidates.push(base.join(".copilot/history-session-state"));
+        }
+
+        for candidate in candidates {
+            if candidate.exists() {
+                roots.push(candidate);
             }
         }
     }
@@ -947,38 +1028,11 @@ impl Connector for CopilotConnector {
             // Check scan_roots for copilot directories.
             for scan_root in &ctx.scan_roots {
                 Self::append_explicit_roots(&mut roots, &scan_root.path);
-                // Check common subdirectories within each scan root.
-                let candidates = [
-                    // VS Code Copilot Chat paths
-                    scan_root
-                        .path
-                        .join(".config/Code/User/globalStorage/github.copilot-chat"),
-                    scan_root.path.join(
-                        "Library/Application Support/Code/User/globalStorage/github.copilot-chat",
-                    ),
-                    scan_root
-                        .path
-                        .join("AppData/Roaming/Code/User/globalStorage/github.copilot-chat"),
-                    scan_root.path.join(
-                        "AppData/Roaming/Code - Insiders/User/globalStorage/github.copilot-chat",
-                    ),
-                    scan_root
-                        .path
-                        .join("AppData/Roaming/VSCodium/User/globalStorage/github.copilot-chat"),
-                    scan_root.path.join(".config/gh-copilot"),
-                    scan_root.path.join(".config/gh/copilot"),
-                    // Copilot CLI session-state paths
-                    scan_root.path.join(".copilot/session-state"),
-                    scan_root.path.join(".copilot/history-session-state"),
-                ];
-
-                for candidate in &candidates {
-                    if candidate.exists() {
-                        roots.push(candidate.clone());
-                    }
-                }
             }
         }
+
+        roots.sort();
+        roots.dedup();
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -1033,6 +1087,7 @@ impl Connector for CopilotConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::scan::ScanRoot;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -1070,6 +1125,40 @@ mod tests {
         let ctx = ScanContext::local_default(root, None);
         let convs = connector.scan(&ctx).unwrap();
         assert!(convs.is_empty());
+    }
+
+    #[test]
+    fn scan_with_explicit_config_root_finds_vscode_storage() {
+        let tmp = TempDir::new().unwrap();
+        let config_root = tmp.path().join(".config");
+        let copilot_dir = config_root.join("Code/User/globalStorage/github.copilot-chat");
+        fs::create_dir_all(&copilot_dir).unwrap();
+
+        let json = r#"[
+            {
+                "id": "conv-config",
+                "workspaceFolder": "/work/config",
+                "turns": [
+                    {
+                        "request": {"message": "Hello", "timestamp": 1700000000000},
+                        "response": {"message": "Hi", "timestamp": 1700000001000}
+                    }
+                ]
+            }
+        ]"#;
+
+        write_json(&copilot_dir, "conversations.json", json);
+
+        let connector = CopilotConnector::new();
+        let ctx = ScanContext::with_roots(
+            tmp.path().join("cass"),
+            vec![ScanRoot::local(config_root)],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("conv-config"));
     }
 
     #[test]

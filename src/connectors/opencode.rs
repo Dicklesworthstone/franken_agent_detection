@@ -135,6 +135,81 @@ impl OpenCodeConnector {
         out
     }
 
+    fn is_local_share_root(path: &Path) -> bool {
+        path.file_name().is_some_and(|name| name == "share")
+            && path
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|name| name == ".local"))
+    }
+
+    fn is_appdata_roaming(path: &Path) -> bool {
+        path.file_name().is_some_and(|name| name == "Roaming")
+            && path
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|name| name == "AppData"))
+    }
+
+    fn append_explicit_db_candidates(out: &mut Vec<PathBuf>, base: &Path) {
+        let file_name = base.file_name().and_then(|n| n.to_str());
+        let is_config = file_name.is_some_and(|n| n == ".config");
+        let is_local = file_name.is_some_and(|n| n == ".local");
+        let is_share = Self::is_local_share_root(base);
+        let is_app_support = file_name.is_some_and(|n| n == "Application Support");
+        let is_roaming = Self::is_appdata_roaming(base);
+        let is_opencode = file_name.is_some_and(|n| n == "opencode");
+
+        if base.extension().is_some_and(|ext| ext == "db") {
+            out.push(base.to_path_buf());
+        } else {
+            out.push(base.join("opencode.db"));
+        }
+
+        if is_opencode {
+            out.push(base.join("opencode.db"));
+        }
+
+        // Treat base as an XDG-style root for opencode data.
+        out.push(base.join("opencode/opencode.db"));
+
+        if is_local {
+            out.push(base.join("share/opencode/opencode.db"));
+        }
+
+        if !(is_config || is_local || is_share || is_app_support || is_roaming || is_opencode) {
+            out.push(base.join(".local/share/opencode/opencode.db"));
+            out.push(base.join(".config/opencode/opencode.db"));
+            out.push(base.join("Library/Application Support/opencode/opencode.db"));
+            out.push(base.join("AppData/Roaming/opencode/opencode.db"));
+        }
+    }
+
+    fn append_explicit_storage_candidates(out: &mut Vec<PathBuf>, base: &Path) {
+        let file_name = base.file_name().and_then(|n| n.to_str());
+        let is_config = file_name.is_some_and(|n| n == ".config");
+        let is_local = file_name.is_some_and(|n| n == ".local");
+        let is_share = Self::is_local_share_root(base);
+        let is_app_support = file_name.is_some_and(|n| n == "Application Support");
+        let is_roaming = Self::is_appdata_roaming(base);
+        let is_opencode = file_name.is_some_and(|n| n == "opencode");
+
+        out.push(base.join("opencode/storage"));
+
+        if is_opencode {
+            out.push(base.join("storage"));
+        }
+
+        if is_local {
+            out.push(base.join("share/opencode/storage"));
+        }
+
+        if !(is_config || is_local || is_share || is_app_support || is_roaming || is_opencode) {
+            out.push(base.join(".local/share/opencode/storage"));
+            out.push(base.join(".config/opencode/storage"));
+            out.push(base.join("Library/Application Support/opencode/storage"));
+            out.push(base.join("AppData/Roaming/opencode/storage"));
+        }
+    }
+
     /// Extract sessions from OpenCode's SQLite database (v1.2+).
     ///
     /// Schema: session(id, title, directory, project_id, time_created, time_updated),
@@ -522,17 +597,7 @@ impl Connector for OpenCodeConnector {
 
         if !ctx.use_default_detection() {
             for scan_root in &ctx.scan_roots {
-                if scan_root.path.extension().is_some_and(|ext| ext == "db") {
-                    db_candidates.push(scan_root.path.clone());
-                }
-                db_candidates.push(scan_root.path.join("opencode.db"));
-                db_candidates.push(scan_root.path.join(".local/share/opencode/opencode.db"));
-                db_candidates.push(scan_root.path.join(".config/opencode/opencode.db"));
-                db_candidates.push(
-                    scan_root
-                        .path
-                        .join("Library/Application Support/opencode/opencode.db"),
-                );
+                Self::append_explicit_db_candidates(&mut db_candidates, &scan_root.path);
             }
         }
 
@@ -586,21 +651,8 @@ impl Connector for OpenCodeConnector {
                 storage_roots.push(ctx.data_dir.clone());
             }
             for scan_root in &ctx.scan_roots {
-                let mut candidates = vec![
-                    scan_root.path.clone(),
-                    scan_root.path.join(".local/share/opencode/storage"),
-                    scan_root.path.join(".config/opencode/storage"),
-                    scan_root
-                        .path
-                        .join("Library/Application Support/opencode/storage"),
-                ];
-                if scan_root
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name == "opencode")
-                {
-                    candidates.push(scan_root.path.join("storage"));
-                }
+                let mut candidates = vec![scan_root.path.clone()];
+                Self::append_explicit_storage_candidates(&mut candidates, &scan_root.path);
                 for candidate in candidates {
                     if candidate.exists() && looks_like_opencode_storage(&candidate) {
                         storage_roots.push(candidate);
@@ -3170,6 +3222,58 @@ mod tests {
             "explicit scan_roots must still check ctx.data_dir for opencode.db"
         );
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-roots"));
+    }
+
+    #[test]
+    fn scan_finds_sqlite_db_with_explicit_config_root() {
+        use crate::connectors::scan::ScanRoot;
+
+        let dir = TempDir::new().unwrap();
+        let config_root = dir.path().join(".config");
+        let opencode_dir = config_root.join("opencode");
+        std::fs::create_dir_all(&opencode_dir).unwrap();
+
+        let db_path = create_test_sqlite_db(&opencode_dir);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            [
+                "sess-config",
+                "proj-config",
+                "Config Session",
+                "/home/user/config",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            [
+                "msg-config",
+                "sess-config",
+                r#"{"role":"user","time":{"created":1700000000000}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            [
+                "part-config",
+                "msg-config",
+                "sess-config",
+                r#"{"type":"text","text":"Config content"}"#,
+            ],
+        )
+        .unwrap();
+
+        let connector = OpenCodeConnector::new();
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(config_root)],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-config"));
     }
 
     /// Regression: when `ctx.data_dir` points directly at an

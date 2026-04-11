@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -90,12 +90,108 @@ impl AmpConnector {
     }
 
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        let file_name = base.file_name().and_then(|n| n.to_str());
+        let is_config = file_name.is_some_and(|n| n == ".config");
+        let is_local = file_name.is_some_and(|n| n == ".local");
+        let is_share = file_name.is_some_and(|n| n == "share")
+            && base
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".local"));
+        let is_app_support = file_name.is_some_and(|n| n == "Application Support");
+        let is_appdata_roaming = file_name.is_some_and(|n| n == "Roaming")
+            && base
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == "AppData"));
+        let is_code_variant =
+            file_name.is_some_and(|n| n == "Code" || n == "Code - Insiders" || n == "VSCodium");
+        let is_user = file_name.is_some_and(|n| n == "User");
+        let is_global_storage = file_name.is_some_and(|n| n == "globalStorage");
+
         if Self::looks_like_root(base) {
             roots.push(base.to_path_buf());
         }
 
-        if base.file_name().is_some_and(|n| n == "globalStorage") {
+        if is_global_storage {
             let candidate = base.join("sourcegraph.amp");
+            if Self::looks_like_root(&candidate) {
+                roots.push(candidate);
+            }
+        }
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+
+        if is_config {
+            candidates.push(base.join("Code/User/globalStorage/sourcegraph.amp"));
+            candidates.push(base.join("Code - Insiders/User/globalStorage/sourcegraph.amp"));
+            candidates.push(base.join("VSCodium/User/globalStorage/sourcegraph.amp"));
+        }
+
+        if is_app_support {
+            candidates.push(base.join("amp"));
+            candidates.push(base.join("Code/User/globalStorage/sourcegraph.amp"));
+            candidates.push(base.join("Code - Insiders/User/globalStorage/sourcegraph.amp"));
+            candidates.push(base.join("VSCodium/User/globalStorage/sourcegraph.amp"));
+        }
+
+        if is_appdata_roaming {
+            candidates.push(base.join("amp"));
+            candidates.push(base.join("Code/User/globalStorage/sourcegraph.amp"));
+            candidates.push(base.join("Code - Insiders/User/globalStorage/sourcegraph.amp"));
+            candidates.push(base.join("VSCodium/User/globalStorage/sourcegraph.amp"));
+        }
+
+        if is_code_variant {
+            candidates.push(base.join("User/globalStorage/sourcegraph.amp"));
+        }
+
+        if is_user {
+            candidates.push(base.join("globalStorage/sourcegraph.amp"));
+        }
+
+        if is_local {
+            candidates.push(base.join("share/amp"));
+        }
+
+        if is_share {
+            candidates.push(base.join("amp"));
+        }
+
+        if !(is_config
+            || is_local
+            || is_share
+            || is_app_support
+            || is_appdata_roaming
+            || is_code_variant
+            || is_user
+            || is_global_storage)
+        {
+            candidates.push(base.join(".local/share/amp"));
+            candidates.push(base.join("Library/Application Support/amp"));
+            candidates.push(base.join("AppData/Roaming/amp"));
+            candidates.push(base.join(".config/Code/User/globalStorage/sourcegraph.amp"));
+            candidates
+                .push(base.join(".config/Code - Insiders/User/globalStorage/sourcegraph.amp"));
+            candidates.push(base.join(".config/VSCodium/User/globalStorage/sourcegraph.amp"));
+            candidates.push(
+                base.join("Library/Application Support/Code/User/globalStorage/sourcegraph.amp"),
+            );
+            candidates.push(base.join(
+                "Library/Application Support/Code - Insiders/User/globalStorage/sourcegraph.amp",
+            ));
+            candidates.push(
+                base.join(
+                    "Library/Application Support/VSCodium/User/globalStorage/sourcegraph.amp",
+                ),
+            );
+            candidates.push(base.join("AppData/Roaming/Code/User/globalStorage/sourcegraph.amp"));
+            candidates.push(
+                base.join("AppData/Roaming/Code - Insiders/User/globalStorage/sourcegraph.amp"),
+            );
+            candidates
+                .push(base.join("AppData/Roaming/VSCodium/User/globalStorage/sourcegraph.amp"));
+        }
+
+        for candidate in candidates {
             if Self::looks_like_root(&candidate) {
                 roots.push(candidate);
             }
@@ -122,44 +218,6 @@ impl Connector for AmpConnector {
         } else {
             let mut explicit_roots: Vec<PathBuf> = Vec::new();
             for scan_root in &ctx.scan_roots {
-                let candidates = [
-                    scan_root.path.clone(),
-                    scan_root.path.join(".local/share/amp"),
-                    scan_root.path.join("Library/Application Support/amp"),
-                    scan_root.path.join("AppData/Roaming/amp"),
-                    scan_root
-                        .path
-                        .join(".config/Code/User/globalStorage/sourcegraph.amp"),
-                    scan_root
-                        .path
-                        .join(".config/Code - Insiders/User/globalStorage/sourcegraph.amp"),
-                    scan_root
-                        .path
-                        .join(".config/VSCodium/User/globalStorage/sourcegraph.amp"),
-                    scan_root.path.join(
-                        "Library/Application Support/Code/User/globalStorage/sourcegraph.amp",
-                    ),
-                    scan_root.path.join(
-                        "Library/Application Support/Code - Insiders/User/globalStorage/sourcegraph.amp",
-                    ),
-                    scan_root
-                        .path
-                        .join("Library/Application Support/VSCodium/User/globalStorage/sourcegraph.amp"),
-                    scan_root
-                        .path
-                        .join("AppData/Roaming/Code/User/globalStorage/sourcegraph.amp"),
-                    scan_root.path.join(
-                        "AppData/Roaming/Code - Insiders/User/globalStorage/sourcegraph.amp",
-                    ),
-                    scan_root
-                        .path
-                        .join("AppData/Roaming/VSCodium/User/globalStorage/sourcegraph.amp"),
-                ];
-                for candidate in candidates {
-                    if Self::looks_like_root(&candidate) {
-                        explicit_roots.push(candidate);
-                    }
-                }
                 Self::append_explicit_roots(&mut explicit_roots, &scan_root.path);
             }
             if explicit_roots.is_empty() {
@@ -1452,6 +1510,32 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages[0].role, "human");
         assert_eq!(convs[0].messages[1].role, "assistantMsg");
+    }
+
+    #[test]
+    fn scan_with_explicit_local_share_root_finds_amp_cache() {
+        let dir = TempDir::new().unwrap();
+        let local_share = dir.path().join(".local/share");
+        let amp_dir = local_share.join("amp");
+        fs::create_dir_all(&amp_dir).unwrap();
+
+        let content = json!({
+            "messages": [
+                {"role": "user", "content": "Hello from XDG"}
+            ]
+        });
+        fs::write(amp_dir.join("thread.json"), content.to_string()).unwrap();
+
+        let connector = AmpConnector::new();
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass"),
+            vec![ScanRoot::local(local_share)],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "Hello from XDG");
     }
 
     #[test]
