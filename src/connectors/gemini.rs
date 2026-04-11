@@ -266,18 +266,26 @@ fn scan_gemini_with_callback(
         }
     } else {
         let mut explicit = Vec::new();
+        let mut add_explicit = |path: &PathBuf| {
+            if looks_like_root(path) {
+                explicit.push(path.clone());
+            }
+            if path.file_name().is_some_and(|n| n == ".gemini") {
+                let candidate = path.join("tmp");
+                if looks_like_root(&candidate) {
+                    explicit.push(candidate);
+                }
+            }
+        };
+
         for scan_root in &ctx.scan_roots {
             let candidate = scan_root.path.join(".gemini/tmp");
             if looks_like_root(&candidate) {
                 explicit.push(candidate);
             }
-            if looks_like_root(&scan_root.path) {
-                explicit.push(scan_root.path.clone());
-            }
+            add_explicit(&scan_root.path);
         }
-        if looks_like_root(&ctx.data_dir) {
-            explicit.push(ctx.data_dir.clone());
-        }
+        add_explicit(&ctx.data_dir);
         if explicit.is_empty() {
             return Ok(());
         }
@@ -943,6 +951,36 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].source_path, session_path);
         assert_eq!(convs[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn scan_with_gemini_root_scan_root() {
+        let tmp = TempDir::new().unwrap();
+        let gemini_root = tmp.path().join(".gemini");
+        let chats_dir = gemini_root.join("tmp").join("hash").join("chats");
+        fs::create_dir_all(&chats_dir).unwrap();
+
+        let session_json = r#"{
+            "sessionId": "session-root",
+            "messages": [
+                {"type": "user", "content": "Hello Gemini!", "timestamp": "2026-01-15T08:41:26.974Z"},
+                {"type": "model", "content": "Hello! How can I help?", "timestamp": "2026-01-15T08:41:30.000Z"}
+            ]
+        }"#;
+        fs::write(chats_dir.join("session-1.json"), session_json).unwrap();
+
+        let connector = GeminiConnector::new();
+        let ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![crate::connectors::scan::ScanRoot::local(
+                gemini_root.clone(),
+            )],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("session-root"));
     }
 
     #[test]

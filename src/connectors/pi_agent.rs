@@ -98,6 +98,34 @@ impl PiAgentConnector {
         out
     }
 
+    fn append_explicit_homes(
+        homes: &mut Vec<PathBuf>,
+        base: &Path,
+        looks_like_root: &impl Fn(&PathBuf) -> bool,
+    ) {
+        if base.file_name().is_some_and(|n| n == ".pi") {
+            let agent = base.join("agent");
+            if looks_like_root(&agent) {
+                homes.push(agent.clone());
+            }
+            let sessions = agent.join("sessions");
+            if looks_like_root(&sessions) {
+                homes.push(sessions);
+            }
+        }
+
+        if base.file_name().is_some_and(|n| n == ".omp") {
+            let agent = base.join("agent");
+            if looks_like_root(&agent) {
+                homes.push(agent.clone());
+            }
+            let sessions = agent.join("sessions");
+            if looks_like_root(&sessions) {
+                homes.push(sessions);
+            }
+        }
+    }
+
     /// Flatten pi-agent message content to a searchable string.
     /// Handles the message.content array which can contain:
     /// - TextContent: {type: "text", text: "..."}
@@ -213,6 +241,7 @@ impl Connector for PiAgentConnector {
             if looks_like_root(&ctx.data_dir) {
                 homes.push(ctx.data_dir.clone());
             }
+            Self::append_explicit_homes(&mut homes, &ctx.data_dir, &looks_like_root);
             for scan_root in &ctx.scan_roots {
                 let candidates = [
                     scan_root.path.clone(),
@@ -226,6 +255,7 @@ impl Connector for PiAgentConnector {
                         homes.push(candidate);
                     }
                 }
+                Self::append_explicit_homes(&mut homes, &scan_root.path, &looks_like_root);
             }
         }
         // Normalize file-shaped homes (e.g. pointing directly at a .jsonl)
@@ -1638,6 +1668,27 @@ mod tests {
             sources.contains("From Oh My Pi"),
             "must include ~/.omp/agent session, found: {sources:?}"
         );
+    }
+
+    #[test]
+    fn scan_with_pi_root_scan_root() {
+        let sandbox = TempDir::new().unwrap();
+        let pi_root = sandbox.path().join(".pi");
+        let sessions = pi_root.join("agent").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("2025-12-01T10-00-00_root-uuid.jsonl"),
+            r#"{"type":"session","id":"sess-root","timestamp":"2025-12-01T10:00:00Z","cwd":"/home/user/root","provider":"anthropic","modelId":"claude-3-opus"}
+{"type":"message","timestamp":"2025-12-01T10:00:01Z","message":{"role":"user","content":"From .pi root"}}"#,
+        )
+        .unwrap();
+
+        let connector = PiAgentConnector::new();
+        let ctx = ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(pi_root)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "From .pi root");
     }
 
     /// Regression: `default_homes_from(None)` must return an empty vec
