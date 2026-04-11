@@ -71,6 +71,26 @@ impl KimiConnector {
         path_str.contains(".kimi") && path_str.contains("sessions")
     }
 
+    fn append_kimi_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if looks_like_kimi_storage(base) {
+            roots.push(base.to_path_buf());
+            return;
+        }
+
+        if base.file_name().is_some_and(|name| name == ".kimi") {
+            let candidate = base.join("sessions");
+            if candidate.exists() {
+                roots.push(candidate);
+            }
+            return;
+        }
+
+        let candidate = base.join(".kimi/sessions");
+        if candidate.exists() {
+            roots.push(candidate);
+        }
+    }
+
     /// Find all wire.jsonl files under a root.
     fn wire_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
@@ -112,17 +132,11 @@ impl Connector for KimiConnector {
             }
         } else {
             for scan_root in &ctx.scan_roots {
-                let kimi_path = scan_root.path.join(".kimi/sessions");
-                if kimi_path.exists() {
-                    roots.push(kimi_path);
-                }
-                if Self::looks_like_kimi_storage(&scan_root.path) {
-                    roots.push(scan_root.path.clone());
-                }
+                Self::append_kimi_roots(&mut roots, &scan_root.path);
             }
 
-            if Self::looks_like_kimi_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                roots.push(ctx.data_dir.clone());
+            if ctx.data_dir.exists() {
+                Self::append_kimi_roots(&mut roots, &ctx.data_dir);
             }
         }
 
@@ -560,6 +574,27 @@ mod tests {
             .filter_map(|c| c.external_id.as_deref())
             .collect();
         assert_eq!(ids, vec!["sess-a", "sess-b"]);
+    }
+
+    #[test]
+    fn scan_with_explicit_root_at_kimi_dir() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_kimi_storage(&dir);
+
+        let lines = vec![
+            r#"{"type": "metadata", "protocol_version": "1.3"}"#,
+            r#"{"timestamp": 1772857971.158, "message": {"type": "TurnBegin", "payload": {"role": "human", "content": "Hello Kimi"}}}"#,
+        ];
+        write_wire_file(&storage, "abc123", "sess-001", &lines);
+
+        let kimi_dir = dir.path().join(".kimi");
+
+        let connector = KimiConnector::new();
+        let ctx = ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(kimi_dir)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id, Some("sess-001".to_string()));
     }
 
     #[test]

@@ -51,6 +51,26 @@ impl QwenConnector {
         path_str.contains(".qwen") && path_str.contains("tmp")
     }
 
+    fn append_qwen_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if Self::looks_like_qwen_storage(base) {
+            roots.push(base.to_path_buf());
+            return;
+        }
+
+        if base.file_name().is_some_and(|name| name == ".qwen") {
+            let candidate = base.join("tmp");
+            if candidate.exists() {
+                roots.push(candidate);
+            }
+            return;
+        }
+
+        let candidate = base.join(".qwen/tmp");
+        if candidate.exists() {
+            roots.push(candidate);
+        }
+    }
+
     /// Find all session-*.json files under a root.
     fn session_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
@@ -92,17 +112,11 @@ impl Connector for QwenConnector {
             }
         } else {
             for scan_root in &ctx.scan_roots {
-                let qwen_path = scan_root.path.join(".qwen/tmp");
-                if qwen_path.exists() {
-                    roots.push(qwen_path);
-                }
-                if Self::looks_like_qwen_storage(&scan_root.path) {
-                    roots.push(scan_root.path.clone());
-                }
+                Self::append_qwen_roots(&mut roots, &scan_root.path);
             }
 
-            if Self::looks_like_qwen_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                roots.push(ctx.data_dir.clone());
+            if ctx.data_dir.exists() {
+                Self::append_qwen_roots(&mut roots, &ctx.data_dir);
             }
         }
 
@@ -427,6 +441,32 @@ mod tests {
             .filter_map(|c| c.external_id.as_deref())
             .collect();
         assert_eq!(ids, vec!["sess-a", "sess-b"]);
+    }
+
+    #[test]
+    fn scan_with_explicit_root_at_qwen_dir() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_qwen_storage(&dir);
+
+        let session_json = r#"{
+            "sessionId": "sess-001",
+            "projectHash": "hash-001",
+            "startTime": "2025-11-08T23:19:10.138Z",
+            "lastUpdated": "2025-11-08T23:19:13.706Z",
+            "messages": [
+                { "id": "msg-001", "timestamp": "2025-11-08T23:19:10.138Z", "type": "user", "content": "Hello Qwen" }
+            ]
+        }"#;
+        write_session_file(&storage, "hash-001", "session-001.json", session_json);
+
+        let qwen_dir = dir.path().join(".qwen");
+
+        let connector = QwenConnector::new();
+        let ctx = ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(qwen_dir)], None);
+
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id, Some("sess-001".to_string()));
     }
 
     #[test]

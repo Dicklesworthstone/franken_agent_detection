@@ -57,6 +57,26 @@ impl FactoryConnector {
             None
         }
     }
+
+    fn append_factory_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if looks_like_factory_storage(base) {
+            roots.push(base.to_path_buf());
+            return;
+        }
+
+        if base.file_name().is_some_and(|name| name == ".factory") {
+            let candidate = base.join("sessions");
+            if candidate.exists() {
+                roots.push(candidate);
+            }
+            return;
+        }
+
+        let candidate = base.join(".factory/sessions");
+        if candidate.exists() {
+            roots.push(candidate);
+        }
+    }
 }
 
 impl Connector for FactoryConnector {
@@ -78,17 +98,11 @@ impl Connector for FactoryConnector {
             }
         } else {
             for scan_root in &ctx.scan_roots {
-                let factory_path = scan_root.path.join(".factory/sessions");
-                if factory_path.exists() {
-                    roots.push(factory_path);
-                }
-                if looks_like_factory_storage(&scan_root.path) {
-                    roots.push(scan_root.path.clone());
-                }
+                Self::append_factory_roots(&mut roots, &scan_root.path);
             }
 
-            if looks_like_factory_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                roots.push(ctx.data_dir.clone());
+            if ctx.data_dir.exists() {
+                Self::append_factory_roots(&mut roots, &ctx.data_dir);
             }
         }
 
@@ -477,6 +491,27 @@ mod tests {
             .filter_map(|c| c.external_id.as_deref())
             .collect();
         assert_eq!(ids, vec!["sess-a", "sess-b"]);
+    }
+
+    #[test]
+    fn scan_with_explicit_root_at_factory_dir() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_factory_storage(&dir);
+
+        let lines = vec![
+            r#"{"type":"session_start","id":"sess-001","title":"Test Session","owner":"testuser","cwd":"/home/user/project"}"#,
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Hello Factory"}}"#,
+        ];
+        write_session_file(&storage, "-home-user-project", "sess-001", &lines);
+
+        let factory_dir = dir.path().join(".factory");
+
+        let connector = FactoryConnector::new();
+        let ctx = ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(factory_dir)], None);
+
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id, Some("sess-001".to_string()));
     }
 
     #[test]
