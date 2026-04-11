@@ -10,6 +10,7 @@
 //! - `context.jsonl` — context/conversation data
 //! - `state.json` — session state
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -98,50 +99,69 @@ impl Connector for KimiConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let root = if ctx.use_default_detection() {
+        let mut roots: Vec<PathBuf> = Vec::new();
+
+        if ctx.use_default_detection() {
             if Self::looks_like_kimi_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                ctx.data_dir.clone()
-            } else {
-                let r = Self::sessions_root();
-                if r.exists() {
-                    r
-                } else {
-                    return Ok(Vec::new());
-                }
+                roots.push(ctx.data_dir.clone());
+            }
+
+            let fallback = Self::sessions_root();
+            if fallback.exists() {
+                roots.push(fallback);
             }
         } else {
-            let kimi_root = ctx.scan_roots.iter().find_map(|sr| {
-                let kimi_path = sr.path.join(".kimi/sessions");
+            for scan_root in &ctx.scan_roots {
+                let kimi_path = scan_root.path.join(".kimi/sessions");
                 if kimi_path.exists() {
-                    Some(kimi_path)
-                } else if Self::looks_like_kimi_storage(&sr.path) {
-                    Some(sr.path.clone())
-                } else {
-                    None
+                    roots.push(kimi_path);
                 }
-            });
-            match kimi_root {
-                Some(r) => r,
-                None => return Ok(Vec::new()),
+                if Self::looks_like_kimi_storage(&scan_root.path) {
+                    roots.push(scan_root.path.clone());
+                }
             }
-        };
 
-        if !root.exists() {
+            if Self::looks_like_kimi_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+                roots.push(ctx.data_dir.clone());
+            }
+        }
+
+        if roots.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut convs = Vec::new();
+        roots.sort();
+        roots.dedup();
 
-        for wire_path in Self::wire_files(&root) {
-            if !file_modified_since(&wire_path, ctx.since_ts) {
+        let mut convs = Vec::new();
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+
+        for root in roots {
+            if !root.exists() {
                 continue;
             }
 
-            match parse_kimi_session(&wire_path) {
-                Ok(Some(conv)) => convs.push(conv),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!(path = %wire_path.display(), error = %e, "kimi parse error");
+            for wire_path in Self::wire_files(&root) {
+                let canonical =
+                    std::fs::canonicalize(&wire_path).unwrap_or_else(|_| wire_path.clone());
+                if !seen_files.insert(canonical) {
+                    continue;
+                }
+
+                if !file_modified_since(&wire_path, ctx.since_ts) {
+                    continue;
+                }
+
+                match parse_kimi_session(&wire_path) {
+                    Ok(Some(conv)) => convs.push(conv),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            path = %wire_path.display(),
+                            error = %e,
+                            "kimi parse error"
+                        );
+                    }
                 }
             }
         }
@@ -421,8 +441,10 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
 
 #[cfg(test)]
 mod tests {
+    use super::scan::ScanRoot;
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     // =========================================================================
@@ -500,6 +522,44 @@ mod tests {
                 .content
                 .contains("Hello! How can I help")
         );
+    }
+
+    #[test]
+    fn scan_with_explicit_roots_scans_all_roots() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let storage_a = create_kimi_storage(&dir_a);
+        let storage_b = create_kimi_storage(&dir_b);
+
+        let lines_a = vec![
+            r#"{"timestamp": 1772857971.0, "message": {"type": "TurnBegin", "payload": {"role": "human", "content": "Hello A"}}}"#,
+            r#"{"timestamp": 1772857980.0, "message": {"type": "ContentPart", "payload": {"content": "Hi A"}}}"#,
+        ];
+        let lines_b = vec![
+            r#"{"timestamp": 1772857972.0, "message": {"type": "TurnBegin", "payload": {"role": "human", "content": "Hello B"}}}"#,
+            r#"{"timestamp": 1772857981.0, "message": {"type": "ContentPart", "payload": {"content": "Hi B"}}}"#,
+        ];
+
+        write_wire_file(&storage_a, "work-a", "sess-a", &lines_a);
+        write_wire_file(&storage_b, "work-b", "sess-b", &lines_b);
+
+        let connector = KimiConnector::new();
+        let ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![
+                ScanRoot::local(dir_a.path().to_path_buf()),
+                ScanRoot::local(dir_b.path().to_path_buf()),
+            ],
+            None,
+        );
+
+        let mut convs = connector.scan(&ctx).unwrap();
+        convs.sort_by(|a, b| a.external_id.cmp(&b.external_id));
+        let ids: Vec<_> = convs
+            .iter()
+            .filter_map(|c| c.external_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec!["sess-a", "sess-b"]);
     }
 
     #[test]
