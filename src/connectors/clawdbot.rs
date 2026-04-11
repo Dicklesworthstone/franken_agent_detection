@@ -66,6 +66,19 @@ impl ClawdbotConnector {
         out.sort();
         out
     }
+
+    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if base.exists() && Self::looks_like_clawdbot_storage(base) {
+            roots.push(base.to_path_buf());
+        }
+
+        if base.file_name().is_some_and(|n| n == ".clawdbot") {
+            let sessions = base.join("sessions");
+            if sessions.exists() {
+                roots.push(sessions);
+            }
+        }
+    }
 }
 
 impl Connector for ClawdbotConnector {
@@ -91,9 +104,8 @@ impl Connector for ClawdbotConnector {
                 let candidate = root.path.join(".clawdbot").join("sessions");
                 if candidate.exists() {
                     roots.push(candidate);
-                } else if Self::looks_like_clawdbot_storage(&root.path) && root.path.exists() {
-                    roots.push(root.path.clone());
                 }
+                Self::append_explicit_roots(&mut roots, &root.path);
             }
         }
 
@@ -237,6 +249,7 @@ impl Connector for ClawdbotConnector {
 
 #[cfg(test)]
 mod tests {
+    use super::scan::ScanRoot;
     use super::*;
     use tempfile::TempDir;
 
@@ -298,6 +311,29 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].role, "user");
+    }
+
+    #[test]
+    fn scan_with_clawdbot_root_scan_root() {
+        let tmp = TempDir::new().unwrap();
+        let clawdbot_root = tmp.path().join(".clawdbot");
+        let sessions = clawdbot_root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        write_session(
+            &sessions,
+            "root.jsonl",
+            &[r#"{"role":"user","content":"From root","timestamp":1700000000000}"#],
+        );
+
+        let connector = ClawdbotConnector::new();
+        let ctx =
+            ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(clawdbot_root)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "From root");
     }
 
     #[test]

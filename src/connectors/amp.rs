@@ -78,6 +78,29 @@ impl AmpConnector {
         roots.extend(Self::vscode_global_storage());
         roots
     }
+
+    fn looks_like_root(path: &Path) -> bool {
+        (path.is_file() && is_amp_log_file(path))
+            || path
+                .file_name()
+                .is_some_and(|n| n.to_str().unwrap_or("").contains("amp"))
+            || std::fs::read_dir(path)
+                .map(|mut d| d.any(|e| e.ok().is_some_and(|e| is_amp_log_file(&e.path()))))
+                .unwrap_or(false)
+    }
+
+    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if Self::looks_like_root(base) {
+            roots.push(base.to_path_buf());
+        }
+
+        if base.file_name().is_some_and(|n| n == "globalStorage") {
+            let candidate = base.join("sourcegraph.amp");
+            if Self::looks_like_root(&candidate) {
+                roots.push(candidate);
+            }
+        }
+    }
 }
 
 impl Connector for AmpConnector {
@@ -89,19 +112,9 @@ impl Connector for AmpConnector {
         let mut convs = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
-        let looks_like_root = |path: &PathBuf| {
-            (path.is_file() && is_amp_log_file(path))
-                || path
-                    .file_name()
-                    .is_some_and(|n| n.to_str().unwrap_or("").contains("amp"))
-                || std::fs::read_dir(path)
-                    .map(|mut d| d.any(|e| e.ok().is_some_and(|e| is_amp_log_file(&e.path()))))
-                    .unwrap_or(false)
-        };
-
         // allow tests to override via ctx.data_dir
         let roots = if ctx.use_default_detection() {
-            if looks_like_root(&ctx.data_dir) {
+            if Self::looks_like_root(&ctx.data_dir) {
                 vec![ctx.data_dir.clone()]
             } else {
                 Self::candidate_roots()
@@ -143,10 +156,11 @@ impl Connector for AmpConnector {
                         .join("AppData/Roaming/VSCodium/User/globalStorage/sourcegraph.amp"),
                 ];
                 for candidate in candidates {
-                    if looks_like_root(&candidate) {
+                    if Self::looks_like_root(&candidate) {
                         explicit_roots.push(candidate);
                     }
                 }
+                Self::append_explicit_roots(&mut explicit_roots, &scan_root.path);
             }
             if explicit_roots.is_empty() {
                 return Ok(Vec::new());
@@ -437,6 +451,7 @@ fn looks_like_uuid(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::scan::ScanRoot;
     use super::*;
     use serde_json::json;
     use std::fs;
@@ -544,6 +559,30 @@ mod tests {
         assert!(!looks_like_uuid("01872a67-152b-46af-a1af-4de6fce3d2b")); // too short
         assert!(!looks_like_uuid("01872a67-152b-46af-a1af-4de6fce3d2b33")); // too long
         assert!(!looks_like_uuid("0187zzzz-152b-46af-a1af-4de6fce3d2b3")); // non-hex
+    }
+
+    #[test]
+    fn scan_with_global_storage_scan_root() {
+        let tmp = TempDir::new().unwrap();
+        let global_storage = tmp.path().join("globalStorage");
+        let amp_root = global_storage.join("sourcegraph.amp");
+        fs::create_dir_all(&amp_root).unwrap();
+
+        let log = json!({
+            "messages": [
+                {"role": "user", "content": "Hello Amp", "created_at": 1700000000000_i64}
+            ]
+        });
+        fs::write(amp_root.join("conversation.json"), log.to_string()).unwrap();
+
+        let connector = AmpConnector::new();
+        let ctx =
+            ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(global_storage)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "Hello Amp");
     }
 
     // =====================================================
