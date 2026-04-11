@@ -140,6 +140,35 @@ impl GooseConnector {
         None
     }
 
+    fn append_db_candidates(db_paths: &mut Vec<PathBuf>, base: &Path) {
+        if base.extension().is_some_and(|ext| ext == "db") {
+            db_paths.push(base.to_path_buf());
+        }
+
+        db_paths.push(base.join("sessions.db"));
+        db_paths.push(base.join("sessions").join("sessions.db"));
+        db_paths.push(base.join(".local/share/goose/sessions/sessions.db"));
+        db_paths.push(base.join(".goose/sessions/sessions.db"));
+    }
+
+    fn append_session_roots(session_roots: &mut Vec<PathBuf>, base: &Path) {
+        if looks_like_goose_sessions(base) {
+            session_roots.push(base.to_path_buf());
+        }
+
+        let candidates = [
+            base.join("sessions"),
+            base.join(".local/share/goose/sessions"),
+            base.join(".goose/sessions"),
+        ];
+
+        for candidate in candidates {
+            if candidate.exists() && looks_like_goose_sessions(&candidate) {
+                session_roots.push(candidate);
+            }
+        }
+    }
+
     /// Extract sessions from Goose's SQLite database (v1.20+).
     ///
     /// Schema:
@@ -429,16 +458,7 @@ impl Connector for GooseConnector {
             }
         } else {
             for scan_root in &ctx.scan_roots {
-                if scan_root.path.extension().is_some_and(|ext| ext == "db") {
-                    db_paths.push(scan_root.path.clone());
-                }
-                db_paths.push(scan_root.path.join("sessions.db"));
-                db_paths.push(
-                    scan_root
-                        .path
-                        .join(".local/share/goose/sessions/sessions.db"),
-                );
-                db_paths.push(scan_root.path.join(".goose/sessions/sessions.db"));
+                Self::append_db_candidates(&mut db_paths, &scan_root.path);
             }
         }
 
@@ -479,21 +499,11 @@ impl Connector for GooseConnector {
                 session_roots.push(dir);
             }
         } else {
-            if ctx.data_dir.exists() && looks_like_goose_sessions(&ctx.data_dir) {
-                session_roots.push(ctx.data_dir.clone());
+            if ctx.data_dir.exists() {
+                Self::append_session_roots(&mut session_roots, &ctx.data_dir);
             }
             for scan_root in &ctx.scan_roots {
-                let candidates = [
-                    scan_root.path.clone(),
-                    scan_root.path.join(".local/share/goose/sessions"),
-                    scan_root.path.join(".goose/sessions"),
-                    scan_root.path.join(".goose"),
-                ];
-                for candidate in candidates {
-                    if candidate.exists() && looks_like_goose_sessions(&candidate) {
-                        session_roots.push(candidate);
-                    }
-                }
+                Self::append_session_roots(&mut session_roots, &scan_root.path);
             }
         }
 
@@ -860,9 +870,11 @@ fn parse_goose_jsonl(path: &Path, session_id: &str) -> Result<NormalizedConversa
 
 #[cfg(test)]
 mod tests {
+    use super::scan::{ScanContext, ScanRoot};
     use super::*;
     use serde_json::json;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     // =====================================================
@@ -907,6 +919,26 @@ mod tests {
     fn looks_like_goose_sessions_empty_dir() {
         let dir = TempDir::new().unwrap();
         assert!(!looks_like_goose_sessions(dir.path()));
+    }
+
+    #[test]
+    fn scan_with_goose_root_scan_root() {
+        let dir = TempDir::new().unwrap();
+        let goose_root = dir.path().join(".goose");
+        let sessions_dir = goose_root.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::write(
+            sessions_dir.join("session1.jsonl"),
+            r#"{"role":"user","content":"hi","created_at":1700000000}"#,
+        )
+        .unwrap();
+
+        let connector = GooseConnector::new();
+        let ctx = ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(goose_root)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("session1"));
     }
 
     // =====================================================

@@ -168,6 +168,37 @@ impl CopilotConnector {
             .any(|pair| pair[0] == "gh" && pair[1] == "copilot")
     }
 
+    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        if base.exists() && Self::looks_like_copilot_storage(base) {
+            roots.push(base.to_path_buf());
+        }
+
+        if base.file_name().is_some_and(|n| n == ".copilot") {
+            let session_state = base.join("session-state");
+            if session_state.exists() {
+                roots.push(session_state);
+            }
+            let history_state = base.join("history-session-state");
+            if history_state.exists() {
+                roots.push(history_state);
+            }
+        }
+
+        if base.file_name().is_some_and(|n| n == "globalStorage") {
+            let copilot_chat = base.join("github.copilot-chat");
+            if copilot_chat.exists() {
+                roots.push(copilot_chat);
+            }
+        }
+
+        if base.file_name().is_some_and(|n| n == "gh") {
+            let gh_copilot = base.join("copilot");
+            if gh_copilot.exists() {
+                roots.push(gh_copilot);
+            }
+        }
+    }
+
     /// Find JSON and JSONL files that may contain conversation data.
     fn find_conversation_files(root: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -915,6 +946,7 @@ impl Connector for CopilotConnector {
         } else {
             // Check scan_roots for copilot directories.
             for scan_root in &ctx.scan_roots {
+                Self::append_explicit_roots(&mut roots, &scan_root.path);
                 // Check common subdirectories within each scan root.
                 let candidates = [
                     // VS Code Copilot Chat paths
@@ -944,11 +976,6 @@ impl Connector for CopilotConnector {
                     if candidate.exists() {
                         roots.push(candidate.clone());
                     }
-                }
-
-                // Also check if the scan root itself is copilot storage.
-                if Self::looks_like_copilot_storage(&scan_root.path) && scan_root.path.exists() {
-                    roots.push(scan_root.path.clone());
                 }
             }
         }
@@ -1006,6 +1033,7 @@ impl Connector for CopilotConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Helper to write a JSON file into a temp directory.
@@ -1296,6 +1324,49 @@ mod tests {
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("remote-001"));
+    }
+
+    #[test]
+    fn scan_with_copilot_root_scan_root() {
+        let tmp = TempDir::new().unwrap();
+        let copilot_root = tmp.path().join(".copilot");
+        let events_dir = copilot_root.join("session-state").join("sess-001");
+
+        let events = r#"{"type":"user.message","session_id":"sess-001","message":"hello"}"#;
+        write_json(&events_dir, "events.jsonl", events);
+
+        let connector = CopilotConnector::new();
+        let ctx =
+            ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(copilot_root)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-001"));
+        assert_eq!(convs[0].metadata["source"], "copilot-cli");
+    }
+
+    #[test]
+    fn scan_with_global_storage_scan_root() {
+        let tmp = TempDir::new().unwrap();
+        let global_storage = tmp.path().join("globalStorage");
+        let copilot_dir = global_storage.join("github.copilot-chat");
+        fs::create_dir_all(&copilot_dir).unwrap();
+
+        let json = r#"[{
+            "id": "global-001",
+            "turns": [
+                {"request": {"message": "hello"}, "response": {"message": "hi"}}
+            ]
+        }]"#;
+        write_json(&copilot_dir, "conversations.json", json);
+
+        let connector = CopilotConnector::new();
+        let ctx =
+            ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(global_storage)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("global-001"));
     }
 
     #[test]

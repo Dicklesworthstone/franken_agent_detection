@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -17,6 +17,8 @@ impl Default for ClineConnector {
         Self::new()
     }
 }
+
+const CLINE_EXTENSIONS: [&str; 2] = ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"];
 
 impl ClineConnector {
     #[must_use]
@@ -46,10 +48,8 @@ impl ClineConnector {
             base.join("Library/Application Support/Cursor/User/globalStorage"),
             base.join("AppData/Roaming/Cursor/User/globalStorage"),
         ];
-        let extensions = ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"];
-
         for root in code_roots.iter().chain(cursor_roots.iter()) {
-            for ext in &extensions {
+            for ext in &CLINE_EXTENSIONS {
                 roots.push(root.join(ext));
             }
         }
@@ -72,6 +72,22 @@ impl ClineConnector {
             path.parent().unwrap_or(path).to_path_buf()
         } else {
             path.to_path_buf()
+        }
+    }
+
+    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+        let base = Self::normalize_root_path(base);
+        if Self::looks_like_storage(&base) {
+            roots.push(base.clone());
+        }
+
+        if base.file_name().is_some_and(|n| n == "globalStorage") {
+            for ext in &CLINE_EXTENSIONS {
+                let candidate = base.join(ext);
+                if candidate.exists() && Self::looks_like_storage(&candidate) {
+                    roots.push(candidate);
+                }
+            }
         }
     }
 
@@ -117,12 +133,12 @@ impl Connector for ClineConnector {
                 Self::storage_roots()
             }
         } else {
-            let explicit: Vec<PathBuf> = ctx
-                .scan_roots
-                .iter()
-                .map(|r| Self::normalize_root_path(&r.path))
-                .filter(|p| Self::looks_like_storage(p))
-                .collect();
+            let mut explicit = Vec::new();
+            for root in &ctx.scan_roots {
+                Self::append_explicit_roots(&mut explicit, &root.path);
+            }
+            explicit.sort();
+            explicit.dedup();
             if explicit.is_empty() {
                 return Ok(Vec::new());
             }
@@ -394,6 +410,28 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].content, "Explicit root");
+    }
+
+    #[test]
+    fn scan_with_global_storage_scan_root() {
+        let dir = TempDir::new().unwrap();
+        let global_storage = dir.path().join("globalStorage");
+        let storage = global_storage.join("saoudrizwan.claude-dev");
+        let task_dir = create_task_dir(&storage, "task-global");
+
+        let messages = json!([{"role": "user", "content": "From globalStorage"}]);
+        fs::write(task_dir.join("ui_messages.json"), messages.to_string()).unwrap();
+
+        let connector = ClineConnector::new();
+        let ctx = ScanContext::with_roots(
+            dir.path().join("not-cline"),
+            vec![ScanRoot::local(global_storage)],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "From globalStorage");
     }
 
     #[test]

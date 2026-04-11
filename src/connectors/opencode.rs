@@ -586,7 +586,7 @@ impl Connector for OpenCodeConnector {
                 storage_roots.push(ctx.data_dir.clone());
             }
             for scan_root in &ctx.scan_roots {
-                let candidates = [
+                let mut candidates = vec![
                     scan_root.path.clone(),
                     scan_root.path.join(".local/share/opencode/storage"),
                     scan_root.path.join(".config/opencode/storage"),
@@ -594,6 +594,13 @@ impl Connector for OpenCodeConnector {
                         .path
                         .join("Library/Application Support/opencode/storage"),
                 ];
+                if scan_root
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == "opencode")
+                {
+                    candidates.push(scan_root.path.join("storage"));
+                }
                 for candidate in candidates {
                     if candidate.exists() && looks_like_opencode_storage(&candidate) {
                         storage_roots.push(candidate);
@@ -1479,6 +1486,56 @@ mod tests {
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].role, "user");
         assert!(convs[0].messages[0].content.contains("Hello, OpenCode!"));
+    }
+
+    #[test]
+    fn scan_with_opencode_root_scan_root() {
+        use crate::connectors::scan::ScanRoot;
+
+        let dir = TempDir::new().unwrap();
+        let storage = create_opencode_storage(&dir);
+
+        let session = json!({
+            "id": "sess-001",
+            "title": "Explicit Root",
+            "directory": "/home/user/project",
+            "projectID": "proj-001",
+            "time": {
+                "created": 1733000000,
+                "updated": 1733000100
+            }
+        });
+        write_session(&storage, "proj-001", &session);
+
+        let message = json!({
+            "id": "msg-001",
+            "role": "user",
+            "sessionID": "sess-001",
+            "time": {
+                "created": 1733000000,
+                "completed": 1733000001
+            }
+        });
+        write_message(&storage, "sess-001", &message);
+
+        let part = json!({
+            "id": "part-001",
+            "messageID": "msg-001",
+            "type": "text",
+            "text": "Hello explicit root!"
+        });
+        write_part(&storage, "msg-001", &part);
+
+        let connector = OpenCodeConnector::new();
+        let ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![ScanRoot::local(dir.path().join("opencode"))],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-001"));
     }
 
     #[test]
