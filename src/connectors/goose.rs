@@ -16,7 +16,7 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use super::scan::ScanContext;
-use super::utils::env_path_nonempty;
+use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -568,9 +568,7 @@ impl Connector for GooseConnector {
                 .collect();
 
             for jsonl_file in jsonl_files {
-                let canonical =
-                    std::fs::canonicalize(&jsonl_file).unwrap_or_else(|_| jsonl_file.clone());
-                if !seen_files.insert(canonical) {
+                if !seen_files.insert(dedupe_path_key(&jsonl_file)) {
                     continue;
                 }
                 if !file_modified_since(&jsonl_file, ctx.since_ts) {

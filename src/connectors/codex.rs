@@ -7,7 +7,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::ScanContext;
-use super::utils::env_path_nonempty;
+use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -285,8 +285,7 @@ fn scan_codex_with_callback(
             .unwrap_or_else(|| CodexConnector::sessions_dir(&home));
 
         for file in files {
-            let canonical = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
-            if !seen_files.insert(canonical) {
+            if !seen_files.insert(dedupe_path_key(&file)) {
                 continue;
             }
             let source_path = file.clone();

@@ -19,7 +19,7 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use super::scan::ScanContext;
-use super::utils::env_path_nonempty;
+use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -694,9 +694,7 @@ impl Connector for OpenCodeConnector {
                 .collect();
 
             for session_file in session_files {
-                let canonical =
-                    std::fs::canonicalize(&session_file).unwrap_or_else(|_| session_file.clone());
-                if !seen_session_files.insert(canonical) {
+                if !seen_session_files.insert(dedupe_path_key(&session_file)) {
                     continue;
                 }
                 if !session_has_updates(&session_file, &message_dir, &part_dir, ctx.since_ts) {

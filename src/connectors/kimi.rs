@@ -22,7 +22,7 @@ use walkdir::WalkDir;
 use super::scan::ScanContext;
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
-    parse_timestamp,
+    parse_timestamp, utils::dedupe_path_key,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -156,9 +156,7 @@ impl Connector for KimiConnector {
             }
 
             for wire_path in Self::wire_files(&root) {
-                let canonical =
-                    std::fs::canonicalize(&wire_path).unwrap_or_else(|_| wire_path.clone());
-                if !seen_files.insert(canonical) {
+                if !seen_files.insert(dedupe_path_key(&wire_path)) {
                     continue;
                 }
 

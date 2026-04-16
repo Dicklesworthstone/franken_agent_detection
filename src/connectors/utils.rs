@@ -19,6 +19,24 @@ pub(crate) fn env_path_nonempty(key: &str) -> Option<PathBuf> {
     env_var_nonempty(key).map(PathBuf::from)
 }
 
+/// Build a deduplication key for hot scan loops without paying the full
+/// `canonicalize()` syscall cost on every ordinary file.
+///
+/// Most indexed session files are not symlinks. A full canonicalization on each
+/// one walks every path component and triggers a storm of `readlink` probes that
+/// dominate no-op incremental scans. We only resolve leaf symlinks here; callers
+/// that need stronger root-level normalization should canonicalize the much
+/// smaller root set separately.
+#[must_use]
+pub(crate) fn dedupe_path_key(path: &std::path::Path) -> PathBuf {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Check if a file was modified since the given timestamp.
 /// Returns true if the file should be processed (modified since timestamp or no timestamp given).
 #[must_use]
@@ -96,6 +114,37 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedupe_path_key;
+
+    #[test]
+    fn dedupe_path_key_keeps_regular_file_paths_stable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("session.jsonl");
+        std::fs::write(&file, "hello").unwrap();
+
+        assert_eq!(dedupe_path_key(&file), file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dedupe_path_key_canonicalizes_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target.jsonl");
+        let link = dir.path().join("link.jsonl");
+        std::fs::write(&target, "hello").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            dedupe_path_key(&link),
+            std::fs::canonicalize(&target).unwrap()
+        );
+    }
 }
 
 /// Flatten content that may be a string or array of content blocks.

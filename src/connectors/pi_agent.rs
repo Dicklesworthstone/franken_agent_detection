@@ -19,7 +19,10 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::ScanContext;
-use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
+use super::{
+    Connector, file_modified_since, franken_detection_for_connector, parse_timestamp,
+    utils::dedupe_path_key,
+};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
 pub struct PiAgentConnector;
@@ -290,7 +293,7 @@ impl Connector for PiAgentConnector {
             for file in files {
                 // Guard against the same session file being reached through
                 // two homes (e.g. a symlink from ~/.pi/agent → ~/.omp/agent).
-                let dedupe_key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+                let dedupe_key = dedupe_path_key(&file);
                 if !seen_session_paths.insert(dedupe_key) {
                     continue;
                 }

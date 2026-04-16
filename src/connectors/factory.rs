@@ -22,7 +22,7 @@ use walkdir::WalkDir;
 use super::scan::ScanContext;
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
-    franken_detection_for_connector, parse_timestamp,
+    franken_detection_for_connector, parse_timestamp, utils::dedupe_path_key,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -132,8 +132,7 @@ impl Connector for FactoryConnector {
                     continue;
                 }
 
-                let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-                if !seen_files.insert(canonical) {
+                if !seen_files.insert(dedupe_path_key(path)) {
                     continue;
                 }
 
