@@ -117,7 +117,7 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod tests {
+mod dedupe_tests {
     use super::dedupe_path_key;
 
     #[test]

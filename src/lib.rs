@@ -581,7 +581,13 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".kimi"]);
         }
         "opencode" => {
+            // The canonical v1.2+ SQLite database. Probed first so diagnostic
+            // output surfaces the data file (not the sibling config directory)
+            // whenever it exists. See cass issue #188 — `~/.config/opencode/`
+            // is the config dir and does NOT hold session data.
+            maybe_push(&mut out, &[".local", "share", "opencode", "opencode.db"]);
             maybe_push(&mut out, &[".local", "share", "opencode"]);
+            maybe_push(&mut out, &[".config", "opencode", "opencode.db"]);
             maybe_push(&mut out, &[".config", "opencode"]);
         }
         "openclaw" => {
@@ -633,7 +639,11 @@ fn detect_roots(
         }
     }
 
-    root_paths.sort();
+    // Preserve probe order — probes are already arranged by priority
+    // (see default_probe_roots), so the first existing root is the most
+    // preferred display path. A lexicographic sort would cause config
+    // directories to shadow data directories — e.g. `.config/opencode`
+    // would mask `.local/share/opencode/opencode.db` (cass issue #188).
     InstalledAgentDetectionEntry {
         slug: slug.to_string(),
         detected,
@@ -1006,7 +1016,12 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 ],
                 "kimi" => vec![tilde(&[".kimi", "sessions"]), tilde(&[".kimi"])],
                 "opencode" => vec![
+                    // Direct path to the v1.2+ SQLite database — probed first
+                    // so display/diagnostics surface the data file (not the
+                    // sibling config dir). See cass issue #188.
+                    tilde(&[".local", "share", "opencode", "opencode.db"]),
                     tilde(&[".local", "share", "opencode"]),
+                    tilde(&[".config", "opencode", "opencode.db"]),
                     tilde(&[".config", "opencode"]),
                 ],
                 "openclaw" => vec![tilde(&[".openclaw", "agents"]), tilde(&[".openclaw"])],

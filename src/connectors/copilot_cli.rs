@@ -225,20 +225,26 @@ impl CopilotCliConnector {
             };
 
             if session_id.is_none() {
-                session_id = event
-                    .get("session_id")
-                    .or_else(|| event.get("sessionId"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+                session_id =
+                    Self::find_nested_str(&event, &["session_id", "sessionId", "sessionID", "id"])
+                        .map(String::from);
             }
 
             if workspace.is_none() {
-                workspace = event
-                    .get("cwd")
-                    .or_else(|| event.get("workingDirectory"))
-                    .or_else(|| event.get("workspace"))
-                    .and_then(|v| v.as_str())
-                    .map(PathBuf::from);
+                workspace = Self::find_nested_str(
+                    &event,
+                    &[
+                        "cwd",
+                        "workingDirectory",
+                        "working_directory",
+                        "workspace",
+                        "workspaceRoot",
+                        "workspace_root",
+                        "projectPath",
+                        "project_path",
+                    ],
+                )
+                .map(PathBuf::from);
             }
 
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -481,10 +487,10 @@ impl CopilotCliConnector {
             None
         };
 
-        // Explicit role field takes precedence.
-        let role = event
-            .get("role")
-            .and_then(|v| v.as_str())
+        // Explicit role field takes precedence. Chronicle-format events also
+        // allow `role` under a nested `data` or `payload` object.
+        let explicit_role = Self::find_nested_str(event, &["role", "author", "sender"]);
+        let role = explicit_role
             .map(|r| {
                 if r == "user" || r == "human" {
                     "user".to_string()
@@ -500,18 +506,27 @@ impl CopilotCliConnector {
 
         let content = Self::extract_content(event);
 
-        // If standard extraction failed, try event-specific fields.
+        // If standard extraction failed, try event-specific fields at both
+        // the top level and inside `data`/`payload` envelopes.
         if content.trim().is_empty() {
-            if let Some(prompt) = event.get("prompt").or_else(|| event.get("initialPrompt")) {
-                let text = flatten_content(prompt);
-                if !text.is_empty() {
-                    return (role, text);
+            let wrappers: [Option<&Value>; 3] =
+                [Some(event), event.get("data"), event.get("payload")];
+            for wrapper in wrappers.into_iter().flatten() {
+                for key in ["prompt", "initialPrompt", "initial_prompt"] {
+                    if let Some(prompt) = wrapper.get(key) {
+                        let text = flatten_content(prompt);
+                        if !text.is_empty() {
+                            return (role, text);
+                        }
+                    }
                 }
-            }
-            if let Some(output) = event.get("output").or_else(|| event.get("result")) {
-                let text = flatten_content(output);
-                if !text.is_empty() {
-                    return (role, text);
+                for key in ["output", "result", "response"] {
+                    if let Some(output) = wrapper.get(key) {
+                        let text = flatten_content(output);
+                        if !text.is_empty() {
+                            return (role, text);
+                        }
+                    }
                 }
             }
         }
@@ -520,23 +535,106 @@ impl CopilotCliConnector {
     }
 
     /// Extract message content from various possible field names.
+    ///
+    /// Copilot CLI's Chronicle-format events (since ~0.0.342) nest the message
+    /// payload under a `data` object — e.g.
+    /// `{"type":"user.message","data":{"content":"..."}}`. Older formats place
+    /// `content` at the top level. We check both shapes plus well-known
+    /// alternative keys, preferring the top-level fields first for
+    /// backwards compatibility.
     fn extract_content(val: &Value) -> String {
-        for key in ["message", "content", "text", "value"] {
-            if let Some(field) = val.get(key) {
+        const CONTENT_KEYS: &[&str] = &["message", "content", "text", "value", "body"];
+
+        // 1. Top-level keys (legacy and some newer events).
+        for key in CONTENT_KEYS {
+            if let Some(field) = val.get(*key) {
                 let text = flatten_content(field);
                 if !text.is_empty() {
                     return text;
                 }
             }
         }
+
+        // 2. Nested `data` payload (Chronicle v2 format).
+        if let Some(data) = val.get("data") {
+            // If `data` is itself a string, treat it as the content directly.
+            if data.is_string() {
+                let text = flatten_content(data);
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            for key in CONTENT_KEYS {
+                if let Some(field) = data.get(*key) {
+                    let text = flatten_content(field);
+                    if !text.is_empty() {
+                        return text;
+                    }
+                }
+            }
+        }
+
+        // 3. Nested `payload` envelope (seen in some shim wrappers).
+        if let Some(payload) = val.get("payload") {
+            for key in CONTENT_KEYS {
+                if let Some(field) = payload.get(*key) {
+                    let text = flatten_content(field);
+                    if !text.is_empty() {
+                        return text;
+                    }
+                }
+            }
+        }
+
         String::new()
     }
 
-    /// Extract timestamp from an event object.
+    /// Look up a string-valued field under any of the provided keys, searching
+    /// the top level and one level of nesting (`data`, `payload`, `metadata`).
+    fn find_nested_str<'a>(val: &'a Value, keys: &[&str]) -> Option<&'a str> {
+        for key in keys {
+            if let Some(v) = val.get(*key).and_then(|v| v.as_str()) {
+                return Some(v);
+            }
+        }
+        for wrapper in ["data", "payload", "metadata"] {
+            if let Some(inner) = val.get(wrapper) {
+                for key in keys {
+                    if let Some(v) = inner.get(*key).and_then(|v| v.as_str()) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract timestamp from an event object, checking both the top level and
+    /// any `data`/`payload`/`metadata` envelope.
     fn extract_timestamp(val: &Value) -> Option<i64> {
-        for key in ["timestamp", "createdAt", "created_at", "time", "ts", "date"] {
-            if let Some(ts) = val.get(key).and_then(parse_timestamp) {
+        const TS_KEYS: &[&str] = &[
+            "timestamp",
+            "createdAt",
+            "created_at",
+            "time",
+            "ts",
+            "date",
+            "startedAt",
+            "started_at",
+        ];
+
+        for key in TS_KEYS {
+            if let Some(ts) = val.get(*key).and_then(parse_timestamp) {
                 return Some(ts);
+            }
+        }
+        for wrapper in ["data", "payload", "metadata"] {
+            if let Some(inner) = val.get(wrapper) {
+                for key in TS_KEYS {
+                    if let Some(ts) = inner.get(*key).and_then(parse_timestamp) {
+                        return Some(ts);
+                    }
+                }
             }
         }
         None
@@ -1008,6 +1106,96 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].agent_slug, "copilot_cli");
         assert_eq!(convs[0].metadata["source"], "copilot-cli");
+    }
+
+    /// Regression test for issue #187: Copilot CLI Chronicle events
+    /// (since ~0.0.342) nest message payloads under a `data` object. Prior to
+    /// the fix, `extract_content` only inspected top-level keys, so these
+    /// events produced zero conversations.
+    #[test]
+    fn scan_parses_chronicle_nested_data_content() {
+        let tmp = TempDir::new().unwrap();
+        let session_dir = tmp.path().join(".copilot/session-state/chronicle-001");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        // Exact shape reported in cass issue #187 for cc314.
+        let events = r#"{"type":"session.start","data":{"sessionId":"chronicle-001","cwd":"/Users/cc314/projects/demo"},"timestamp":"2026-03-01T10:00:00.000Z"}
+{"type":"user.message","data":{"content":"explain this repo"},"timestamp":"2026-03-01T10:00:01.000Z"}
+{"type":"assistant.message","data":{"content":"This is a Rust project.","toolRequests":[]},"timestamp":"2026-03-01T10:00:02.000Z"}
+{"type":"user.message","data":{"content":"what does lib.rs export?"},"timestamp":"2026-03-01T10:00:03.000Z"}
+{"type":"assistant.message","data":{"content":"It re-exports connector factories.","toolRequests":[{"name":"Read","input":{"path":"lib.rs"}}]},"timestamp":"2026-03-01T10:00:04.000Z"}
+"#;
+
+        write_file(&session_dir, "events.jsonl", events);
+
+        let connector = CopilotCliConnector::new();
+        let root = tmp.path().join(".copilot/session-state");
+        let ctx = ScanContext::local_default(root, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(
+            convs.len(),
+            1,
+            "chronicle events should yield 1 conversation"
+        );
+        let conv = &convs[0];
+        assert_eq!(conv.agent_slug, "copilot_cli");
+        // session ID extracted from nested data OR the directory name.
+        assert!(
+            conv.external_id.as_deref() == Some("chronicle-001"),
+            "expected session id 'chronicle-001', got {:?}",
+            conv.external_id
+        );
+        assert_eq!(
+            conv.workspace,
+            Some(PathBuf::from("/Users/cc314/projects/demo")),
+            "workspace should come from nested data.cwd"
+        );
+        assert_eq!(conv.messages.len(), 4, "two user + two assistant messages");
+        assert_eq!(conv.messages[0].role, "user");
+        assert!(conv.messages[0].content.contains("explain this repo"));
+        assert_eq!(conv.messages[1].role, "assistant");
+        assert!(conv.messages[1].content.contains("Rust project"));
+        assert_eq!(conv.messages[2].role, "user");
+        assert!(conv.messages[2].content.contains("lib.rs"));
+        assert_eq!(conv.messages[3].role, "assistant");
+        assert!(conv.messages[3].content.contains("connector factories"));
+        // Title derived from first user message.
+        assert!(
+            conv.title
+                .as_deref()
+                .is_some_and(|t| t.contains("explain this repo")),
+            "title should be the first user message prefix"
+        );
+        // Timestamps must parse from ISO8601 strings in data/top-level.
+        assert!(conv.started_at.is_some());
+        assert!(conv.ended_at.is_some());
+        assert!(conv.started_at.unwrap() < conv.ended_at.unwrap());
+    }
+
+    /// Chronicle sessions where the directory UUID is the only source of the
+    /// session id must still be indexed.
+    #[test]
+    fn scan_chronicle_falls_back_to_directory_uuid() {
+        let tmp = TempDir::new().unwrap();
+        let uuid = "4c5e9a9e-1234-4abc-9def-000000000001";
+        let session_dir = tmp.path().join(format!(".copilot/session-state/{uuid}"));
+        fs::create_dir_all(&session_dir).unwrap();
+
+        // No sessionId field anywhere — only nested data.content messages.
+        let events = r#"{"type":"user.message","data":{"content":"hi"},"timestamp":"2026-03-01T10:00:00.000Z"}
+{"type":"assistant.message","data":{"content":"hello"},"timestamp":"2026-03-01T10:00:01.000Z"}
+"#;
+        write_file(&session_dir, "events.jsonl", events);
+
+        let connector = CopilotCliConnector::new();
+        let root = tmp.path().join(".copilot/session-state");
+        let ctx = ScanContext::local_default(root, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some(uuid));
+        assert_eq!(convs[0].messages.len(), 2);
     }
 
     #[test]
