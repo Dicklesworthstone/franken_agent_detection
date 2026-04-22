@@ -16,7 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
+use frankensqlite::{Connection, params};
 use serde_json::Value;
 
 use super::scan::ScanContext;
@@ -287,25 +288,22 @@ impl CursorConnector {
 
         let prefix_len = prefix.len();
 
-        if let Ok(mut stmt) =
-            conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?")
-        {
-            let rows = stmt.query_map([&prefix, &limit], |row| {
-                let key: String = row.get(0)?;
-                let value: String = row.get(1)?;
+        if let Ok(rows) = conn.query_map_collect(
+            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?",
+            params![prefix.as_str(), limit.as_str()],
+            |row| {
+                let key: String = row.get_typed(0)?;
+                let value: String = row.get_typed(1)?;
                 Ok((key, value))
-            });
-
-            if let Ok(rows) = rows {
-                for row in rows.flatten() {
-                    let (key, value) = row;
-                    // Key format: bubbleId:{composerId}:{bubbleId}
-                    // Extract just the bubbleId part
-                    if key.len() > prefix_len {
-                        let bubble_id = &key[prefix_len..];
-                        if let Ok(parsed) = serde_json::from_str::<Value>(&value) {
-                            bubble_map.insert(bubble_id.to_string(), parsed);
-                        }
+            },
+        ) {
+            for (key, value) in rows {
+                // Key format: bubbleId:{composerId}:{bubbleId}
+                // Extract just the bubbleId part
+                if key.len() > prefix_len {
+                    let bubble_id = &key[prefix_len..];
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&value) {
+                        bubble_map.insert(bubble_id.to_string(), parsed);
                     }
                 }
             }
@@ -379,14 +377,15 @@ impl CursorConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = Connection::open_with_flags(
-            db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        let conn = open_with_flags(
+            db_path.to_string_lossy().as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .with_context(|| format!("failed to open Cursor db: {}", db_path.display()))?;
 
         // Set busy timeout to 5 seconds to avoid locking errors when Cursor is running
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute("PRAGMA busy_timeout = 5000;")
+            .with_context(|| "failed to set busy_timeout")?;
 
         let mut convs = Vec::new();
         let mut seen_ids = HashSet::new();
@@ -394,50 +393,44 @@ impl CursorConnector {
         // Try cursorDiskKV table for composerData entries
         let composer_prefix = "composerData:";
         let composer_limit = Self::prefix_upper_bound(composer_prefix);
-        if let Ok(mut stmt) =
-            conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?")
-        {
-            let rows = stmt.query_map([composer_prefix, composer_limit.as_str()], |row| {
-                let key: String = row.get(0)?;
-                let value: String = row.get(1)?;
+        if let Ok(rows) = conn.query_map_collect(
+            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?",
+            params![composer_prefix, composer_limit.as_str()],
+            |row| {
+                let key: String = row.get_typed(0)?;
+                let value: String = row.get_typed(1)?;
                 Ok((key, value))
-            });
-
-            if let Ok(rows) = rows {
-                for row in rows.flatten() {
-                    let (key, value) = row;
-                    if let Some(conv) = Self::parse_composer_data(
-                        &key,
-                        &value,
-                        db_path,
-                        since_ts,
-                        &mut seen_ids,
-                        Some(&conn),
-                    ) {
-                        convs.push(conv);
-                    }
+            },
+        ) {
+            for (key, value) in rows {
+                if let Some(conv) = Self::parse_composer_data(
+                    &key,
+                    &value,
+                    db_path,
+                    since_ts,
+                    &mut seen_ids,
+                    Some(&conn),
+                ) {
+                    convs.push(conv);
                 }
             }
         }
 
         // Also try ItemTable for legacy aichat data
-        if let Ok(mut stmt) = conn.prepare(
+        if let Ok(rows) = conn.query_map_collect(
             "SELECT key, value FROM ItemTable WHERE key LIKE '%aichat%chatdata%' OR key LIKE '%composer%'",
-        ) {
-            let rows = stmt.query_map([], |row| {
-                let key: String = row.get(0)?;
-                let value: String = row.get(1)?;
+            params![],
+            |row| {
+                let key: String = row.get_typed(0)?;
+                let value: String = row.get_typed(1)?;
                 Ok((key, value))
-            });
-
-            if let Ok(rows) = rows {
-                for row in rows.flatten() {
-                    let (key, value) = row;
-                    if let Some(conv) =
-                        Self::parse_aichat_data(&key, &value, db_path, since_ts, &mut seen_ids)
-                    {
-                        convs.push(conv);
-                    }
+            },
+        ) {
+            for (key, value) in rows {
+                if let Some(conv) =
+                    Self::parse_aichat_data(&key, &value, db_path, since_ts, &mut seen_ids)
+                {
+                    convs.push(conv);
                 }
             }
         }
@@ -864,7 +857,8 @@ impl Connector for CursorConnector {
 mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
-    use rusqlite::Connection;
+    use frankensqlite::compat::ConnectionExt;
+    use frankensqlite::params;
     use serde_json::json;
     use std::collections::HashSet;
     use std::fs;
@@ -872,17 +866,11 @@ mod tests {
 
     /// Create a test SQLite database with the cursorDiskKV table
     fn create_test_db(path: &Path) -> Connection {
-        let conn = Connection::open(path).unwrap();
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)",
-            [],
-        )
-        .unwrap();
+        let conn = Connection::open(path.to_string_lossy().as_ref()).unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
         conn
     }
 
@@ -1491,9 +1479,9 @@ mod tests {
 
         let conn = create_test_db(&db_path);
         let value = json!({ "text": "Database test" }).to_string();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            ["composerData:db-test-123", &value],
+            params!["composerData:db-test-123", value.as_str()],
         )
         .unwrap();
         drop(conn);
@@ -1515,9 +1503,12 @@ mod tests {
             }]
         })
         .to_string();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
-            ["workbench.panel.aichat.view.aichat.chatdata", &value],
+            params![
+                "workbench.panel.aichat.view.aichat.chatdata",
+                value.as_str()
+            ],
         )
         .unwrap();
         drop(conn);
@@ -1594,9 +1585,9 @@ mod tests {
         let db_path = global_dir.join("state.vscdb");
         let conn = create_test_db(&db_path);
         let value = json!({ "text": "Scan test" }).to_string();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            ["composerData:scan-123", &value],
+            params!["composerData:scan-123", value.as_str()],
         )
         .unwrap();
         drop(conn);
@@ -1621,9 +1612,9 @@ mod tests {
         let db_path = global_dir.join("state.vscdb");
         let conn = create_test_db(&db_path);
         let value = json!({ "text": "Explicit root" }).to_string();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            ["composerData:explicit-123", &value],
+            params!["composerData:explicit-123", value.as_str()],
         )
         .unwrap();
         drop(conn);
@@ -1653,9 +1644,9 @@ mod tests {
         let db_path = global_dir.join("state.vscdb");
         let conn = create_test_db(&db_path);
         let value = json!({ "text": "Path test" }).to_string();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            ["composerData:path-123", &value],
+            params!["composerData:path-123", value.as_str()],
         )
         .unwrap();
         drop(conn);
@@ -1965,7 +1956,7 @@ mod tests {
         fs::write(&db_path, "not a sqlite database at all").unwrap();
 
         let result = CursorConnector::extract_from_db(&db_path, None);
-        // rusqlite may open the file lazily; query failures are caught with if-let-Ok
+        // SQLite engines may open the file lazily; query failures are caught with if-let-Ok
         // The important thing is that it doesn't panic
         if let Ok(convs) = result {
             assert!(
@@ -1981,12 +1972,9 @@ mod tests {
         let db_path = dir.path().join("no_tables.vscdb");
 
         // Create a valid SQLite DB but without the expected tables
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE unrelated_table (id INTEGER PRIMARY KEY, data TEXT)",
-            [],
-        )
-        .unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+        conn.execute("CREATE TABLE unrelated_table (id INTEGER PRIMARY KEY, data TEXT)")
+            .unwrap();
         drop(conn);
 
         let result = CursorConnector::extract_from_db(&db_path, None);
@@ -2009,9 +1997,9 @@ mod tests {
             ]
         })
         .to_string();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            ["composerData:v040-missing", &value],
+            params!["composerData:v040-missing", value.as_str()],
         )
         .unwrap();
         drop(conn);
@@ -2070,32 +2058,32 @@ mod tests {
         let conn = create_test_db(&db_path);
 
         // Insert invalid JSON
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            ["composerData:invalid-1", "not valid json {{{"],
+            params!["composerData:invalid-1", "not valid json {{{"],
         )
         .unwrap();
 
         // Insert valid entry
         let valid_value = json!({ "text": "Valid entry" }).to_string();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            ["composerData:valid-1", &valid_value],
+            params!["composerData:valid-1", valid_value.as_str()],
         )
         .unwrap();
 
         // Insert empty JSON
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            ["composerData:empty-1", "{}"],
+            params!["composerData:empty-1", "{}"],
         )
         .unwrap();
 
         // Insert another valid entry
         let valid_value2 = json!({ "text": "Another valid" }).to_string();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
-            ["composerData:valid-2", &valid_value2],
+            params!["composerData:valid-2", valid_value2.as_str()],
         )
         .unwrap();
 

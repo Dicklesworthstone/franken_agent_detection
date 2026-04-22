@@ -32,10 +32,7 @@ urlencoding = { version = "2", optional = true }
 aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 
-# --- Optional: Cursor/OpenCode SQLite session databases ---
-rusqlite = { version = "0.38", optional = true, features = ["bundled", "modern_sqlite"] }
-
-# --- Optional: frankensqlite for new connectors (Crush, etc.) ---
+# --- Optional: SQLite-backed session databases ---
 frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "e3f57c9a", package = "fsqlite", optional = true }
 
 [features]
@@ -53,14 +50,14 @@ connectors = [
 # ChatGPT: AES-256-GCM decryption for v2/v3 encrypted conversations
 chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
 # Cursor: SQLite database access for state.vscdb
-cursor = ["connectors", "dep:rusqlite", "dep:urlencoding"]
+cursor = ["connectors", "dep:frankensqlite", "dep:urlencoding"]
 # OpenCode: SQLite database access for v1.2+ opencode.db
-opencode = ["connectors", "dep:rusqlite", "dep:urlencoding"]
+opencode = ["connectors", "dep:frankensqlite", "dep:urlencoding"]
 # Goose: SQLite database access for Goose sessions.db
-goose = ["connectors", "dep:rusqlite", "dep:urlencoding"]
+goose = ["connectors", "dep:frankensqlite", "dep:urlencoding"]
 # Hermes: SQLite database access for Hermes Agent state.db
-hermes = ["connectors", "dep:rusqlite", "dep:urlencoding"]
-# Crush: SQLite database access for Charm's Crush agent (uses frankensqlite)
+hermes = ["connectors", "dep:frankensqlite", "dep:urlencoding"]
+# Crush: SQLite database access for Charm's Crush agent
 crush = ["connectors", "dep:frankensqlite"]
 # All connectors enabled
 all-connectors = ["connectors", "chatgpt", "cursor", "opencode", "goose", "hermes", "crush"]

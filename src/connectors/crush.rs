@@ -11,7 +11,7 @@
 //! The `parts` column contains a JSON array of objects with `type` and `text` fields;
 //! text content is extracted from entries where `type == "text"`.
 //!
-//! **NOTE:** This connector uses `frankensqlite` — NOT rusqlite. See AGENTS.md RULE 2.
+//! **NOTE:** This connector uses `frankensqlite`. See AGENTS.md RULE 2.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
