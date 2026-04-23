@@ -809,6 +809,7 @@ impl CopilotConnector {
             .get("cwd")
             .or_else(|| val.get("workingDirectory"))
             .or_else(|| val.get("workspace"))
+            .or_else(|| val.get("workspacePath"))
             .and_then(|v| v.as_str())
             .map(PathBuf::from);
 
