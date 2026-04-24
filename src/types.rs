@@ -291,31 +291,45 @@ impl PathMapping {
         }
 
         let rest = &path[self.from.len()..];
-        let boundary_ok =
-            self.from.ends_with('/') || self.from.ends_with('\\') || rest.starts_with(['/', '\\']);
-        if boundary_ok {
-            let from_sep = if self.from.ends_with('/') {
-                Some('/')
-            } else if self.from.ends_with('\\') {
-                Some('\\')
-            } else {
-                None
-            };
+        let from_ends_with_sep = self.from.ends_with('/') || self.from.ends_with('\\');
+        let rest_starts_with_sep = rest.starts_with(['/', '\\']);
 
-            if let Some(sep) = from_sep {
-                let needs_sep = !self.to.ends_with('/')
-                    && !self.to.ends_with('\\')
-                    && !rest.starts_with(['/', '\\']);
-
-                if needs_sep {
-                    return Some(format!("{}{}{}", self.to, sep, rest));
-                }
-            }
-
-            Some(format!("{}{}", self.to, rest))
-        } else {
-            None
+        // Boundary check: the match must land on a path separator on at
+        // least one side, otherwise we'd be matching a filename substring
+        // (e.g. `from="/a"` vs `path="/ab"`).
+        if !from_ends_with_sep && !rest_starts_with_sep {
+            return None;
         }
+
+        let to_ends_with_sep = self.to.ends_with('/') || self.to.ends_with('\\');
+
+        // Emit exactly one separator at the splice, regardless of which
+        // side carried it:
+        //
+        //   to_sep   rest_sep   action
+        //   ------   --------   -------------------------------------
+        //   true     true       drop the leading sep from `rest`
+        //   true     false      concatenate — `to` already has the sep
+        //   false    true       concatenate — `rest` carries the sep
+        //   false    false      insert a sep; `from` must have had one
+        //                       (by the boundary check), so use the same
+        //                       flavor it used.
+        //
+        // Without this, `from="/a"`, `to="/b/"`, `path="/a/file"` used to
+        // produce `"/b//file"` because `to` ended with `/` and `rest`
+        // began with `/`, and the old branch-shape only inserted a
+        // separator when `from` had ended with one. Double-separator
+        // output canonicalizes identically under POSIX but breaks
+        // string-based path-equality checks in downstream consumers.
+        let rewritten = match (to_ends_with_sep, rest_starts_with_sep) {
+            (true, true) => format!("{}{}", self.to, &rest[1..]),
+            (true, false) | (false, true) => format!("{}{}", self.to, rest),
+            (false, false) => {
+                let sep = if self.from.ends_with('\\') { '\\' } else { '/' };
+                format!("{}{}{}", self.to, sep, rest)
+            }
+        };
+        Some(rewritten)
     }
 
     /// Check if this mapping applies to a given agent.

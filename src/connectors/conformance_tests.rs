@@ -568,6 +568,23 @@ mod conformance {
                 ("/a", "/b", "/a/file", Some("/b/file")),
                 ("/a", "/b", "/ab", None), // no match (not a prefix boundary)
                 ("/a/", "/b/", "/a/file", Some("/b/file")),
+                // Cross-sep combinations — these pin the "emit exactly one
+                // separator at the splice" contract across every combination
+                // of trailing-sep-on-`from`, trailing-sep-on-`to`, and
+                // leading-sep-on-`rest`:
+                //
+                //   from has `/`, to has `/`   → to + rest           (rest has no sep)
+                ("/a/", "/b/", "/a/file/x", Some("/b/file/x")),
+                //   from has `/`, to no `/`    → to + sep + rest     (rest has no sep)
+                ("/a/", "/b", "/a/file", Some("/b/file")),
+                //   from no `/`, to has `/`    → to + rest[1..]      (drop rest's sep)
+                //   Regression: without the drop this produced `"/b//file"`.
+                ("/a", "/b/", "/a/file", Some("/b/file")),
+                //   from no `/`, to no `/`     → to + rest            (rest keeps its sep)
+                ("/a", "/b", "/a/deep/nested/file", Some("/b/deep/nested/file")),
+                // Windows-style backslash flavor of each shape:
+                ("C:\\a", "D:\\b\\", "C:\\a\\file", Some("D:\\b\\file")),
+                ("C:\\a\\", "D:\\b", "C:\\a\\file", Some("D:\\b\\file")),
             ];
 
             for (from, to, input, expected) in cases {
@@ -584,6 +601,62 @@ mod conformance {
                     result,
                     expected
                 );
+            }
+        }
+
+        #[test]
+        fn path_mapping_emits_single_separator_at_splice() {
+            // Property: for any (from, to, path) where `apply` returns
+            // Some(output), `output` never contains `//` or `\\` (as a
+            // doubled separator, not the Windows UNC prefix). Consecutive
+            // separators are semantically safe under POSIX canonicalization
+            // but break string-based path-equality checks in downstream
+            // consumers (workspace-matching, cache keys, export manifests).
+            let shapes: &[(&str, &str)] = &[
+                ("/a", "/b"),
+                ("/a", "/b/"),
+                ("/a/", "/b"),
+                ("/a/", "/b/"),
+                ("C:\\a", "D:\\b"),
+                ("C:\\a", "D:\\b\\"),
+                ("C:\\a\\", "D:\\b"),
+                ("C:\\a\\", "D:\\b\\"),
+            ];
+            let posix_inputs = ["/a", "/a/", "/a/file", "/a/deep/dir/file"];
+            let windows_inputs = ["C:\\a", "C:\\a\\", "C:\\a\\file", "C:\\a\\deep\\dir\\file"];
+
+            for (from, to) in shapes {
+                let mapping = PathMapping::new(*from, *to);
+                let inputs: &[&str] = if from.contains('\\') {
+                    &windows_inputs
+                } else {
+                    &posix_inputs
+                };
+                for input in inputs {
+                    if let Some(output) = mapping.apply(input) {
+                        assert!(
+                            !output.contains("//"),
+                            "PathMapping({:?} -> {:?}).apply({:?}) = {:?} contains `//`",
+                            from,
+                            to,
+                            input,
+                            output
+                        );
+                        // Allow the `\\` UNC prefix only at the start of a
+                        // Windows path; look for a doubled backslash anywhere
+                        // after position 0.
+                        if let Some(pos) = output[1..].find("\\\\") {
+                            panic!(
+                                "PathMapping({:?} -> {:?}).apply({:?}) = {:?} contains doubled `\\\\` at offset {}",
+                                from,
+                                to,
+                                input,
+                                output,
+                                pos + 1
+                            );
+                        }
+                    }
+                }
             }
         }
 
