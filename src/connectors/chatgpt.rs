@@ -108,6 +108,17 @@ impl ChatGptConnector {
 
         for path_opt in key_file_paths.iter().flatten() {
             if path_opt.exists() {
+                // [coding_agent_session_search-srzwm] Refuse symlinks
+                // and refuse mode > 0600. The AES-256 key in this file
+                // decrypts the operator's ChatGPT conversation history;
+                // an OS-shared dev box where another user has read
+                // access to ~/.config/cass/ would expose every
+                // ChatGPT conversation. SSH refuses to use a private
+                // key with mode > 0600 for this exact reason — apply
+                // the same discipline here.
+                if !Self::chatgpt_key_file_mode_is_safe(path_opt) {
+                    continue;
+                }
                 match fs::read(path_opt) {
                     Ok(key_bytes) if key_bytes.len() == KEY_SIZE => {
                         let mut key = [0u8; KEY_SIZE];
@@ -135,6 +146,59 @@ impl ChatGptConnector {
         }
 
         None
+    }
+
+    /// `coding_agent_session_search-srzwm`: gate the chatgpt key file
+    /// by the same permission rules SSH applies to private keys.
+    /// Refuses symlinks (a symlink to /etc/passwd or /dev/null would
+    /// silently load garbage as a "key"), and refuses any mode where
+    /// group/other have read/write/exec bits set (mode & 0o077 != 0).
+    /// Returns false on Windows / non-Unix where mode bits are not
+    /// meaningful in the same way; the caller will then proceed to
+    /// fs::read on those platforms (cass desktop encryption is
+    /// macOS-only anyway, so this is mostly defensive).
+    #[cfg(unix)]
+    fn chatgpt_key_file_mode_is_safe(path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let symlink_meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to stat chatgpt key file"
+                );
+                return false;
+            }
+        };
+        if symlink_meta.file_type().is_symlink() {
+            tracing::warn!(
+                path = %path.display(),
+                "refusing to load chatgpt key file: path is a symlink — \
+                 the key file MUST be a regular file owned by the operator"
+            );
+            return false;
+        }
+        let mode = symlink_meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                path = %path.display(),
+                mode = format!("{mode:#o}"),
+                "refusing to load chatgpt key file: mode {mode:#o} grants \
+                 group/other access. Set permissions to 0600 (chmod 600 {})",
+                path.display()
+            );
+            return false;
+        }
+        true
+    }
+
+    #[cfg(not(unix))]
+    fn chatgpt_key_file_mode_is_safe(_path: &Path) -> bool {
+        // Windows: mode bits don't carry the same meaning. Fall through
+        // to the read; ChatGPT desktop encryption is macOS-only
+        // currently, so this branch is largely unreachable.
+        true
     }
 
     /// Get the ChatGPT app support directory
@@ -632,6 +696,66 @@ mod tests {
         };
         assert!(connector.encryption_key.is_some());
         assert_eq!(connector.encryption_key.unwrap(), key_bytes);
+    }
+
+    /// `coding_agent_session_search-srzwm`: pin the SSH-style key-file
+    /// permission discipline. Mode 0644 / 0664 / any group-or-other
+    /// permission MUST be refused; 0600 (and stricter) MUST pass.
+    #[test]
+    #[cfg(unix)]
+    fn chatgpt_key_file_mode_is_safe_refuses_permissive_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("chatgpt_key.bin");
+        fs::write(&key_path, [0u8; KEY_SIZE]).unwrap();
+
+        // 0600 — strict, must pass.
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            ChatGptConnector::chatgpt_key_file_mode_is_safe(&key_path),
+            "0600 mode must be accepted"
+        );
+
+        // 0644 — world-readable, must be refused.
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !ChatGptConnector::chatgpt_key_file_mode_is_safe(&key_path),
+            "0644 mode (world-readable) MUST be refused — leaks AES-256 key to other users"
+        );
+
+        // 0660 — group-readable, must be refused.
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(
+            !ChatGptConnector::chatgpt_key_file_mode_is_safe(&key_path),
+            "0660 mode (group-readable) MUST be refused"
+        );
+
+        // 0400 — read-only owner, must pass.
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            ChatGptConnector::chatgpt_key_file_mode_is_safe(&key_path),
+            "0400 mode must be accepted"
+        );
+    }
+
+    /// `coding_agent_session_search-srzwm`: symlinks at the key file
+    /// path MUST be refused. A symlink to /dev/null or /etc/passwd
+    /// would silently load the wrong bytes as a "key" — bad UX (the
+    /// decrypt fails further downstream with a confusing error)
+    /// AND a TOCTOU surface (the symlink target can change between
+    /// stat and read).
+    #[test]
+    #[cfg(unix)]
+    fn chatgpt_key_file_mode_is_safe_refuses_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let real_key = dir.path().join("real_key.bin");
+        fs::write(&real_key, [0u8; KEY_SIZE]).unwrap();
+        let link_path = dir.path().join("symlinked_key.bin");
+        std::os::unix::fs::symlink(&real_key, &link_path).unwrap();
+        assert!(
+            !ChatGptConnector::chatgpt_key_file_mode_is_safe(&link_path),
+            "symlink at the chatgpt key file path MUST be refused"
+        );
     }
 
     #[test]
