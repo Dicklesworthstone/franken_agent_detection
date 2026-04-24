@@ -581,7 +581,12 @@ mod conformance {
                 //   Regression: without the drop this produced `"/b//file"`.
                 ("/a", "/b/", "/a/file", Some("/b/file")),
                 //   from no `/`, to no `/`     → to + rest            (rest keeps its sep)
-                ("/a", "/b", "/a/deep/nested/file", Some("/b/deep/nested/file")),
+                (
+                    "/a",
+                    "/b",
+                    "/a/deep/nested/file",
+                    Some("/b/deep/nested/file"),
+                ),
                 // Windows-style backslash flavor of each shape:
                 ("C:\\a", "D:\\b\\", "C:\\a\\file", Some("D:\\b\\file")),
                 ("C:\\a\\", "D:\\b", "C:\\a\\file", Some("D:\\b\\file")),

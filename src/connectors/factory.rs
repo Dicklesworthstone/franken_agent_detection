@@ -88,10 +88,20 @@ impl Connector for FactoryConnector {
         let mut roots: Vec<PathBuf> = Vec::new();
 
         if ctx.use_default_detection() {
-            if looks_like_factory_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+            // When the caller explicitly points `data_dir` at what
+            // already looks like Factory's own session storage, treat
+            // that as "scan this exact location" and do NOT also merge
+            // in the home-dir fallback. Previous behavior silently
+            // unioned both, which meant a caller who wanted to scan a
+            // specific archive instead got its contents fused with
+            // whatever happened to live under `~/.factory/sessions`.
+            // The same pollution also made tests pass on clean CI but
+            // fail on any dev machine with a real Factory install.
+            let data_dir_is_factory_storage =
+                looks_like_factory_storage(&ctx.data_dir) && ctx.data_dir.exists();
+            if data_dir_is_factory_storage {
                 roots.push(ctx.data_dir.clone());
-            }
-            if let Some(root) = Self::sessions_root() {
+            } else if let Some(root) = Self::sessions_root() {
                 if root.exists() {
                     roots.push(root);
                 }

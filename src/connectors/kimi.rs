@@ -122,13 +122,23 @@ impl Connector for KimiConnector {
         let mut roots: Vec<PathBuf> = Vec::new();
 
         if ctx.use_default_detection() {
-            if Self::looks_like_kimi_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+            // Parallel to the factory.rs fix: when the caller has
+            // already pointed `data_dir` at what looks like Kimi's
+            // session storage, trust that as the one location to scan
+            // and skip the home-dir fallback. Unioning them silently
+            // fused a caller-requested archive with whatever lives
+            // under the platform default, and left tests passing on
+            // clean CI but failing on machines that have a real Kimi
+            // install.
+            let data_dir_is_kimi_storage =
+                Self::looks_like_kimi_storage(&ctx.data_dir) && ctx.data_dir.exists();
+            if data_dir_is_kimi_storage {
                 roots.push(ctx.data_dir.clone());
-            }
-
-            let fallback = Self::sessions_root();
-            if fallback.exists() {
-                roots.push(fallback);
+            } else {
+                let fallback = Self::sessions_root();
+                if fallback.exists() {
+                    roots.push(fallback);
+                }
             }
         } else {
             for scan_root in &ctx.scan_roots {
