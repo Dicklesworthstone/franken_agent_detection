@@ -33,7 +33,7 @@ aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
-frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "038f0f46", package = "fsqlite", optional = true }
+frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "34a149cf", package = "fsqlite", optional = true }
 
 [features]
 default = []
