@@ -90,9 +90,18 @@ impl CodebuffConnector {
         let content = fs::read_to_string(&rs).ok()?;
         let v: Value = serde_json::from_str(&content).ok()?;
         // Try a few shapes — different SDK versions stash this differently.
+        // The current Codebuff SDK records cwd at `sessionState.fileContext.cwd`
+        // (with `sessionState.fileContext.projectRoot` as a sibling). Older /
+        // alternate builds stash it at the top level or under `state` /
+        // `initialState`. Probe all known locations.
         let cwd = v
-            .pointer("/cwd")
+            .pointer("/sessionState/fileContext/cwd")
+            .or_else(|| v.pointer("/sessionState/fileContext/projectRoot"))
+            .or_else(|| v.pointer("/fileContext/cwd"))
+            .or_else(|| v.pointer("/fileContext/projectRoot"))
+            .or_else(|| v.pointer("/cwd"))
             .or_else(|| v.pointer("/projectPath"))
+            .or_else(|| v.pointer("/projectRoot"))
             .or_else(|| v.pointer("/state/cwd"))
             .or_else(|| v.pointer("/initialState/cwd"))
             .and_then(Value::as_str)?;
@@ -388,6 +397,30 @@ mod tests {
         fs::write(
             p.parent().unwrap().join("run-state.json"),
             format!(r#"{{"cwd":"{real_cwd}"}}"#),
+        )
+        .unwrap();
+        let conv = CodebuffConnector::new().parse_chat_file(&p).unwrap();
+        assert_eq!(conv.workspace, Some(PathBuf::from(real_cwd)));
+    }
+
+    #[test]
+    fn parse_chat_file_uses_run_state_cwd_from_session_state_file_context() {
+        // Real-world Codebuff schema observed in
+        // ~/.config/manicode/projects/<name>/chats/<id>/run-state.json:
+        // the cwd lives at sessionState.fileContext.cwd
+        let dir = TempDir::new().unwrap();
+        let p = write_chat(
+            dir.path(),
+            "sanitized_name",
+            "c1",
+            r#"[{"role":"user","content":"x"}]"#,
+        );
+        let real_cwd = "/Users/me/code/codex_mac";
+        fs::write(
+            p.parent().unwrap().join("run-state.json"),
+            format!(
+                r#"{{"sessionState":{{"fileContext":{{"cwd":"{real_cwd}","projectRoot":"{real_cwd}"}}}}}}"#
+            ),
         )
         .unwrap();
         let conv = CodebuffConnector::new().parse_chat_file(&p).unwrap();
