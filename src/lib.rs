@@ -49,7 +49,8 @@ pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenData
 pub use connectors::{
     Connector, PathTrie, ScanContext, ScanRoot, WorkspaceCache, aider::AiderConnector,
     amp::AmpConnector, claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector,
-    cline::ClineConnector, codex::CodexConnector, copilot::CopilotConnector,
+    cline::ClineConnector, codebuff::CodebuffConnector, codex::CodexConnector,
+    copilot::CopilotConnector,
     copilot_cli::CopilotCliConnector, estimate_tokens_from_content, extract_claude_code_tokens,
     extract_codex_tokens, extract_invocations_from_content_blocks, extract_tokens_for_agent,
     factory::FactoryConnector, file_modified_since, flatten_content,
@@ -121,6 +122,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "claude",
     "clawdbot",
     "cline",
+    "codebuff",
     "codex",
     "continue",
     "copilot_cli",
@@ -147,6 +149,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "claude" | "claude-code" => Some("claude"),
         "clawdbot" | "clawd-bot" => Some("clawdbot"),
         "cline" => Some("cline"),
+        "codebuff" | "manicode" | "codebuff-cli" => Some("codebuff"),
         "codex" | "codex-cli" => Some("codex"),
         "continue" | "continue-dev" => Some("continue"),
         "copilot_cli" | "copilot-cli" | "gh-copilot" => Some("copilot_cli"),
@@ -259,6 +262,16 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
     match slug {
         "aider" => {
             let root = read("CASS_AIDER_DATA_ROOT")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root)])
+        }
+        "codebuff" => {
+            // Codebuff (formerly Manicode) honors CODEBUFF_DATA_DIR per its CLI;
+            // fall back to legacy MANICODE_DATA_DIR for older installs.
+            let root = read("CODEBUFF_DATA_DIR")
+                .or_else(|| read("MANICODE_DATA_DIR"))?;
             if root.is_empty() {
                 return None;
             }
@@ -443,6 +456,20 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".config", "gh-copilot"]);
             maybe_push(&mut out, &[".config", "gh", "copilot"]);
             maybe_push(&mut out, &[".local", "share", "github-copilot"]);
+        }
+        "codebuff" => {
+            // Codebuff persists chats under ~/.config/manicode (legacy name still
+            // used on disk by the CLI, even after the rebrand). Newer builds may
+            // use ~/.config/codebuff. Both are probed so detection works on any
+            // version.
+            maybe_push(&mut out, &[".config", "manicode"]);
+            maybe_push(&mut out, &[".config", "manicode-dev"]);
+            maybe_push(&mut out, &[".config", "manicode-staging"]);
+            maybe_push(&mut out, &[".config", "codebuff"]);
+            maybe_push(&mut out, &["Library", "Application Support", "manicode"]);
+            maybe_push(&mut out, &["Library", "Application Support", "codebuff"]);
+            maybe_push(&mut out, &["AppData", "Roaming", "manicode"]);
+            maybe_push(&mut out, &["AppData", "Roaming", "codebuff"]);
         }
         "crush" => {
             maybe_push(&mut out, &[".crush"]);
@@ -902,6 +929,16 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     }
                     paths
                 }
+                "codebuff" => vec![
+                    tilde(&[".config", "manicode"]),
+                    tilde(&[".config", "manicode-dev"]),
+                    tilde(&[".config", "manicode-staging"]),
+                    tilde(&[".config", "codebuff"]),
+                    tilde(&["Library", "Application Support", "manicode"]),
+                    tilde(&["Library", "Application Support", "codebuff"]),
+                    tilde(&["AppData", "Roaming", "manicode"]),
+                    tilde(&["AppData", "Roaming", "codebuff"]),
+                ],
                 "codex" => vec![tilde(&[".codex", "sessions"])],
                 "continue" => vec![tilde(&[".continue", "sessions"]), tilde(&[".continue"])],
                 "copilot_cli" => vec![

@@ -17,7 +17,22 @@ Crate: <https://crates.io/crates/franken-agent-detection>
 
 ## [Unreleased] -- since v0.1.3
 
-No unreleased changes yet.
+### New connectors
+
+- **Codebuff** (formerly Manicode): detection + session scan for chats stored
+  under `~/.config/manicode/projects/<project>/chats/<chatId>/chat-messages.json`
+  (and the rebranded `~/.config/codebuff/...` layout). Honors `CODEBUFF_DATA_DIR`
+  and the legacy `MANICODE_DATA_DIR` env overrides. Recovers the originating cwd
+  from the sibling `run-state.json` so sessions group by real project path
+  rather than the on-disk sanitized basename. Walks `manicode-dev` and
+  `manicode-staging` channels when present.
+
+  - Slug: `codebuff` (aliases: `manicode`, `codebuff-cli`)
+  - Added to `KNOWN_CONNECTORS`, `default_probe_roots`, and
+    `default_probe_paths_tilde`.
+  - 12 unit tests covering discovery, parsing, multi-shape input
+    (`messages` wrapper vs. bare array), aliased roles, RunState cwd
+    recovery, malformed input, and credits-in-`extra` preservation.
 
 ---
 

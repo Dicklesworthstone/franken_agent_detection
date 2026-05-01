@@ -9,6 +9,7 @@ pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
+pub mod codebuff;
 pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;
@@ -160,6 +161,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
     let mut v: Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> = vec![
         ("codex", || Box::new(codex::CodexConnector::new())),
         ("cline", || Box::new(cline::ClineConnector::new())),
+        ("codebuff", || Box::new(codebuff::CodebuffConnector::new())),
         ("gemini", || Box::new(gemini::GeminiConnector::new())),
         ("claude", || {
             Box::new(claude_code::ClaudeCodeConnector::new())
