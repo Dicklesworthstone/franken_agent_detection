@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 use super::scan::ScanContext;
 use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{
-    Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
+    Connector, extract_invocations_from_content_blocks, flatten_content,
     franken_detection_for_connector, parse_timestamp,
 };
 use crate::types::{
@@ -19,6 +19,11 @@ use crate::types::{
 pub struct CodexConnector;
 
 const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+
+enum FileScanMetadata {
+    Process(Option<fs::Metadata>),
+    Skip,
+}
 
 impl Default for CodexConnector {
     fn default() -> Self {
@@ -151,6 +156,30 @@ impl CodexConnector {
 
     fn should_compact_large_message_extra(file_size_bytes: Option<u64>) -> bool {
         file_size_bytes.is_some_and(|size| size >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES)
+    }
+
+    fn file_metadata_if_modified(path: &Path, since_ts: Option<i64>) -> FileScanMetadata {
+        let Ok(metadata) = fs::metadata(path) else {
+            return FileScanMetadata::Process(None);
+        };
+        if Self::metadata_modified_since(&metadata, since_ts) {
+            FileScanMetadata::Process(Some(metadata))
+        } else {
+            FileScanMetadata::Skip
+        }
+    }
+
+    fn metadata_modified_since(metadata: &fs::Metadata, since_ts: Option<i64>) -> bool {
+        since_ts.is_none_or(|ts| {
+            let threshold = ts.saturating_sub(1_000);
+            metadata.modified().map_or(true, |modified| {
+                modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(true, |duration| {
+                        i64::try_from(duration.as_millis()).unwrap_or(i64::MAX) >= threshold
+                    })
+            })
+        })
     }
 
     fn compact_message_extra(raw: &Value) -> Value {
@@ -289,10 +318,12 @@ fn scan_codex_with_callback(
                 continue;
             }
             let source_path = file.clone();
-            if !file_modified_since(&file, ctx.since_ts) {
-                continue;
-            }
-            let file_size_bytes = fs::metadata(&file).ok().map(|metadata| metadata.len());
+            let file_metadata = match CodexConnector::file_metadata_if_modified(&file, ctx.since_ts)
+            {
+                FileScanMetadata::Process(metadata) => metadata,
+                FileScanMetadata::Skip => continue,
+            };
+            let file_size_bytes = file_metadata.as_ref().map(std::fs::Metadata::len);
             let compact_message_extra =
                 CodexConnector::should_compact_large_message_extra(file_size_bytes);
             if compact_message_extra {
@@ -635,6 +666,7 @@ mod tests {
     use crate::connectors::scan::ScanRoot;
     use serde_json::json;
     use std::fs;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     // =====================================================
@@ -903,6 +935,51 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-mode performance harness; run explicitly for Codex scan wall-clock evidence"]
+    fn perf_scan_large_codex_fixture() {
+        let file_count = std::env::var("FAD_CODEX_SCAN_BENCH_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2_000);
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+
+        for i in 0..file_count {
+            let day_dir = sessions
+                .join("2026")
+                .join("05")
+                .join(format!("{:02}", (i % 28) + 1));
+            fs::create_dir_all(&day_dir).unwrap();
+            let ts = 1_746_265_600_000_u64 + u64::try_from(i).unwrap();
+            fs::write(
+                day_dir.join(format!("rollout-{i:06}.jsonl")),
+                format!(
+                    r#"{{"type":"event_msg","timestamp":{ts},"payload":{{"type":"user_message","message":"bench user {i}"}}}}
+{{"type":"response_item","timestamp":{},"payload":{{"role":"assistant","content":"bench assistant {i}"}}}}
+"#,
+                    ts + 1
+                ),
+            )
+            .unwrap();
+        }
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir, None);
+        let start = Instant::now();
+        let convs = connector.scan(&ctx).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(convs.len(), file_count);
+        eprintln!(
+            "fad_codex_scan_large_fixture files={} elapsed_ms={} ns_per_file={}",
+            file_count,
+            elapsed.as_millis(),
+            elapsed.as_nanos() / u128::try_from(file_count).unwrap()
+        );
+    }
+
+    #[test]
     fn compact_message_extra_keeps_only_cass_metadata() {
         let raw = json!({
             "model": "gpt-5-codex",
@@ -930,6 +1007,31 @@ mod tests {
             LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES,
         )));
         assert!(!CodexConnector::should_compact_large_message_extra(None));
+    }
+
+    #[test]
+    fn file_metadata_if_modified_preserves_scan_fallbacks() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("rollout-meta.jsonl");
+        fs::write(&file, "{}").unwrap();
+
+        assert!(matches!(
+            CodexConnector::file_metadata_if_modified(&file, None),
+            FileScanMetadata::Process(Some(_))
+        ));
+        assert!(
+            matches!(
+                CodexConnector::file_metadata_if_modified(&file, Some(i64::MAX)),
+                FileScanMetadata::Skip
+            ),
+            "future since_ts should skip older files"
+        );
+
+        let missing = dir.path().join("missing.jsonl");
+        assert!(matches!(
+            CodexConnector::file_metadata_if_modified(&missing, Some(i64::MAX)),
+            FileScanMetadata::Process(None)
+        ));
     }
 
     #[test]
