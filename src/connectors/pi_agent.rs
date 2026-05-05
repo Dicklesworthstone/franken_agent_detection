@@ -1281,6 +1281,7 @@ mod tests {
             .join("sessions")
             .join("2025-12-01T10-00-00_uuid1.jsonl");
         assert_eq!(convs[0].source_path, expected_path);
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

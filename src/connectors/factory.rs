@@ -519,6 +519,7 @@ mod tests {
         assert_eq!(convs[0].messages[0].role, "user");
         assert_eq!(convs[0].messages[0].content, "Hello Factory");
         assert_eq!(convs[0].messages[1].role, "assistant");
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

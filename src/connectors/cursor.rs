@@ -1648,6 +1648,23 @@ mod tests {
         assert!(result.is_ok());
         let convs = result.unwrap();
         assert_eq!(convs.len(), 1);
+
+        let discovered_paths: HashSet<PathBuf> = connector
+            .discover_source_files(&ctx)
+            .unwrap()
+            .into_iter()
+            .map(|source| source.source_path)
+            .collect();
+        assert!(
+            discovered_paths.contains(&db_path),
+            "discovery should include consumed Cursor database {}",
+            db_path.display()
+        );
+        assert!(
+            convs[0].source_path.starts_with(&db_path),
+            "Cursor conversation source path should be derived from consumed db {}",
+            db_path.display()
+        );
     }
 
     #[test]

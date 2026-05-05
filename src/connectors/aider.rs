@@ -654,6 +654,7 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].source_path, history_file);
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     // =====================================================

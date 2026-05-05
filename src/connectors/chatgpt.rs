@@ -1932,5 +1932,6 @@ mod tests {
 
         assert_eq!(convs.len(), 1, "should extract only the valid conversation");
         assert_eq!(convs[0].messages[0].content, "Valid conversation");
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 }

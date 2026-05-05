@@ -862,6 +862,7 @@ mod tests {
         assert_eq!(convs[0].ended_at, Some(1_700_000_004_000));
         assert!(convs[0].title.as_ref().unwrap().contains("read a file"));
         assert_eq!(convs[0].metadata["source"], "copilot-cli");
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

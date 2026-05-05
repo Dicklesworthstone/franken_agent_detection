@@ -392,6 +392,7 @@ mod tests {
                 .unwrap_or("")
                 .contains("sess-123")
         );
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

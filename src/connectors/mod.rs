@@ -105,6 +105,37 @@ pub trait Connector {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn assert_discovery_covers_scan_sources<C: Connector + ?Sized>(
+    connector: &C,
+    ctx: &ScanContext,
+) {
+    let discovered_paths = connector
+        .discover_source_files(ctx)
+        .expect("source discovery should succeed")
+        .into_iter()
+        .map(|source| source.source_path)
+        .collect::<std::collections::HashSet<_>>();
+    let scanned_paths = connector
+        .scan(ctx)
+        .expect("scan should succeed")
+        .into_iter()
+        .map(|conversation| conversation.source_path)
+        .collect::<std::collections::HashSet<_>>();
+
+    assert!(
+        !scanned_paths.is_empty(),
+        "fixture should produce at least one scanned conversation"
+    );
+    for scanned_path in scanned_paths {
+        assert!(
+            discovered_paths.contains(&scanned_path),
+            "discovery should include scanned source path {}",
+            scanned_path.display()
+        );
+    }
+}
+
 /// Map connector slugs to franken-agent-detection slugs.
 fn connector_to_franken_slug(connector_slug: &str) -> String {
     match connector_slug.trim().to_ascii_lowercase().as_str() {

@@ -389,6 +389,8 @@ fn flush_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensqlite::compat::ConnectionExt;
+    use frankensqlite::params;
 
     #[test]
     fn extract_text_from_parts_basic() {
@@ -420,5 +422,62 @@ mod tests {
         // When type is omitted, default to "text"
         let json = r#"[{"text":"no type field"}]"#;
         assert_eq!(extract_text_from_parts(Some(json)), "no type field");
+    }
+
+    #[test]
+    fn scan_discovers_consumed_sqlite_database() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("crush.db");
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+
+        conn.execute(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                cost REAL
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE messages (
+                session_id TEXT,
+                role TEXT,
+                parts TEXT,
+                created_at INTEGER,
+                model TEXT,
+                provider TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO sessions (id, title, prompt_tokens, completion_tokens, cost)
+             VALUES (?, ?, ?, ?, ?)",
+            params!["sess-001", "Crush Test", 1_i64, 2_i64, 0.01_f64],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO messages (session_id, role, parts, created_at, model, provider)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                "sess-001",
+                "user",
+                r#"[{"type":"text","text":"Hello Crush"}]"#,
+                1_733_000_000_000_i64,
+                "crush-model",
+                "crush"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let connector = CrushConnector::new();
+        let ctx = ScanContext::local_default(db_path.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].source_path, db_path);
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 }

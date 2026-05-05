@@ -1239,6 +1239,7 @@ mod tests {
         assert!(convs[0].ended_at.is_some());
         assert!(convs[0].title.is_some());
         assert!(convs[0].title.as_ref().unwrap().contains("sort a vector"));
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

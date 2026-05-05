@@ -460,6 +460,7 @@ mod tests {
         assert_eq!(convs[0].messages[0].content, "Hello Qwen");
         assert_eq!(convs[0].messages[1].role, "assistant");
         assert!(convs[0].messages[1].content.contains("How can I help"));
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

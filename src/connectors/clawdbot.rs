@@ -326,6 +326,7 @@ mod tests {
         assert_eq!(convs[0].title, Some("Hello there".to_string()));
         assert!(convs[0].started_at.is_some());
         assert!(convs[0].ended_at.is_some());
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

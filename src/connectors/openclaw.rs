@@ -665,6 +665,7 @@ mod tests {
         );
         assert!(convs[0].workspace.is_some());
         assert!(convs[0].started_at.is_some());
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

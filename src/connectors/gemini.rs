@@ -1128,6 +1128,7 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
 
         assert!(convs[0].source_path.ends_with("session-1.json"));
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

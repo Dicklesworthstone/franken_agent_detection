@@ -449,7 +449,7 @@ impl Connector for ClineConnector {
                     external_id: task_id,
                     title,
                     workspace,
-                    source_path: path.clone(),
+                    source_path: file.clone(),
                     started_at: messages.iter().filter_map(|m| m.created_at).min(),
                     ended_at: messages.iter().filter_map(|m| m.created_at).max(),
                     metadata: serde_json::json!({"source": "cline"}),
@@ -696,6 +696,7 @@ mod tests {
                 && source.role == DiscoveredSourceRole::MetadataSidecar
                 && !source.required_for_reconstruction
         }));
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

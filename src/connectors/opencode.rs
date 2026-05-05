@@ -1760,6 +1760,7 @@ mod tests {
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].role, "user");
         assert!(convs[0].messages[0].content.contains("Hello, OpenCode!"));
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

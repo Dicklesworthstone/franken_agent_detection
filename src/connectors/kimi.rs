@@ -592,6 +592,7 @@ mod tests {
                 .content
                 .contains("Hello! How can I help")
         );
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]
