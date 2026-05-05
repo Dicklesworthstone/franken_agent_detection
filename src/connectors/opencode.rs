@@ -27,7 +27,7 @@
     clippy::unreadable_literal
 )]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -468,6 +468,7 @@ impl OpenCodeConnector {
             )
             .with_context(|| "failed to query OpenCode sessions")?;
 
+        let mut messages_by_session = Self::load_sqlite_messages_by_session(&conn)?;
         let mut convs = Vec::new();
         let mut seen_ids = HashSet::new();
 
@@ -476,8 +477,7 @@ impl OpenCodeConnector {
                 continue;
             }
 
-            // Load messages for this session
-            let messages = Self::load_messages_sqlite(&conn, &session.id)?;
+            let messages = messages_by_session.remove(&session.id).unwrap_or_default();
             if messages.is_empty() {
                 continue;
             }
@@ -534,39 +534,40 @@ impl OpenCodeConnector {
         Ok(convs)
     }
 
-    /// Load messages + parts for a session from SQLite.
-    fn load_messages_sqlite(conn: &Connection, session_id: &str) -> Result<Vec<NormalizedMessage>> {
-        // Query messages for this session. Read time_created as raw value since
-        // Drizzle ORM may store it as TEXT or INTEGER.
-        let rows: Vec<(String, String, Option<SqliteValue>)> = conn.query_map_collect(
-            "SELECT id, data, time_created FROM message WHERE session_id = ? ORDER BY time_created ASC",
-            params![session_id],
+    fn load_sqlite_messages_by_session(
+        conn: &Connection,
+    ) -> Result<HashMap<String, Vec<NormalizedMessage>>> {
+        let mut parts_by_message = Self::load_sqlite_parts_by_message(conn)?;
+        let rows: Vec<SqliteMessageRow> = conn.query_map_collect(
+            "SELECT session_id, id, data, time_created
+             FROM message
+             ORDER BY session_id ASC, time_created ASC, id ASC",
+            params![],
             |row| {
-                let id: String = row.get_typed(0)?;
-                let data: String = row.get_typed(1)?;
-                let time_created_raw = optional_sqlite_value(row, 2);
-                Ok((id, data, time_created_raw))
+                Ok(SqliteMessageRow {
+                    session_id: row.get_typed(0)?,
+                    id: row.get_typed(1)?,
+                    data_json: row.get_typed(2)?,
+                    time_created_raw: optional_sqlite_value(row, 3),
+                })
             },
         )?;
 
-        let mut pending: Vec<(Option<i64>, String, NormalizedMessage)> = Vec::new();
+        let mut pending_by_session: HashMap<String, Vec<PendingSqliteMessage>> = HashMap::new();
 
-        for (msg_id, data_json, time_created_raw) in rows {
-            // Parse the JSON data blob
-            let msg_data: SqliteMessageData = match serde_json::from_str(&data_json) {
+        for row in rows {
+            let msg_data: SqliteMessageData = match serde_json::from_str(&row.data_json) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::debug!(
-                        "opencode sqlite: failed to parse message data for {msg_id}: {e}"
+                        "opencode sqlite: failed to parse message data for {}: {e}",
+                        row.id
                     );
                     continue;
                 }
             };
 
-            // Load parts for this message
-            let parts = Self::load_parts_sqlite(conn, &msg_id)?;
-
-            // Build content from parts, falling back to message-level content
+            let parts = parts_by_message.remove(&row.id).unwrap_or_default();
             let content_text = if !parts.is_empty() {
                 assemble_content_from_parts(&parts)
             } else {
@@ -578,8 +579,8 @@ impl OpenCodeConnector {
             }
 
             let role = msg_data.role.unwrap_or_else(|| "assistant".to_string());
-            // Prefer JSON-embedded timestamp, fall back to column timestamp
-            let col_ts = time_created_raw
+            let col_ts = row
+                .time_created_raw
                 .as_ref()
                 .and_then(normalize_sqlite_ts_value);
             let created_at =
@@ -592,58 +593,71 @@ impl OpenCodeConnector {
                 Some("user".to_string())
             };
 
-            pending.push((
-                created_at,
-                msg_id.clone(),
-                NormalizedMessage {
-                    idx: 0,
-                    role,
-                    author,
+            let message_id = row.id;
+            let session_id = row.session_id;
+            pending_by_session
+                .entry(session_id.clone())
+                .or_default()
+                .push(PendingSqliteMessage {
                     created_at,
-                    content: content_text,
-                    extra: serde_json::json!({
-                        "message_id": msg_id,
-                        "session_id": session_id,
-                    }),
-                    invocations: Vec::new(),
-                    snippets: Vec::new(),
-                },
-            ));
+                    message_id: message_id.clone(),
+                    message: NormalizedMessage {
+                        idx: 0,
+                        role,
+                        author,
+                        created_at,
+                        content: content_text,
+                        extra: serde_json::json!({
+                            "message_id": message_id,
+                            "session_id": session_id,
+                        }),
+                        invocations: Vec::new(),
+                        snippets: Vec::new(),
+                    },
+                });
         }
 
-        // Sort by timestamp, then by message id
-        pending.sort_by(|a, b| {
-            let a_ts = a.0.unwrap_or(i64::MAX);
-            let b_ts = b.0.unwrap_or(i64::MAX);
-            a_ts.cmp(&b_ts).then_with(|| a.1.cmp(&b.1))
-        });
-        let mut messages: Vec<NormalizedMessage> =
-            pending.into_iter().map(|(_, _, msg)| msg).collect();
-        crate::types::reindex_messages(&mut messages);
+        let mut messages_by_session = HashMap::new();
+        for (session_id, mut pending) in pending_by_session {
+            pending.sort_by(|a, b| {
+                let a_ts = a.created_at.unwrap_or(i64::MAX);
+                let b_ts = b.created_at.unwrap_or(i64::MAX);
+                a_ts.cmp(&b_ts)
+                    .then_with(|| a.message_id.cmp(&b.message_id))
+            });
+            let mut messages: Vec<NormalizedMessage> =
+                pending.into_iter().map(|pending| pending.message).collect();
+            crate::types::reindex_messages(&mut messages);
+            messages_by_session.insert(session_id, messages);
+        }
 
-        Ok(messages)
+        Ok(messages_by_session)
     }
 
-    /// Load parts for a message from SQLite.
-    fn load_parts_sqlite(conn: &Connection, message_id: &str) -> Result<Vec<PartInfo>> {
-        let rows: Vec<String> = conn.query_map_collect(
-            "SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC",
-            params![message_id],
-            |row| row.get_typed(0),
+    fn load_sqlite_parts_by_message(conn: &Connection) -> Result<HashMap<String, Vec<PartInfo>>> {
+        let rows: Vec<(String, String)> = conn.query_map_collect(
+            "SELECT message_id, data
+             FROM part
+             ORDER BY message_id ASC, time_created ASC, id ASC",
+            params![],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
         )?;
 
-        let mut parts = Vec::new();
-        for row in rows {
+        let mut parts_by_message: HashMap<String, Vec<PartInfo>> = HashMap::new();
+        for (message_id, row) in rows {
             match serde_json::from_str::<SqlitePartData>(&row) {
                 Ok(part_data) => {
-                    parts.push(PartInfo {
-                        id: part_data.id,
-                        index: part_data.index,
-                        message_id: None,
-                        part_type: part_data.part_type,
-                        text: part_data.text,
-                        state: part_data.state,
-                    });
+                    parts_by_message
+                        .entry(message_id)
+                        .or_default()
+                        .push(PartInfo {
+                            id: part_data.id,
+                            index: part_data.index,
+                            message_id: None,
+                            part_type: part_data.part_type,
+                            text: part_data.text,
+                            state: part_data.state,
+                        });
                 }
                 Err(e) => {
                     tracing::debug!("opencode sqlite: failed to parse part data: {e}");
@@ -651,9 +665,25 @@ impl OpenCodeConnector {
             }
         }
 
-        sort_parts_for_message(&mut parts);
-        Ok(parts)
+        for parts in parts_by_message.values_mut() {
+            sort_parts_for_message(parts);
+        }
+
+        Ok(parts_by_message)
     }
+}
+
+struct SqliteMessageRow {
+    session_id: String,
+    id: String,
+    data_json: String,
+    time_created_raw: Option<SqliteValue>,
+}
+
+struct PendingSqliteMessage {
+    created_at: Option<i64>,
+    message_id: String,
+    message: NormalizedMessage,
 }
 
 /// Session row from SQLite.
