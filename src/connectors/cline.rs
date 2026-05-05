@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::Value;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -179,6 +179,100 @@ impl ClineConnector {
 
         false
     }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let override_root = Self::normalize_root_path(&ctx.data_dir);
+        let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
+            if Self::looks_like_storage(&override_root) {
+                vec![ScanRoot::local(override_root)]
+            } else {
+                Self::storage_roots()
+                    .into_iter()
+                    .map(ScanRoot::local)
+                    .collect()
+            }
+        } else {
+            let mut explicit = Vec::new();
+            for root in &ctx.scan_roots {
+                let mut paths = Vec::new();
+                Self::append_explicit_roots(&mut paths, &root.path);
+                explicit.extend(paths.into_iter().map(|path| root.with_path(path)));
+            }
+            explicit
+        };
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for root in Self::source_roots(ctx) {
+            if !root.path.exists() {
+                continue;
+            }
+            let entries = match fs::read_dir(&root.path) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    tracing::debug!(path = %root.path.display(), error = %err, "cline: skipping unreadable source-discovery directory");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let task_dir = entry.path();
+                if !task_dir.is_dir() {
+                    continue;
+                }
+                if task_dir.file_name().and_then(|s| s.to_str()) == Some("taskHistory.json") {
+                    continue;
+                }
+
+                let ui_messages_path = task_dir.join("ui_messages.json");
+                let api_messages_path = task_dir.join("api_conversation_history.json");
+                let source_file = if ui_messages_path.exists() {
+                    Some(ui_messages_path)
+                } else if api_messages_path.exists() {
+                    Some(api_messages_path)
+                } else {
+                    None
+                };
+
+                let Some(file) = source_file else {
+                    continue;
+                };
+                if !file_modified_since(&file, ctx.since_ts) {
+                    continue;
+                }
+
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "cline",
+                        &root,
+                        file,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+
+                let meta_path = task_dir.join("task_metadata.json");
+                if meta_path.exists() {
+                    out.push(
+                        DiscoveredSourceFile::new(
+                            "cline",
+                            &root,
+                            meta_path,
+                            DiscoveredSourceRole::MetadataSidecar,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Connector for ClineConnector {
@@ -188,25 +282,10 @@ impl Connector for ClineConnector {
 
     #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let override_root = Self::normalize_root_path(&ctx.data_dir);
-        let roots = if ctx.use_default_detection() {
-            if Self::looks_like_storage(&override_root) {
-                vec![override_root]
-            } else {
-                Self::storage_roots()
-            }
-        } else {
-            let mut explicit = Vec::new();
-            for root in &ctx.scan_roots {
-                Self::append_explicit_roots(&mut explicit, &root.path);
-            }
-            explicit.sort();
-            explicit.dedup();
-            if explicit.is_empty() {
-                return Ok(Vec::new());
-            }
-            explicit
-        };
+        let roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -380,6 +459,10 @@ impl Connector for ClineConnector {
         }
 
         Ok(convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 
@@ -583,6 +666,36 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].title, Some("My Cline Task".to_string()));
+    }
+
+    #[test]
+    fn discover_source_files_includes_primary_and_metadata_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_cline_storage(&dir);
+        let task_dir = create_task_dir(&storage, "task-discovery");
+
+        let messages = json!([{"role": "user", "content": "Test"}]);
+        let metadata = json!({"title": "Discovered Cline Task"});
+        let primary = task_dir.join("ui_messages.json");
+        let sidecar = task_dir.join("task_metadata.json");
+        fs::write(&primary, messages.to_string()).unwrap();
+        fs::write(&sidecar, metadata.to_string()).unwrap();
+
+        let connector = ClineConnector::new();
+        let ctx = ScanContext::local_default(storage, None);
+        let discovered = connector.discover_source_files(&ctx).unwrap();
+
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.iter().any(|source| {
+            source.source_path == primary
+                && source.role == DiscoveredSourceRole::PrimarySessionLog
+                && source.required_for_reconstruction
+        }));
+        assert!(discovered.iter().any(|source| {
+            source.source_path == sidecar
+                && source.role == DiscoveredSourceRole::MetadataSidecar
+                && !source.required_for_reconstruction
+        }));
     }
 
     #[test]

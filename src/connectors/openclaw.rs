@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -237,6 +237,62 @@ impl OpenClawConnector {
         out
     }
 
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = Vec::new();
+        if ctx.use_default_detection() {
+            if let Some(explicit) = Self::session_root_from_candidate(&ctx.data_dir)
+                && Self::looks_like_openclaw_storage(&explicit)
+                && explicit.exists()
+            {
+                roots.push(ScanRoot::local(explicit));
+            } else {
+                roots.extend(
+                    Self::find_agent_session_dirs()
+                        .into_iter()
+                        .map(ScanRoot::local),
+                );
+            }
+        } else {
+            for root in &ctx.scan_roots {
+                roots.extend(
+                    Self::roots_from_scan_path(&root.path)
+                        .into_iter()
+                        .map(|path| root.with_path(path)),
+                );
+            }
+        }
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for mut root in Self::source_roots(ctx) {
+            if root.path.is_file() {
+                let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
+                root = root.with_path(parent);
+            }
+            for file in Self::session_files(&root.path) {
+                if !file_modified_since(&file, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "openclaw",
+                        &root,
+                        file,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+        }
+        out
+    }
+
     /// Flatten `OpenClaw` content blocks into a single string.
     /// Content is an array of blocks: text, toolCall, thinking.
     fn flatten_openclaw_content(content: &Value) -> String {
@@ -285,25 +341,10 @@ impl Connector for OpenClawConnector {
 
     #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-
-        if ctx.use_default_detection() {
-            if let Some(explicit) = Self::session_root_from_candidate(&ctx.data_dir)
-                && Self::looks_like_openclaw_storage(&explicit)
-                && explicit.exists()
-            {
-                roots.push(explicit);
-            } else {
-                roots.extend(Self::find_agent_session_dirs());
-            }
-        } else {
-            for root in &ctx.scan_roots {
-                roots.extend(Self::roots_from_scan_path(&root.path));
-            }
-        }
-
-        roots.sort();
-        roots.dedup();
+        let roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -543,6 +584,10 @@ impl Connector for OpenClawConnector {
         );
 
         Ok(convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

@@ -39,7 +39,7 @@ pub mod workspace_cache;
 mod conformance_tests;
 
 pub use path_trie::PathTrie;
-pub use scan::{ScanContext, ScanRoot};
+pub use scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 pub use token_extraction::{
     ExtractedTokenUsage, ModelInfo, TokenDataSource, estimate_tokens_from_content,
     extract_claude_code_tokens, extract_codex_tokens, extract_tokens_for_agent, normalize_model,
@@ -72,6 +72,20 @@ pub trait Connector {
     /// first materialize the full corpus via `scan()`.
     fn supports_streaming_scan(&self) -> bool {
         false
+    }
+
+    /// Discover the raw source files this connector will consume for a scan.
+    ///
+    /// Implementations must use the same provider-specific root expansion,
+    /// filtering, and deduplication logic as `scan()` / `scan_with_callback()`.
+    /// The contract is intentionally file-oriented and pre-parse: callers such
+    /// as CASS can mirror precious source artifacts before parser failures,
+    /// malformed records, or projection bugs can make a session invisible.
+    fn discover_source_files(
+        &self,
+        _ctx: &ScanContext,
+    ) -> anyhow::Result<Vec<DiscoveredSourceFile>> {
+        Ok(Vec::new())
     }
 
     /// Scan conversation history and emit conversations incrementally.

@@ -26,7 +26,7 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -184,6 +184,69 @@ impl CopilotCliConnector {
         // Keep traversal deterministic.
         files.sort();
         files
+    }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = Vec::new();
+
+        if ctx.use_default_detection() {
+            if Self::looks_like_cli_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+                roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            } else {
+                roots.extend(
+                    Self::cli_candidate_paths()
+                        .into_iter()
+                        .filter(|path| path.exists())
+                        .map(ScanRoot::local),
+                );
+            }
+        } else {
+            for scan_root in &ctx.scan_roots {
+                let candidates = [
+                    scan_root.path.join(".copilot/session-state"),
+                    scan_root.path.join(".copilot/history-session-state"),
+                    scan_root.path.join(".config/gh-copilot"),
+                    scan_root.path.join(".config/gh/copilot"),
+                    scan_root.path.join(".local/share/github-copilot"),
+                ];
+
+                for candidate in &candidates {
+                    if candidate.exists() {
+                        roots.push(scan_root.with_path(candidate.clone()));
+                    }
+                }
+
+                let mut explicit = Vec::new();
+                Self::append_explicit_roots(&mut explicit, &scan_root.path);
+                roots.extend(explicit.into_iter().map(|path| scan_root.with_path(path)));
+            }
+        }
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for root in Self::source_roots(ctx) {
+            for file in Self::find_event_files(&root.path) {
+                if !file_modified_since(&file, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "copilot_cli",
+                        &root,
+                        file,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+        }
+        out
     }
 
     /// Parse a JSONL event log file into conversations.
@@ -679,37 +742,10 @@ impl Connector for CopilotCliConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-
-        if ctx.use_default_detection() {
-            if Self::looks_like_cli_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                roots.push(ctx.data_dir.clone());
-            } else {
-                for path in Self::cli_candidate_paths() {
-                    if path.exists() {
-                        roots.push(path);
-                    }
-                }
-            }
-        } else {
-            for scan_root in &ctx.scan_roots {
-                let candidates = [
-                    scan_root.path.join(".copilot/session-state"),
-                    scan_root.path.join(".copilot/history-session-state"),
-                    scan_root.path.join(".config/gh-copilot"),
-                    scan_root.path.join(".config/gh/copilot"),
-                    scan_root.path.join(".local/share/github-copilot"),
-                ];
-
-                for candidate in &candidates {
-                    if candidate.exists() {
-                        roots.push(candidate.clone());
-                    }
-                }
-
-                Self::append_explicit_roots(&mut roots, &scan_root.path);
-            }
-        }
+        let roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -751,6 +787,10 @@ impl Connector for CopilotCliConnector {
         }
 
         Ok(all_conversations)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

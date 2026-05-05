@@ -6,6 +6,17 @@
 //! **Pre-v1.20 (JSONL):** Data at `~/.local/share/goose/sessions/` or legacy
 //! `~/.goose/sessions/` using `*.jsonl` files — one per session.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    clippy::missing_const_for_fn,
+    clippy::must_use_candidate,
+    clippy::option_if_let_else,
+    clippy::single_option_map,
+    clippy::too_many_lines,
+    clippy::unreadable_literal
+)]
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +27,7 @@ use frankensqlite::{Connection, Row, SqliteValue, params};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
@@ -206,6 +217,127 @@ impl GooseConnector {
         for candidate in candidates {
             if candidate.exists() && looks_like_goose_sessions(&candidate) {
                 session_roots.push(candidate);
+            }
+        }
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut sources = Vec::new();
+        Self::discover_sqlite_sources(ctx, &mut sources);
+        Self::discover_jsonl_sources(ctx, &mut sources);
+        sources
+    }
+
+    fn discover_sqlite_sources(ctx: &ScanContext, sources: &mut Vec<DiscoveredSourceFile>) {
+        let mut candidates: Vec<(ScanRoot, PathBuf)> = Vec::new();
+        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
+            let root = ScanRoot::local(ctx.data_dir.clone());
+            candidates.push((root, ctx.data_dir.clone()));
+        } else if !ctx.data_dir.as_os_str().is_empty() {
+            let root = ScanRoot::local(ctx.data_dir.clone());
+            let db_path = root.path.join("sessions.db");
+            candidates.push((root, db_path));
+        }
+
+        if ctx.use_default_detection() {
+            if let Some(db) = Self::sqlite_db_path() {
+                let root = ScanRoot::local(db.clone());
+                candidates.push((root, db));
+            }
+        } else {
+            for scan_root in &ctx.scan_roots {
+                let mut db_paths = Vec::new();
+                Self::append_db_candidates(&mut db_paths, &scan_root.path);
+                candidates.extend(
+                    db_paths
+                        .into_iter()
+                        .map(|db_path| (scan_root.clone(), db_path)),
+                );
+            }
+        }
+
+        let mut seen = HashSet::new();
+        sources.extend(
+            candidates
+                .into_iter()
+                .filter(|(_, db_path)| db_path.is_file())
+                .filter(|(_, db_path)| seen.insert(db_path.clone()))
+                .map(|(root, db_path)| {
+                    DiscoveredSourceFile::new(
+                        "goose",
+                        &root,
+                        db_path,
+                        DiscoveredSourceRole::SqliteDatabase,
+                        true,
+                    )
+                    .with_fs_metadata()
+                }),
+        );
+    }
+
+    fn discover_jsonl_sources(ctx: &ScanContext, sources: &mut Vec<DiscoveredSourceFile>) {
+        let mut session_roots: Vec<(ScanRoot, PathBuf)> = Vec::new();
+        if ctx.use_default_detection() {
+            if ctx.data_dir.exists() && looks_like_goose_sessions(&ctx.data_dir) {
+                let root = ScanRoot::local(ctx.data_dir.clone());
+                session_roots.push((root, ctx.data_dir.clone()));
+            } else if let Some(dir) = Self::sessions_dir() {
+                let root = ScanRoot::local(dir.clone());
+                session_roots.push((root, dir));
+            }
+        } else {
+            if ctx.data_dir.exists() {
+                let root = ScanRoot::local(ctx.data_dir.clone());
+                let mut roots = Vec::new();
+                Self::append_session_roots(&mut roots, &ctx.data_dir);
+                session_roots.extend(
+                    roots
+                        .into_iter()
+                        .map(|session_root| (root.clone(), session_root)),
+                );
+            }
+            for scan_root in &ctx.scan_roots {
+                let mut roots = Vec::new();
+                Self::append_session_roots(&mut roots, &scan_root.path);
+                session_roots.extend(
+                    roots
+                        .into_iter()
+                        .map(|session_root| (scan_root.clone(), session_root)),
+                );
+            }
+        }
+
+        session_roots.sort_by(|left, right| left.1.cmp(&right.1));
+        session_roots.dedup_by(|left, right| left.1 == right.1);
+
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+        for (root, sessions_dir) in session_roots {
+            let jsonl_files: Vec<PathBuf> = WalkDir::new(&sessions_dir)
+                .max_depth(2)
+                .into_iter()
+                .flatten()
+                .filter(|e| e.file_type().is_file())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+                .map(|e| e.path().to_path_buf())
+                .collect();
+
+            for jsonl_file in jsonl_files {
+                if !seen_files.insert(dedupe_path_key(&jsonl_file)) {
+                    continue;
+                }
+                if !file_modified_since(&jsonl_file, ctx.since_ts) {
+                    continue;
+                }
+                sources.push(
+                    DiscoveredSourceFile::new(
+                        "goose",
+                        &root,
+                        jsonl_file,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
             }
         }
     }
@@ -589,6 +721,10 @@ impl Connector for GooseConnector {
 
         Ok(convs)
     }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
+    }
 }
 
 /// Check if a directory looks like a Goose sessions directory.
@@ -926,7 +1062,7 @@ mod tests {
 
     #[test]
     fn default_creates_connector() {
-        let connector = GooseConnector::default();
+        let connector = GooseConnector;
         let _ = connector;
     }
 
@@ -1225,7 +1361,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let jsonl_path = dir.path().join("test-session.jsonl");
 
-        let lines = vec![
+        let lines = [
             json!({"role": "user", "content": "Hello", "id": "msg1", "created_at": 1700000000}).to_string(),
             json!({"role": "assistant", "content": "Hi there!", "id": "msg2", "created_at": 1700000001}).to_string(),
         ];
@@ -1552,5 +1688,39 @@ mod tests {
 
         let convs = GooseConnector::extract_from_sqlite(&db_path, None).unwrap();
         assert!(convs.is_empty());
+    }
+
+    #[test]
+    fn discover_source_files_includes_sqlite_and_jsonl_sources() {
+        let temp = TempDir::new().unwrap();
+        let sessions_root = temp.path().join("goose").join("sessions");
+        fs::create_dir_all(&sessions_root).unwrap();
+        let db_path = sessions_root.join("sessions.db");
+        let jsonl_path = sessions_root.join("legacy.jsonl");
+        fs::write(&db_path, b"not a real sqlite db").unwrap();
+        fs::write(
+            &jsonl_path,
+            br#"{"role":"user","content":[{"type":"text","text":"hello"}],"created_at":1700000000}"#,
+        )
+        .unwrap();
+
+        let root = ScanRoot::local(sessions_root.clone());
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        let sources = GooseConnector::new()
+            .discover_source_files(&ctx)
+            .expect("source discovery");
+
+        assert!(sources.iter().any(|source| {
+            source.source_path == db_path
+                && source.provider_slug == "goose"
+                && source.role == DiscoveredSourceRole::SqliteDatabase
+                && source.required_for_reconstruction
+        }));
+        assert!(sources.iter().any(|source| {
+            source.source_path == jsonl_path
+                && source.provider_slug == "goose"
+                && source.role == DiscoveredSourceRole::PrimarySessionLog
+                && source.required_for_reconstruction
+        }));
     }
 }

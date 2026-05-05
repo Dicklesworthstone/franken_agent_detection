@@ -18,7 +18,7 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, file_modified_since, franken_detection_for_connector, parse_timestamp,
     utils::dedupe_path_key,
@@ -197,53 +197,43 @@ impl PiAgentConnector {
 
         String::new()
     }
-}
 
-impl Connector for PiAgentConnector {
-    fn detect(&self) -> DetectionResult {
-        franken_detection_for_connector("pi_agent").unwrap_or_else(DetectionResult::not_found)
+    fn looks_like_root(path: &Path) -> bool {
+        path.join("sessions").exists()
+            || path
+                .file_name()
+                .is_some_and(|n| n.to_str().unwrap_or("").contains("pi"))
+            || path.file_name().is_some_and(|n| n == "sessions")
+            || path.to_str().is_some_and(|s| {
+                s.contains(".pi/agent") || s.contains(".omp/agent") || s.contains("pi-agent")
+            })
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        // Use data_root if it looks like a pi-agent directory (for testing)
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let is_pi_agent_dir = ctx.data_dir.to_str().is_some_and(|s| {
             s.contains(".pi/agent")
                 || s.contains(".omp/agent")
                 || s.ends_with("/pi-agent")
                 || s.ends_with("\\pi-agent")
         });
-        let looks_like_root = |path: &PathBuf| {
-            path.join("sessions").exists()
-                || path
-                    .file_name()
-                    .is_some_and(|n| n.to_str().unwrap_or("").contains("pi"))
-                // Accept the sessions directory itself (e.g. ~/.pi/agent/sessions)
-                // which is what detection returns as root_path
-                || path
-                    .file_name()
-                    .is_some_and(|n| n == "sessions")
-                || path.to_str().is_some_and(|s| {
-                    s.contains(".pi/agent") || s.contains(".omp/agent") || s.contains("pi-agent")
-                })
-        };
 
-        // Build the candidate list of home directories to scan. Default
-        // detection walks both `~/.pi/agent` (pi-mono) and `~/.omp/agent`
-        // (Oh My Pi), so users with either (or both) installations get
-        // complete discovery without additional configuration (#174).
-        let mut homes: Vec<PathBuf> = Vec::new();
+        let mut homes: Vec<ScanRoot> = Vec::new();
         if ctx.use_default_detection() {
             if is_pi_agent_dir {
-                homes.push(ctx.data_dir.clone());
+                homes.push(ScanRoot::local(ctx.data_dir.clone()));
             } else {
-                homes.extend(Self::default_homes());
+                homes.extend(Self::default_homes().into_iter().map(ScanRoot::local));
             }
         } else {
-            if looks_like_root(&ctx.data_dir) {
-                homes.push(ctx.data_dir.clone());
+            if Self::looks_like_root(&ctx.data_dir) {
+                homes.push(ScanRoot::local(ctx.data_dir.clone()));
             }
-            Self::append_explicit_homes(&mut homes, &ctx.data_dir, &looks_like_root);
+            let mut data_candidates = Vec::new();
+            Self::append_explicit_homes(&mut data_candidates, &ctx.data_dir, &|path| {
+                Self::looks_like_root(path)
+            });
+            homes.extend(data_candidates.into_iter().map(ScanRoot::local));
+
             for scan_root in &ctx.scan_roots {
                 let candidates = [
                     scan_root.path.clone(),
@@ -253,29 +243,70 @@ impl Connector for PiAgentConnector {
                     scan_root.path.join(".omp/agent/sessions"),
                 ];
                 for candidate in candidates {
-                    if looks_like_root(&candidate) {
-                        homes.push(candidate);
+                    if Self::looks_like_root(&candidate) {
+                        homes.push(scan_root.with_path(candidate));
                     }
                 }
-                Self::append_explicit_homes(&mut homes, &scan_root.path, &looks_like_root);
+                let mut derived = Vec::new();
+                Self::append_explicit_homes(&mut derived, &scan_root.path, &|path| {
+                    Self::looks_like_root(path)
+                });
+                homes.extend(derived.into_iter().map(|path| scan_root.with_path(path)));
             }
         }
-        // Normalize file-shaped homes (e.g. pointing directly at a .jsonl)
-        // to their parent directory, matching the legacy single-home behavior.
+
         for home in &mut homes {
-            if home.is_file() {
-                *home = home.parent().unwrap_or(home).to_path_buf();
+            if home.path.is_file() {
+                home.path = home.path.parent().unwrap_or(&home.path).to_path_buf();
             }
         }
-        // Deduplicate homes preserving order (important when the same path
-        // appears via both `ctx.data_dir` and `default_homes()`).
-        {
-            let mut seen = HashSet::new();
-            homes.retain(|p| {
-                let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-                seen.insert(canonical)
-            });
+
+        let mut seen = HashSet::new();
+        homes.retain(|root| {
+            let canonical = std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone());
+            seen.insert(canonical)
+        });
+        homes
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
+        for root in Self::source_roots(ctx) {
+            for file in Self::session_files(&root.path) {
+                if !seen_session_paths.insert(dedupe_path_key(&file)) {
+                    continue;
+                }
+                if !file_modified_since(&file, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "pi_agent",
+                        &root,
+                        file,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
         }
+        out
+    }
+}
+
+impl Connector for PiAgentConnector {
+    fn detect(&self) -> DetectionResult {
+        franken_detection_for_connector("pi_agent").unwrap_or_else(DetectionResult::not_found)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let homes: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         let mut convs = Vec::new();
         let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
@@ -521,6 +552,10 @@ impl Connector for PiAgentConnector {
         }
 
         Ok(convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
@@ -182,6 +182,91 @@ impl CodexConnector {
         })
     }
 
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let is_codex_dir = ctx.data_dir.to_str().is_some_and(|s| {
+            s.contains(".codex") || s.ends_with("/codex") || s.ends_with("\\codex")
+        }) && ctx.data_dir.join("sessions").exists();
+
+        let mut roots: Vec<ScanRoot> =
+            if ctx.use_default_detection() {
+                if is_codex_dir {
+                    vec![ScanRoot::local(ctx.data_dir.clone())]
+                } else {
+                    vec![ScanRoot::local(Self::home())]
+                }
+            } else {
+                let mut explicit = Vec::new();
+                for scan_root in &ctx.scan_roots {
+                    Self::append_explicit_roots(&mut explicit, &scan_root.path);
+                }
+                explicit
+                    .into_iter()
+                    .map(|path| {
+                        if let Some(root) = ctx.scan_roots.iter().find(|root| {
+                            path.starts_with(&root.path) || root.path.starts_with(&path)
+                        }) {
+                            root.with_path(path)
+                        } else {
+                            ScanRoot::local(path)
+                        }
+                    })
+                    .collect()
+            };
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let roots = Self::source_roots(ctx);
+        let mut out = Vec::new();
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+
+        for root in roots {
+            let explicit_file = root
+                .path
+                .is_file()
+                .then_some(root.path.clone())
+                .filter(|path| Self::is_rollout_file(path));
+            let home = explicit_file
+                .as_ref()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| root.path.clone());
+            if !home.exists() {
+                continue;
+            }
+
+            let files = explicit_file
+                .clone()
+                .map_or_else(|| Self::rollout_files(&home), |path| vec![path]);
+
+            for file in files {
+                if !seen_files.insert(dedupe_path_key(&file)) {
+                    continue;
+                }
+                if matches!(
+                    Self::file_metadata_if_modified(&file, ctx.since_ts),
+                    FileScanMetadata::Skip
+                ) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "codex",
+                        &root,
+                        file,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+        }
+
+        out
+    }
+
     fn compact_message_extra(raw: &Value) -> Value {
         let mut cass = serde_json::Map::new();
 
@@ -263,28 +348,10 @@ fn scan_codex_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    let is_codex_dir =
-        ctx.data_dir.to_str().is_some_and(|s| {
-            s.contains(".codex") || s.ends_with("/codex") || s.ends_with("\\codex")
-        }) && ctx.data_dir.join("sessions").exists();
-
-    let roots: Vec<PathBuf> = if ctx.use_default_detection() {
-        if is_codex_dir {
-            vec![ctx.data_dir.clone()]
-        } else {
-            vec![CodexConnector::home()]
-        }
-    } else {
-        let mut explicit = Vec::new();
-        for scan_root in &ctx.scan_roots {
-            CodexConnector::append_explicit_roots(&mut explicit, &scan_root.path);
-        }
-        explicit
-    };
-
-    let mut roots = roots;
-    roots.sort();
-    roots.dedup();
+    let roots: Vec<PathBuf> = CodexConnector::source_roots(ctx)
+        .into_iter()
+        .map(|root| root.path)
+        .collect();
 
     if roots.is_empty() {
         return Ok(());
@@ -651,6 +718,10 @@ impl Connector for CodexConnector {
         true
     }
 
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
+    }
+
     fn scan_with_callback(
         &self,
         ctx: &ScanContext,
@@ -893,6 +964,36 @@ mod tests {
             streamed[0].messages[1].content,
             scanned[0].messages[1].content
         );
+    }
+
+    #[test]
+    fn discover_source_files_matches_scanned_rollout_sources() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"Hello Codex"}}"#;
+        let rollout = sessions.join("rollout-discovery.jsonl");
+        fs::write(&rollout, content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir, None);
+        let discovered = connector.discover_source_files(&ctx).unwrap();
+        let scanned = connector.scan(&ctx).unwrap();
+
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|source| source.source_path.clone())
+                .collect::<Vec<_>>(),
+            vec![scanned[0].source_path.clone()]
+        );
+        assert_eq!(discovered[0].role, DiscoveredSourceRole::PrimarySessionLog);
+        assert!(discovered[0].required_for_reconstruction);
+        assert_eq!(discovered[0].provider_slug, "codex");
+        assert_eq!(discovered[0].source_path, rollout);
     }
 
     #[test]

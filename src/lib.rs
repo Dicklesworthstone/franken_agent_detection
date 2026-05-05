@@ -47,12 +47,12 @@ pub use connectors::opencode::OpenCodeConnector;
 pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenDataSource};
 #[cfg(feature = "connectors")]
 pub use connectors::{
-    Connector, PathTrie, ScanContext, ScanRoot, WorkspaceCache, aider::AiderConnector,
-    amp::AmpConnector, claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector,
-    cline::ClineConnector, codex::CodexConnector, copilot::CopilotConnector,
-    copilot_cli::CopilotCliConnector, estimate_tokens_from_content, extract_claude_code_tokens,
-    extract_codex_tokens, extract_invocations_from_content_blocks, extract_tokens_for_agent,
-    factory::FactoryConnector, file_modified_since, flatten_content,
+    Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot,
+    WorkspaceCache, aider::AiderConnector, amp::AmpConnector, claude_code::ClaudeCodeConnector,
+    clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
+    copilot::CopilotConnector, copilot_cli::CopilotCliConnector, estimate_tokens_from_content,
+    extract_claude_code_tokens, extract_codex_tokens, extract_invocations_from_content_blocks,
+    extract_tokens_for_agent, factory::FactoryConnector, file_modified_since, flatten_content,
     franken_detection_for_connector, gemini::GeminiConnector, get_connector_factories,
     kimi::KimiConnector, normalize_model, openclaw::OpenClawConnector, parse_timestamp,
     pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,

@@ -5,6 +5,7 @@ use crate::types::{Origin, PathMapping, Platform};
 use once_cell::sync::OnceCell;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 /// A root directory to scan with associated provenance.
 #[derive(Debug)]
@@ -73,6 +74,18 @@ impl ScanRoot {
             .push(PathMapping::new(src_prefix, dst_prefix));
         self.rewrite_trie = OnceCell::new();
         self
+    }
+
+    /// Return the same root metadata pointed at a derived source path.
+    #[must_use]
+    pub fn with_path(&self, path: PathBuf) -> Self {
+        Self {
+            path,
+            origin: self.origin.clone(),
+            platform: self.platform,
+            workspace_rewrites: self.workspace_rewrites.clone(),
+            rewrite_trie: OnceCell::new(),
+        }
     }
 
     /// Get or build the cached rewrite trie.
@@ -166,6 +179,82 @@ impl ScanContext {
     }
 }
 
+/// Connector-declared role for a file used during source reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveredSourceRole {
+    /// Main conversation log or message container.
+    PrimarySessionLog,
+    /// Optional or required metadata file read alongside the primary source.
+    MetadataSidecar,
+    /// `SQLite` database file used as the storage source of truth.
+    SqliteDatabase,
+}
+
+impl DiscoveredSourceRole {
+    /// Stable string name for diagnostics and downstream JSON contracts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimarySessionLog => "primary_session_log",
+            Self::MetadataSidecar => "metadata_sidecar",
+            Self::SqliteDatabase => "sqlite_database",
+        }
+    }
+}
+
+/// A file a connector is about to consume or consult while building sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredSourceFile {
+    pub provider_slug: String,
+    pub scan_root: PathBuf,
+    pub source_path: PathBuf,
+    pub role: DiscoveredSourceRole,
+    pub origin: Origin,
+    pub platform: Option<Platform>,
+    pub required_for_reconstruction: bool,
+    pub size_bytes: Option<u64>,
+    pub modified_at_ms: Option<i64>,
+}
+
+impl DiscoveredSourceFile {
+    /// Create a discovered source file preserving scan-root provenance.
+    #[must_use]
+    pub fn new(
+        provider_slug: impl Into<String>,
+        root: &ScanRoot,
+        source_path: PathBuf,
+        role: DiscoveredSourceRole,
+        required_for_reconstruction: bool,
+    ) -> Self {
+        Self {
+            provider_slug: provider_slug.into(),
+            scan_root: root.path.clone(),
+            source_path,
+            role,
+            origin: root.origin.clone(),
+            platform: root.platform,
+            required_for_reconstruction,
+            size_bytes: None,
+            modified_at_ms: None,
+        }
+    }
+
+    /// Attach best-effort file metadata without making discovery fail.
+    #[must_use]
+    pub fn with_fs_metadata(mut self) -> Self {
+        if let Ok(metadata) = std::fs::metadata(&self.source_path) {
+            self.size_bytes = Some(metadata.len());
+            self.modified_at_ms = metadata.modified().ok().and_then(|mtime| {
+                mtime
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+            });
+        }
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +301,51 @@ mod tests {
             root.rewrite_workspace("/remote/home/project/file.rs", None),
             "/local/home/project/file.rs"
         );
+    }
+
+    #[test]
+    fn scan_root_with_path_preserves_provenance() {
+        let origin = Origin::remote("workstation");
+        let root = ScanRoot::remote(
+            PathBuf::from("/mirror"),
+            origin.clone(),
+            Some(Platform::Linux),
+        )
+        .with_rewrite("/remote", "/local");
+
+        let derived = root.with_path(PathBuf::from("/mirror/session.jsonl"));
+
+        assert_eq!(derived.path, PathBuf::from("/mirror/session.jsonl"));
+        assert_eq!(derived.origin, origin);
+        assert_eq!(derived.platform, Some(Platform::Linux));
+        assert_eq!(derived.workspace_rewrites, root.workspace_rewrites);
+    }
+
+    #[test]
+    fn discovered_source_file_preserves_root_metadata() {
+        let root = ScanRoot::remote(
+            PathBuf::from("/remote/.codex"),
+            Origin::remote_with_host("css", "css.example"),
+            Some(Platform::Linux),
+        );
+
+        let source = DiscoveredSourceFile::new(
+            "codex",
+            &root,
+            PathBuf::from("/remote/.codex/sessions/rollout-a.jsonl"),
+            DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        );
+
+        assert_eq!(source.provider_slug, "codex");
+        assert_eq!(source.scan_root, root.path);
+        assert_eq!(
+            source.source_path,
+            PathBuf::from("/remote/.codex/sessions/rollout-a.jsonl")
+        );
+        assert_eq!(source.role.as_str(), "primary_session_log");
+        assert!(source.required_for_reconstruction);
+        assert!(source.origin.is_remote());
     }
 
     #[test]

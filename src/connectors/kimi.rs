@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp, utils::dedupe_path_key,
@@ -111,6 +111,82 @@ impl KimiConnector {
         out.sort();
         out
     }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = Vec::new();
+        if ctx.use_default_detection() {
+            let data_dir_is_kimi_storage =
+                Self::looks_like_kimi_storage(&ctx.data_dir) && ctx.data_dir.exists();
+            if data_dir_is_kimi_storage {
+                roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            } else {
+                let fallback = Self::sessions_root();
+                if fallback.exists() {
+                    roots.push(ScanRoot::local(fallback));
+                }
+            }
+        } else {
+            for scan_root in &ctx.scan_roots {
+                let mut candidates = Vec::new();
+                Self::append_kimi_roots(&mut candidates, &scan_root.path);
+                roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
+            }
+
+            if ctx.data_dir.exists() {
+                let mut candidates = Vec::new();
+                Self::append_kimi_roots(&mut candidates, &ctx.data_dir);
+                roots.extend(candidates.into_iter().map(ScanRoot::local));
+            }
+        }
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+        for root in Self::source_roots(ctx) {
+            if !root.path.exists() {
+                continue;
+            }
+            for wire_path in Self::wire_files(&root.path) {
+                if !seen_files.insert(dedupe_path_key(&wire_path)) {
+                    continue;
+                }
+                if !file_modified_since(&wire_path, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "kimi",
+                        &root,
+                        wire_path.clone(),
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+                if let Some(session_dir) = wire_path.parent() {
+                    let state = session_dir.join("state.json");
+                    if state.exists() {
+                        out.push(
+                            DiscoveredSourceFile::new(
+                                "kimi",
+                                &root,
+                                state,
+                                DiscoveredSourceRole::MetadataSidecar,
+                                false,
+                            )
+                            .with_fs_metadata(),
+                        );
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Connector for KimiConnector {
@@ -119,36 +195,10 @@ impl Connector for KimiConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-
-        if ctx.use_default_detection() {
-            // Parallel to the factory.rs fix: when the caller has
-            // already pointed `data_dir` at what looks like Kimi's
-            // session storage, trust that as the one location to scan
-            // and skip the home-dir fallback. Unioning them silently
-            // fused a caller-requested archive with whatever lives
-            // under the platform default, and left tests passing on
-            // clean CI but failing on machines that have a real Kimi
-            // install.
-            let data_dir_is_kimi_storage =
-                Self::looks_like_kimi_storage(&ctx.data_dir) && ctx.data_dir.exists();
-            if data_dir_is_kimi_storage {
-                roots.push(ctx.data_dir.clone());
-            } else {
-                let fallback = Self::sessions_root();
-                if fallback.exists() {
-                    roots.push(fallback);
-                }
-            }
-        } else {
-            for scan_root in &ctx.scan_roots {
-                Self::append_kimi_roots(&mut roots, &scan_root.path);
-            }
-
-            if ctx.data_dir.exists() {
-                Self::append_kimi_roots(&mut roots, &ctx.data_dir);
-            }
-        }
+        let mut roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -189,6 +239,10 @@ impl Connector for KimiConnector {
         }
 
         Ok(convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

@@ -257,6 +257,45 @@ mod conformance {
                 );
             }
         }
+
+        #[test]
+        fn all_factories_support_source_discovery_contract() {
+            let temp = TempDir::new().expect("create temp dir");
+            let factories = get_connector_factories();
+
+            for (slug, factory) in factories {
+                let connector = factory();
+                let root = ScanRoot::local(temp.path().join(slug));
+                let ctx = ScanContext::with_roots(
+                    temp.path().to_path_buf(),
+                    vec![root],
+                    Some(1_700_000_000_000),
+                );
+                let sources = connector
+                    .discover_source_files(&ctx)
+                    .unwrap_or_else(|err| panic!("connector {slug} discovery failed: {err}"));
+
+                for source in sources {
+                    assert_eq!(
+                        source.provider_slug,
+                        slug.replace("claude", "claude_code"),
+                        "connector {slug} should report its own provider slug"
+                    );
+                    assert!(
+                        !source.source_path.as_os_str().is_empty(),
+                        "connector {slug} produced empty discovered source path"
+                    );
+                    assert!(
+                        !source.scan_root.as_os_str().is_empty(),
+                        "connector {slug} produced empty discovered scan root"
+                    );
+                    assert!(
+                        !source.role.as_str().is_empty(),
+                        "connector {slug} produced empty discovered source role"
+                    );
+                }
+            }
+        }
     }
 
     // =========================================================================

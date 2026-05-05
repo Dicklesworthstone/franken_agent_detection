@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::env_path_nonempty;
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
@@ -214,6 +214,83 @@ impl GeminiConnector {
         file_size_bytes.is_some_and(|size| size >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES)
     }
 
+    fn looks_like_root(path: &Path) -> bool {
+        Self::is_session_file(path)
+            || path.join("chats").exists()
+            || fs::read_dir(path).is_ok_and(|mut d| {
+                d.any(|e| e.ok().is_some_and(|e| Self::is_session_file(&e.path())))
+            })
+            || fs::read_dir(path).is_ok_and(|mut d| {
+                d.any(|e| e.ok().is_some_and(|e| e.path().join("chats").exists()))
+            })
+    }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
+            if Self::looks_like_root(&ctx.data_dir) {
+                vec![ScanRoot::local(ctx.data_dir.clone())]
+            } else {
+                vec![ScanRoot::local(Self::root())]
+            }
+        } else {
+            let mut explicit = Vec::new();
+            for scan_root in &ctx.scan_roots {
+                let candidate = scan_root.path.join(".gemini/tmp");
+                if Self::looks_like_root(&candidate) {
+                    explicit.push(scan_root.with_path(candidate));
+                }
+                if Self::looks_like_root(&scan_root.path) {
+                    explicit.push(scan_root.clone());
+                }
+                if scan_root.path.file_name().is_some_and(|n| n == ".gemini") {
+                    let candidate = scan_root.path.join("tmp");
+                    if Self::looks_like_root(&candidate) {
+                        explicit.push(scan_root.with_path(candidate));
+                    }
+                }
+            }
+            if Self::looks_like_root(&ctx.data_dir) {
+                explicit.push(ScanRoot::local(ctx.data_dir.clone()));
+            }
+            if ctx.data_dir.file_name().is_some_and(|n| n == ".gemini") {
+                let candidate = ctx.data_dir.join("tmp");
+                if Self::looks_like_root(&candidate) {
+                    explicit.push(ScanRoot::local(candidate));
+                }
+            }
+            explicit
+        };
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for root in Self::source_roots(ctx) {
+            if !root.path.exists() {
+                continue;
+            }
+            for file in Self::session_files(&root.path) {
+                if !file_modified_since(&file, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "gemini",
+                        &root,
+                        file,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+        }
+        out
+    }
+
     fn compact_message_extra(raw: &Value) -> Value {
         let mut out = serde_json::Map::new();
 
@@ -246,62 +323,10 @@ fn scan_gemini_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    // Use data_root only if it looks like a Gemini directory (for testing)
-    // Otherwise use the default root
-    let looks_like_root = |path: &PathBuf| {
-        GeminiConnector::is_session_file(path)
-            || path.join("chats").exists()
-            || fs::read_dir(path).is_ok_and(|mut d| {
-                d.any(|e| {
-                    e.ok()
-                        .is_some_and(|e| GeminiConnector::is_session_file(&e.path()))
-                })
-            })
-            || fs::read_dir(path).is_ok_and(|mut d| {
-                d.any(|e| e.ok().is_some_and(|e| e.path().join("chats").exists()))
-            })
-    };
-    let roots: Vec<PathBuf> = if ctx.use_default_detection() {
-        if looks_like_root(&ctx.data_dir) {
-            vec![ctx.data_dir.clone()]
-        } else {
-            vec![GeminiConnector::root()]
-        }
-    } else {
-        let mut explicit = Vec::new();
-        for scan_root in &ctx.scan_roots {
-            let candidate = scan_root.path.join(".gemini/tmp");
-            if looks_like_root(&candidate) {
-                explicit.push(candidate);
-            }
-            if looks_like_root(&scan_root.path) {
-                explicit.push(scan_root.path.clone());
-            }
-            if scan_root.path.file_name().is_some_and(|n| n == ".gemini") {
-                let candidate = scan_root.path.join("tmp");
-                if looks_like_root(&candidate) {
-                    explicit.push(candidate);
-                }
-            }
-        }
-        if looks_like_root(&ctx.data_dir) {
-            explicit.push(ctx.data_dir.clone());
-        }
-        if ctx.data_dir.file_name().is_some_and(|n| n == ".gemini") {
-            let candidate = ctx.data_dir.join("tmp");
-            if looks_like_root(&candidate) {
-                explicit.push(candidate);
-            }
-        }
-        if explicit.is_empty() {
-            return Ok(());
-        }
-        explicit
-    };
-
-    let mut roots = roots;
-    roots.sort();
-    roots.dedup();
+    let roots: Vec<PathBuf> = GeminiConnector::source_roots(ctx)
+        .into_iter()
+        .map(|root| root.path)
+        .collect();
 
     for root in roots {
         if !root.exists() {
@@ -498,6 +523,10 @@ impl Connector for GeminiConnector {
 
     fn supports_streaming_scan(&self) -> bool {
         true
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 
     fn scan_with_callback(

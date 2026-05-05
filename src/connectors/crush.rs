@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use frankensqlite::compat::{ConnectionExt, OpenFlags, ParamValue, RowExt, open_with_flags};
 use serde::Deserialize;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::env_path_nonempty;
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
@@ -123,6 +123,60 @@ impl CrushConnector {
             },
         )
     }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut db_paths: Vec<ScanRoot> = Vec::new();
+
+        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
+            db_paths.push(ScanRoot::local(ctx.data_dir.clone()));
+        } else if ctx.use_default_detection() {
+            if let Some(global) = Self::global_db_path() {
+                db_paths.push(ScanRoot::local(global));
+            }
+            db_paths.extend(
+                Self::discover_project_dbs()
+                    .into_iter()
+                    .map(ScanRoot::local),
+            );
+            let candidate = ctx.data_dir.join("crush.db");
+            if candidate.exists() {
+                db_paths.push(ScanRoot::local(candidate));
+            }
+        } else {
+            let candidate = ctx.data_dir.join("crush.db");
+            if candidate.exists() {
+                db_paths.push(ScanRoot::local(candidate));
+            }
+            for scan_root in &ctx.scan_roots {
+                if scan_root.path.extension().is_some_and(|ext| ext == "db") {
+                    db_paths.push(scan_root.clone());
+                }
+                db_paths.push(scan_root.with_path(scan_root.path.join("crush.db")));
+                db_paths.push(scan_root.with_path(scan_root.path.join(".crush/crush.db")));
+            }
+        }
+
+        let mut seen = HashSet::new();
+        db_paths.retain(|root| seen.insert(root.path.clone()));
+        db_paths
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        Self::source_roots(ctx)
+            .into_iter()
+            .filter(|root| root.path.exists())
+            .map(|root| {
+                DiscoveredSourceFile::new(
+                    "crush",
+                    &root,
+                    root.path.clone(),
+                    DiscoveredSourceRole::SqliteDatabase,
+                    true,
+                )
+                .with_fs_metadata()
+            })
+            .collect()
+    }
 }
 
 impl Connector for CrushConnector {
@@ -133,42 +187,10 @@ impl Connector for CrushConnector {
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
 
-        // Determine database paths to scan.
-        let mut db_paths: Vec<PathBuf> = Vec::new();
-
-        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
-            // Explicit db path override.
-            db_paths.push(ctx.data_dir.clone());
-        } else if ctx.use_default_detection() {
-            // Auto-detect: global db + per-project dbs.
-            if let Some(global) = Self::global_db_path() {
-                db_paths.push(global);
-            }
-            db_paths.extend(Self::discover_project_dbs());
-            let candidate = ctx.data_dir.join("crush.db");
-            if candidate.exists() {
-                db_paths.push(candidate);
-            }
-        } else {
-            // data_dir might be the parent containing crush.db
-            let candidate = ctx.data_dir.join("crush.db");
-            if candidate.exists() {
-                db_paths.push(candidate);
-            }
-            for scan_root in &ctx.scan_roots {
-                if scan_root.path.extension().is_some_and(|ext| ext == "db") {
-                    db_paths.push(scan_root.path.clone());
-                }
-                db_paths.push(scan_root.path.join("crush.db"));
-                db_paths.push(scan_root.path.join(".crush/crush.db"));
-            }
-        }
-
-        // Deduplicate while preserving priority order.
-        {
-            let mut seen = HashSet::new();
-            db_paths.retain(|p| seen.insert(p.clone()));
-        }
+        let db_paths: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         // Track seen session IDs to dedup across global + per-project databases.
         let mut seen_ids: HashSet<String> = HashSet::new();
@@ -198,6 +220,10 @@ impl Connector for CrushConnector {
         }
 
         Ok(convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

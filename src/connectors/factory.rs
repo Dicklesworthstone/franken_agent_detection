@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp, utils::dedupe_path_key,
@@ -77,6 +77,86 @@ impl FactoryConnector {
             roots.push(candidate);
         }
     }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = Vec::new();
+        if ctx.use_default_detection() {
+            let data_dir_is_factory_storage =
+                looks_like_factory_storage(&ctx.data_dir) && ctx.data_dir.exists();
+            if data_dir_is_factory_storage {
+                roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            } else if let Some(root) = Self::sessions_root()
+                && root.exists()
+            {
+                roots.push(ScanRoot::local(root));
+            }
+        } else {
+            for scan_root in &ctx.scan_roots {
+                let mut candidates = Vec::new();
+                Self::append_factory_roots(&mut candidates, &scan_root.path);
+                roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
+            }
+
+            if ctx.data_dir.exists() {
+                let mut candidates = Vec::new();
+                Self::append_factory_roots(&mut candidates, &ctx.data_dir);
+                roots.extend(candidates.into_iter().map(ScanRoot::local));
+            }
+        }
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+        for root in Self::source_roots(ctx) {
+            if !root.path.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&root.path).into_iter().flatten() {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if !seen_files.insert(dedupe_path_key(path)) {
+                    continue;
+                }
+                if !file_modified_since(path, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "factory",
+                        &root,
+                        path.to_path_buf(),
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+                let settings = path.with_extension("settings.json");
+                if settings.exists() {
+                    out.push(
+                        DiscoveredSourceFile::new(
+                            "factory",
+                            &root,
+                            settings,
+                            DiscoveredSourceRole::MetadataSidecar,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Connector for FactoryConnector {
@@ -85,36 +165,10 @@ impl Connector for FactoryConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-
-        if ctx.use_default_detection() {
-            // When the caller explicitly points `data_dir` at what
-            // already looks like Factory's own session storage, treat
-            // that as "scan this exact location" and do NOT also merge
-            // in the home-dir fallback. Previous behavior silently
-            // unioned both, which meant a caller who wanted to scan a
-            // specific archive instead got its contents fused with
-            // whatever happened to live under `~/.factory/sessions`.
-            // The same pollution also made tests pass on clean CI but
-            // fail on any dev machine with a real Factory install.
-            let data_dir_is_factory_storage =
-                looks_like_factory_storage(&ctx.data_dir) && ctx.data_dir.exists();
-            if data_dir_is_factory_storage {
-                roots.push(ctx.data_dir.clone());
-            } else if let Some(root) = Self::sessions_root() {
-                if root.exists() {
-                    roots.push(root);
-                }
-            }
-        } else {
-            for scan_root in &ctx.scan_roots {
-                Self::append_factory_roots(&mut roots, &scan_root.path);
-            }
-
-            if ctx.data_dir.exists() {
-                Self::append_factory_roots(&mut roots, &ctx.data_dir);
-            }
-        }
+        let mut roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -162,6 +216,10 @@ impl Connector for FactoryConnector {
         }
 
         Ok(convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

@@ -1,4 +1,4 @@
-//! OpenCode connector for JSON file-based and SQLite storage.
+//! `OpenCode` connector for JSON file-based and `SQLite` storage.
 //!
 //! **v1.2+ (SQLite):** Data is stored in `~/.local/share/opencode/opencode.db`
 //! with tables: session, message, part. The `message.data` and `part.data` columns
@@ -8,6 +8,24 @@
 //!   - session/{projectID}/{sessionID}.json  - Session metadata
 //!   - message/{sessionID}/{messageID}.json  - Message metadata
 //!   - part/{messageID}/{partID}.json        - Actual message content
+
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    clippy::if_not_else,
+    clippy::manual_let_else,
+    clippy::manual_string_new,
+    clippy::map_unwrap_or,
+    clippy::missing_const_for_fn,
+    clippy::must_use_candidate,
+    clippy::nonminimal_bool,
+    clippy::option_if_let_else,
+    clippy::single_option_map,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_wraps,
+    clippy::unreadable_literal
+)]
 
 use std::collections::HashSet;
 use std::fs;
@@ -19,7 +37,7 @@ use frankensqlite::{Connection, Row, SqliteValue, params};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
@@ -208,6 +226,208 @@ impl OpenCodeConnector {
             out.push(base.join(".config/opencode/storage"));
             out.push(base.join("Library/Application Support/opencode/storage"));
             out.push(base.join("AppData/Roaming/opencode/storage"));
+        }
+    }
+
+    fn sqlite_source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut db_candidates: Vec<ScanRoot> = Vec::new();
+        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
+            db_candidates.push(ScanRoot::local(ctx.data_dir.clone()));
+        } else if !ctx.data_dir.as_os_str().is_empty() {
+            db_candidates.push(ScanRoot::local(ctx.data_dir.join("opencode.db")));
+        }
+
+        if !ctx.use_default_detection() {
+            for scan_root in &ctx.scan_roots {
+                let mut candidates = Vec::new();
+                Self::append_explicit_db_candidates(&mut candidates, &scan_root.path);
+                db_candidates.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
+            }
+        }
+
+        db_candidates.extend(
+            Self::sqlite_db_candidates()
+                .into_iter()
+                .map(ScanRoot::local),
+        );
+
+        let mut seen = HashSet::new();
+        db_candidates.retain(|root| seen.insert(root.path.clone()));
+        db_candidates
+    }
+
+    fn storage_source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut storage_roots: Vec<ScanRoot> = Vec::new();
+        if ctx.use_default_detection() {
+            if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
+                storage_roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            } else if let Some(root) = Self::storage_root() {
+                storage_roots.push(ScanRoot::local(root));
+            }
+        } else {
+            if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
+                storage_roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            }
+            for scan_root in &ctx.scan_roots {
+                let mut candidates = vec![scan_root.path.clone()];
+                Self::append_explicit_storage_candidates(&mut candidates, &scan_root.path);
+                for candidate in candidates {
+                    if candidate.exists() && looks_like_opencode_storage(&candidate) {
+                        storage_roots.push(scan_root.with_path(candidate));
+                    }
+                }
+            }
+        }
+
+        storage_roots.sort_by(|a, b| a.path.cmp(&b.path));
+        storage_roots.dedup_by(|a, b| a.path == b.path);
+        storage_roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        Self::discover_sqlite_sources(ctx, &mut out);
+        Self::discover_legacy_storage_sources(ctx, &mut out);
+        out
+    }
+
+    fn discover_sqlite_sources(ctx: &ScanContext, out: &mut Vec<DiscoveredSourceFile>) {
+        let mut seen = HashSet::new();
+
+        for root in Self::sqlite_source_roots(ctx) {
+            if !root.path.is_file() {
+                continue;
+            }
+            let canonical = std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone());
+            if !seen.insert(canonical) {
+                continue;
+            }
+            out.push(
+                DiscoveredSourceFile::new(
+                    "opencode",
+                    &root,
+                    root.path.clone(),
+                    DiscoveredSourceRole::SqliteDatabase,
+                    true,
+                )
+                .with_fs_metadata(),
+            );
+        }
+    }
+
+    fn discover_legacy_storage_sources(ctx: &ScanContext, out: &mut Vec<DiscoveredSourceFile>) {
+        let mut seen_session_files = HashSet::new();
+        for root in Self::storage_source_roots(ctx) {
+            let session_dir = root.path.join("session");
+            let message_dir = root.path.join("message");
+            let part_dir = root.path.join("part");
+            if !session_dir.exists() {
+                continue;
+            }
+
+            let session_files: Vec<PathBuf> = WalkDir::new(&session_dir)
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry.file_type().is_file())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .map(|entry| entry.path().to_path_buf())
+                .collect();
+
+            for session_file in session_files {
+                if !seen_session_files.insert(dedupe_path_key(&session_file)) {
+                    continue;
+                }
+                if !session_has_updates(&session_file, &message_dir, &part_dir, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "opencode",
+                        &root,
+                        session_file.clone(),
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+
+                Self::discover_legacy_session_sidecars(
+                    &root,
+                    &session_file,
+                    &message_dir,
+                    &part_dir,
+                    out,
+                );
+            }
+        }
+    }
+
+    fn discover_legacy_session_sidecars(
+        root: &ScanRoot,
+        session_file: &Path,
+        message_dir: &Path,
+        part_dir: &Path,
+        out: &mut Vec<DiscoveredSourceFile>,
+    ) {
+        let Some(session_id) = session_file.file_stem().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let session_msg_dir = message_dir.join(session_id);
+        if !session_msg_dir.exists() {
+            return;
+        }
+
+        for entry in WalkDir::new(&session_msg_dir).into_iter().flatten() {
+            if !entry.file_type().is_file()
+                || !entry.path().extension().is_some_and(|ext| ext == "json")
+            {
+                continue;
+            }
+
+            let message_file = entry.path().to_path_buf();
+            out.push(
+                DiscoveredSourceFile::new(
+                    "opencode",
+                    root,
+                    message_file.clone(),
+                    DiscoveredSourceRole::MetadataSidecar,
+                    true,
+                )
+                .with_fs_metadata(),
+            );
+            Self::discover_legacy_message_parts(root, &message_file, part_dir, out);
+        }
+    }
+
+    fn discover_legacy_message_parts(
+        root: &ScanRoot,
+        message_file: &Path,
+        part_dir: &Path,
+        out: &mut Vec<DiscoveredSourceFile>,
+    ) {
+        let Some(message_id) = message_file.file_stem().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let message_part_dir = part_dir.join(message_id);
+        for part_entry in WalkDir::new(&message_part_dir).into_iter().flatten() {
+            if !part_entry.file_type().is_file()
+                || part_entry
+                    .path()
+                    .extension()
+                    .is_none_or(|ext| ext != "json")
+            {
+                continue;
+            }
+            out.push(
+                DiscoveredSourceFile::new(
+                    "opencode",
+                    root,
+                    part_entry.path().to_path_buf(),
+                    DiscoveredSourceRole::MetadataSidecar,
+                    true,
+                )
+                .with_fs_metadata(),
+            );
         }
     }
 
@@ -758,6 +978,10 @@ impl Connector for OpenCodeConnector {
         }
 
         Ok(convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

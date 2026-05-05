@@ -13,7 +13,7 @@ use anyhow::Result;
 use serde_json::json;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -156,18 +156,12 @@ impl AiderConnector {
             messages,
         })
     }
-}
 
-impl Connector for AiderConnector {
-    fn detect(&self) -> DetectionResult {
-        franken_detection_for_connector("aider").unwrap_or_else(DetectionResult::not_found)
-    }
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = Vec::new();
 
-    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-
-        let mut add_root = |root: PathBuf| {
-            if !roots.contains(&root) {
+        let mut add_root = |root: ScanRoot| {
+            if !roots.iter().any(|existing| existing.path == root.path) {
                 roots.push(root);
             }
         };
@@ -185,41 +179,73 @@ impl Connector for AiderConnector {
                 ctx.data_dir.clone()
             };
 
-            // Check if data_root is actually the CASS DB directory
             let is_cass_db_dir = data_root.join("agent_search.db").exists();
 
-            // Check for override env var first
             if let Ok(override_root) = dotenvy::var("CASS_AIDER_DATA_ROOT")
                 && !override_root.trim().is_empty()
             {
-                add_root(PathBuf::from(override_root.trim()));
+                add_root(ScanRoot::local(PathBuf::from(override_root.trim())));
             } else if !is_cass_db_dir && data_root.exists() && data_root.is_dir() {
-                // Use data_root for recursive search (will find history files in subdirs)
-                // BUT skip if it looks like the CASS DB directory to avoid wasteful scanning
-                add_root(data_root);
+                add_root(ScanRoot::local(data_root));
             } else {
-                // Only fall back to CWD/home when data_root doesn't exist or is the DB dir
                 if let Ok(cwd) = std::env::current_dir() {
-                    add_root(cwd);
+                    add_root(ScanRoot::local(cwd));
                 }
                 if let Some(home) = dirs::home_dir()
                     && home.join(".aider.chat.history.md").exists()
                 {
-                    add_root(home);
+                    add_root(ScanRoot::local(home));
                 }
             }
         } else {
-            // Explicit roots provided (e.g. remote mirrors) - use them directly
             for root in &ctx.scan_roots {
-                add_root(root.path.clone());
+                add_root(root.clone());
             }
         }
+
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let roots = Self::source_roots(ctx);
+        let root_refs: Vec<&Path> = roots.iter().map(|root| root.path.as_path()).collect();
+        let files = Self::find_chat_files(&root_refs);
+
+        files
+            .into_iter()
+            .filter(|path| file_modified_since(path, ctx.since_ts))
+            .filter_map(|path| {
+                roots
+                    .iter()
+                    .find(|root| path.starts_with(&root.path))
+                    .map(|root| {
+                        DiscoveredSourceFile::new(
+                            "aider",
+                            root,
+                            path,
+                            DiscoveredSourceRole::PrimarySessionLog,
+                            true,
+                        )
+                        .with_fs_metadata()
+                    })
+            })
+            .collect()
+    }
+}
+
+impl Connector for AiderConnector {
+    fn detect(&self) -> DetectionResult {
+        franken_detection_for_connector("aider").unwrap_or_else(DetectionResult::not_found)
+    }
+
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let roots = Self::source_roots(ctx);
 
         if roots.is_empty() {
             return Ok(Vec::new());
         }
 
-        let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let root_refs: Vec<&Path> = roots.iter().map(|root| root.path.as_path()).collect();
         let files = Self::find_chat_files(&root_refs);
 
         let mut conversations = Vec::new();
@@ -235,6 +261,10 @@ impl Connector for AiderConnector {
             }
         }
         Ok(conversations)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

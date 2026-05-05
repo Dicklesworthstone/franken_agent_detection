@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -61,6 +61,55 @@ impl ClaudeCodeConnector {
 
     fn should_compact_large_message_extra(file_size_bytes: Option<u64>) -> bool {
         file_size_bytes.is_some_and(|size| size >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES)
+    }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let looks_like_root = |path: &PathBuf| path.join("projects").exists();
+
+        let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
+            if looks_like_root(&ctx.data_dir) {
+                vec![ScanRoot::local(ctx.data_dir.clone())]
+            } else {
+                vec![ScanRoot::local(Self::projects_root())]
+            }
+        } else {
+            ctx.scan_roots.clone()
+        };
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for root in Self::source_roots(ctx) {
+            let scan_target = root.path.clone();
+            if !scan_target.exists() {
+                continue;
+            }
+            let session_paths = if scan_target.is_file() {
+                vec![scan_target]
+            } else {
+                Self::session_files(&scan_target)
+            };
+            for path in session_paths {
+                if !file_modified_since(&path, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "claude_code",
+                        &root,
+                        path,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+        }
+        out
     }
 
     fn compact_message_extra(raw: &Value) -> Value {
@@ -162,17 +211,10 @@ fn scan_claude_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    let looks_like_root = |path: &PathBuf| path.join("projects").exists();
-
-    let roots: Vec<PathBuf> = if ctx.use_default_detection() {
-        if looks_like_root(&ctx.data_dir) {
-            vec![ctx.data_dir.clone()]
-        } else {
-            vec![ClaudeCodeConnector::projects_root()]
-        }
-    } else {
-        ctx.scan_roots.iter().map(|r| r.path.clone()).collect()
-    };
+    let roots: Vec<PathBuf> = ClaudeCodeConnector::source_roots(ctx)
+        .into_iter()
+        .map(|root| root.path)
+        .collect();
 
     let mut file_count = 0;
 
@@ -469,6 +511,10 @@ impl Connector for ClaudeCodeConnector {
 
     fn supports_streaming_scan(&self) -> bool {
         true
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 
     fn scan_with_callback(

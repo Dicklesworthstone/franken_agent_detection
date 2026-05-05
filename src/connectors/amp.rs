@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
     franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
@@ -197,6 +197,60 @@ impl AmpConnector {
             }
         }
     }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
+            if Self::looks_like_root(&ctx.data_dir) {
+                vec![ScanRoot::local(ctx.data_dir.clone())]
+            } else {
+                Self::candidate_roots()
+                    .into_iter()
+                    .map(ScanRoot::local)
+                    .collect()
+            }
+        } else {
+            let mut explicit_roots = Vec::new();
+            for scan_root in &ctx.scan_roots {
+                let mut candidates = Vec::new();
+                Self::append_explicit_roots(&mut candidates, &scan_root.path);
+                explicit_roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
+            }
+            explicit_roots
+        };
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for root in Self::source_roots(ctx) {
+            if !root.path.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&root.path).into_iter().flatten() {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if !is_amp_log_file(path) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "amp",
+                        &root,
+                        path.to_path_buf(),
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+        }
+        out
+    }
 }
 
 impl Connector for AmpConnector {
@@ -209,27 +263,10 @@ impl Connector for AmpConnector {
         let mut convs = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
-        // allow tests to override via ctx.data_dir
-        let roots = if ctx.use_default_detection() {
-            if Self::looks_like_root(&ctx.data_dir) {
-                vec![ctx.data_dir.clone()]
-            } else {
-                Self::candidate_roots()
-            }
-        } else {
-            let mut explicit_roots: Vec<PathBuf> = Vec::new();
-            for scan_root in &ctx.scan_roots {
-                Self::append_explicit_roots(&mut explicit_roots, &scan_root.path);
-            }
-            if explicit_roots.is_empty() {
-                return Ok(Vec::new());
-            }
-            explicit_roots
-        };
-
-        let mut roots = roots;
-        roots.sort();
-        roots.dedup();
+        let roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         for root in roots {
             if !root.exists() {
@@ -334,6 +371,10 @@ impl Connector for AmpConnector {
         }
 
         Ok(convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

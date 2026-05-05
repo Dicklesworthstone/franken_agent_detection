@@ -53,7 +53,7 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -315,6 +315,56 @@ impl CopilotConnector {
         // Keep connector traversal deterministic across filesystems/runs.
         files.sort();
         files
+    }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = Vec::new();
+
+        if ctx.use_default_detection() {
+            if Self::looks_like_copilot_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+                roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            } else {
+                roots.extend(
+                    Self::all_candidate_paths()
+                        .into_iter()
+                        .filter(|path| path.exists())
+                        .map(ScanRoot::local),
+                );
+            }
+        } else {
+            for scan_root in &ctx.scan_roots {
+                let mut candidates = Vec::new();
+                Self::append_explicit_roots(&mut candidates, &scan_root.path);
+                roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
+            }
+        }
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for root in Self::source_roots(ctx) {
+            let files = Self::find_conversation_files(&root.path);
+            for file in files {
+                if !file_modified_since(&file, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "copilot",
+                        &root,
+                        file,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+        }
+        out
     }
 
     /// Parse a single JSON file that may contain one or more conversations.
@@ -994,29 +1044,10 @@ impl Connector for CopilotConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-
-        if ctx.use_default_detection() {
-            // Check if data_dir itself looks like copilot storage (for testing).
-            if Self::looks_like_copilot_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                roots.push(ctx.data_dir.clone());
-            } else {
-                // Use default detection paths.
-                for path in Self::all_candidate_paths() {
-                    if path.exists() {
-                        roots.push(path);
-                    }
-                }
-            }
-        } else {
-            // Check scan_roots for copilot directories.
-            for scan_root in &ctx.scan_roots {
-                Self::append_explicit_roots(&mut roots, &scan_root.path);
-            }
-        }
-
-        roots.sort();
-        roots.dedup();
+        let roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -1065,6 +1096,10 @@ impl Connector for CopilotConnector {
         }
 
         Ok(all_conversations)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

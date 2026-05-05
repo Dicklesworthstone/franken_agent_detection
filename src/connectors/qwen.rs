@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp, utils::dedupe_path_key,
@@ -98,6 +98,79 @@ impl QwenConnector {
         out.sort();
         out
     }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = Vec::new();
+        if ctx.use_default_detection() {
+            if Self::looks_like_qwen_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+                roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            }
+            let root = Self::tmp_root();
+            if root.exists() {
+                roots.push(ScanRoot::local(root));
+            }
+        } else {
+            for scan_root in &ctx.scan_roots {
+                let mut candidates = Vec::new();
+                Self::append_qwen_roots(&mut candidates, &scan_root.path);
+                roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
+            }
+
+            if ctx.data_dir.exists() {
+                let mut candidates = Vec::new();
+                Self::append_qwen_roots(&mut candidates, &ctx.data_dir);
+                roots.extend(candidates.into_iter().map(ScanRoot::local));
+            }
+        }
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+        for root in Self::source_roots(ctx) {
+            if !root.path.exists() {
+                continue;
+            }
+            for session_path in Self::session_files(&root.path) {
+                if !seen_files.insert(dedupe_path_key(&session_path)) {
+                    continue;
+                }
+                if !file_modified_since(&session_path, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "qwen",
+                        &root,
+                        session_path.clone(),
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+                if let Some(project_dir) = session_path.parent().and_then(Path::parent) {
+                    let config = project_dir.join("config.json");
+                    if config.exists() {
+                        out.push(
+                            DiscoveredSourceFile::new(
+                                "qwen",
+                                &root,
+                                config,
+                                DiscoveredSourceRole::MetadataSidecar,
+                                false,
+                            )
+                            .with_fs_metadata(),
+                        );
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Connector for QwenConnector {
@@ -106,25 +179,10 @@ impl Connector for QwenConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-
-        if ctx.use_default_detection() {
-            if Self::looks_like_qwen_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                roots.push(ctx.data_dir.clone());
-            }
-            let root = Self::tmp_root();
-            if root.exists() {
-                roots.push(root);
-            }
-        } else {
-            for scan_root in &ctx.scan_roots {
-                Self::append_qwen_roots(&mut roots, &scan_root.path);
-            }
-
-            if ctx.data_dir.exists() {
-                Self::append_qwen_roots(&mut roots, &ctx.data_dir);
-            }
-        }
+        let mut roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -165,6 +223,10 @@ impl Connector for QwenConnector {
         }
 
         Ok(convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

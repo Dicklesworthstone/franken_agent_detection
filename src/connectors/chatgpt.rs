@@ -30,6 +30,19 @@
 //! - Encrypted JSON data
 //! - 16-byte authentication tag at the end
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::doc_markdown,
+    clippy::map_unwrap_or,
+    clippy::missing_const_for_fn,
+    clippy::must_use_candidate,
+    clippy::redundant_closure_for_method_calls,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unreadable_literal
+)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -42,7 +55,7 @@ use base64::prelude::*;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -87,13 +100,12 @@ impl ChatGptConnector {
                         "chatgpt encryption key loaded from CHATGPT_ENCRYPTION_KEY env var"
                     );
                     return Some(key);
-                } else {
-                    tracing::warn!(
-                        "CHATGPT_ENCRYPTION_KEY has wrong length: {} (expected {})",
-                        key_bytes.len(),
-                        KEY_SIZE
-                    );
                 }
+                tracing::warn!(
+                    "CHATGPT_ENCRYPTION_KEY has wrong length: {} (expected {})",
+                    key_bytes.len(),
+                    KEY_SIZE
+                );
             } else {
                 tracing::warn!("CHATGPT_ENCRYPTION_KEY is not valid base64");
             }
@@ -311,6 +323,61 @@ impl ChatGptConnector {
         // Keep connector traversal deterministic across filesystems/runs.
         files.sort();
         files
+    }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
+            if Self::looks_like_base(&ctx.data_dir) {
+                vec![ScanRoot::local(ctx.data_dir.clone())]
+            } else if let Some(default_base) = Self::app_support_dir() {
+                vec![ScanRoot::local(default_base)]
+            } else {
+                Vec::new()
+            }
+        } else {
+            let mut explicit = Vec::new();
+            for root in &ctx.scan_roots {
+                let mut candidates = Vec::new();
+                Self::append_explicit_roots(&mut candidates, &root.path);
+                explicit.extend(candidates.into_iter().map(|path| root.with_path(path)));
+            }
+            explicit
+        };
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(&self, ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for root in Self::source_roots(ctx) {
+            if !root.path.exists() {
+                continue;
+            }
+            let conv_dirs = Self::find_conversation_dirs(&root.path);
+            for (dir_path, is_encrypted) in conv_dirs {
+                if is_encrypted && self.encryption_key.is_none() {
+                    continue;
+                }
+                for path in Self::conversation_files(&dir_path) {
+                    if !file_modified_since(&path, ctx.since_ts) {
+                        continue;
+                    }
+                    out.push(
+                        DiscoveredSourceFile::new(
+                            "chatgpt",
+                            &root,
+                            path,
+                            DiscoveredSourceRole::PrimarySessionLog,
+                            true,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+            }
+        }
+        out
     }
 
     /// Decrypt an encrypted conversation file
@@ -586,29 +653,10 @@ impl Connector for ChatGptConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let roots: Vec<PathBuf> = if ctx.use_default_detection() {
-            if Self::looks_like_base(&ctx.data_dir) {
-                vec![ctx.data_dir.clone()]
-            } else if let Some(default_base) = Self::app_support_dir() {
-                vec![default_base]
-            } else {
-                vec![]
-            }
-        } else {
-            // Explicit roots
-            let mut explicit = Vec::new();
-            for root in &ctx.scan_roots {
-                Self::append_explicit_roots(&mut explicit, &root.path);
-            }
-            if explicit.is_empty() {
-                return Ok(Vec::new());
-            }
-            explicit
-        };
-
-        let mut roots = roots;
-        roots.sort();
-        roots.dedup();
+        let roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         let mut all_convs = Vec::new();
 
@@ -673,6 +721,10 @@ impl Connector for ChatGptConnector {
         }
 
         Ok(all_convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(self.discover_sources(ctx))
     }
 }
 

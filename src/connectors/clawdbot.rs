@@ -14,7 +14,7 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -79,6 +79,59 @@ impl ClawdbotConnector {
             }
         }
     }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = Vec::new();
+        if ctx.use_default_detection() {
+            if Self::looks_like_clawdbot_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+                roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            } else {
+                let root = Self::sessions_root();
+                if root.exists() {
+                    roots.push(ScanRoot::local(root));
+                }
+            }
+        } else {
+            for root in &ctx.scan_roots {
+                let candidate = root.path.join(".clawdbot").join("sessions");
+                if candidate.exists() {
+                    roots.push(root.with_path(candidate));
+                }
+                let mut explicit = Vec::new();
+                Self::append_explicit_roots(&mut explicit, &root.path);
+                roots.extend(explicit.into_iter().map(|path| root.with_path(path)));
+            }
+        }
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for mut root in Self::source_roots(ctx) {
+            if root.path.is_file() {
+                let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
+                root = root.with_path(parent);
+            }
+            for file in Self::session_files(&root.path) {
+                if !file_modified_since(&file, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "clawdbot",
+                        &root,
+                        file,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+        }
+        out
+    }
 }
 
 impl Connector for ClawdbotConnector {
@@ -88,26 +141,10 @@ impl Connector for ClawdbotConnector {
 
     #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-
-        if ctx.use_default_detection() {
-            if Self::looks_like_clawdbot_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                roots.push(ctx.data_dir.clone());
-            } else {
-                let root = Self::sessions_root();
-                if root.exists() {
-                    roots.push(root);
-                }
-            }
-        } else {
-            for root in &ctx.scan_roots {
-                let candidate = root.path.join(".clawdbot").join("sessions");
-                if candidate.exists() {
-                    roots.push(candidate);
-                }
-                Self::append_explicit_roots(&mut roots, &root.path);
-            }
-        }
+        let roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -244,6 +281,10 @@ impl Connector for ClawdbotConnector {
         }
 
         Ok(convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

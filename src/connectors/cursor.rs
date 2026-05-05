@@ -12,6 +12,19 @@
 //! And in the `ItemTable` with keys like:
 //! - `workbench.panel.aichat.view.aichat.chatdata` - Legacy chat data
 
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::doc_markdown,
+    clippy::map_unwrap_or,
+    clippy::match_same_arms,
+    clippy::missing_const_for_fn,
+    clippy::must_use_candidate,
+    clippy::option_if_let_else,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unreadable_literal
+)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -20,7 +33,7 @@ use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
 use frankensqlite::{Connection, params};
 use serde_json::Value;
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -234,6 +247,49 @@ impl CursorConnector {
         // Keep connector traversal deterministic across filesystems/runs.
         dbs.sort();
         dbs
+    }
+
+    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = Vec::new();
+        if ctx.use_default_detection() {
+            if Self::looks_like_base(&ctx.data_dir) {
+                roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            } else if let Some(default_base) = Self::app_support_dir() {
+                roots.push(ScanRoot::local(default_base));
+            }
+        } else {
+            for scan_root in &ctx.scan_roots {
+                let mut candidates = Vec::new();
+                Self::append_explicit_roots(&mut candidates, &scan_root.path);
+                roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
+            }
+        }
+
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for root in Self::source_roots(ctx) {
+            for db_path in Self::find_db_files(&root.path) {
+                if !file_modified_since(&db_path, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "cursor",
+                        &root,
+                        db_path,
+                        DiscoveredSourceRole::SqliteDatabase,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+        }
+        out
     }
 
     /// Fast existence probe for detect(): return true on the first matching
@@ -794,21 +850,10 @@ impl Connector for CursorConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        // Determine base directories to scan
-        let mut roots: Vec<PathBuf> = Vec::new();
-
-        if ctx.use_default_detection() {
-            if Self::looks_like_base(&ctx.data_dir) {
-                roots.push(ctx.data_dir.clone());
-            } else if let Some(default_base) = Self::app_support_dir() {
-                roots.push(default_base);
-            }
-        } else {
-            // Explicit roots provided - use them all
-            for r in &ctx.scan_roots {
-                Self::append_explicit_roots(&mut roots, &r.path);
-            }
-        }
+        let roots: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -850,6 +895,10 @@ impl Connector for CursorConnector {
         }
 
         Ok(all_convs)
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
     }
 }
 

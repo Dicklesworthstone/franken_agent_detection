@@ -13,6 +13,12 @@
 //!   `messages`:  session_id (FK), role, content, tool_calls (JSON),
 //!                tool_name, tool_call_id, reasoning, timestamp (REAL)
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    clippy::missing_const_for_fn
+)]
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +26,7 @@ use anyhow::{Context, Result};
 use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
 use frankensqlite::{Connection, params};
 
-use super::scan::ScanContext;
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::env_path_nonempty;
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{
@@ -72,6 +78,50 @@ impl HermesConnector {
         }
 
         None
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut candidates: Vec<(ScanRoot, PathBuf)> = Vec::new();
+        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
+            let root = ScanRoot::local(ctx.data_dir.clone());
+            candidates.push((root, ctx.data_dir.clone()));
+        } else if !ctx.data_dir.as_os_str().is_empty() {
+            let root = ScanRoot::local(ctx.data_dir.clone());
+            let db_path = root.path.join("state.db");
+            candidates.push((root, db_path));
+        }
+
+        if ctx.use_default_detection() {
+            if let Some(db) = Self::sqlite_db_path() {
+                let root = ScanRoot::local(db.clone());
+                candidates.push((root, db));
+            }
+        } else {
+            for scan_root in &ctx.scan_roots {
+                if scan_root.path.extension().is_some_and(|ext| ext == "db") {
+                    candidates.push((scan_root.clone(), scan_root.path.clone()));
+                }
+                candidates.push((scan_root.clone(), scan_root.path.join("state.db")));
+                candidates.push((scan_root.clone(), scan_root.path.join(".hermes/state.db")));
+            }
+        }
+
+        let mut seen = HashSet::new();
+        candidates
+            .into_iter()
+            .filter(|(_, db_path)| db_path.is_file())
+            .filter(|(_, db_path)| seen.insert(db_path.clone()))
+            .map(|(root, db_path)| {
+                DiscoveredSourceFile::new(
+                    "hermes",
+                    &root,
+                    db_path,
+                    DiscoveredSourceRole::SqliteDatabase,
+                    true,
+                )
+                .with_fs_metadata()
+            })
+            .collect()
     }
 
     /// Extract sessions from the Hermes SQLite database.
@@ -353,6 +403,10 @@ impl Connector for HermesConnector {
 
         Ok(convs)
     }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources(ctx))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -517,5 +571,39 @@ mod tests {
             HermesConnector::infer_workspace(&messages),
             Some(PathBuf::from("/home/user/project/src"))
         );
+    }
+
+    #[test]
+    fn discover_source_files_includes_state_db_candidates() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let hermes_root = temp.path().join("hermes-home");
+        let nested_root = temp.path().join("nested-home");
+        std::fs::create_dir_all(&hermes_root).expect("hermes root");
+        std::fs::create_dir_all(nested_root.join(".hermes")).expect("nested hermes root");
+        let direct_db = hermes_root.join("state.db");
+        let nested_db = nested_root.join(".hermes/state.db");
+        std::fs::write(&direct_db, b"not a real sqlite db").expect("direct db");
+        std::fs::write(&nested_db, b"not a real sqlite db").expect("nested db");
+
+        let roots = vec![
+            ScanRoot::local(hermes_root.clone()),
+            ScanRoot::local(nested_root.clone()),
+        ];
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), roots, None);
+        let sources = HermesConnector::new()
+            .discover_source_files(&ctx)
+            .expect("source discovery");
+        let mut paths = sources
+            .iter()
+            .map(|source| source.source_path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        assert_eq!(paths, vec![direct_db, nested_db]);
+        assert!(sources.iter().all(|source| {
+            source.provider_slug == "hermes"
+                && source.role == DiscoveredSourceRole::SqliteDatabase
+                && source.required_for_reconstruction
+        }));
     }
 }
