@@ -3119,6 +3119,74 @@ mod tests {
         assert_eq!(convs.len(), 2);
     }
 
+    #[test]
+    fn sqlite_extract_groups_bulk_scanned_messages_by_session() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+
+        for session_id in ["sess-a", "sess-b"] {
+            conn.execute_compat(
+                "INSERT INTO session (id, title) VALUES (?1, ?2)",
+                params![session_id, format!("Session {session_id}")],
+            )
+            .unwrap();
+        }
+
+        for (message_id, session_id, role, created_at) in [
+            ("msg-a-late", "sess-a", "assistant", 30_i64),
+            ("msg-b-only", "sess-b", "user", 20_i64),
+            ("msg-a-early", "sess-a", "user", 10_i64),
+        ] {
+            conn.execute_compat(
+                "INSERT INTO message (id, session_id, data, time_created)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    message_id,
+                    session_id,
+                    format!(r#"{{"role":"{role}"}}"#),
+                    created_at
+                ],
+            )
+            .unwrap();
+            conn.execute_compat(
+                "INSERT INTO part (id, message_id, session_id, data, time_created)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    format!("part-{message_id}"),
+                    message_id,
+                    session_id,
+                    format!(r#"{{"type":"text","text":"content for {message_id}"}}"#),
+                    created_at
+                ],
+            )
+            .unwrap();
+        }
+
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        assert_eq!(convs.len(), 2);
+
+        let sess_a = convs
+            .iter()
+            .find(|conv| conv.external_id.as_deref() == Some("sess-a"))
+            .expect("sess-a conversation");
+        assert_eq!(sess_a.messages.len(), 2);
+        assert_eq!(sess_a.messages[0].idx, 0);
+        assert_eq!(sess_a.messages[0].content, "content for msg-a-early");
+        assert_eq!(sess_a.messages[1].idx, 1);
+        assert_eq!(sess_a.messages[1].content, "content for msg-a-late");
+
+        let sess_b = convs
+            .iter()
+            .find(|conv| conv.external_id.as_deref() == Some("sess-b"))
+            .expect("sess-b conversation");
+        assert_eq!(sess_b.messages.len(), 1);
+        assert_eq!(sess_b.messages[0].idx, 0);
+        assert_eq!(sess_b.messages[0].content, "content for msg-b-only");
+    }
+
     /// Test that SQLite extraction handles integer timestamps (epoch seconds)
     /// which Drizzle ORM may use instead of TEXT ISO 8601 strings.
     #[test]
