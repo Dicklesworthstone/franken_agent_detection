@@ -6,6 +6,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::env_path_nonempty;
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -29,6 +30,16 @@ impl ClaudeCodeConnector {
     }
 
     fn projects_root() -> PathBuf {
+        // Honor the env-var redirects Claude Code itself documents, in the same
+        // precedence order: explicit override first, XDG fallback second, then
+        // the home-relative default. Without this the connector silently
+        // ignores caam-isolated profiles and any user with XDG_CONFIG_HOME set.
+        if let Some(explicit) = env_path_nonempty("CLAUDE_CONFIG_DIR") {
+            return explicit.join("projects");
+        }
+        if let Some(xdg) = env_path_nonempty("XDG_CONFIG_HOME") {
+            return xdg.join("claude-code").join("projects");
+        }
         dirs::home_dir()
             .unwrap_or_default()
             .join(".claude/projects")
@@ -560,8 +571,20 @@ mod tests {
 
     #[test]
     fn projects_root_returns_claude_projects_path() {
+        // We can't reliably manipulate env vars in parallel tests
+        // (std::env::set_var is unsafe and forbid'd), so accept any of the
+        // three valid forms the resolver can produce: explicit override,
+        // XDG fallback, or home-relative default. Mirrors the relaxed shape
+        // used by codex.rs::home_returns_path_ending_with_codex.
         let root = ClaudeCodeConnector::projects_root();
-        assert!(root.ends_with(".claude/projects"));
+        let path_str = root.to_string_lossy().to_string();
+        let valid = root.ends_with(".claude/projects")
+            || root.ends_with("claude-code/projects")
+            || path_str.contains("projects");
+        assert!(
+            valid,
+            "projects_root() should return a path related to claude/projects, got: {path_str}"
+        );
     }
 
     #[test]
