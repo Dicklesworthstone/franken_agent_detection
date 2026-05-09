@@ -41,6 +41,8 @@ pub use connectors::crush::CrushConnector;
 pub use connectors::cursor::CursorConnector;
 #[cfg(feature = "goose")]
 pub use connectors::goose::GooseConnector;
+#[cfg(feature = "hermes")]
+pub use connectors::hermes::HermesConnector;
 #[cfg(feature = "opencode")]
 pub use connectors::opencode::OpenCodeConnector;
 #[cfg(feature = "connectors")]
