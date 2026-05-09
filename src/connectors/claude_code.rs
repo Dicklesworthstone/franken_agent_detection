@@ -30,19 +30,43 @@ impl ClaudeCodeConnector {
     }
 
     fn projects_root() -> PathBuf {
-        // Honor the env-var redirects Claude Code itself documents, in the same
-        // precedence order: explicit override first, XDG fallback second, then
-        // the home-relative default. Without this the connector silently
-        // ignores caam-isolated profiles and any user with XDG_CONFIG_HOME set.
-        if let Some(explicit) = env_path_nonempty("CLAUDE_CONFIG_DIR") {
+        Self::projects_root_resolved(
+            env_path_nonempty("CLAUDE_CONFIG_DIR").as_deref(),
+            env_path_nonempty("XDG_CONFIG_HOME").as_deref(),
+            dirs::home_dir().as_deref(),
+        )
+    }
+
+    /// Pure resolver for [`Self::projects_root`] — split out so the precedence
+    /// chain can be unit-tested without manipulating process env vars
+    /// (`std::env::set_var` is `unsafe` and not safe across parallel tests).
+    ///
+    /// Honors the env-var redirects Claude Code itself documents, in the same
+    /// precedence order:
+    ///   1. `CLAUDE_CONFIG_DIR` — explicit override.
+    ///   2. `XDG_CONFIG_HOME`   — XDG fallback.
+    ///   3. `${HOME}/.claude/projects` — default.
+    ///
+    /// Without this, the connector silently ignores caam-isolated profiles and
+    /// any user with `XDG_CONFIG_HOME` set.
+    fn projects_root_resolved(
+        claude_config_dir: Option<&Path>,
+        xdg_config_home: Option<&Path>,
+        home_dir: Option<&Path>,
+    ) -> PathBuf {
+        if let Some(explicit) = claude_config_dir {
             return explicit.join("projects");
         }
-        if let Some(xdg) = env_path_nonempty("XDG_CONFIG_HOME") {
+        if let Some(xdg) = xdg_config_home {
             return xdg.join("claude-code").join("projects");
         }
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".claude/projects")
+        // Match the historical behavior: when even `dirs::home_dir()` returns
+        // None we fall back to a relative `.claude/projects` path. That keeps
+        // strict-mode test environments (sandboxes with no HOME) unchanged.
+        home_dir.map_or_else(
+            || PathBuf::from(".claude/projects"),
+            |h| h.join(".claude/projects"),
+        )
     }
 
     fn session_files(scan_target: &Path) -> Vec<PathBuf> {
@@ -571,19 +595,75 @@ mod tests {
 
     #[test]
     fn projects_root_returns_claude_projects_path() {
-        // We can't reliably manipulate env vars in parallel tests
-        // (std::env::set_var is unsafe and forbid'd), so accept any of the
-        // three valid forms the resolver can produce: explicit override,
-        // XDG fallback, or home-relative default. Mirrors the relaxed shape
-        // used by codex.rs::home_returns_path_ending_with_codex.
+        // Smoke test on the env-aware entry point. We can't reliably mutate
+        // env vars in parallel tests (std::env::set_var is unsafe + forbid'd),
+        // so this test only asserts the invariant that holds across all three
+        // resolver branches: the path's last component is "projects". The
+        // *precedence* logic is exercised by `projects_root_resolved_*` below
+        // against explicit inputs, where we don't depend on process env at all.
         let root = ClaudeCodeConnector::projects_root();
-        let path_str = root.to_string_lossy().to_string();
-        let valid = root.ends_with(".claude/projects")
-            || root.ends_with("claude-code/projects")
-            || path_str.contains("projects");
-        assert!(
-            valid,
-            "projects_root() should return a path related to claude/projects, got: {path_str}"
+        assert_eq!(
+            root.file_name().and_then(|n| n.to_str()),
+            Some("projects"),
+            "projects_root() should always return a path ending in 'projects', got: {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn projects_root_resolved_uses_explicit_override_first() {
+        let explicit = std::path::Path::new("/opt/claude_explicit");
+        let xdg = std::path::Path::new("/opt/xdg");
+        let home = std::path::Path::new("/opt/home");
+        let root = ClaudeCodeConnector::projects_root_resolved(
+            Some(explicit),
+            Some(xdg),
+            Some(home),
+        );
+        assert_eq!(root, PathBuf::from("/opt/claude_explicit/projects"));
+    }
+
+    #[test]
+    fn projects_root_resolved_falls_back_to_xdg_when_no_explicit_override() {
+        let xdg = std::path::Path::new("/opt/xdg");
+        let home = std::path::Path::new("/opt/home");
+        let root = ClaudeCodeConnector::projects_root_resolved(None, Some(xdg), Some(home));
+        // XDG layout is `${XDG_CONFIG_HOME}/claude-code/projects` (no leading
+        // dot), distinct from the `.claude/projects` home-relative default —
+        // matches what the Claude Code CLI itself does when XDG is set, and
+        // what caam writes per-profile.
+        assert_eq!(root, PathBuf::from("/opt/xdg/claude-code/projects"));
+    }
+
+    #[test]
+    fn projects_root_resolved_uses_home_when_no_overrides() {
+        let home = std::path::Path::new("/home/jane");
+        let root = ClaudeCodeConnector::projects_root_resolved(None, None, Some(home));
+        assert_eq!(root, PathBuf::from("/home/jane/.claude/projects"));
+    }
+
+    #[test]
+    fn projects_root_resolved_falls_back_to_relative_when_home_missing() {
+        // Sandboxed test environments occasionally have no HOME — historical
+        // behavior was to return a relative `.claude/projects`, preserved here.
+        let root = ClaudeCodeConnector::projects_root_resolved(None, None, None);
+        assert_eq!(root, PathBuf::from(".claude/projects"));
+    }
+
+    #[test]
+    fn projects_root_resolved_treats_explicit_as_higher_priority_than_xdg() {
+        // Regression guard: if the precedence is ever swapped (XDG before
+        // CLAUDE_CONFIG_DIR), caam-style multi-account isolation that sets
+        // both vars to *different* values would silently route to the wrong
+        // profile. Pin the precedence here so a refactor can't quietly undo it.
+        let explicit = std::path::Path::new("/opt/account_A");
+        let xdg = std::path::Path::new("/opt/account_B/xdg_config");
+        let root = ClaudeCodeConnector::projects_root_resolved(Some(explicit), Some(xdg), None);
+        assert_eq!(root, PathBuf::from("/opt/account_A/projects"));
+        // Verify it did NOT pick the XDG path.
+        assert_ne!(
+            root,
+            PathBuf::from("/opt/account_B/xdg_config/claude-code/projects")
         );
     }
 
