@@ -37,6 +37,19 @@ impl ClaudeCodeConnector {
         )
     }
 
+    fn projects_root_candidates() -> Vec<PathBuf> {
+        let primary = Self::projects_root();
+        let mut roots = Self::projects_root_candidates_resolved(
+            env_path_nonempty("CLAUDE_CONFIG_DIR").as_deref(),
+            env_path_nonempty("XDG_CONFIG_HOME").as_deref(),
+            dirs::home_dir().as_deref(),
+        );
+        if !roots.contains(&primary) {
+            roots.push(primary);
+        }
+        roots
+    }
+
     /// Pure resolver for [`Self::projects_root`] — split out so the precedence
     /// chain can be unit-tested without manipulating process env vars
     /// (`std::env::set_var` is `unsafe` and not safe across parallel tests).
@@ -67,6 +80,28 @@ impl ClaudeCodeConnector {
             || PathBuf::from(".claude/projects"),
             |h| h.join(".claude/projects"),
         )
+    }
+
+    fn projects_root_candidates_resolved(
+        claude_config_dir: Option<&Path>,
+        xdg_config_home: Option<&Path>,
+        home_dir: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        if let Some(explicit) = claude_config_dir {
+            return vec![explicit.join("projects")];
+        }
+
+        let mut roots = Vec::new();
+        if let Some(xdg) = xdg_config_home {
+            roots.push(xdg.join("claude-code").join("projects"));
+        }
+        roots.push(home_dir.map_or_else(
+            || PathBuf::from(".claude/projects"),
+            |home| home.join(".claude/projects"),
+        ));
+        roots.sort();
+        roots.dedup();
+        roots
     }
 
     fn session_files(scan_target: &Path) -> Vec<PathBuf> {
@@ -105,7 +140,10 @@ impl ClaudeCodeConnector {
             if looks_like_root(&ctx.data_dir) {
                 vec![ScanRoot::local(ctx.data_dir.clone())]
             } else {
-                vec![ScanRoot::local(Self::projects_root())]
+                Self::projects_root_candidates()
+                    .into_iter()
+                    .map(ScanRoot::local)
+                    .collect()
             }
         } else {
             ctx.scan_roots.clone()
@@ -615,11 +653,8 @@ mod tests {
         let explicit = std::path::Path::new("/opt/claude_explicit");
         let xdg = std::path::Path::new("/opt/xdg");
         let home = std::path::Path::new("/opt/home");
-        let root = ClaudeCodeConnector::projects_root_resolved(
-            Some(explicit),
-            Some(xdg),
-            Some(home),
-        );
+        let root =
+            ClaudeCodeConnector::projects_root_resolved(Some(explicit), Some(xdg), Some(home));
         assert_eq!(root, PathBuf::from("/opt/claude_explicit/projects"));
     }
 
@@ -665,6 +700,31 @@ mod tests {
             root,
             PathBuf::from("/opt/account_B/xdg_config/claude-code/projects")
         );
+    }
+
+    #[test]
+    fn projects_root_candidates_keep_home_fallback_when_xdg_is_set() {
+        let xdg = std::path::Path::new("/opt/xdg");
+        let home = std::path::Path::new("/home/jane");
+        let roots =
+            ClaudeCodeConnector::projects_root_candidates_resolved(None, Some(xdg), Some(home));
+
+        assert!(roots.contains(&PathBuf::from("/opt/xdg/claude-code/projects")));
+        assert!(roots.contains(&PathBuf::from("/home/jane/.claude/projects")));
+    }
+
+    #[test]
+    fn projects_root_candidates_explicit_override_does_not_scan_fallbacks() {
+        let explicit = std::path::Path::new("/opt/claude_explicit");
+        let xdg = std::path::Path::new("/opt/xdg");
+        let home = std::path::Path::new("/home/jane");
+        let roots = ClaudeCodeConnector::projects_root_candidates_resolved(
+            Some(explicit),
+            Some(xdg),
+            Some(home),
+        );
+
+        assert_eq!(roots, vec![PathBuf::from("/opt/claude_explicit/projects")]);
     }
 
     #[test]
