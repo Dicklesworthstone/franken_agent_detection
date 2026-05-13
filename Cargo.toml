@@ -1,6 +1,6 @@
 [package]
 name = "franken-agent-detection"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -37,7 +37,7 @@ frankensqlite = { version = "*", git = "https://github.com/Dicklesworthstone/fra
 
 [features]
 default = []
-# Base connector support: shared deps for all 15 connectors
+# Base connector support: shared deps for built-in non-SQLite connectors
 connectors = [
     "dep:anyhow",
     "dep:serde_json",

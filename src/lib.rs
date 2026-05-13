@@ -132,6 +132,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "gemini",
     "github-copilot",
     "goose",
+    "hermes",
     "kimi",
     "opencode",
     "openclaw",
@@ -158,6 +159,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "gemini" | "gemini-cli" => Some("gemini"),
         "github-copilot" | "copilot" => Some("github-copilot"),
         "goose" | "goose-ai" => Some("goose"),
+        "hermes" | "hermes-agent" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
@@ -577,6 +579,10 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".config", "goose"]);
             maybe_push(&mut out, &[".goose", "sessions"]);
             maybe_push(&mut out, &[".goose"]);
+        }
+        "hermes" => {
+            maybe_push(&mut out, &[".hermes", "state.db"]);
+            maybe_push(&mut out, &[".hermes"]);
         }
         "kimi" => {
             maybe_push(&mut out, &[".kimi", "sessions"]);
@@ -1016,6 +1022,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".goose", "sessions"]),
                     tilde(&[".goose"]),
                 ],
+                "hermes" => vec![tilde(&[".hermes", "state.db"]), tilde(&[".hermes"])],
                 "kimi" => vec![tilde(&[".kimi", "sessions"]), tilde(&[".kimi"])],
                 "opencode" => vec![
                     // Direct path to the v1.2+ SQLite database — probed first
@@ -1398,6 +1405,10 @@ mod tests {
 
         let windsurf = by_slug.get("windsurf").expect("windsurf paths");
         assert!(windsurf.contains(&"~/.config/windsurf".to_string()));
+
+        let hermes = by_slug.get("hermes").expect("hermes paths");
+        assert!(hermes.contains(&"~/.hermes/state.db".to_string()));
+        assert!(hermes.contains(&"~/.hermes".to_string()));
 
         let cline = by_slug.get("cline").expect("cline paths");
         assert!(
