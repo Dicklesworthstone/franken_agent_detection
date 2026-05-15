@@ -132,6 +132,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "gemini",
     "github-copilot",
     "goose",
+    "grok",
     "hermes",
     "kimi",
     "opencode",
@@ -159,6 +160,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "gemini" | "gemini-cli" => Some("gemini"),
         "github-copilot" | "copilot" => Some("github-copilot"),
         "goose" | "goose-ai" => Some("goose"),
+        "grok" | "grok-cli" | "grok-build" | "xai-grok" => Some("grok"),
         "hermes" | "hermes-agent" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
         "opencode" | "open-code" => Some("opencode"),
@@ -579,6 +581,18 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".config", "goose"]);
             maybe_push(&mut out, &[".goose", "sessions"]);
             maybe_push(&mut out, &[".goose"]);
+        }
+        "grok" => {
+            // xAI Grok CLI / Grok Build TUI keep their state under ~/.grok/.
+            // Probe the sessions directory first (the highest-signal artifact),
+            // then the parent so detection still fires for fresh installs that
+            // haven't created a session yet. The auth.json file is universally
+            // present once `grok` has been authenticated and is a useful
+            // additional probe target for accounts that wipe sessions between
+            // runs.
+            maybe_push(&mut out, &[".grok", "sessions"]);
+            maybe_push(&mut out, &[".grok", "auth.json"]);
+            maybe_push(&mut out, &[".grok"]);
         }
         "hermes" => {
             maybe_push(&mut out, &[".hermes", "state.db"]);
@@ -1022,6 +1036,11 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".goose", "sessions"]),
                     tilde(&[".goose"]),
                 ],
+                "grok" => vec![
+                    tilde(&[".grok", "sessions"]),
+                    tilde(&[".grok", "auth.json"]),
+                    tilde(&[".grok"]),
+                ],
                 "hermes" => vec![tilde(&[".hermes", "state.db"]), tilde(&[".hermes"])],
                 "kimi" => vec![tilde(&[".kimi", "sessions"]), tilde(&[".kimi"])],
                 "opencode" => vec![
@@ -1409,6 +1428,11 @@ mod tests {
         let hermes = by_slug.get("hermes").expect("hermes paths");
         assert!(hermes.contains(&"~/.hermes/state.db".to_string()));
         assert!(hermes.contains(&"~/.hermes".to_string()));
+
+        let grok = by_slug.get("grok").expect("grok paths");
+        assert!(grok.contains(&"~/.grok/sessions".to_string()));
+        assert!(grok.contains(&"~/.grok/auth.json".to_string()));
+        assert!(grok.contains(&"~/.grok".to_string()));
 
         let cline = by_slug.get("cline").expect("cline paths");
         assert!(

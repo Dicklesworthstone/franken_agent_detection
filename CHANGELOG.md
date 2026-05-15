@@ -17,7 +17,20 @@ Crate: <https://crates.io/crates/franken-agent-detection>
 
 ## [Unreleased] -- since v0.1.3
 
-No unreleased changes yet.
+### Added
+
+- **Grok (xAI) added to the detection inventory.** xAI's Grok CLI / Grok
+  Build TUI keeps its state under `~/.grok/` (sessions, auth, hooks). Added
+  `grok` to `KNOWN_CONNECTORS`, taught `canonical_connector_slug` the
+  `grok-cli` / `grok-build` / `xai-grok` aliases, and wired up
+  `default_probe_roots` for `~/.grok/sessions`, `~/.grok/auth.json`, and
+  `~/.grok`. Conformance test updated so `default_probe_paths_tilde_covers_expected_roots`
+  asserts the new probe roots.
+
+  Note: this lands detection-level support (presence, probe roots) only.
+  A full conversation/normalization connector for Grok session data is
+  deferred — Grok's session format is JSON-on-disk but the schema is still
+  evolving, so adding a connector now would invite churn.
 
 ---
 
