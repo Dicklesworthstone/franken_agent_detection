@@ -1,6 +1,6 @@
 //! Shared utility functions used by all connectors.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Read an environment variable, trimming whitespace and treating empty strings as unset.
 pub(crate) fn env_var_nonempty(key: &str) -> Option<String> {
@@ -17,6 +17,35 @@ pub(crate) fn env_var_nonempty(key: &str) -> Option<String> {
 /// Read an environment variable as a filesystem path, ignoring empty strings.
 pub(crate) fn env_path_nonempty(key: &str) -> Option<PathBuf> {
     env_var_nonempty(key).map(PathBuf::from)
+}
+
+/// Read `CASS_EXCLUDE_PATHS` as a comma/newline-delimited list of exact files
+/// or directory prefixes to skip during connector scans.
+///
+/// This is intentionally implemented in the connector crate rather than in CASS
+/// so source discovery and parsing stay aligned: a path excluded here is neither
+/// pre-mirrored nor parsed.
+pub(crate) fn excluded_scan_paths_from_env() -> Vec<PathBuf> {
+    env_var_nonempty("CASS_EXCLUDE_PATHS")
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split([',', '\n'])
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Return true when `path` should be skipped because it equals or is under one
+/// of the configured exclusions.
+#[must_use]
+pub(crate) fn path_is_excluded(path: &Path, excluded_paths: &[PathBuf]) -> bool {
+    excluded_paths
+        .iter()
+        .any(|excluded| path == excluded || path.starts_with(excluded))
 }
 
 /// Build a deduplication key for hot scan loops without paying the full

@@ -6,7 +6,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::env_path_nonempty;
+use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -155,6 +155,13 @@ impl ClaudeCodeConnector {
     }
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        Self::discover_sources_with_exclusions(ctx, &excluded_scan_paths_from_env())
+    }
+
+    fn discover_sources_with_exclusions(
+        ctx: &ScanContext,
+        excluded_paths: &[PathBuf],
+    ) -> Vec<DiscoveredSourceFile> {
         let mut out = Vec::new();
         for root in Self::source_roots(ctx) {
             let scan_target = root.path.clone();
@@ -167,6 +174,13 @@ impl ClaudeCodeConnector {
                 Self::session_files(&scan_target)
             };
             for path in session_paths {
+                if path_is_excluded(&path, excluded_paths) {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "claude_code skipping excluded session source"
+                    );
+                    continue;
+                }
                 if !file_modified_since(&path, ctx.since_ts) {
                     continue;
                 }
@@ -284,6 +298,15 @@ fn scan_claude_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    scan_claude_with_callback_with_exclusions(ctx, on_conversation, &excluded_scan_paths_from_env())
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_claude_with_callback_with_exclusions(
+    ctx: &ScanContext,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    excluded_paths: &[PathBuf],
+) -> Result<()> {
     let roots: Vec<PathBuf> = ClaudeCodeConnector::source_roots(ctx)
         .into_iter()
         .map(|root| root.path)
@@ -312,6 +335,13 @@ fn scan_claude_with_callback(
         };
 
         for path in session_paths {
+            if path_is_excluded(&path, excluded_paths) {
+                tracing::debug!(
+                    path = %path.display(),
+                    "claude_code skipping excluded session file"
+                );
+                continue;
+            }
             let ext = path.extension().and_then(|s| s.to_str());
             if !file_modified_since(&path, ctx.since_ts) {
                 continue;
@@ -826,6 +856,64 @@ mod tests {
             streamed[0].messages[1].content,
             scanned[0].messages[1].content
         );
+    }
+
+    #[test]
+    fn scan_skips_explicitly_excluded_session_path_without_skipping_siblings() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        let active_session = claude_dir.join("active.jsonl");
+        let stable_session = claude_dir.join("stable.jsonl");
+        fs::write(
+            &active_session,
+            r#"{"type":"user","message":{"role":"user","content":"active in-progress content"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &stable_session,
+            r#"{"type":"user","message":{"role":"user","content":"stable content"}}"#,
+        )
+        .unwrap();
+
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let mut streamed = Vec::new();
+        scan_claude_with_callback_with_exclusions(
+            &ctx,
+            &mut |conversation| {
+                streamed.push(conversation);
+                Ok(())
+            },
+            std::slice::from_ref(&active_session),
+        )
+        .unwrap();
+
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].source_path, stable_session);
+        assert_eq!(streamed[0].messages[0].content, "stable content");
+    }
+
+    #[test]
+    fn discover_source_files_skips_explicitly_excluded_session_path() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        let active_session = claude_dir.join("active.jsonl");
+        let stable_session = claude_dir.join("stable.jsonl");
+        fs::write(&active_session, "{}").unwrap();
+        fs::write(&stable_session, "{}").unwrap();
+
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let discovered = ClaudeCodeConnector::discover_sources_with_exclusions(
+            &ctx,
+            std::slice::from_ref(&active_session),
+        );
+
+        let source_paths: Vec<_> = discovered
+            .into_iter()
+            .map(|source| source.source_path)
+            .collect();
+        assert_eq!(source_paths, vec![stable_session]);
     }
 
     #[test]
