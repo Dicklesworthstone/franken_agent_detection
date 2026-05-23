@@ -450,7 +450,7 @@ impl CursorConnector {
         let composer_prefix = "composerData:";
         let composer_limit = Self::prefix_upper_bound(composer_prefix);
         if let Ok(rows) = conn.query_map_collect(
-            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?",
+            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
             params![composer_prefix, composer_limit.as_str()],
             |row| {
                 let key: String = row.get_typed(0)?;
@@ -474,7 +474,7 @@ impl CursorConnector {
 
         // Also try ItemTable for legacy aichat data
         if let Ok(rows) = conn.query_map_collect(
-            "SELECT key, value FROM ItemTable WHERE key LIKE '%aichat%chatdata%' OR key LIKE '%composer%'",
+            "SELECT key, value FROM ItemTable WHERE (key LIKE '%aichat%chatdata%' OR key LIKE '%composer%') AND value IS NOT NULL",
             params![],
             |row| {
                 let key: String = row.get_typed(0)?;
@@ -1584,6 +1584,36 @@ mod tests {
 
         let result = CursorConnector::extract_from_db(&db_path, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_from_db_skips_rows_with_null_value() {
+        // Cursor stores some rows in cursorDiskKV / ItemTable with a NULL value
+        // (e.g. internal markers without payload). The row mapper requests
+        // `value` as `String`, so a single NULL row used to abort the entire
+        // `query_map_collect` via fail-fast semantics, silently dropping every
+        // valid composerData row alongside it.
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.vscdb");
+
+        let conn = create_test_db(&db_path);
+        let value = json!({ "text": "real conversation" }).to_string();
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params!["composerData:real-1", value.as_str()],
+        )
+        .unwrap();
+        // NULL-value row that previously poisoned the whole query.
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, NULL)",
+            params!["composerData:null-marker"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert!(convs[0].messages[0].content.contains("real conversation"));
     }
 
     // =========================================================================
