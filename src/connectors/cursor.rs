@@ -450,7 +450,10 @@ impl CursorConnector {
         let composer_prefix = "composerData:";
         let composer_limit = Self::prefix_upper_bound(composer_prefix);
         if let Ok(rows) = conn.query_map_collect(
-            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?",
+            // Filter out NULL-value rows: Cursor inserts internal markers with no
+            // chat payload, and `row.get_typed(1)?` on NULL aborts the whole
+            // query_map_collect — silently turning every row into zero conversations.
+            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
             params![composer_prefix, composer_limit.as_str()],
             |row| {
                 let key: String = row.get_typed(0)?;
@@ -474,7 +477,7 @@ impl CursorConnector {
 
         // Also try ItemTable for legacy aichat data
         if let Ok(rows) = conn.query_map_collect(
-            "SELECT key, value FROM ItemTable WHERE key LIKE '%aichat%chatdata%' OR key LIKE '%composer%'",
+            "SELECT key, value FROM ItemTable WHERE (key LIKE '%aichat%chatdata%' OR key LIKE '%composer%') AND value IS NOT NULL",
             params![],
             |row| {
                 let key: String = row.get_typed(0)?;
@@ -1584,6 +1587,70 @@ mod tests {
 
         let result = CursorConnector::extract_from_db(&db_path, None);
         assert!(result.is_err());
+    }
+
+    // Cursor inserts internal marker rows into `cursorDiskKV` with NULL `value`
+    // (e.g. composer metadata stubs). Without filtering, `row.get_typed::<String>(1)?`
+    // on NULL aborts the row mapper, the `if let Ok(rows) = ...` swallows the error,
+    // and the whole connector silently returns zero conversations. Regression test:
+    // a single NULL row must not mask the valid rows beside it. (PR #8)
+    #[test]
+    fn extract_from_db_skips_null_value_rows_in_cursor_disk_kv() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.vscdb");
+
+        let conn = create_test_db(&db_path);
+        // One valid composer entry.
+        let value = json!({ "text": "Valid conversation" }).to_string();
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params!["composerData:valid-row", value.as_str()],
+        )
+        .unwrap();
+        // One internal-marker entry with NULL value sitting in the same prefix range.
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, NULL)",
+            params!["composerData:null-marker"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        assert_eq!(
+            convs.len(),
+            1,
+            "NULL-value row must not abort the row mapper for valid sibling rows"
+        );
+        assert!(convs[0].messages[0].content.contains("Valid conversation"));
+    }
+
+    #[test]
+    fn extract_from_db_skips_null_value_rows_in_item_table() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.vscdb");
+
+        let conn = create_test_db(&db_path);
+        let value = json!({
+            "tabs": [{ "bubbles": [{"text": "Valid aichat", "type": "user"}] }]
+        })
+        .to_string();
+        conn.execute_compat(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            params![
+                "workbench.panel.aichat.view.aichat.chatdata",
+                value.as_str()
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO ItemTable (key, value) VALUES (?, NULL)",
+            params!["workbench.panel.aichat.view.composer.null-marker"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        assert_eq!(convs.len(), 1);
     }
 
     // =========================================================================
