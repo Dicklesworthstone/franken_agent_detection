@@ -87,10 +87,15 @@ pub fn file_modified_since(path: &std::path::Path, since_ts: Option<i64>) -> boo
 #[must_use]
 pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
     if let Some(ts) = val.as_i64() {
-        let ts = if (0..100_000_000_000).contains(&ts) {
-            ts.saturating_mul(1000)
+        // Detect nanoseconds: QClaw stores timestamps as nanoseconds since Unix epoch
+        // (e.g. 1779436938177999872), which are > 1 quadrillion.
+        // Milliseconds max: ~1 trillion (10^12). Anything > 1 quadrillion (10^15) is ns.
+        let ts = if ts > 1_000_000_000_000_000 {
+            ts / 1_000_000  // ns -> ms
+        } else if (1..100_000_000_000).contains(&ts) {
+            ts.saturating_mul(1000)  // seconds -> ms
         } else {
-            ts
+            ts  // already ms
         };
         return Some(ts);
     }
@@ -102,10 +107,12 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
         if let Some(f) = val.as_f64() {
             if f.is_finite() && f > 0.0 {
                 #[allow(clippy::cast_possible_truncation)]
-                let ts = if f < 100_000_000_000.0 {
-                    (f * 1000.0).round() as i64
+                let ts = if f > 1_000_000_000_000_000.0 {
+                    (f / 1_000_000.0).round() as i64  // ns -> ms
+                } else if f < 100_000_000_000.0 {
+                    (f * 1000.0).round() as i64  // seconds -> ms
                 } else {
-                    f.round() as i64
+                    f.round() as i64  // already ms
                 };
                 return Some(ts);
             }
@@ -113,10 +120,12 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
     }
     if let Some(s) = val.as_str() {
         if let Ok(num) = s.parse::<i64>() {
-            let ts = if (0..100_000_000_000).contains(&num) {
-                num.saturating_mul(1000)
+            let ts = if num > 1_000_000_000_000_000 {
+                num / 1_000_000  // ns -> ms
+            } else if (0..100_000_000_000).contains(&num) {
+                num.saturating_mul(1000)  // seconds -> ms
             } else {
-                num
+                num  // already ms
             };
             return Some(ts);
         }
@@ -125,10 +134,12 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
                 return None;
             }
             #[allow(clippy::cast_possible_truncation)]
-            let ts = if (0.0..100_000_000_000.0).contains(&num) {
-                (num * 1000.0).round() as i64
+            let ts = if num > 1_000_000_000_000_000.0 {
+                (num / 1_000_000.0).round() as i64  // ns -> ms
+            } else if (0.0..100_000_000_000.0).contains(&num) {
+                (num * 1000.0).round() as i64  // seconds -> ms
             } else {
-                num.round() as i64
+                num.round() as i64  // already ms
             };
             return Some(ts);
         }
@@ -408,6 +419,51 @@ mod tests {
     fn parse_timestamp_zero() {
         let val = json!(0);
         assert_eq!(parse_timestamp(&val), Some(0));
+    }
+
+    // --- QClaw nanoseconds timestamp tests ---
+
+    #[test]
+    fn parse_timestamp_qclaw_nanoseconds() {
+        // QClaw stores timestamps as nanoseconds since Unix epoch.
+        // 1779436938177999872 ns = 2026-05-23T10:55:38.177999872 UTC
+        let val = json!(1_779_436_938_177_999_872_i64);
+        let ms = parse_timestamp(&val);
+        assert!(ms.is_some());
+        assert_eq!(ms, Some(1_779_436_938_177_999)); // ns -> ms
+    }
+
+    #[test]
+    fn parse_timestamp_qclaw_nanoseconds_large() {
+        // Very large ns value (near year 2100)
+        let val = json!(4_100_000_000_000_000_000_i64);
+        let ms = parse_timestamp(&val);
+        assert!(ms.is_some());
+        assert_eq!(ms, Some(4_100_000_000_000_000)); // ns -> ms
+    }
+
+    #[test]
+    fn parse_timestamp_qclaw_nanoseconds_float() {
+        let val = json!(1_779_436_938_177_999_872.0);
+        let ms = parse_timestamp(&val);
+        assert!(ms.is_some());
+        assert_eq!(ms, Some(1_779_436_938_177_999));
+    }
+
+    #[test]
+    fn parse_timestamp_qclaw_nanoseconds_string() {
+        let val = json!("1779436938177999872");
+        let ms = parse_timestamp(&val);
+        assert!(ms.is_some());
+        assert_eq!(ms, Some(1_779_436_938_177_999));
+    }
+
+    #[test]
+    fn parse_timestamp_qclaw_nanoseconds_string_float() {
+        let val = json!("1779436938177999872.5");
+        let ms = parse_timestamp(&val);
+        assert!(ms.is_some());
+        assert_eq!(ms, Some(1_779_436_938_178_000));
     }
 
     // --- flatten_content tests ---

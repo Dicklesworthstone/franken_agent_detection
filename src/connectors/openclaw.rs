@@ -1,11 +1,17 @@
-//! Connector for `OpenClaw` session logs.
+//! Connector for `OpenClaw` and `QClaw` session logs.
 //!
 //! `OpenClaw` stores JSONL sessions at:
 //! - ~/.openclaw/agents/<agent-name>/sessions/*.jsonl
 //!
-//! Each line has a `type` discriminator: "session", "message", "`model_change`",
-//! "`thinking_level_change`", "custom". Messages are wrapped:
+//! `QClaw` (the commercial wrapper around OpenClaw) stores sessions at:
+//! - ~/.qclaw-oversea/agents/<agent-name>/sessions/*.jsonl
+//!
+//! Both formats use the same JSONL structure. Each line has a `type` discriminator:
+//! "session", "message", "model_change", "thinking_level_change", "custom".
+//! Messages are wrapped:
 //! {"type":"message","id":"...","message":{"role":"user","content":[...],...}}
+//!
+//! Timestamps may be in milliseconds, seconds, or (QClaw) nanoseconds.
 
 use std::fs;
 use std::io::BufRead;
@@ -37,14 +43,31 @@ impl OpenClawConnector {
         dirs::home_dir().map(|home| home.join(".openclaw"))
     }
 
+    /// QClaw stores sessions at ~/.qclaw-oversea/agents/ (QClaw is a commercial
+    /// wrapper around OpenClaw, used by the QClaw desktop application).
+    fn qclaw_home() -> Option<PathBuf> {
+        dirs::home_dir().map(|home| home.join(".qclaw-oversea"))
+    }
+
     fn agents_root() -> Option<PathBuf> {
         Self::openclaw_home().map(|home| home.join("agents"))
     }
 
+    /// QClaw agents root: ~/.qclaw-oversea/agents/
+    fn qclaw_agents_root() -> Option<PathBuf> {
+        Self::qclaw_home().map(|home| home.join("agents"))
+    }
+
     fn find_agent_session_dirs() -> Vec<PathBuf> {
-        Self::agents_root().map_or_else(Vec::new, |agents_root| {
-            Self::find_agent_session_dirs_at(&agents_root)
-        })
+        let mut dirs: Vec<PathBuf> = Self::agents_root()
+            .map_or_else(Vec::new, |agents_root| Self::find_agent_session_dirs_at(&agents_root));
+        // Also scan QClaw sessions
+        if let Some(qclaw_agents) = Self::qclaw_agents_root() {
+            dirs.extend(Self::find_agent_session_dirs_at(&qclaw_agents));
+        }
+        dirs.sort();
+        dirs.dedup();
+        dirs
     }
 
     fn find_agent_session_dirs_at(agents_root: &Path) -> Vec<PathBuf> {
@@ -188,6 +211,13 @@ impl OpenClawConnector {
             roots.extend(Self::find_agent_session_dirs_at(&embedded_agents));
         }
 
+        // QClaw: ~/.qclaw-oversea/agents (QClaw desktop app wrapper)
+        if let Some(qclaw_agents) = Self::qclaw_agents_root()
+            && qclaw_agents.exists()
+        {
+            roots.extend(Self::find_agent_session_dirs_at(&qclaw_agents));
+        }
+
         if path.file_name().and_then(|n| n.to_str()) == Some(".openclaw") {
             roots.extend(Self::find_agent_session_dirs_at(&path.join("agents")));
         }
@@ -305,12 +335,27 @@ impl OpenClawConnector {
                         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         match block_type {
                             "text" => block.get("text").and_then(|t| t.as_str()).map(String::from),
-                            "toolCall" => {
+                            "toolCall" | "tool_call" => {
                                 let name = block
                                     .get("name")
                                     .and_then(|n| n.as_str())
                                     .unwrap_or("tool_call");
                                 Some(format!("[tool: {name}]"))
+                            }
+                            "tool_result" => {
+                                // QClaw uses "tool_result" blocks for tool output
+                                let content = block.get("content");
+                                match content {
+                                    Some(serde_json::Value::String(s)) => Some(s.clone()),
+                                    Some(serde_json::Value::Array(arr)) => {
+                                        let parts: Vec<String> = arr
+                                            .iter()
+                                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()).map(String::from))
+                                            .collect();
+                                        Some(parts.join("\n"))
+                                    }
+                                    _ => content.and_then(|v| v.as_str()).map(String::from),
+                                }
                             }
                             "thinking" => {
                                 block.get("text").and_then(|t| t.as_str()).map(String::from)
