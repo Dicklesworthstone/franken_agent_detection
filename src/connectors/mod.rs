@@ -26,6 +26,7 @@ pub mod kimi;
 pub mod openclaw;
 #[cfg(feature = "opencode")]
 pub mod opencode;
+pub mod openhands;
 pub mod path_trie;
 pub mod pi_agent;
 pub mod qwen;
@@ -217,6 +218,9 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("factory", || Box::new(factory::FactoryConnector::new())),
         ("kimi", || Box::new(kimi::KimiConnector::new())),
         ("openclaw", || Box::new(openclaw::OpenClawConnector::new())),
+        ("openhands", || {
+            Box::new(openhands::OpenHandsConnector::new())
+        }),
         ("copilot", || Box::new(copilot::CopilotConnector::new())),
         ("copilot_cli", || {
             Box::new(copilot_cli::CopilotCliConnector::new())

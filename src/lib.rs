@@ -56,8 +56,9 @@ pub use connectors::{
     extract_claude_code_tokens, extract_codex_tokens, extract_invocations_from_content_blocks,
     extract_tokens_for_agent, factory::FactoryConnector, file_modified_since, flatten_content,
     franken_detection_for_connector, gemini::GeminiConnector, get_connector_factories,
-    kimi::KimiConnector, normalize_model, openclaw::OpenClawConnector, parse_timestamp,
-    pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,
+    kimi::KimiConnector, normalize_model, openclaw::OpenClawConnector,
+    openhands::OpenHandsConnector, parse_timestamp, pi_agent::PiAgentConnector,
+    qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -137,6 +138,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "kimi",
     "opencode",
     "openclaw",
+    "openhands",
     "pi_agent",
     "qwen",
     "vibe",
@@ -165,6 +167,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
+        "openhands" | "open-hands" => Some("openhands"),
         "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
         "vibe" | "vibe-cli" => Some("vibe"),
@@ -276,6 +279,13 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                 return None;
             }
             Some(vec![PathBuf::from(root).join("sessions")])
+        }
+        "openhands" => {
+            let root = read("CASS_OPENHANDS_DATA_ROOT")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root)])
         }
         "pi_agent" => {
             let root = read("PI_CODING_AGENT_DIR")?;
@@ -633,6 +643,10 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         "openclaw" => {
             maybe_push(&mut out, &[".openclaw"]);
             maybe_push(&mut out, &[".openclaw", "agents"]);
+        }
+        "openhands" => {
+            maybe_push(&mut out, &[".openhands", "conversations"]);
+            maybe_push(&mut out, &[".openhands"]);
         }
         "pi_agent" => {
             maybe_push(&mut out, &[".pi", "agent", "sessions"]);
@@ -1083,6 +1097,10 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".config", "opencode"]),
                 ],
                 "openclaw" => vec![tilde(&[".openclaw", "agents"]), tilde(&[".openclaw"])],
+                "openhands" => vec![
+                    tilde(&[".openhands", "conversations"]),
+                    tilde(&[".openhands"]),
+                ],
                 "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
                 "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],
                 "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],

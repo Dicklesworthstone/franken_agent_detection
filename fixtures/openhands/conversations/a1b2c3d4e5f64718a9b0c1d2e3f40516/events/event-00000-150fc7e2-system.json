@@ -1,0 +1,41 @@
+{
+  "id": "150fc7e2-9660-4cc9-8b5b-13e78366b54d",
+  "timestamp": "2026-05-20T19:00:55.619644",
+  "source": "agent",
+  "system_prompt": {
+    "cache_prompt": false,
+    "type": "text",
+    "text": "You are OpenHands, an autonomous software engineering agent. Work in the provided repository and use the available tools to satisfy the user's request."
+  },
+  "tools": [
+    {
+      "description": "Execute a shell command in the terminal.",
+      "action_type": "TerminalAction",
+      "observation_type": "TerminalObservation",
+      "kind": "TerminalTool",
+      "title": "terminal"
+    },
+    {
+      "description": "Custom editing tool for viewing, creating and editing files.",
+      "action_type": "FileEditorAction",
+      "observation_type": "FileEditorObservation",
+      "kind": "FileEditorTool",
+      "title": "file_editor"
+    },
+    {
+      "description": "Structured task management for tracking progress.",
+      "action_type": "TaskTrackerAction",
+      "observation_type": "TaskTrackerObservation",
+      "kind": "TaskTrackerTool",
+      "title": "task_tracker"
+    },
+    {
+      "description": "Signal completion of the current task.",
+      "action_type": "FinishAction",
+      "observation_type": "FinishObservation",
+      "kind": "FinishTool",
+      "title": "finish"
+    }
+  ],
+  "kind": "SystemPromptEvent"
+}

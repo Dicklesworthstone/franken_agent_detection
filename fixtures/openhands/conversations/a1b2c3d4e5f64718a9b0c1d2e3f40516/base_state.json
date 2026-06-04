@@ -1,0 +1,24 @@
+{
+  "id": "a1b2c3d4-e5f6-4718-a9b0-c1d2e3f40516",
+  "agent": {
+    "llm": {
+      "model": "openai/gpt-5.1",
+      "api_key": "**********",
+      "num_retries": 5,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "native_tool_calling": true,
+      "reasoning_effort": "high",
+      "usage_id": "agent"
+    },
+    "tools": [
+      {"name": "terminal", "params": {}},
+      {"name": "file_editor", "params": {}},
+      {"name": "task_tracker", "params": {}}
+    ],
+    "include_default_tools": ["FinishTool", "ThinkTool"]
+  },
+  "workspace": {"path": "/mnt/2TBSSD/Projects/uuid_service"},
+  "max_iterations": 500,
+  "stuck_detection": true
+}
