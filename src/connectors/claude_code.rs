@@ -50,6 +50,20 @@ impl ClaudeCodeConnector {
         roots
     }
 
+    fn desktop_session_roots_resolved(home_dir: Option<&Path>) -> Vec<PathBuf> {
+        let Some(home) = home_dir else {
+            return Vec::new();
+        };
+        let claude_support = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude");
+        vec![
+            claude_support.join("claude-code-sessions"),
+            claude_support.join("local-agent-mode-sessions"),
+        ]
+    }
+
     /// Pure resolver for [`Self::projects_root`] — split out so the precedence
     /// chain can be unit-tested without manipulating process env vars
     /// (`std::env::set_var` is `unsafe` and not safe across parallel tests).
@@ -99,6 +113,7 @@ impl ClaudeCodeConnector {
             || PathBuf::from(".claude/projects"),
             |home| home.join(".claude/projects"),
         ));
+        roots.extend(Self::desktop_session_roots_resolved(home_dir));
         roots.sort();
         roots.dedup();
         roots
@@ -131,6 +146,94 @@ impl ClaudeCodeConnector {
 
     fn should_compact_large_message_extra(file_size_bytes: Option<u64>) -> bool {
         file_size_bytes.is_some_and(|size| size >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES)
+    }
+
+    fn path_is_desktop_sidecar(path: &Path) -> bool {
+        path.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some("claude-code-sessions" | "local-agent-mode-sessions")
+            )
+        })
+    }
+
+    fn discovered_source_role(path: &Path) -> DiscoveredSourceRole {
+        if Self::path_is_desktop_sidecar(path) {
+            DiscoveredSourceRole::MetadataSidecar
+        } else {
+            DiscoveredSourceRole::PrimarySessionLog
+        }
+    }
+
+    fn non_empty_json_string(value: &Value, key: &str) -> Option<String> {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    }
+
+    fn desktop_sidecar_metadata_message(raw: &Value) -> Option<NormalizedMessage> {
+        let title = Self::non_empty_json_string(raw, "title");
+        let cwd = Self::non_empty_json_string(raw, "cwd");
+        let model = Self::non_empty_json_string(raw, "model");
+        let cli_session_id = Self::non_empty_json_string(raw, "cliSessionId");
+        let session_id = Self::non_empty_json_string(raw, "sessionId");
+        let permission_mode = Self::non_empty_json_string(raw, "permissionMode");
+        if title.is_none()
+            && cwd.is_none()
+            && model.is_none()
+            && cli_session_id.is_none()
+            && session_id.is_none()
+        {
+            return None;
+        }
+
+        let mut lines = vec!["Claude Code Desktop session metadata".to_string()];
+        if let Some(title) = &title {
+            lines.push(format!("Title: {title}"));
+        }
+        if let Some(cwd) = &cwd {
+            lines.push(format!("Workspace: {cwd}"));
+        }
+        if let Some(model) = &model {
+            lines.push(format!("Model: {model}"));
+        }
+        if let Some(permission_mode) = &permission_mode {
+            lines.push(format!("Permission mode: {permission_mode}"));
+        }
+        if let Some(cli_session_id) = &cli_session_id {
+            lines.push(format!("CLI session id: {cli_session_id}"));
+        } else if let Some(session_id) = &session_id {
+            lines.push(format!("Session id: {session_id}"));
+        }
+        lines.push(
+            "Conversation body unavailable in this Desktop sidecar; Claude Code may have culled the CLI JSONL body."
+                .to_string(),
+        );
+
+        let created_at = raw
+            .get("lastActivityAt")
+            .or_else(|| raw.get("createdAt"))
+            .and_then(parse_timestamp);
+        Some(NormalizedMessage {
+            idx: 0,
+            role: "system".to_string(),
+            author: Some("claude_code_desktop".to_string()),
+            created_at,
+            content: lines.join("\n"),
+            extra: serde_json::json!({
+                "cass": {
+                    "source": "claude_code_desktop_sidecar",
+                    "body_available": false,
+                    "body_cull_note": "Claude Code may auto-cull CLI JSONL bodies while Desktop sidecars retain title/workspace metadata."
+                },
+                "raw": raw
+            }),
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        })
     }
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
@@ -188,8 +291,8 @@ impl ClaudeCodeConnector {
                     DiscoveredSourceFile::new(
                         "claude_code",
                         &root,
-                        path,
-                        DiscoveredSourceRole::PrimarySessionLog,
+                        path.clone(),
+                        Self::discovered_source_role(&path),
                         true,
                     )
                     .with_fs_metadata(),
@@ -366,8 +469,11 @@ fn scan_claude_with_callback_with_exclusions(
             let mut ended_at: Option<i64> = None;
             let mut workspace: Option<PathBuf> = None;
             let mut session_id: Option<String> = None;
+            let mut cli_session_id: Option<String> = None;
             let mut git_branch: Option<String> = None;
             let mut json_title: Option<String> = None;
+            let mut permission_mode: Option<String> = None;
+            let mut source_kind = "claude_code";
 
             if ext == Some("jsonl") {
                 let file = std::fs::File::open(&path)
@@ -485,7 +591,28 @@ fn scan_claude_with_callback_with_exclusions(
                     }
                 };
 
-                json_title = val.get("title").and_then(|t| t.as_str()).map(String::from);
+                json_title = ClaudeCodeConnector::non_empty_json_string(&val, "title");
+                if workspace.is_none() {
+                    workspace =
+                        ClaudeCodeConnector::non_empty_json_string(&val, "cwd").map(PathBuf::from);
+                }
+                if session_id.is_none() {
+                    session_id = ClaudeCodeConnector::non_empty_json_string(&val, "sessionId");
+                }
+                if cli_session_id.is_none() {
+                    cli_session_id =
+                        ClaudeCodeConnector::non_empty_json_string(&val, "cliSessionId");
+                }
+                if permission_mode.is_none() {
+                    permission_mode =
+                        ClaudeCodeConnector::non_empty_json_string(&val, "permissionMode");
+                }
+                let sidecar_created_at = val.get("createdAt").and_then(parse_timestamp);
+                let sidecar_last_activity_at = val.get("lastActivityAt").and_then(parse_timestamp);
+                started_at = started_at
+                    .or(sidecar_created_at)
+                    .or(sidecar_last_activity_at);
+                ended_at = ended_at.or(sidecar_last_activity_at).or(sidecar_created_at);
 
                 if let Some(arr) = val.get("messages").and_then(|m| m.as_array()) {
                     for item in arr {
@@ -535,6 +662,14 @@ fn scan_claude_with_callback_with_exclusions(
                         });
                     }
                 }
+                if messages.is_empty()
+                    && ClaudeCodeConnector::path_is_desktop_sidecar(&path)
+                    && let Some(message) =
+                        ClaudeCodeConnector::desktop_sidecar_metadata_message(&val)
+                {
+                    source_kind = "claude_code_desktop_sidecar";
+                    messages.push(message);
+                }
                 crate::types::reindex_messages(&mut messages);
             }
 
@@ -570,25 +705,32 @@ fn scan_claude_with_callback_with_exclusions(
 
             on_conversation(NormalizedConversation {
                 agent_slug: "claude_code".into(),
-                external_id: external_id_root
-                    .as_deref()
-                    .and_then(|base| path.strip_prefix(base).ok())
-                    .and_then(|rel| rel.to_str())
-                    .map(std::string::ToString::to_string)
-                    .or_else(|| {
-                        path.file_name()
-                            .and_then(|s| s.to_str())
-                            .map(std::string::ToString::to_string)
-                    }),
+                external_id: if source_kind == "claude_code_desktop_sidecar" {
+                    cli_session_id.clone().or_else(|| session_id.clone())
+                } else {
+                    external_id_root
+                        .as_deref()
+                        .and_then(|base| path.strip_prefix(base).ok())
+                        .and_then(|rel| rel.to_str())
+                        .map(std::string::ToString::to_string)
+                        .or_else(|| {
+                            path.file_name()
+                                .and_then(|s| s.to_str())
+                                .map(std::string::ToString::to_string)
+                        })
+                },
                 title,
                 workspace,
                 source_path: path.clone(),
                 started_at,
                 ended_at,
                 metadata: serde_json::json!({
-                    "source": "claude_code",
+                    "source": source_kind,
                     "sessionId": session_id,
-                    "gitBranch": git_branch
+                    "cliSessionId": cli_session_id,
+                    "gitBranch": git_branch,
+                    "permissionMode": permission_mode,
+                    "bodyAvailable": source_kind != "claude_code_desktop_sidecar"
                 }),
                 messages,
             })?;
@@ -741,6 +883,19 @@ mod tests {
 
         assert!(roots.contains(&PathBuf::from("/opt/xdg/claude-code/projects")));
         assert!(roots.contains(&PathBuf::from("/home/jane/.claude/projects")));
+    }
+
+    #[test]
+    fn projects_root_candidates_include_macos_desktop_sidecar_roots() {
+        let home = std::path::Path::new("/Users/jane");
+        let roots = ClaudeCodeConnector::projects_root_candidates_resolved(None, None, Some(home));
+
+        assert!(roots.contains(&PathBuf::from(
+            "/Users/jane/Library/Application Support/Claude/claude-code-sessions"
+        )));
+        assert!(roots.contains(&PathBuf::from(
+            "/Users/jane/Library/Application Support/Claude/local-agent-mode-sessions"
+        )));
     }
 
     #[test]
@@ -980,6 +1135,78 @@ mod tests {
         assert_eq!(convs[0].workspace, Some(PathBuf::from("/projects/myapp")));
         assert_eq!(convs[0].metadata["sessionId"], "sess-123");
         assert_eq!(convs[0].metadata["gitBranch"], "main");
+    }
+
+    #[test]
+    fn scan_indexes_macos_desktop_sidecar_metadata_without_body() {
+        let dir = TempDir::new().unwrap();
+        let sidecar_root = dir
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions");
+        let sidecar_path = sidecar_root
+            .join("workspace-uuid")
+            .join("session-uuid")
+            .join("local_msg.json");
+        fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
+        fs::write(
+            &sidecar_path,
+            json!({
+                "sessionId": "local_msg",
+                "cliSessionId": "cli-session-123",
+                "cwd": "/Users/jane/project",
+                "createdAt": 1_773_244_128_013_i64,
+                "lastActivityAt": 1_773_278_849_911_i64,
+                "model": "claude-opus-4-6",
+                "title": "Prepare Endeavor Outliers 2025 demo case",
+                "permissionMode": "plan"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(sidecar_root.clone())],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+        assert_eq!(conv.external_id.as_deref(), Some("cli-session-123"));
+        assert_eq!(
+            conv.title.as_deref(),
+            Some("Prepare Endeavor Outliers 2025 demo case")
+        );
+        assert_eq!(conv.workspace, Some(PathBuf::from("/Users/jane/project")));
+        assert_eq!(conv.source_path, sidecar_path);
+        assert_eq!(conv.started_at, Some(1_773_244_128_013));
+        assert_eq!(conv.ended_at, Some(1_773_278_849_911));
+        assert_eq!(conv.metadata["source"], "claude_code_desktop_sidecar");
+        assert_eq!(conv.metadata["cliSessionId"], "cli-session-123");
+        assert_eq!(conv.metadata["bodyAvailable"], false);
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].role, "system");
+        assert!(conv.messages[0].content.contains("Prepare Endeavor"));
+        assert!(
+            conv.messages[0]
+                .content
+                .contains("Workspace: /Users/jane/project")
+        );
+        assert!(
+            conv.messages[0]
+                .content
+                .contains("CLI session id: cli-session-123")
+        );
+        assert!(
+            conv.messages[0]
+                .content
+                .contains("culled the CLI JSONL body")
+        );
     }
 
     #[test]

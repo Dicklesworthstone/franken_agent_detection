@@ -436,6 +436,24 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         "claude" => {
             maybe_push(&mut out, &[".claude"]);
             maybe_push(&mut out, &[".config", "claude"]);
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "Claude",
+                    "claude-code-sessions",
+                ],
+            );
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "Claude",
+                    "local-agent-mode-sessions",
+                ],
+            );
         }
         "clawdbot" => {
             maybe_push(&mut out, &[".clawdbot"]);
@@ -850,6 +868,18 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".claude", "projects"]),
                     tilde(&[".claude"]),
                     tilde(&[".config", "claude"]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "Claude",
+                        "claude-code-sessions",
+                    ]),
+                    tilde(&[
+                        "Library",
+                        "Application Support",
+                        "Claude",
+                        "local-agent-mode-sessions",
+                    ]),
                 ],
                 "clawdbot" => vec![tilde(&[".clawdbot", "sessions"]), tilde(&[".clawdbot"])],
                 "cline" => {
