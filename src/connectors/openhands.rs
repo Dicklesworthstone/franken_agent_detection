@@ -145,7 +145,27 @@ impl OpenHandsConnector {
                 files.push(path);
             }
         }
-        files.sort();
+        // Sort by the numeric event ordinal, NOT lexically. OpenHands names
+        // events `event-NNNNN-uuid.json`; a plain string sort only matches
+        // timeline order while the zero-padding width is fixed, so once a
+        // session passes 99,999 events `event-100000-` sorts before
+        // `event-99999-`, reordering messages and — because ObservationEvents
+        // fold onto their ActionEvent by processing order — orphaning tool
+        // results. Parse the ordinal and sort on (ordinal, filename); files
+        // whose ordinal can't be parsed sort last, then lexically.
+        let event_ordinal = |p: &Path| -> u64 {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|name| name.strip_prefix("event-"))
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|digits| digits.parse::<u64>().ok())
+                .unwrap_or(u64::MAX)
+        };
+        files.sort_by(|a, b| {
+            event_ordinal(a)
+                .cmp(&event_ordinal(b))
+                .then_with(|| a.cmp(b))
+        });
         files
     }
 
@@ -383,7 +403,14 @@ fn parse_conversation(
                     .get("source")
                     .and_then(Value::as_str)
                     .unwrap_or("agent");
-                let role = role_for_source(source);
+                // Prefer the authoritative llm_message.role when present (a
+                // MessageEvent may carry source:"environment" while its
+                // llm_message.role is the real user/assistant role); fall back
+                // to the top-level source otherwise.
+                let role = event
+                    .pointer("/llm_message/role")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| role_for_source(source), role_for_source);
                 let content = event
                     .pointer("/llm_message/content")
                     .map(flatten_content)
@@ -703,6 +730,37 @@ mod tests {
         assert!(!OpenHandsConnector::is_conversation_dir(dir.path()));
         fs::create_dir_all(dir.path().join("events")).unwrap();
         assert!(OpenHandsConnector::is_conversation_dir(dir.path()));
+    }
+
+    #[test]
+    fn event_files_sort_by_numeric_ordinal_past_99999() {
+        let dir = TempDir::new().unwrap();
+        let events = dir.path().join("events");
+        fs::create_dir_all(&events).unwrap();
+        // Names chosen so a lexical sort would wrongly place event-100000/100001
+        // BEFORE event-99999. Written in non-sorted order to defeat readdir luck.
+        for name in [
+            "event-100001-cccc.json",
+            "event-00009-aaaa.json",
+            "event-100000-bbbb.json",
+            "event-99999-dddd.json",
+        ] {
+            fs::write(events.join(name), "{}").unwrap();
+        }
+        let got: Vec<String> = OpenHandsConnector::event_files(dir.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "event-00009-aaaa.json".to_string(),
+                "event-99999-dddd.json".to_string(),
+                "event-100000-bbbb.json".to_string(),
+                "event-100001-cccc.json".to_string(),
+            ],
+            "event files must sort by numeric ordinal, not lexically",
+        );
     }
 
     #[test]
