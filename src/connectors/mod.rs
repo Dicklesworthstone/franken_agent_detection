@@ -26,6 +26,7 @@ pub mod kimi;
 pub mod openclaw;
 #[cfg(feature = "opencode")]
 pub mod opencode;
+pub mod openhands;
 pub mod path_trie;
 pub mod pi_agent;
 pub mod qwen;

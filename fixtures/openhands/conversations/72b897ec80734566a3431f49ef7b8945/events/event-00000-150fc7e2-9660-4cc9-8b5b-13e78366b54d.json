@@ -1,0 +1,66 @@
+{
+  "id": "150fc7e2-9660-4cc9-8b5b-13e78366b54d", 
+  "timestamp": "2026-05-20T19:00:55.619644", 
+  "source": "agent", 
+  "system_prompt": {"cache_prompt": false, "type": "text", "text": "<redacted>"}, 
+  "tools": [
+    {
+      "description": "Execute a shell command in the terminal within [...]king directory\n  changes, and running processes.", 
+      "action_type": "TerminalAction", 
+      "observation_type": "TerminalObservation", 
+      "annotations": {"title": "terminal", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}, 
+      "kind": "TerminalTool", 
+      "title": "terminal"
+    }, 
+    {
+      "description": "Custom editing tool for viewing, creating and e[...]h this directory instead of the root filesystem.", 
+      "action_type": "FileEditorAction", 
+      "observation_type": "FileEditorObservation", 
+      "annotations": {"title": "file_editor", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}, 
+      "kind": "FileEditorTool", 
+      "title": "file_editor"
+    }, 
+    {
+      "description": "This tool provides structured task management c[...]d ensures comprehensive requirement fulfillment.", 
+      "action_type": "TaskTrackerAction", 
+      "observation_type": "TaskTrackerObservation", 
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}, 
+      "kind": "TaskTrackerTool", 
+      "title": "task_tracker"
+    }, 
+    {
+      "description": "Launch a subagent to handle complex, multi-step[...]  trace or the verbose setup/teardown output.\"\n\n", 
+      "action_type": "TaskAction", 
+      "observation_type": "TaskObservation", 
+      "annotations": {"title": "task", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}, 
+      "kind": "TaskTool", 
+      "title": "task"
+    }, 
+    {
+      "description": "Signals the completion of the current task or c[...]llow-up questions if more information is needed\n", 
+      "action_type": "FinishAction", 
+      "observation_type": "FinishObservation", 
+      "annotations": {"title": "finish", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}, 
+      "kind": "FinishTool", 
+      "title": "finish"
+    }, 
+    {
+      "description": "Use the tool to think about something. It will [...]y and does not execute any code or make changes.", 
+      "action_type": "ThinkAction", 
+      "observation_type": "ThinkObservation", 
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}, 
+      "kind": "ThinkTool", 
+      "title": "think"
+    }, 
+    {
+      "description": "Invoke a skill by name.\n\nThis is the only suppo[...]namic context) and\nreturned as the tool result.\n", 
+      "action_type": "InvokeSkillAction", 
+      "observation_type": "InvokeSkillObservation", 
+      "annotations": {"title": "invoke_skill", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}, 
+      "kind": "InvokeSkillTool", 
+      "title": "invoke_skill"
+    }
+  ], 
+  "dynamic_context": {"cache_prompt": false, "type": "text", "text": "<redacted>"}, 
+  "kind": "SystemPromptEvent"
+}

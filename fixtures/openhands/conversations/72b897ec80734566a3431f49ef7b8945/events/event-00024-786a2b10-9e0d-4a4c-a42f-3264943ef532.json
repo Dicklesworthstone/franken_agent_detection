@@ -1,0 +1,14 @@
+{
+  "id": "786a2b10-9e0d-4a4c-a42f-3264943ef532", 
+  "timestamp": "2026-05-20T19:09:35.816590", 
+  "source": "agent", 
+  "llm_message": {
+    "role": "assistant", 
+    "content": [ {"cache_prompt": false, "type": "text", "text": "<redacted>"} ], 
+    "thinking_blocks": []
+  }, 
+  "llm_response_id": "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW[...]NDAxNmEwZTNmMmI5N2JjODE5NmFkN2VhN2IyNjZjYmRiZWQ=", 
+  "activated_skills": [], 
+  "extended_content": [], 
+  "kind": "MessageEvent"
+}

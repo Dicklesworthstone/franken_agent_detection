@@ -1,0 +1,13 @@
+{
+  "id": "ce3a34cb-54ea-4e43-a5f5-d7de26d94b31", 
+  "timestamp": "2026-05-20T19:06:50.737517", 
+  "source": "user", 
+  "llm_message": {
+    "role": "user", 
+    "content": [ {"cache_prompt": false, "type": "text", "text": "<redacted>"} ], 
+    "thinking_blocks": []
+  }, 
+  "activated_skills": [], 
+  "extended_content": [], 
+  "kind": "MessageEvent"
+}
