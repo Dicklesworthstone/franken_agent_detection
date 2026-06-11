@@ -519,6 +519,15 @@ fn parse_conversation(
     }
 
     if messages.is_empty() {
+        // read_transcript_records already returns [] for an empty/un-run
+        // conversation, so reaching here means every record was a content-less
+        // marker — or the transcript schema drifted out from under us. Surface
+        // it loudly rather than letting the conversation silently vanish.
+        tracing::warn!(
+            transcript = %transcript.display(),
+            records = records.len(),
+            "antigravity: transcript produced no messages (possible agy schema drift)"
+        );
         return None;
     }
 
@@ -646,6 +655,75 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
     }
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// agy version-compatibility guard (bd-47kjh.2.5)
+// ---------------------------------------------------------------------------
+
+/// The `agy` versions whose transcript schema this reader has been validated against.
+///
+/// agy self-updates (`agy update`) and its on-disk formats are private and
+/// undocumented, so bump this list whenever the reader is re-checked against a
+/// newer agy. The connector itself never crashes on drift — unknown step types
+/// are preserved (`extra.agy_type`) and a content-less transcript warns — but
+/// this lets cass/ntm/CI proactively flag an untested agy so we re-validate.
+pub const AGY_TESTED_VERSIONS: &[&str] = &["1.0.7"];
+
+/// Best-effort `agy --version`, parsed to a bare dotted-numeric string (e.g.
+/// `1.0.7`). Returns `None` if agy is absent or the output is unparseable.
+#[must_use]
+pub fn installed_agy_version() -> Option<String> {
+    let output = std::process::Command::new("agy")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_agy_version(&text)
+}
+
+/// Pull the first dotted-numeric version token out of `agy --version` text such
+/// as `agy version 1.0.7` or `v1.0.7`.
+fn parse_agy_version(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|tok| tok.trim_start_matches('v'))
+        .find(|t| {
+            let parts: Vec<&str> = t.split('.').collect();
+            parts.len() >= 2
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(String::from)
+}
+
+/// Whether `version` is one this reader was validated against.
+#[must_use]
+pub fn agy_version_is_tested(version: &str) -> bool {
+    let v = version.trim().trim_start_matches('v');
+    AGY_TESTED_VERSIONS.contains(&v)
+}
+
+/// CI/diagnostic signal for agy version drift.
+///
+/// If agy is installed at a version this reader has NOT been validated against,
+/// log a loud warning so the transcript reader gets re-checked after an
+/// `agy update`. Returns the installed version (if any). Intended for a
+/// startup/CI check — NOT the hot scan path.
+pub fn warn_if_untested_agy_version() -> Option<String> {
+    let version = installed_agy_version()?;
+    if !agy_version_is_tested(&version) {
+        tracing::warn!(
+            installed = %version,
+            tested = ?AGY_TESTED_VERSIONS,
+            "antigravity: installed agy version is outside the tested-compatible set; \
+             re-validate the transcript reader (bd-47kjh.2.5)"
+        );
+    }
+    Some(version)
 }
 
 impl Connector for AntigravityConnector {
@@ -1006,6 +1084,74 @@ mod tests {
         let ctx =
             ScanContext::with_roots(base.clone(), vec![ScanRoot::local(base)], Some(i64::MAX));
         assert!(AntigravityConnector::new().scan(&ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tested_versions_registry_and_version_check() {
+        assert!(AGY_TESTED_VERSIONS.contains(&"1.0.7"));
+        assert!(agy_version_is_tested("1.0.7"));
+        assert!(agy_version_is_tested("v1.0.7"));
+        assert!(!agy_version_is_tested("1.0.8"));
+        assert!(!agy_version_is_tested("2.0.0"));
+    }
+
+    #[test]
+    fn parse_agy_version_extracts_dotted_numeric_token() {
+        assert_eq!(
+            parse_agy_version("agy version 1.0.7").as_deref(),
+            Some("1.0.7")
+        );
+        assert_eq!(parse_agy_version("v1.0.7\n").as_deref(), Some("1.0.7"));
+        assert_eq!(
+            parse_agy_version("Antigravity CLI 1.2.34 (build x)").as_deref(),
+            Some("1.2.34")
+        );
+        assert_eq!(parse_agy_version("no version here").as_deref(), None);
+    }
+
+    #[test]
+    fn transcript_with_only_markers_yields_no_conversation() {
+        // A transcript whose only records carry no timeline content must not
+        // panic and must not fabricate a conversation (it warns instead).
+        let dir = TempDir::new().unwrap();
+        let logs = dir.path().join(".system_generated").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("transcript.jsonl"),
+            "{\"step_index\":0,\"source\":\"SYSTEM\",\"type\":\"CONVERSATION_HISTORY\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:42Z\"}\n",
+        )
+        .unwrap();
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        );
+        assert!(AntigravityConnector::new().scan(&ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_transcript_lines_are_skipped_not_fatal() {
+        let dir = TempDir::new().unwrap();
+        let logs = dir.path().join(".system_generated").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        // A junk line between two valid records: junk is skipped, the rest parse.
+        fs::write(
+            logs.join("transcript.jsonl"),
+            "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:42Z\",\"content\":\"<USER_REQUEST>\\nhi there\\n</USER_REQUEST>\"}\nthis is not json\n{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:43Z\",\"content\":\"hello!\"}\n",
+        )
+        .unwrap();
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        );
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].messages.len(),
+            2,
+            "valid records survive a junk line"
+        );
     }
 
     #[test]
