@@ -50,13 +50,13 @@ pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenData
 #[cfg(feature = "connectors")]
 pub use connectors::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot,
-    WorkspaceCache, aider::AiderConnector, amp::AmpConnector, claude_code::ClaudeCodeConnector,
-    clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
-    copilot::CopilotConnector, copilot_cli::CopilotCliConnector, estimate_tokens_from_content,
-    extract_claude_code_tokens, extract_codex_tokens, extract_invocations_from_content_blocks,
-    extract_tokens_for_agent, factory::FactoryConnector, file_modified_since, flatten_content,
-    franken_detection_for_connector, gemini::GeminiConnector, get_connector_factories,
-    kimi::KimiConnector, normalize_model, openclaw::OpenClawConnector,
+    WorkspaceCache, aider::AiderConnector, amp::AmpConnector, antigravity::AntigravityConnector,
+    claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
+    codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
+    estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,
+    extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
+    file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
+    get_connector_factories, kimi::KimiConnector, normalize_model, openclaw::OpenClawConnector,
     openhands::OpenHandsConnector, parse_timestamp, pi_agent::PiAgentConnector,
     qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
@@ -120,6 +120,7 @@ pub enum AgentDetectError {
 const KNOWN_CONNECTORS: &[&str] = &[
     "aider",
     "amp",
+    "antigravity",
     "chatgpt",
     "claude",
     "clawdbot",
@@ -149,6 +150,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
     match slug {
         "aider" | "aider-cli" => Some("aider"),
         "amp" | "amp-cli" => Some("amp"),
+        "antigravity" | "agy" | "antigravity-cli" => Some("antigravity"),
         "chatgpt" | "chat-gpt" | "chatgpt-desktop" => Some("chatgpt"),
         "claude" | "claude-code" => Some("claude"),
         "clawdbot" | "clawd-bot" => Some("clawdbot"),
@@ -268,6 +270,13 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
     match slug {
         "aider" => {
             let root = read("CASS_AIDER_DATA_ROOT")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root)])
+        }
+        "antigravity" => {
+            let root = read("CASS_ANTIGRAVITY_DATA_ROOT")?;
             if root.is_empty() {
                 return None;
             }
@@ -497,6 +506,11 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".factory", "sessions"]);
             maybe_push(&mut out, &[".factory-droid"]);
             maybe_push(&mut out, &[".config", "factory-droid"]);
+        }
+        "antigravity" => {
+            maybe_push(&mut out, &[".gemini", "antigravity-cli", "conversations"]);
+            maybe_push(&mut out, &[".gemini", "antigravity-cli", "brain"]);
+            maybe_push(&mut out, &[".gemini", "antigravity-cli"]);
         }
         "gemini" => {
             maybe_push(&mut out, &[".gemini"]);
@@ -990,6 +1004,11 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".factory", "sessions"]),
                     tilde(&[".factory-droid"]),
                     tilde(&[".config", "factory-droid"]),
+                ],
+                "antigravity" => vec![
+                    tilde(&[".gemini", "antigravity-cli", "conversations"]),
+                    tilde(&[".gemini", "antigravity-cli", "brain"]),
+                    tilde(&[".gemini", "antigravity-cli"]),
                 ],
                 "gemini" => vec![
                     tilde(&[".gemini", "tmp"]),

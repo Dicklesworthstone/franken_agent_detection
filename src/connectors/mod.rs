@@ -4,6 +4,7 @@
 
 pub mod aider;
 pub mod amp;
+pub mod antigravity;
 #[cfg(feature = "chatgpt")]
 pub mod chatgpt;
 pub mod claude_code;
@@ -213,6 +214,9 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("clawdbot", || Box::new(clawdbot::ClawdbotConnector::new())),
         ("vibe", || Box::new(vibe::VibeConnector::new())),
         ("amp", || Box::new(amp::AmpConnector::new())),
+        ("antigravity", || {
+            Box::new(antigravity::AntigravityConnector::new())
+        }),
         ("aider", || Box::new(aider::AiderConnector::new())),
         ("pi_agent", || Box::new(pi_agent::PiAgentConnector::new())),
         ("factory", || Box::new(factory::FactoryConnector::new())),

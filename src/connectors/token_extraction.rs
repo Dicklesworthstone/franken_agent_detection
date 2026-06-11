@@ -320,7 +320,7 @@ pub fn extract_tokens_for_agent(
     let extracted = match agent_slug {
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
-        "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" => {
+        "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" | "antigravity" => {
             let model_name = extra
                 .get("model")
                 .or_else(|| extra.pointer("/cass/model"))
