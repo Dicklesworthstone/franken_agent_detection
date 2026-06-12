@@ -156,11 +156,14 @@ impl AntigravityConnector {
 
         let mut out = Vec::new();
         // The transcript sits at <conv>/.system_generated/logs/transcript.jsonl,
-        // so the conversation dir is three levels above the file. From the base
-        // dir that file is at depth 5 (base/brain/<uuid>/.system_generated/logs).
+        // so the conversation dir is three levels above the file. From the
+        // antigravity-cli base it is at depth 5; the cap is set higher so a scan
+        // root one or two levels above (e.g. ~ or ~/.gemini, as remote mirrors
+        // can produce) still finds it. The .system_generated/logs ancestry filter
+        // below keeps correctness regardless of depth — the cap only bounds cost.
         for entry in WalkDir::new(scan_target)
             .min_depth(1)
-            .max_depth(6)
+            .max_depth(8)
             .into_iter()
             .flatten()
         {
@@ -263,8 +266,17 @@ fn extract_user_request(content: &str) -> (String, Option<String>, Option<String
 /// "The user changed setting `Model Selection` from None to Gemini 3.1 Pro
 /// (High). No need to comment…" → `Some("Gemini 3.1 Pro (High)")`.
 fn model_from_settings(settings: &str) -> Option<String> {
-    let marker = " to ";
-    let start = settings.find(marker)? + marker.len();
+    // agy phrases this as "... from <old> to <model>. ...". Anchor on " from "
+    // and take the FIRST " to " AFTER it, so a " to " appearing earlier (e.g. in
+    // a setting name, or a non-None previous value containing " to ") cannot
+    // hijack the parse. Fall back to the first " to " when no " from " is present.
+    let from_marker = " from ";
+    let to_marker = " to ";
+    let search_from = settings
+        .find(from_marker)
+        .map_or(0, |i| i + from_marker.len());
+    let rel = settings[search_from..].find(to_marker)?;
+    let start = search_from + rel + to_marker.len();
     let tail = &settings[start..];
     let end = tail.find(". ").unwrap_or(tail.len());
     let model = tail[..end].trim().trim_end_matches('.').trim();
@@ -841,6 +853,20 @@ mod tests {
             Some("Gemini 3.1 Pro (High)")
         );
         assert_eq!(model_from_settings("changed from X to None. done"), None);
+        // An earlier " to " (in a setting name / prior value) must NOT hijack the
+        // parse: anchor on " from " then the next " to ".
+        assert_eq!(
+            model_from_settings(
+                "changed setting `Auto to Stop` from None to Gemini 3.1 Pro (High). ok"
+            )
+            .as_deref(),
+            Some("Gemini 3.1 Pro (High)")
+        );
+        // No " from " marker: fall back to the first " to ".
+        assert_eq!(
+            model_from_settings("set model to Gemini 3.1 Pro (High). thanks").as_deref(),
+            Some("Gemini 3.1 Pro (High)")
+        );
     }
 
     #[test]
