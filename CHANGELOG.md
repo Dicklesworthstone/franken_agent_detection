@@ -17,7 +17,17 @@ Crate: <https://crates.io/crates/franken-agent-detection>
 
 ## [Unreleased] -- since v0.1.3
 
-No unreleased changes yet.
+### Added
+- **Hermes connector** (Nous Research agent). Indexes `~/.hermes/sessions/session_*.json`,
+  skipping `request_dump_*.json`. Maps each session's `messages[]` (roles
+  `user`/`assistant`/`tool`) to normalized messages, folds assistant `reasoning`
+  into searchable content, and preserves `tool_calls`/`finish_reason`/
+  `codex_reasoning_items` in `extra`. Parses Hermes's naive (no-timezone)
+  ISO-8601 timestamps. Plain JSON, so it rides the base `connectors` feature
+  (no new feature flag). Registered in `get_connector_factories()`,
+  `KNOWN_CONNECTORS`, `canonical_connector_slug` (aliases `hermes-agent`,
+  `nous-hermes`), and detection roots (`~/.hermes/sessions`). Honors
+  `CASS_HERMES_DATA_ROOT`.
 
 ---
 

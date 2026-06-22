@@ -49,9 +49,9 @@ pub use connectors::{
     copilot_cli::CopilotCliConnector, estimate_tokens_from_content, extract_claude_code_tokens,
     extract_codex_tokens, extract_tokens_for_agent, factory::FactoryConnector, file_modified_since,
     flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
-    get_connector_factories, kimi::KimiConnector, normalize_model, openclaw::OpenClawConnector,
-    parse_timestamp, pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction,
-    vibe::VibeConnector,
+    get_connector_factories, hermes::HermesConnector, kimi::KimiConnector, normalize_model,
+    openclaw::OpenClawConnector, parse_timestamp, pi_agent::PiAgentConnector, qwen::QwenConnector,
+    token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -126,6 +126,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "gemini",
     "github-copilot",
     "goose",
+    "hermes",
     "kimi",
     "opencode",
     "openclaw",
@@ -152,6 +153,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "gemini" | "gemini-cli" => Some("gemini"),
         "github-copilot" | "copilot" => Some("github-copilot"),
         "goose" | "goose-ai" => Some("goose"),
+        "hermes" | "hermes-agent" | "nous-hermes" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
@@ -556,6 +558,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".copilot", "history-session-state"]),
                 ],
                 "goose" => vec![tilde(&[".goose", "sessions"])],
+                "hermes" => vec![tilde(&[".hermes", "sessions"]), tilde(&[".hermes"])],
                 "kimi" => vec![tilde(&[".kimi", "sessions"])],
                 "opencode" => vec![tilde(&[".local", "share", "opencode"])],
                 "openclaw" => vec![tilde(&[".openclaw", "agents"])],

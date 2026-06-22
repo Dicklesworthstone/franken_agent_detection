@@ -1,6 +1,6 @@
 //! Shared connector infrastructure.
 //!
-//! Utilities, data structures, and scan primitives used by all 15 connectors.
+//! Utilities, data structures, and scan primitives used by all connectors.
 
 pub mod aider;
 pub mod amp;
@@ -18,6 +18,7 @@ pub mod crush;
 pub mod cursor;
 pub mod factory;
 pub mod gemini;
+pub mod hermes;
 pub mod kimi;
 pub mod openclaw;
 #[cfg(feature = "opencode")]
@@ -149,6 +150,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("codex", || Box::new(codex::CodexConnector::new())),
         ("cline", || Box::new(cline::ClineConnector::new())),
         ("gemini", || Box::new(gemini::GeminiConnector::new())),
+        ("hermes", || Box::new(hermes::HermesConnector::new())),
         ("claude", || {
             Box::new(claude_code::ClaudeCodeConnector::new())
         }),
