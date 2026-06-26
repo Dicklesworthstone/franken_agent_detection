@@ -31,11 +31,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
 use frankensqlite::{Connection, params};
-use serde_json::Value;
+use serde_json::{Map, Value};
+use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::{
+    Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
+    franken_detection_for_connector, parse_timestamp,
+};
+use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage, reindex_messages};
 
 /// Cursor v0.40+ bubble type constants (numeric encoding)
 mod bubble_type {
@@ -289,6 +294,9 @@ impl CursorConnector {
                 );
             }
         }
+        // Cursor Agent transcripts (gh #306) — mirror scan_agent_transcripts so
+        // discovery covers every scanned source (conformance contract).
+        Self::discover_agent_sources(ctx, &mut out);
         out
     }
 
@@ -847,22 +855,390 @@ impl CursorConnector {
     }
 }
 
+// =====================================================================
+// Cursor Agent transcripts (gh #306)
+// =====================================================================
+//
+// Cursor's newer "Agent" surface does NOT live in the Composer `state.vscdb`
+// (`composerData:*`) path above. It writes clean per-session JSONL transcripts:
+//
+//   ~/.cursor/projects/<url-encoded-project>/agent-transcripts/<sid>/<sid>.jsonl
+//
+// Each line is one message in (essentially) Anthropic's wire shape:
+//
+//   {"role":"user","message":{"content":[{"type":"text","text":"..."}]}}
+//   {"role":"assistant","message":{"content":[{"type":"text","text":"..."},
+//                                  {"type":"tool_use","name":"Grep","input":{...}}]}}
+//
+// This block adds that source as an ADDITIVE second scan path. It is fully
+// independent of the Composer reader: the `state.vscdb` -> `composerData:*`
+// extraction above (and every other connector) is byte-for-byte unaffected.
+//
+// The shape is reporter-documented (gh #306) and unverifiable against real
+// Cursor data here, so every step degrades gracefully: blank/malformed lines
+// are skipped (never fatal), missing/unknown fields are tolerated, and a
+// transcript yielding no messages is dropped with a warning rather than
+// fabricating a conversation. The undocumented `agentKv:blob:*` binary KV
+// entries are intentionally NOT decoded — guessing that private format would be
+// the opposite of defensive; the JSONL transcripts are the clean documented
+// source.
+
+/// Directory segment that brackets a session's transcript directory.
+const AGENT_TRANSCRIPTS_DIR: &str = "agent-transcripts";
+/// Normalized agent slug, shared with the Composer path (same agent).
+const CURSOR_AGENT_SLUG: &str = "cursor";
+
+impl CursorConnector {
+    /// Default root holding `~/.cursor/projects/`. Overridable via
+    /// `CASS_CURSOR_PROJECTS_ROOT` for tests / remote mirrors.
+    fn agent_projects_root() -> Option<PathBuf> {
+        if let Some(explicit) = env_path_nonempty("CASS_CURSOR_PROJECTS_ROOT") {
+            return Some(explicit);
+        }
+        dirs::home_dir().map(|h| h.join(".cursor").join("projects"))
+    }
+
+    /// Roots under which to look for Agent transcripts. Mirrors the Composer
+    /// root policy: default detection uses `~/.cursor/projects`; explicit scan
+    /// roots (e.g. remote mirrors) are walked as-is.
+    fn agent_scan_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
+            Self::agent_projects_root()
+                .into_iter()
+                .map(ScanRoot::local)
+                .collect()
+        } else {
+            ctx.scan_roots.clone()
+        };
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+        roots.dedup_by(|a, b| a.path == b.path);
+        roots
+    }
+
+    /// True only for a *primary* session transcript
+    /// `<...>/agent-transcripts/<sid>/<sid>.jsonl`. Subagent transcripts (under a
+    /// `subagents/` subtree, or any file whose stem differs from its parent dir
+    /// name) are excluded.
+    fn is_primary_agent_transcript(path: &Path) -> bool {
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            return false;
+        }
+        if path
+            .components()
+            .any(|c| c.as_os_str().to_str() == Some("subagents"))
+        {
+            return false;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        // `<sid>/<sid>.jsonl`: the file's stem equals its directory name.
+        if parent.file_name().and_then(|s| s.to_str()) != Some(stem) {
+            return false;
+        }
+        // Grandparent must be the `agent-transcripts` directory.
+        parent
+            .parent()
+            .and_then(|gp| gp.file_name())
+            .and_then(|s| s.to_str())
+            == Some(AGENT_TRANSCRIPTS_DIR)
+    }
+
+    /// Resolve every primary Agent transcript reachable from a scan target.
+    fn agent_transcript_files(scan_target: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in WalkDir::new(scan_target)
+            .min_depth(1)
+            .max_depth(8)
+            .into_iter()
+            .flatten()
+        {
+            if entry.file_type().is_file() && Self::is_primary_agent_transcript(entry.path()) {
+                out.push(entry.path().to_path_buf());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The `(root, transcript)` pairs that BOTH `scan()` and
+    /// `discover_source_files()` consume, so discovery always covers every
+    /// scanned source (the connector conformance contract).
+    fn agent_transcript_sources(ctx: &ScanContext) -> Vec<(ScanRoot, PathBuf)> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        for root in Self::agent_scan_roots(ctx) {
+            if !root.path.exists() {
+                continue;
+            }
+            for transcript in Self::agent_transcript_files(&root.path) {
+                if !file_modified_since(&transcript, ctx.since_ts) {
+                    continue;
+                }
+                if !seen.insert(dedupe_path_key(&transcript)) {
+                    continue;
+                }
+                out.push((root.clone(), transcript));
+            }
+        }
+        out
+    }
+
+    /// The encoded `<project>` directory name for a transcript path.
+    fn agent_project_dir_name(transcript: &Path) -> Option<String> {
+        // <project>/agent-transcripts/<sid>/<sid>.jsonl
+        transcript
+            .parent()? // <sid>/
+            .parent()? // agent-transcripts/
+            .parent()? // <project>/
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(String::from)
+    }
+
+    /// Best-effort decode of Cursor's encoded project directory name into a
+    /// workspace path. Cursor encodes the absolute project path by replacing
+    /// path separators with `-` (gh #306: `Users-ibrahim-workspace-foo` ->
+    /// `/Users/ibrahim/workspace/foo`). The raw encoded name is always preserved
+    /// in metadata, so this lossy reconstruction is non-load-bearing; returns
+    /// `None` rather than guessing when it cannot produce a path.
+    fn decode_agent_workspace(encoded: &str) -> Option<PathBuf> {
+        let decoded = urlencoding::decode(encoded)
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_else(|_| encoded.to_string());
+        let trimmed = decoded.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Some encodings keep real separators; treat an already-pathlike value
+        // as-is rather than shredding it on `-`.
+        if trimmed.contains('/') {
+            return Some(PathBuf::from(trimmed));
+        }
+        let joined = trimmed
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        if joined.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(format!("/{joined}")))
+    }
+
+    /// Read a JSONL transcript into per-line records, skipping blank and
+    /// individually-malformed lines (warned, never fatal).
+    fn read_agent_transcript_records(transcript: &Path) -> Vec<Value> {
+        let Ok(text) = std::fs::read_to_string(transcript) else {
+            return Vec::new();
+        };
+        let mut records = Vec::new();
+        for (lineno, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(trimmed) {
+                Ok(value) => records.push(value),
+                Err(err) => tracing::warn!(
+                    transcript = %transcript.display(),
+                    line = lineno + 1,
+                    error = %err,
+                    "cursor: skipping malformed agent-transcript line"
+                ),
+            }
+        }
+        records
+    }
+
+    /// Map one transcript record to a normalized message, or `None` when it
+    /// carries no usable content.
+    fn agent_record_to_message(rec: &Value) -> Option<NormalizedMessage> {
+        let role_raw = rec.get("role").and_then(Value::as_str).unwrap_or("");
+        if role_raw.trim().is_empty() {
+            return None;
+        }
+        let role = Self::normalize_role(role_raw);
+
+        // The documented shape nests content at `message.content`; tolerate a
+        // top-level `content` too. Both array-of-blocks and plain-string forms
+        // are handled by `flatten_content`.
+        let content_val = rec
+            .pointer("/message/content")
+            .or_else(|| rec.get("content"));
+        let (content, invocations) = content_val.map_or_else(
+            || (String::new(), Vec::new()),
+            |v| {
+                (
+                    flatten_content(v),
+                    extract_invocations_from_content_blocks(v),
+                )
+            },
+        );
+
+        // No per-message timestamp in the documented shape; use one defensively
+        // if a future/real record carries it.
+        let created_at = rec
+            .get("timestamp")
+            .or_else(|| rec.get("createdAt"))
+            .or_else(|| rec.get("created_at"))
+            .and_then(parse_timestamp);
+
+        if content.trim().is_empty() && invocations.is_empty() {
+            return None;
+        }
+
+        Some(NormalizedMessage {
+            idx: 0,
+            role,
+            author: None,
+            created_at,
+            content,
+            extra: Value::Object(Map::new()),
+            invocations,
+            snippets: Vec::new(),
+        })
+    }
+
+    /// Parse a single Agent transcript file into a normalized conversation.
+    fn parse_agent_transcript(
+        transcript: &Path,
+        root: &ScanRoot,
+    ) -> Option<NormalizedConversation> {
+        let records = Self::read_agent_transcript_records(transcript);
+        if records.is_empty() {
+            return None;
+        }
+
+        let mut messages: Vec<NormalizedMessage> = Vec::new();
+        let mut started_at: Option<i64> = None;
+        let mut ended_at: Option<i64> = None;
+        for rec in &records {
+            if let Some(msg) = Self::agent_record_to_message(rec) {
+                if let Some(ts) = msg.created_at {
+                    started_at = Some(started_at.map_or(ts, |cur| cur.min(ts)));
+                    ended_at = Some(ended_at.map_or(ts, |cur| cur.max(ts)));
+                }
+                messages.push(msg);
+            }
+        }
+
+        if messages.is_empty() {
+            tracing::warn!(
+                transcript = %transcript.display(),
+                records = records.len(),
+                "cursor: agent transcript produced no messages (possible schema drift)"
+            );
+            return None;
+        }
+
+        // The documented record shape has no timestamps; fall back to the file's
+        // mtime so the conversation still has a sortable time.
+        if started_at.is_none() {
+            if let Some(ms) = std::fs::metadata(transcript).ok().and_then(|meta| {
+                meta.modified().ok().and_then(|m| {
+                    m.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .and_then(|d| i64::try_from(d.as_millis()).ok())
+                })
+            }) {
+                started_at = Some(ms);
+                ended_at = Some(ms);
+            }
+        }
+
+        reindex_messages(&mut messages);
+
+        let external_id = transcript
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(String::from);
+        let project = Self::agent_project_dir_name(transcript);
+        let workspace = project
+            .as_deref()
+            .and_then(Self::decode_agent_workspace)
+            .map(|w| {
+                let rewritten =
+                    root.rewrite_workspace(&w.to_string_lossy(), Some(CURSOR_AGENT_SLUG));
+                PathBuf::from(rewritten)
+            });
+
+        let title = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .or_else(|| messages.first())
+            .and_then(|m| m.content.lines().find(|l| !l.trim().is_empty()))
+            .map(|line| line.chars().take(100).collect::<String>());
+
+        let mut metadata = Map::new();
+        metadata.insert(
+            "source".to_string(),
+            Value::String(CURSOR_AGENT_SLUG.to_string()),
+        );
+        metadata.insert(
+            "cursor_format".to_string(),
+            Value::String("agent".to_string()),
+        );
+        if let Some(p) = &project {
+            metadata.insert("cursor_project_dir".to_string(), Value::String(p.clone()));
+        }
+
+        Some(NormalizedConversation {
+            agent_slug: CURSOR_AGENT_SLUG.to_string(),
+            external_id,
+            title,
+            workspace,
+            source_path: transcript.to_path_buf(),
+            started_at,
+            ended_at,
+            metadata: Value::Object(metadata),
+            messages,
+        })
+    }
+
+    /// Append Agent-transcript conversations to `out` (additive to Composer).
+    fn scan_agent_transcripts(ctx: &ScanContext, out: &mut Vec<NormalizedConversation>) {
+        for (root, transcript) in Self::agent_transcript_sources(ctx) {
+            if let Some(conv) = Self::parse_agent_transcript(&transcript, &root) {
+                out.push(conv);
+            }
+        }
+    }
+
+    /// Agent-transcript files as discovered sources (mirrors `scan_agent_transcripts`).
+    fn discover_agent_sources(ctx: &ScanContext, out: &mut Vec<DiscoveredSourceFile>) {
+        for (root, transcript) in Self::agent_transcript_sources(ctx) {
+            out.push(
+                DiscoveredSourceFile::new(
+                    CURSOR_AGENT_SLUG,
+                    &root,
+                    transcript,
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata(),
+            );
+        }
+    }
+}
+
 impl Connector for CursorConnector {
     fn detect(&self) -> DetectionResult {
         franken_detection_for_connector("cursor").unwrap_or_else(DetectionResult::not_found)
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let mut all_convs = Vec::new();
+
+        // Composer (`state.vscdb` -> `composerData:*`) — unchanged behavior.
         let roots: Vec<PathBuf> = Self::source_roots(ctx)
             .into_iter()
             .map(|root| root.path)
             .collect();
-
-        if roots.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut all_convs = Vec::new();
 
         for root in roots {
             if !root.exists() {
@@ -896,6 +1272,9 @@ impl Connector for CursorConnector {
                 }
             }
         }
+
+        // Cursor Agent transcripts (gh #306) — additive second source.
+        Self::scan_agent_transcripts(ctx, &mut all_convs);
 
         Ok(all_convs)
     }
@@ -2286,4 +2665,209 @@ mod tests {
     // The original cass test mutated HOME to validate default detection behavior.
     // Rust 2024 marks process-wide environment mutation as unsafe, and this crate
     // forbids unsafe code globally. Keep behavior covered by explicit-root tests.
+}
+
+#[cfg(test)]
+mod agent_transcript_tests {
+    //! Tests for the Cursor Agent transcript reader (gh #306). Fixtures use the
+    //! reporter's documented `{role, message:{content:[...]}}` shape plus
+    //! malformed / partial inputs to prove graceful degradation. All tests use
+    //! explicit scan roots (no HOME / env mutation), so the Composer path and
+    //! every other connector remain byte-for-byte unaffected.
+    use super::*;
+    use crate::connectors::assert_discovery_covers_scan_sources;
+    use std::fs;
+    use tempfile::TempDir;
+
+    const USER_LINE: &str =
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"find the bug"}]}}"#;
+    const ASSISTANT_LINE: &str = r#"{"role":"assistant","message":{"content":[{"type":"text","text":"on it"},{"type":"tool_use","name":"Grep","input":{"pattern":"bug"}}]}}"#;
+
+    fn write_transcript(root: &Path, project: &str, sid: &str, lines: &[&str]) -> PathBuf {
+        let dir = root.join(project).join(AGENT_TRANSCRIPTS_DIR).join(sid);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{sid}.jsonl"));
+        fs::write(&file, format!("{}\n", lines.join("\n"))).unwrap();
+        file
+    }
+
+    fn ctx_for(root: &Path) -> ScanContext {
+        ScanContext::with_roots(
+            root.to_path_buf(),
+            vec![ScanRoot::local(root.to_path_buf())],
+            None,
+        )
+    }
+
+    #[test]
+    fn scan_parses_documented_agent_shape() {
+        let tmp = TempDir::new().unwrap();
+        write_transcript(
+            tmp.path(),
+            "Users-ibrahim-workspace-foo",
+            "sess-1",
+            &[USER_LINE, ASSISTANT_LINE],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
+        assert_eq!(convs.len(), 1);
+        let c = &convs[0];
+        assert_eq!(c.agent_slug, "cursor");
+        assert_eq!(c.external_id.as_deref(), Some("sess-1"));
+        assert_eq!(c.metadata["cursor_format"], "agent");
+        assert_eq!(c.metadata["source"], "cursor");
+        assert_eq!(
+            c.metadata["cursor_project_dir"],
+            "Users-ibrahim-workspace-foo"
+        );
+        assert_eq!(
+            c.workspace.as_deref(),
+            Some(Path::new("/Users/ibrahim/workspace/foo"))
+        );
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.messages[0].role, "user");
+        assert!(c.messages[0].content.contains("find the bug"));
+        assert_eq!(c.messages[1].role, "assistant");
+        assert!(c.messages[1].invocations.iter().any(|i| i.name == "Grep"));
+        assert!(c.title.as_deref().unwrap().starts_with("find the bug"));
+        // Indices are contiguous from 0.
+        for (i, m) in c.messages.iter().enumerate() {
+            assert_eq!(m.idx, i64::try_from(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn subagent_and_non_primary_transcripts_are_skipped() {
+        let tmp = TempDir::new().unwrap();
+        // Primary (kept).
+        write_transcript(tmp.path(), "proj", "main-sid", &[USER_LINE]);
+        // Subagent transcript under subagents/ (skipped).
+        let sub = tmp
+            .path()
+            .join("proj")
+            .join(AGENT_TRANSCRIPTS_DIR)
+            .join("main-sid")
+            .join("subagents")
+            .join("sub-1");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("sub-1.jsonl"), format!("{USER_LINE}\n")).unwrap();
+        // Non-primary sibling file (stem != dir name) (skipped).
+        let dir = tmp
+            .path()
+            .join("proj")
+            .join(AGENT_TRANSCRIPTS_DIR)
+            .join("main-sid");
+        fs::write(dir.join("notes.jsonl"), format!("{USER_LINE}\n")).unwrap();
+
+        let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
+        assert_eq!(convs.len(), 1, "only the primary transcript is indexed");
+        assert_eq!(convs[0].external_id.as_deref(), Some("main-sid"));
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped_not_fatal() {
+        let tmp = TempDir::new().unwrap();
+        write_transcript(
+            tmp.path(),
+            "proj",
+            "s",
+            &[USER_LINE, "this is not json", ASSISTANT_LINE],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2, "valid records survive junk");
+    }
+
+    #[test]
+    fn empty_and_contentless_transcripts_yield_no_conversation() {
+        let tmp = TempDir::new().unwrap();
+        // Empty file.
+        write_transcript(tmp.path(), "p1", "empty", &[]);
+        // A role with empty content + an unrelated object.
+        write_transcript(
+            tmp.path(),
+            "p2",
+            "blank",
+            &[
+                r#"{"role":"user","message":{"content":[]}}"#,
+                r#"{"foo":"bar"}"#,
+            ],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
+        assert!(convs.is_empty(), "no fabricated conversations");
+    }
+
+    #[test]
+    fn partial_records_degrade_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        write_transcript(
+            tmp.path(),
+            "proj",
+            "s",
+            &[
+                // Missing `message` wrapper; top-level content as a plain string.
+                r#"{"role":"user","content":"plain string content"}"#,
+                // Missing role -> skipped, never fatal.
+                r#"{"message":{"content":[{"type":"text","text":"no role"}]}}"#,
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}"#,
+            ],
+        );
+        let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2, "role-less record dropped");
+        assert!(
+            convs[0].messages[0]
+                .content
+                .contains("plain string content")
+        );
+    }
+
+    #[test]
+    fn discovery_covers_agent_scan_sources() {
+        let tmp = TempDir::new().unwrap();
+        write_transcript(tmp.path(), "proj", "s", &[USER_LINE, ASSISTANT_LINE]);
+        assert_discovery_covers_scan_sources(&CursorConnector::new(), &ctx_for(tmp.path()));
+
+        let discovered = CursorConnector::new()
+            .discover_source_files(&ctx_for(tmp.path()))
+            .unwrap();
+        assert!(
+            discovered.iter().any(|d| d.provider_slug == "cursor"
+                && d.source_path.extension().is_some_and(|e| e == "jsonl")
+                && d.role == DiscoveredSourceRole::PrimarySessionLog
+                && d.required_for_reconstruction),
+            "the agent transcript jsonl must be a required primary source"
+        );
+    }
+
+    #[test]
+    fn decode_agent_workspace_matches_documented_example() {
+        assert_eq!(
+            CursorConnector::decode_agent_workspace("Users-ibrahim-workspace-foo"),
+            Some(PathBuf::from("/Users/ibrahim/workspace/foo"))
+        );
+        // Empty / junk degrade to None, never panic.
+        assert_eq!(CursorConnector::decode_agent_workspace(""), None);
+        assert_eq!(CursorConnector::decode_agent_workspace("-"), None);
+    }
+
+    #[test]
+    fn since_ts_in_future_skips_agent_transcript() {
+        let tmp = TempDir::new().unwrap();
+        write_transcript(tmp.path(), "proj", "s", &[USER_LINE]);
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            Some(i64::MAX),
+        );
+        assert!(CursorConnector::new().scan(&ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_agent_transcripts_leaves_scan_empty_and_safe() {
+        // A root with neither a state.vscdb nor agent-transcripts yields nothing
+        // and must not panic or fabricate anything.
+        let tmp = TempDir::new().unwrap();
+        let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
+        assert!(convs.is_empty());
+    }
 }
