@@ -167,7 +167,7 @@ impl ClineConnector {
         if path.is_dir() {
             return fs::read_dir(path).is_ok_and(|mut d| {
                 d.any(|e| {
-                    e.ok().is_some_and(|e| {
+                    e.is_ok_and(|e| {
                         let p = e.path();
                         p.is_dir()
                             && (p.join("ui_messages.json").exists()

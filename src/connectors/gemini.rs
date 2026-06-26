@@ -217,12 +217,10 @@ impl GeminiConnector {
     fn looks_like_root(path: &Path) -> bool {
         Self::is_session_file(path)
             || path.join("chats").exists()
-            || fs::read_dir(path).is_ok_and(|mut d| {
-                d.any(|e| e.ok().is_some_and(|e| Self::is_session_file(&e.path())))
-            })
-            || fs::read_dir(path).is_ok_and(|mut d| {
-                d.any(|e| e.ok().is_some_and(|e| e.path().join("chats").exists()))
-            })
+            || fs::read_dir(path)
+                .is_ok_and(|mut d| d.any(|e| e.is_ok_and(|e| Self::is_session_file(&e.path()))))
+            || fs::read_dir(path)
+                .is_ok_and(|mut d| d.any(|e| e.is_ok_and(|e| e.path().join("chats").exists())))
     }
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {

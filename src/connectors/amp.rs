@@ -86,7 +86,7 @@ impl AmpConnector {
                 .file_name()
                 .is_some_and(|n| n.to_str().unwrap_or("").contains("amp"))
             || std::fs::read_dir(path)
-                .is_ok_and(|mut d| d.any(|e| e.ok().is_some_and(|e| is_amp_log_file(&e.path()))))
+                .is_ok_and(|mut d| d.any(|e| e.is_ok_and(|e| is_amp_log_file(&e.path()))))
     }
 
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
