@@ -34,6 +34,36 @@ Crate: <https://crates.io/crates/franken-agent-detection>
 
 ---
 
+## [0.1.9] -- 2026-06-30
+
+### Fixed
+
+- **Codex connector now captures modern `output_text` assistant messages and
+  `response_item` tool calls/results** ([#13]). Modern Codex rollout JSONL
+  (Codex Desktop / Responses-API format) encodes assistant text as
+  `{"type":"output_text"}` content blocks and encodes tool activity as
+  `response_item` payloads (`function_call`, `function_call_output`,
+  `custom_tool_call`, `custom_tool_call_output`) rather than
+  `event_msg`/`tool_call`. The connector previously dropped all of these:
+  - `extract_content_part` did not treat `output_text` as a text-bearing block,
+    so assistant `response_item` messages flattened to empty and were skipped.
+  - The `response_item` handler only read `payload.content`; tool calls/results
+    carry no `content`, so they were dropped entirely.
+
+  The `response_item` handler now dispatches on `payload.type`:
+  `function_call` / `custom_tool_call` become assistant messages with a
+  normalized tool invocation (name, `call_id`, and arguments decoded from the
+  JSON-string `arguments` / freeform `input`, falling back to the raw string);
+  `function_call_output` / `custom_tool_call_output` become first-class `tool`
+  timeline messages carrying the captured output, with `call_id` preserved in
+  `extra`. Encrypted `reasoning` items (no plaintext) and the legacy JSON
+  format are unaffected. Verified against real `~/.codex` sessions; adds a
+  checked-in modern rollout fixture plus regression tests.
+
+  [#13]: https://github.com/Dicklesworthstone/franken_agent_detection/issues/13
+
+---
+
 ## [0.1.3] -- 2026-03-21
 
 Work that accumulated on `main` after the v0.1.2 tag (2026-03-02), now
