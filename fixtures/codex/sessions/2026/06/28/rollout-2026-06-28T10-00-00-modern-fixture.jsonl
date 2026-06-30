@@ -1,0 +1,9 @@
+{"timestamp":"2026-06-28T10:00:00.000Z","type":"session_meta","payload":{"id":"thread-modern-1","cwd":"/tmp/demo-project"}}
+{"timestamp":"2026-06-28T10:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"please inspect the files and apply a small patch"}}
+{"timestamp":"2026-06-28T10:00:02.000Z","type":"response_item","payload":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"I will inspect the files and then apply a patch."}]}}
+{"timestamp":"2026-06-28T10:00:03.000Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\"cmd\":\"ls\",\"workdir\":\"/tmp/demo-project\"}","call_id":"call_1"}}
+{"timestamp":"2026-06-28T10:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"README.md\nsrc\n"}}
+{"timestamp":"2026-06-28T10:00:05.000Z","type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_2","name":"apply_patch","input":"*** Begin Patch\n*** Add File: hello.txt\n+hello world\n*** End Patch"}}
+{"timestamp":"2026-06-28T10:00:06.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_2","output":"Success. Updated the following files:\nA hello.txt\n"}}
+{"timestamp":"2026-06-28T10:00:07.000Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAAAA-opaque-no-plaintext"}}
+{"timestamp":"2026-06-28T10:00:08.000Z","type":"event_msg","payload":{"type":"token_count","input_tokens":120,"output_tokens":45}}

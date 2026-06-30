@@ -212,7 +212,14 @@ fn extract_content_part(item: &serde_json::Value) -> Option<String> {
     let item_type = item.get("type").and_then(|v| v.as_str());
 
     if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-        if item_type.is_none() || item_type == Some("text") || item_type == Some("input_text") {
+        // `output_text` is the modern Codex/Responses-API assistant text block;
+        // `input_text` is the user/developer counterpart. Both, like a plain
+        // `text` block, carry rendered text we want to surface.
+        if item_type.is_none()
+            || item_type == Some("text")
+            || item_type == Some("input_text")
+            || item_type == Some("output_text")
+        {
             return Some(text.to_string());
         }
     }
@@ -448,6 +455,13 @@ mod tests {
     fn flatten_content_input_text_block() {
         let val = json!([{"type": "input_text", "text": "Codex input"}]);
         assert_eq!(flatten_content(&val), "Codex input");
+    }
+
+    #[test]
+    fn flatten_content_output_text_block() {
+        // Modern Codex assistant messages encode text as `output_text` blocks.
+        let val = json!([{"type": "output_text", "text": "Codex assistant output"}]);
+        assert_eq!(flatten_content(&val), "Codex assistant output");
     }
 
     #[test]

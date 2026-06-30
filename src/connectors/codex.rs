@@ -343,6 +343,43 @@ fn update_time_bounds(started_at: &mut Option<i64>, ended_at: &mut Option<i64>, 
     }
 }
 
+/// Parse the arguments of a modern Codex `response_item` tool call.
+///
+/// `function_call` payloads carry `arguments` as a JSON-encoded string (e.g.
+/// `"{\"cmd\":\"ls\"}"`); `custom_tool_call` payloads (e.g. `apply_patch`) carry
+/// freeform `input`. Returns the decoded JSON when the string parses, otherwise
+/// the raw string, so downstream consumers never lose the original payload.
+fn parse_tool_call_arguments(payload: &Value) -> Option<Value> {
+    let raw = payload.get("arguments").or_else(|| payload.get("input"))?;
+    match raw {
+        Value::String(s) if !s.is_empty() => {
+            Some(serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.clone())))
+        }
+        other => Some(other.clone()),
+    }
+}
+
+/// Extract the textual output of a modern Codex `response_item` tool result.
+///
+/// `output` is almost always a plain string, but the Responses API can also
+/// nest it as `{"content":[{"text":...}]}`; handle both shapes and fall back to
+/// flattening so structured results still surface as searchable text.
+fn tool_output_text(payload: &Value) -> String {
+    let Some(output) = payload.get("output") else {
+        return String::new();
+    };
+    if let Some(text) = output.as_str() {
+        return text.to_string();
+    }
+    if let Some(content) = output.get("content") {
+        let flattened = flatten_content(content);
+        if !flattened.trim().is_empty() {
+            return flattened;
+        }
+    }
+    flatten_content(output)
+}
+
 #[allow(clippy::too_many_lines)]
 fn scan_codex_with_callback(
     ctx: &ScanContext,
@@ -451,39 +488,121 @@ fn scan_codex_with_callback(
                         }
                         "response_item" => {
                             if let Some(payload) = val.get("payload") {
-                                let role = payload
-                                    .get("role")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("agent");
+                                let payload_type = payload.get("type").and_then(|v| v.as_str());
 
-                                let content_str = payload
-                                    .get("content")
-                                    .map(flatten_content)
-                                    .unwrap_or_default();
+                                match payload_type {
+                                    // Modern Codex encodes tool calls as
+                                    // `response_item` entries rather than
+                                    // `event_msg`/`tool_call`. `function_call`
+                                    // is a structured tool (e.g. `exec_command`);
+                                    // `custom_tool_call` is a freeform tool
+                                    // (e.g. `apply_patch`). Both lack a `content`
+                                    // field, so without explicit handling they
+                                    // flatten to empty and get dropped.
+                                    Some("function_call" | "custom_tool_call") => {
+                                        let tool_name = payload
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown")
+                                            .to_string();
+                                        let arguments = parse_tool_call_arguments(payload);
+                                        let call_id = payload
+                                            .get("call_id")
+                                            .or_else(|| payload.get("id"))
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from);
 
-                                if content_str.trim().is_empty() {
-                                    continue;
+                                        let content_text = format!("[Tool: {tool_name}]");
+                                        update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: "assistant".to_string(),
+                                            author: None,
+                                            created_at: created,
+                                            content: content_text,
+                                            extra: if compact_message_extra {
+                                                CodexConnector::compact_message_extra(&val)
+                                            } else {
+                                                val
+                                            },
+                                            invocations: vec![NormalizedInvocation {
+                                                kind: "tool".to_string(),
+                                                name: tool_name,
+                                                raw_name: None,
+                                                call_id,
+                                                arguments,
+                                            }],
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+                                    // Tool results: `output` carries the captured
+                                    // stdout / patch summary. Emit as a
+                                    // first-class `tool` timeline entry; the
+                                    // linking `call_id` is preserved in `extra`.
+                                    Some("function_call_output" | "custom_tool_call_output") => {
+                                        let output_text = tool_output_text(payload);
+                                        if output_text.trim().is_empty() {
+                                            continue;
+                                        }
+                                        update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: "tool".to_string(),
+                                            author: None,
+                                            created_at: created,
+                                            content: output_text,
+                                            extra: if compact_message_extra {
+                                                CodexConnector::compact_message_extra(&val)
+                                            } else {
+                                                val
+                                            },
+                                            invocations: Vec::new(),
+                                            snippets: Vec::new(),
+                                        });
+                                    }
+                                    // Plain messages: assistant `output_text`,
+                                    // user/developer `input_text`, or legacy
+                                    // string content. Encrypted `reasoning`
+                                    // items have no plaintext content and are
+                                    // intentionally skipped here (plaintext
+                                    // reasoning arrives via `event_msg`).
+                                    _ => {
+                                        let role = payload
+                                            .get("role")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("agent");
+
+                                        let content_str = payload
+                                            .get("content")
+                                            .map(flatten_content)
+                                            .unwrap_or_default();
+
+                                        if content_str.trim().is_empty() {
+                                            continue;
+                                        }
+
+                                        update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        let invocations = payload.get("content").map_or_else(
+                                            Vec::new,
+                                            extract_invocations_from_content_blocks,
+                                        );
+
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: role.to_string(),
+                                            author: None,
+                                            created_at: created,
+                                            content: content_str,
+                                            extra: if compact_message_extra {
+                                                CodexConnector::compact_message_extra(&val)
+                                            } else {
+                                                val
+                                            },
+                                            invocations,
+                                            snippets: Vec::new(),
+                                        });
+                                    }
                                 }
-
-                                update_time_bounds(&mut started_at, &mut ended_at, created);
-                                let invocations = payload
-                                    .get("content")
-                                    .map_or_else(Vec::new, extract_invocations_from_content_blocks);
-
-                                messages.push(NormalizedMessage {
-                                    idx: 0,
-                                    role: role.to_string(),
-                                    author: None,
-                                    created_at: created,
-                                    content: content_str,
-                                    extra: if compact_message_extra {
-                                        CodexConnector::compact_message_extra(&val)
-                                    } else {
-                                        val
-                                    },
-                                    invocations,
-                                    snippets: Vec::new(),
-                                });
                             }
                         }
                         "event_msg" => {
@@ -929,6 +1048,109 @@ mod tests {
         assert_eq!(convs[0].messages[0].role, "user");
         assert_eq!(convs[0].messages[0].content, "Hello Codex");
         assert_eq!(convs[0].messages[1].role, "assistant");
+    }
+
+    #[test]
+    fn scan_parses_modern_response_item_output_text_and_tool_calls() {
+        // Regression test for #13: modern Codex rollout files encode assistant
+        // text as `output_text` content blocks and encode tool calls/results as
+        // `response_item` payloads (`function_call`, `function_call_output`,
+        // `custom_tool_call`, `custom_tool_call_output`). None of these were
+        // captured before, silently dropping assistant output and tool activity.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("codex");
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::with_roots(fixture.clone(), vec![ScanRoot::local(fixture)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1, "fixture is a single rollout");
+        let conv = &convs[0];
+        assert_eq!(conv.workspace, Some(PathBuf::from("/tmp/demo-project")));
+
+        // user, assistant output_text, function_call, function_call_output,
+        // custom_tool_call, custom_tool_call_output = 6 messages. The encrypted
+        // reasoning item carries no plaintext content and is skipped.
+        assert_eq!(
+            conv.messages.len(),
+            6,
+            "all modern shapes captured (encrypted reasoning skipped): {:#?}",
+            conv.messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // Assistant `output_text` is no longer dropped.
+        let assistant = conv
+            .messages
+            .iter()
+            .find(|m| {
+                m.role == "assistant"
+                    && m.content == "I will inspect the files and then apply a patch."
+            })
+            .expect("assistant output_text message captured");
+        assert!(assistant.invocations.is_empty());
+
+        // `function_call` -> tool invocation with JSON-string arguments parsed.
+        let exec = conv
+            .messages
+            .iter()
+            .find(|m| m.invocations.iter().any(|i| i.name == "exec_command"))
+            .expect("exec_command function_call captured");
+        let exec_inv = &exec.invocations[0];
+        assert_eq!(exec_inv.kind, "tool");
+        assert_eq!(exec_inv.call_id.as_deref(), Some("call_1"));
+        assert_eq!(
+            exec_inv
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("cmd"))
+                .and_then(|v| v.as_str()),
+            Some("ls"),
+            "JSON-string arguments are decoded into structured JSON"
+        );
+
+        // `function_call_output` -> tool result, linkable via call_id in extra.
+        let exec_out = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool" && m.content.contains("README.md"))
+            .expect("function_call_output captured as tool result");
+        assert_eq!(
+            exec_out
+                .extra
+                .pointer("/payload/call_id")
+                .and_then(|v| v.as_str()),
+            Some("call_1"),
+            "tool result remains linkable to its originating call"
+        );
+
+        // `custom_tool_call` (apply_patch) -> tool invocation; freeform input kept.
+        let patch = conv
+            .messages
+            .iter()
+            .find(|m| m.invocations.iter().any(|i| i.name == "apply_patch"))
+            .expect("apply_patch custom_tool_call captured");
+        let patch_inv = &patch.invocations[0];
+        assert_eq!(patch_inv.call_id.as_deref(), Some("call_2"));
+        assert!(
+            patch_inv
+                .arguments
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("Begin Patch")),
+            "non-JSON tool input is retained as a raw string"
+        );
+
+        // `custom_tool_call_output` -> tool result message.
+        assert!(
+            conv.messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("A hello.txt")),
+            "custom_tool_call_output captured as tool result"
+        );
     }
 
     #[test]
