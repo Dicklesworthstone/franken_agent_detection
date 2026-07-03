@@ -25,6 +25,62 @@ use super::{
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
+/// A Pi session store format that the `pi_agent` connector does not index.
+///
+/// `pi_agent_rust` supports three on-disk session formats: the default JSONL
+/// (`jsonl_v3`) tree store, an optional SQLite-backed store (`sqlite_v1`, built
+/// via the default `sqlite-sessions` feature), and the segmented Session Store
+/// V2 (`native_v2`) sidecar. This connector only parses the JSONL store, so a
+/// user on a non-default store would otherwise get silent zero or partial
+/// coverage. Each detected unsupported store is surfaced as a machine-readable
+/// diagnostic — matching the connector framework's existing `tracing`
+/// diagnostic shape (structured key/value fields) — so the compatibility
+/// boundary is explicit rather than invisible.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UnsupportedPiStore {
+    /// Stable machine key for the store format: `"session_store_v2"` or
+    /// `"sqlite_sessions"`.
+    pub store_format: &'static str,
+    /// Support status for this format. Currently always `"unsupported"`.
+    pub support_status: &'static str,
+    /// Filesystem path to the detected store: a `*.v2` sidecar directory or a
+    /// `*.sqlite` per-session file.
+    pub path: PathBuf,
+}
+
+impl UnsupportedPiStore {
+    const fn session_store_v2(path: PathBuf) -> Self {
+        Self {
+            store_format: "session_store_v2",
+            support_status: "unsupported",
+            path,
+        }
+    }
+
+    const fn sqlite_sessions(path: PathBuf) -> Self {
+        Self {
+            store_format: "sqlite_sessions",
+            support_status: "unsupported",
+            path,
+        }
+    }
+
+    /// Emit this diagnostic via `tracing::warn!` with structured fields so it
+    /// is both human-readable and machine-parseable (e.g. under a JSON tracing
+    /// subscriber).
+    fn warn(&self) {
+        tracing::warn!(
+            connector = "pi_agent",
+            store_format = self.store_format,
+            support_status = self.support_status,
+            path = %self.path.display(),
+            "pi_agent: detected unsupported Pi session store; cass indexes only \
+             the default JSONL (v3) store, so this session's history may be \
+             partial or unindexed until this format is supported"
+        );
+    }
+}
+
 pub struct PiAgentConnector;
 
 impl Default for PiAgentConnector {
@@ -51,12 +107,45 @@ impl PiAgentConnector {
     /// so scans don't silently fall through to the process's working
     /// directory via `PathBuf::new().join("sessions")`.
     fn default_homes() -> Vec<PathBuf> {
-        if let Ok(explicit) = dotenvy::var("PI_CODING_AGENT_DIR")
-            && !explicit.is_empty()
-        {
-            return vec![PathBuf::from(explicit)];
+        let sessions_dir = dotenvy::var("PI_SESSIONS_DIR").ok();
+        let coding_agent_dir = dotenvy::var("PI_CODING_AGENT_DIR").ok();
+        Self::homes_from_overrides(
+            sessions_dir.as_deref(),
+            coding_agent_dir.as_deref(),
+            dirs::home_dir().as_deref(),
+        )
+    }
+
+    /// Pure candidate-home derivation shared by [`Self::default_homes`], split
+    /// out so the env-driven precedence can be unit-tested without mutating
+    /// process environment (`std::env::set_var` is `unsafe` and forbidden at
+    /// the crate level).
+    ///
+    /// Precedence mirrors `pi_agent_rust`'s own config resolution:
+    /// - `PI_SESSIONS_DIR` names a sessions directory **directly**
+    ///   (`pi_agent_rust` `config.rs::sessions_dir_from_env`), so it is added as a
+    ///   standalone root and is honored **independently** of
+    ///   `PI_CODING_AGENT_DIR` — the two are separate env vars, and a custom
+    ///   sessions dir must be scanned even when the agent home is also pinned.
+    /// - `PI_CODING_AGENT_DIR` pins the agent home and suppresses the built-in
+    ///   `~/.pi/agent` + `~/.omp/agent` defaults, but never suppresses an
+    ///   explicit `PI_SESSIONS_DIR`.
+    /// - Empty values (`FOO=""`) are treated as unset.
+    fn homes_from_overrides(
+        sessions_dir: Option<&str>,
+        coding_agent_dir: Option<&str>,
+        home: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Some(sessions) = sessions_dir.filter(|s| !s.is_empty()) {
+            out.push(PathBuf::from(sessions));
         }
-        Self::default_homes_from(dirs::home_dir().as_deref())
+        if let Some(explicit) = coding_agent_dir.filter(|s| !s.is_empty()) {
+            out.push(PathBuf::from(explicit));
+            return out;
+        }
+        out.extend(Self::default_homes_from(home));
+        out
     }
 
     /// Test-accessible variant of [`Self::default_homes`] that takes an
@@ -294,6 +383,86 @@ impl PiAgentConnector {
         }
         out
     }
+
+    /// Detect Pi session stores under `root` that this connector cannot index.
+    ///
+    /// Grounded in `pi_agent_rust`'s actual layout:
+    /// - **Session Store V2** (`native_v2`): a `<stem>.v2/` sidecar directory
+    ///   identified by a `manifest.json` or `index/offsets.jsonl` inside it —
+    ///   the same signature `pi_agent_rust` uses in
+    ///   `session_store_v2::has_v2_sidecar`. When a V2 sidecar is present the
+    ///   adjacent JSONL file can be stale, so its coverage is best-effort only.
+    /// - **SQLite sessions** (`sqlite_v1`): a per-session `*.sqlite` file. Real
+    ///   session files carry a `_` (mirroring `<timestamp>_<uuid>` naming); the
+    ///   always-present `session-index.sqlite` metadata index sidecar has no
+    ///   `_`, so default JSONL installs never trip this diagnostic.
+    fn detect_unsupported_stores(root: &Path) -> Vec<UnsupportedPiStore> {
+        let mut out = Vec::new();
+        let sessions = Self::sessions_dir(root);
+        if !sessions.exists() {
+            return out;
+        }
+        for entry in WalkDir::new(&sessions).into_iter().flatten() {
+            let name = entry.file_name().to_str().unwrap_or("");
+            if entry.file_type().is_dir() {
+                let is_v2_dir = Path::new(name)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("v2"));
+                if is_v2_dir
+                    && (entry.path().join("manifest.json").exists()
+                        || entry.path().join("index").join("offsets.jsonl").exists())
+                {
+                    out.push(UnsupportedPiStore::session_store_v2(
+                        entry.path().to_path_buf(),
+                    ));
+                }
+            } else if entry.file_type().is_file()
+                && Path::new(name)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sqlite"))
+                && name.contains('_')
+            {
+                out.push(UnsupportedPiStore::sqlite_sessions(
+                    entry.path().to_path_buf(),
+                ));
+            }
+        }
+        // Deterministic ordering across filesystems/runs.
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
+    /// Collect deduplicated unsupported-store diagnostics across `homes`.
+    fn collect_unsupported_stores(homes: &[PathBuf]) -> Vec<UnsupportedPiStore> {
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut out = Vec::new();
+        for home in homes {
+            for store in Self::detect_unsupported_stores(home) {
+                if seen.insert(dedupe_path_key(&store.path)) {
+                    out.push(store);
+                }
+            }
+        }
+        out
+    }
+
+    /// Machine-readable diagnostics for Pi session stores this connector cannot
+    /// index (Session Store V2 sidecars and SQLite-backed sessions).
+    ///
+    /// Returns one entry per detected unsupported store so a consumer (e.g. a
+    /// `cass diag --json` / `capabilities --json` surface) can report the
+    /// compatibility boundary explicitly instead of implying full coverage.
+    /// `scan()` additionally logs each of these via `tracing::warn!`.
+    #[must_use]
+    pub fn unsupported_store_diagnostics(&self, ctx: &ScanContext) -> Vec<UnsupportedPiStore> {
+        let homes: Vec<PathBuf> = Self::source_roots(ctx)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
+        Self::collect_unsupported_stores(&homes)
+    }
 }
 
 impl Connector for PiAgentConnector {
@@ -307,6 +476,14 @@ impl Connector for PiAgentConnector {
             .into_iter()
             .map(|root| root.path)
             .collect();
+
+        // Surface Pi storage formats this connector does not index (Session
+        // Store V2 sidecars, SQLite-backed session stores) as explicit,
+        // machine-readable diagnostics so users on non-default storage are not
+        // silently left with zero/partial coverage.
+        for store in Self::collect_unsupported_stores(&homes) {
+            store.warn();
+        }
 
         let mut convs = Vec::new();
         let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
@@ -1754,5 +1931,219 @@ mod tests {
         assert_eq!(homes.len(), 2);
         assert_eq!(homes[0], PathBuf::from(".pi/agent"));
         assert_eq!(homes[1], PathBuf::from(".omp/agent"));
+    }
+
+    // =====================================================
+    // Issue #313 — PI_SESSIONS_DIR + unsupported store detection
+    // =====================================================
+
+    /// `PI_SESSIONS_DIR` names a sessions directory directly and is honored as
+    /// a standalone root, independently of the built-in `~/.pi` + `~/.omp`
+    /// defaults (which remain present when no `PI_CODING_AGENT_DIR` override is
+    /// set). Exercised via the pure helper so no process env is mutated.
+    #[test]
+    fn homes_from_overrides_honors_pi_sessions_dir() {
+        let home = PathBuf::from("/home/user");
+        let homes =
+            PiAgentConnector::homes_from_overrides(Some("/custom/pi-sessions"), None, Some(&home));
+        assert_eq!(
+            homes[0],
+            PathBuf::from("/custom/pi-sessions"),
+            "PI_SESSIONS_DIR must be the first candidate root"
+        );
+        assert!(homes.contains(&home.join(".pi/agent")));
+        assert!(homes.contains(&home.join(".omp/agent")));
+    }
+
+    /// `PI_SESSIONS_DIR` and `PI_CODING_AGENT_DIR` are independent: the custom
+    /// sessions dir is still scanned even when the agent home is pinned (and
+    /// the pin suppresses the built-in `~/.pi` + `~/.omp` defaults).
+    #[test]
+    fn homes_from_overrides_sessions_dir_and_coding_agent_dir_coexist() {
+        let homes = PiAgentConnector::homes_from_overrides(
+            Some("/custom/pi-sessions"),
+            Some("/opt/pi/agent"),
+            Some(Path::new("/home/user")),
+        );
+        assert_eq!(
+            homes,
+            vec![
+                PathBuf::from("/custom/pi-sessions"),
+                PathBuf::from("/opt/pi/agent"),
+            ]
+        );
+    }
+
+    /// An empty `PI_SESSIONS_DIR=""` is treated as unset (no phantom root).
+    #[test]
+    fn homes_from_overrides_empty_pi_sessions_dir_ignored() {
+        let homes =
+            PiAgentConnector::homes_from_overrides(Some(""), None, Some(Path::new("/home/user")));
+        assert!(!homes.contains(&PathBuf::new()));
+        assert_eq!(homes.len(), 2, "only the two built-in defaults: {homes:?}");
+    }
+
+    /// A custom sessions root that contains JSONL session files *directly*
+    /// (no nested `sessions/` subdir) is indexed — the shape `PI_SESSIONS_DIR`
+    /// produces. Driven through an explicit scan root so no env is mutated.
+    #[test]
+    fn scan_indexes_sessions_directly_under_custom_sessions_dir() {
+        let dir = TempDir::new().unwrap();
+        // Name contains "pi" so `looks_like_root` accepts it as a Pi root.
+        let sessions_root = dir.path().join("pi-sessions");
+        let project = sessions_root.join("--home-me-proj--");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("2025-12-01T10-00-00_uuid.jsonl"),
+            "{\"type\":\"session\",\"id\":\"s1\",\"timestamp\":\"2025-12-01T10:00:00Z\",\"cwd\":\"/home/me/proj\"}\n{\"type\":\"message\",\"timestamp\":\"2025-12-01T10:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"From PI_SESSIONS_DIR\"}}",
+        )
+        .unwrap();
+
+        let connector = PiAgentConnector::new();
+        let ctx = ScanContext::with_roots(
+            sessions_root.clone(),
+            vec![ScanRoot::local(sessions_root)],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "From PI_SESSIONS_DIR");
+    }
+
+    #[test]
+    fn detect_unsupported_stores_flags_session_store_v2_via_manifest() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions").join("--proj--");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("2025-12-01T10-00-00_uuid.jsonl"),
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"hi"}}"#,
+        )
+        .unwrap();
+        let v2 = sessions.join("2025-12-01T10-00-00_uuid.v2");
+        fs::create_dir_all(&v2).unwrap();
+        fs::write(v2.join("manifest.json"), "{}").unwrap();
+
+        let stores = PiAgentConnector::detect_unsupported_stores(dir.path());
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].store_format, "session_store_v2");
+        assert_eq!(stores[0].support_status, "unsupported");
+        assert_eq!(stores[0].path, v2);
+    }
+
+    #[test]
+    fn detect_unsupported_stores_flags_session_store_v2_via_offsets_index() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        let v2 = sessions.join("2025-12-01T10-00-00_uuid.v2");
+        fs::create_dir_all(v2.join("index")).unwrap();
+        fs::write(v2.join("index").join("offsets.jsonl"), "").unwrap();
+
+        let stores = PiAgentConnector::detect_unsupported_stores(dir.path());
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].store_format, "session_store_v2");
+    }
+
+    #[test]
+    fn detect_unsupported_stores_flags_sqlite_sessions() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions").join("--proj--");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("2025-12-01T10-00-00_uuid.sqlite"),
+            b"SQLite format 3\0",
+        )
+        .unwrap();
+
+        let stores = PiAgentConnector::detect_unsupported_stores(dir.path());
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].store_format, "sqlite_sessions");
+    }
+
+    /// The always-present `session-index.sqlite` metadata index sidecar (and
+    /// its `-wal`/`-shm` companions) must never be flagged as an unsupported
+    /// store, or every default JSONL install would emit a false diagnostic.
+    #[test]
+    fn detect_unsupported_stores_ignores_session_index_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("session-index.sqlite"), b"SQLite format 3\0").unwrap();
+        fs::write(sessions.join("session-index.sqlite-wal"), b"").unwrap();
+        fs::write(
+            sessions.join("2025-12-01T10-00-00_uuid.jsonl"),
+            r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"hi"}}"#,
+        )
+        .unwrap();
+
+        let stores = PiAgentConnector::detect_unsupported_stores(dir.path());
+        assert!(
+            stores.is_empty(),
+            "index sidecar must not be flagged: {stores:?}"
+        );
+    }
+
+    #[test]
+    fn detect_unsupported_stores_empty_when_no_sessions_dir() {
+        let dir = TempDir::new().unwrap();
+        let stores = PiAgentConnector::detect_unsupported_stores(dir.path());
+        assert!(stores.is_empty());
+    }
+
+    /// A stale JSONL next to a V2 sidecar is still indexed best-effort, while
+    /// the V2 store is surfaced separately via the diagnostics API.
+    #[test]
+    fn scan_indexes_jsonl_and_diagnostics_report_v2_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_pi_agent_storage(&dir);
+        write_session_file(
+            &storage,
+            "2025-12-01T10-00-00_uuid.jsonl",
+            &[
+                r#"{"type":"message","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"partial"}}"#,
+            ],
+        );
+        let v2 = storage.join("sessions").join("2025-12-01T10-00-00_uuid.v2");
+        fs::create_dir_all(&v2).unwrap();
+        fs::write(v2.join("manifest.json"), "{}").unwrap();
+
+        let connector = PiAgentConnector::new();
+        let ctx = ScanContext::local_default(storage, None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "partial");
+
+        let diags = connector.unsupported_store_diagnostics(&ctx);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].store_format, "session_store_v2");
+    }
+
+    #[test]
+    fn unsupported_store_diagnostics_reports_v2_and_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("pi-agent");
+        let sessions = root.join("sessions").join("--proj--");
+        fs::create_dir_all(&sessions).unwrap();
+        let v2 = sessions.join("2025-12-01T10-00-00_a.v2");
+        fs::create_dir_all(&v2).unwrap();
+        fs::write(v2.join("manifest.json"), "{}").unwrap();
+        fs::write(
+            sessions.join("2025-12-01T11-00-00_b.sqlite"),
+            b"SQLite format 3\0",
+        )
+        .unwrap();
+
+        let connector = PiAgentConnector::new();
+        let ctx = ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root)], None);
+        let diags = connector.unsupported_store_diagnostics(&ctx);
+        let formats: HashSet<&str> = diags.iter().map(|d| d.store_format).collect();
+        assert!(
+            formats.contains("session_store_v2"),
+            "expected V2 diagnostic, got {diags:?}"
+        );
+        assert!(
+            formats.contains("sqlite_sessions"),
+            "expected SQLite diagnostic, got {diags:?}"
+        );
     }
 }
