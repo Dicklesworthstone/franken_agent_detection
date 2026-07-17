@@ -1,8 +1,9 @@
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
@@ -176,7 +177,9 @@ impl GeminiConnector {
             && path
                 .extension()
                 .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonl")
+                })
             && path
                 .parent()
                 .and_then(|p| p.file_name())
@@ -184,8 +187,8 @@ impl GeminiConnector {
                 == Some("chats")
     }
 
-    /// Find all session JSON files in the Gemini structure.
-    /// Structure: ~/.gemini/tmp/<hash>/chats/session-*.json
+    /// Find all legacy JSON and current event-sourced JSONL session files.
+    /// Structure: `~/.gemini/tmp/<project>/chats/session-*.{json,jsonl}`.
     fn session_files(root: &Path) -> Vec<PathBuf> {
         if root.is_file() {
             return if Self::is_session_file(root) {
@@ -314,6 +317,155 @@ impl GeminiConnector {
 
         Value::Object(out)
     }
+
+    /// Apply session-level fields from a header or `$set` patch.
+    ///
+    /// `messages` is special: Gemini uses `$set.messages` to compact/reseed the
+    /// event stream, so the newest array is the authoritative snapshot. Bare
+    /// message records encountered after that snapshot are appended normally.
+    fn apply_session_fields(
+        session: &mut Map<String, Value>,
+        messages: &mut Vec<Value>,
+        fields: Map<String, Value>,
+        file: &Path,
+        line_number: usize,
+    ) {
+        for (key, value) in fields {
+            if key == "messages" {
+                match value {
+                    Value::Array(snapshot) => *messages = snapshot,
+                    _ => {
+                        tracing::warn!(
+                            path = %file.display(),
+                            line = line_number,
+                            "gemini: ignoring non-array messages snapshot"
+                        );
+                    }
+                }
+            } else {
+                session.insert(key, value);
+            }
+        }
+    }
+
+    /// Replay Gemini CLI's event-sourced JSONL into the legacy session shape.
+    ///
+    /// The stream consists of one `kind: main` header, `$set` patches, and bare
+    /// message records. Individual malformed lines are skipped so an interrupted
+    /// final write cannot hide the valid prefix of an otherwise usable session.
+    fn replay_jsonl_session(reader: impl BufRead, file: &Path) -> Value {
+        let mut session = Map::new();
+        let mut messages = Vec::new();
+
+        for (line_index, line_result) in reader.lines().enumerate() {
+            let line_number = line_index + 1;
+            let line = match line_result {
+                Ok(line) => line,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %file.display(),
+                        line = line_number,
+                        %error,
+                        "gemini: stopping after an unreadable JSONL line"
+                    );
+                    break;
+                }
+            };
+            let trimmed = line.trim().trim_start_matches('\u{feff}');
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let record = match serde_json::from_str::<Value>(trimmed) {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %file.display(),
+                        line = line_number,
+                        %error,
+                        "gemini: skipping malformed JSONL line"
+                    );
+                    continue;
+                }
+            };
+            let Value::Object(mut object) = record else {
+                tracing::warn!(
+                    path = %file.display(),
+                    line = line_number,
+                    "gemini: skipping non-object JSONL line"
+                );
+                continue;
+            };
+
+            if let Some(patch) = object.remove("$set") {
+                if let Value::Object(fields) = patch {
+                    Self::apply_session_fields(
+                        &mut session,
+                        &mut messages,
+                        fields,
+                        file,
+                        line_number,
+                    );
+                } else {
+                    tracing::warn!(
+                        path = %file.display(),
+                        line = line_number,
+                        "gemini: ignoring non-object $set patch"
+                    );
+                }
+                continue;
+            }
+
+            if object.get("kind").and_then(Value::as_str) == Some("main") {
+                Self::apply_session_fields(&mut session, &mut messages, object, file, line_number);
+                continue;
+            }
+
+            // Current Gemini CLI writes messages as bare records. Requiring a
+            // string type avoids treating unknown metadata events as messages.
+            if object.get("type").and_then(Value::as_str).is_some() {
+                messages.push(Value::Object(object));
+            }
+        }
+
+        session.insert("messages".to_string(), Value::Array(messages));
+        Value::Object(session)
+    }
+
+    fn parse_session_file(file: &Path) -> Option<Value> {
+        let file_handle = match fs::File::open(file) {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!(path = %file.display(), %error, "failed to open Gemini session");
+                return None;
+            }
+        };
+        let reader = std::io::BufReader::new(file_handle);
+        let is_jsonl = file
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"));
+
+        if is_jsonl {
+            return Some(Self::replay_jsonl_session(reader, file));
+        }
+
+        match serde_json::from_reader(reader) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(path = %file.display(), %error, "failed to parse Gemini session");
+                None
+            }
+        }
+    }
+
+    fn normalize_message_role(message_type: &str) -> &str {
+        match message_type {
+            "model" | "gemini" => "assistant",
+            "info" | "error" => "system",
+            other => other,
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -349,20 +501,8 @@ fn scan_gemini_with_callback(
                 );
             }
 
-            let file_handle = match std::fs::File::open(&file) {
-                Ok(handle) => handle,
-                Err(e) => {
-                    tracing::warn!("failed to open session {}: {}", file.display(), e);
-                    continue;
-                }
-            };
-            let reader = std::io::BufReader::new(file_handle);
-            let mut val: Value = match serde_json::from_reader(reader) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("failed to parse session {}: {}", file.display(), e);
-                    continue;
-                }
+            let Some(mut val) = GeminiConnector::parse_session_file(&file) else {
+                continue;
             };
 
             // Extract session metadata
@@ -395,13 +535,9 @@ fn scan_gemini_with_callback(
             let mut ended_at = last_updated;
 
             for item in messages_arr {
-                // Role from "type" field - Gemini uses "user" and "model"
+                // Legacy Gemini used `model`; current Gemini CLI uses `gemini`.
                 let msg_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("model");
-                let role = if msg_type == "model" {
-                    "assistant"
-                } else {
-                    msg_type
-                };
+                let role = GeminiConnector::normalize_message_role(msg_type);
 
                 // Parse timestamp using shared utility
                 let created = item.get("timestamp").and_then(parse_timestamp);
@@ -747,16 +883,17 @@ mod tests {
     // ==================== session_files Tests ====================
 
     #[test]
-    fn session_files_finds_session_json_in_chats() {
+    fn session_files_finds_legacy_json_and_current_jsonl_in_chats() {
         let dir = TempDir::new().unwrap();
         let hash_dir = dir.path().join("abcd1234");
         let chats_dir = hash_dir.join("chats");
         fs::create_dir_all(&chats_dir).unwrap();
         fs::write(chats_dir.join("session-1.json"), "{}").unwrap();
         fs::write(chats_dir.join("session-2.json"), "{}").unwrap();
+        fs::write(chats_dir.join("session-3.JSONL"), "{}").unwrap();
 
         let files = GeminiConnector::session_files(dir.path());
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
     }
 
     #[test]
@@ -904,6 +1041,82 @@ mod tests {
         assert_eq!(conv.messages[0].content, "Hello Gemini!");
         assert_eq!(conv.messages[1].role, "assistant"); // model -> assistant
         assert_eq!(conv.messages[1].content, "Hello! How can I help?");
+    }
+
+    #[test]
+    fn scan_replays_event_sourced_jsonl_with_authoritative_reseeds() {
+        let dir = TempDir::new().unwrap();
+        let chats_dir = dir.path().join("gemini_project").join("chats");
+        fs::create_dir_all(&chats_dir).unwrap();
+
+        let session_jsonl = concat!(
+            r#"{"kind":"main","sessionId":"jsonl-session","projectHash":"project-123","startTime":"2026-07-09T04:00:00Z","lastUpdated":"2026-07-09T04:00:01Z"}"#,
+            "\n",
+            r#"{"id":"discarded-before-seed","type":"user","timestamp":"2026-07-09T04:00:02Z","content":"superseded prefix"}"#,
+            "\n",
+            r#"{"$set":{"lastUpdated":"2026-07-09T04:00:03Z","messages":[{"id":"u1","type":"user","timestamp":"2026-07-09T04:00:00Z","content":[{"text":"authoritative question"}]},{"id":"a1","type":"gemini","timestamp":"2026-07-09T04:00:01Z","content":"first answer"}]}}"#,
+            "\n",
+            r#"{"id":"discarded-by-reseed","type":"user","timestamp":"2026-07-09T04:00:04Z","content":"intermediate append"}"#,
+            "\n",
+            r#"{"$set":{"lastUpdated":"2026-07-09T04:00:05Z","messages":[{"id":"u1","type":"user","timestamp":"2026-07-09T04:00:00Z","content":[{"text":"authoritative question"}]},{"id":"a1","type":"gemini","timestamp":"2026-07-09T04:00:01Z","content":"compacted answer"}]}}"#,
+            "\n",
+            r#"{"id":"i1","type":"info","timestamp":"2026-07-09T04:00:06Z","content":"model switched"}"#,
+            "\n",
+            r#"{"id":"a2","type":"gemini","timestamp":"2026-07-09T04:00:07Z","content":"answer after compaction"}"#,
+            "\n",
+            r#"{"id":"e1","type":"error","timestamp":"2026-07-09T04:00:08Z","content":"recoverable notice"}"#,
+            "\n",
+            r#"{"id":"truncated","type":"gemini","content":"unfinished"#,
+        );
+        let session_path = chats_dir.join("session-2026-07-09T04-00-jsonl.jsonl");
+        fs::write(&session_path, session_jsonl).unwrap();
+
+        let connector = GeminiConnector::new();
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+        let conversations = connector.scan(&ctx).unwrap();
+
+        assert_eq!(conversations.len(), 1);
+        let conversation = &conversations[0];
+        assert_eq!(conversation.external_id.as_deref(), Some("jsonl-session"));
+        assert_eq!(conversation.metadata["project_hash"], "project-123");
+        assert_eq!(conversation.source_path, session_path);
+        assert_eq!(conversation.messages.len(), 5);
+        assert_eq!(conversation.messages[0].content, "authoritative question");
+        assert_eq!(conversation.messages[1].content, "compacted answer");
+        assert_eq!(conversation.messages[2].content, "model switched");
+        assert_eq!(conversation.messages[3].content, "answer after compaction");
+        assert_eq!(conversation.messages[4].content, "recoverable notice");
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "assistant", "system", "assistant", "system"]
+        );
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("superseded"))
+        );
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("intermediate"))
+        );
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| message.idx)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert!(conversation.started_at.is_some());
+        assert!(conversation.ended_at > conversation.started_at);
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]
