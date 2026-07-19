@@ -56,9 +56,9 @@ pub use connectors::{
     estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,
     extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
-    get_connector_factories, kimi::KimiConnector, normalize_model, openclaw::OpenClawConnector,
-    openhands::OpenHandsConnector, parse_timestamp, pi_agent::PiAgentConnector,
-    qwen::QwenConnector, token_extraction, vibe::VibeConnector,
+    get_connector_factories, grok::GrokConnector, kimi::KimiConnector, normalize_model,
+    openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
+    pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};

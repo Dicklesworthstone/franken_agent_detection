@@ -19,6 +19,33 @@ Crate: <https://crates.io/crates/franken-agent-detection>
 
 ### Added
 
+- **Grok Build connector (`GrokConnector`)** — full parser + factory for
+  xAI's official `grok` coding CLI
+  (Dicklesworthstone/coding_agent_session_search#328), building on the
+  detection scaffolding below. Reads `$GROK_HOME/sessions/` (default
+  `~/.grok/sessions/`), whose layout is
+  `sessions/<percent-encoded-cwd>/<session-uuid>/`: `updates.jsonl` (the ACP
+  session-update stream the CLI's own docs call the authoritative
+  conversation log) is the primary read path, `summary.json` supplies
+  metadata (id, cwd, title, timestamps, `current_model_id`), and
+  `chat_history.jsonl` is a fallback so user prompts still index when every
+  model call in a session failed. The empirical grok-0.2.103 line envelope
+  (`method: "_x.ai/session/update"`, `params.update.sessionUpdate`,
+  `_meta.agentTimestampMs` at either level) is parsed tolerantly; ACP chunk
+  kinds (`user_message_chunk` / `agent_message_chunk` /
+  `agent_thought_chunk`) coalesce into single messages, `tool_call` /
+  `tool_call_update` become `tool`-role messages with structured
+  invocations and streamed output (updates supersede one another), and
+  unknown kinds (`hook_execution`, `retry_state`, `plan`, future additions)
+  are skipped without dropping the session. Workspace resolution prefers
+  `summary.json` `info.cwd`, then a group-level `.cwd` file, then
+  percent-decoding the group directory name. Registered in
+  `get_connector_factories` as `grok`; streaming scan + source discovery
+  (`updates.jsonl` primary, `chat_history.jsonl` + `summary.json`
+  sidecars) included, with synthetic-fixture tests for chunk coalescing,
+  tool-call lifecycle, the chat-history fallback, cwd decoding, and
+  scan-root flexibility.
+
 - **Grok (xAI) added to the detection inventory.** xAI's Grok CLI / Grok
   Build TUI keeps its state under `~/.grok/` (sessions, auth, hooks). Added
   `grok` to `KNOWN_CONNECTORS`, taught `canonical_connector_slug` the

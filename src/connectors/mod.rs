@@ -21,6 +21,7 @@ pub mod factory;
 pub mod gemini;
 #[cfg(feature = "goose")]
 pub mod goose;
+pub mod grok;
 #[cfg(feature = "hermes")]
 pub mod hermes;
 pub mod kimi;
@@ -230,6 +231,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
             Box::new(copilot_cli::CopilotCliConnector::new())
         }),
         ("qwen", || Box::new(qwen::QwenConnector::new())),
+        ("grok", || Box::new(grok::GrokConnector::new())),
     ];
     #[cfg(feature = "opencode")]
     v.push(("opencode", || Box::new(opencode::OpenCodeConnector::new())));
