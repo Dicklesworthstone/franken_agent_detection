@@ -690,14 +690,15 @@ fn parse_session(session_dir: &Path) -> Option<NormalizedConversation> {
     } else {
         (Vec::new(), None, None)
     };
-    let mut source_path = updates_path;
-    if messages.is_empty() && chat_history_path.is_file() {
+    let source_path = if messages.is_empty() && chat_history_path.is_file() {
         messages = parse_chat_history_fallback(&chat_history_path);
         // The normalized messages came from the fallback history, so preserve
         // that exact provenance even when an update stream exists but contains
         // only non-message telemetry (for example a failed model turn).
-        source_path = chat_history_path;
-    }
+        chat_history_path
+    } else {
+        updates_path
+    };
     if messages.is_empty() {
         // An un-run or content-less session; nothing to index.
         return None;
