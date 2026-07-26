@@ -303,6 +303,13 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root).join("sessions")])
         }
+        "kimi" => {
+            let root = read("KIMI_CODE_HOME")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root).join("sessions")])
+        }
         "goose" => {
             let root = read("GOOSE_PATH_ROOT")?;
             if root.is_empty() {
@@ -641,6 +648,10 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".hermes"]);
         }
         "kimi" => {
+            // Current kimi-code layout first (protocol 1.4+), then the legacy
+            // `~/.kimi` store so both generations are detected.
+            maybe_push(&mut out, &[".kimi-code", "sessions"]);
+            maybe_push(&mut out, &[".kimi-code"]);
             maybe_push(&mut out, &[".kimi", "sessions"]);
             maybe_push(&mut out, &[".kimi"]);
         }
@@ -1105,7 +1116,12 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".grok"]),
                 ],
                 "hermes" => vec![tilde(&[".hermes", "state.db"]), tilde(&[".hermes"])],
-                "kimi" => vec![tilde(&[".kimi", "sessions"]), tilde(&[".kimi"])],
+                "kimi" => vec![
+                    tilde(&[".kimi-code", "sessions"]),
+                    tilde(&[".kimi-code"]),
+                    tilde(&[".kimi", "sessions"]),
+                    tilde(&[".kimi"]),
+                ],
                 "opencode" => vec![
                     // Direct path to the v1.2+ SQLite database — probed first
                     // so display/diagnostics surface the data file (not the
