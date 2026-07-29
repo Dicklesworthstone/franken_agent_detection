@@ -99,6 +99,17 @@ impl OpenCodeConnector {
         None
     }
 
+    /// Home/XDG DB discovery is only valid when every supplied scan root
+    /// refers to this machine. A remote-mirror root must never pull the
+    /// local canonical `opencode.db` into its scan — the caller attributes
+    /// everything returned by that invocation to the remote source, so the
+    /// local sessions would be double-indexed under the remote `source_id`
+    /// (cass#357). Vacuously true when `scan_roots` is empty, preserving
+    /// default detection and the issue #174 local-explicit-root behavior.
+    fn allow_local_default_dbs(ctx: &ScanContext) -> bool {
+        ctx.scan_roots.iter().all(|root| root.origin.is_local())
+    }
+
     /// All known locations where OpenCode may store its SQLite database,
     /// in priority order. Exposed so that scan paths can fall back through
     /// them even when the caller provided an explicit (non-matching)
@@ -245,11 +256,13 @@ impl OpenCodeConnector {
             }
         }
 
-        db_candidates.extend(
-            Self::sqlite_db_candidates()
-                .into_iter()
-                .map(ScanRoot::local),
-        );
+        if Self::allow_local_default_dbs(ctx) {
+            db_candidates.extend(
+                Self::sqlite_db_candidates()
+                    .into_iter()
+                    .map(ScanRoot::local),
+            );
+        }
 
         let mut seen = HashSet::new();
         db_candidates.retain(|root| seen.insert(root.path.clone()));
@@ -837,7 +850,9 @@ impl Connector for OpenCodeConnector {
             }
         }
 
-        db_candidates.extend(Self::sqlite_db_candidates());
+        if Self::allow_local_default_dbs(ctx) {
+            db_candidates.extend(Self::sqlite_db_candidates());
+        }
 
         // Deduplicate while preserving priority order.
         {
@@ -3667,6 +3682,124 @@ mod tests {
         assert!(
             convs.is_empty(),
             "nonexistent .db path should not produce sessions"
+        );
+    }
+
+    /// Regression for cass#357: a remote-mirror scan root must never pull the
+    /// local machine's canonical home/XDG `opencode.db` into its scan. The
+    /// caller attributes everything returned by that invocation to the remote
+    /// source, so a home fallback double-indexes local sessions under the
+    /// remote `source_id`.
+    #[test]
+    fn remote_scan_root_does_not_include_local_default_dbs() {
+        let dir = TempDir::new().unwrap();
+        let mirror = dir.path().join("remotes/studio/mirror/opencode");
+        fs::create_dir_all(&mirror).unwrap();
+        let db_path = create_test_sqlite_db(&mirror);
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "sess-remote",
+                "proj-r",
+                "Remote Session",
+                "/home/remote/project"
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params![
+                "msg-remote",
+                "sess-remote",
+                r#"{"role":"user","time":{"created":1700000000000}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part-remote",
+                "msg-remote",
+                "sess-remote",
+                r#"{"type":"text","text":"Remote content"}"#,
+            ],
+        )
+        .unwrap();
+
+        let ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![ScanRoot::remote(
+                mirror.clone(),
+                crate::types::Origin::remote("studio"),
+                None,
+            )],
+            None,
+        );
+        assert!(
+            !OpenCodeConnector::allow_local_default_dbs(&ctx),
+            "a remote scan root must disable the home/XDG DB fallback (cass#357)"
+        );
+
+        let connector = OpenCodeConnector::new();
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(
+            convs
+                .iter()
+                .filter(|c| c.external_id.as_deref() == Some("sess-remote"))
+                .count(),
+            1,
+            "the remote mirror's own DB must still be scanned"
+        );
+        for conv in &convs {
+            assert!(
+                conv.source_path.starts_with(&mirror),
+                "remote-context scan leaked a session outside the mirror root (cass#357): {}",
+                conv.source_path.display()
+            );
+        }
+        // Discovery must stay in lockstep with scan (trait contract).
+        let discovered = connector.discover_source_files(&ctx).unwrap();
+        for file in &discovered {
+            assert!(
+                file.source_path.starts_with(&mirror),
+                "remote-context discovery leaked a source outside the mirror root (cass#357): {}",
+                file.source_path.display()
+            );
+        }
+    }
+
+    /// Companion to the cass#357 guard: local explicit roots (and empty
+    /// roots, i.e. default detection) must keep the issue #174 home/XDG DB
+    /// fallback, and any remote root in the mix disables it.
+    #[test]
+    fn local_scan_roots_keep_default_db_fallback() {
+        let dir = TempDir::new().unwrap();
+        let local_ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        );
+        assert!(OpenCodeConnector::allow_local_default_dbs(&local_ctx));
+
+        let default_ctx = ScanContext::local_default(PathBuf::new(), None);
+        assert!(OpenCodeConnector::allow_local_default_dbs(&default_ctx));
+
+        let mixed_ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![
+                ScanRoot::local(dir.path().to_path_buf()),
+                ScanRoot::remote(
+                    dir.path().join("mirror"),
+                    crate::types::Origin::remote("laptop"),
+                    None,
+                ),
+            ],
+            None,
+        );
+        assert!(
+            !OpenCodeConnector::allow_local_default_dbs(&mixed_ctx),
+            "any remote root disables the local-default fallback"
         );
     }
 }
