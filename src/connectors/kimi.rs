@@ -88,10 +88,15 @@ impl KimiConnector {
         override_home: Option<PathBuf>,
         home: Option<&Path>,
     ) -> Vec<PathBuf> {
-        let mut out = Vec::new();
+        // An explicit KIMI_CODE_HOME pins the home and suppresses the
+        // built-in defaults — matching both the detection registry's
+        // env_override_roots semantics and the sibling pi_agent connector's
+        // PI_CODING_AGENT_DIR contract, so detect() and scan() cannot
+        // disagree about which trees exist (fresh-eyes finding, cass#351).
         if let Some(env_home) = override_home {
-            out.push(env_home.join("sessions"));
+            return vec![env_home.join("sessions")];
         }
+        let mut out = Vec::new();
         if let Some(home) = home {
             out.push(home.join(".kimi-code").join("sessions"));
             out.push(home.join(".kimi").join("sessions"));
@@ -227,6 +232,16 @@ impl KimiConnector {
 
         roots.sort_by(|a, b| a.path.cmp(&b.path));
         roots.dedup_by(|a, b| a.path == b.path);
+        // Dedup by canonical identity too: `~/.kimi` symlinked to
+        // `~/.kimi-code` (a plausible migration shim), a copied home, or a
+        // non-canonical `KIMI_CODE_HOME` spelling would otherwise scan the
+        // same physical tree twice and emit colliding external_ids
+        // (fresh-eyes finding, cass#351; same pattern as pi_agent).
+        let mut seen_canonical = std::collections::HashSet::new();
+        roots.retain(|root| {
+            let canonical = std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone());
+            seen_canonical.insert(canonical)
+        });
         roots
     }
 
@@ -746,6 +761,17 @@ fn attach_tool_result_to_call(
         return false;
     };
 
+    // First result wins: a duplicate toolCallId (or a repeated result for
+    // the same call) must not silently clobber the recorded output — the
+    // caller emits the extra result as a standalone tool message instead.
+    if message
+        .extra
+        .pointer("/cass/tool_result")
+        .is_some_and(|existing| !existing.is_null())
+    {
+        return false;
+    }
+
     if !message.extra.is_object() {
         message.extra = Value::Object(serde_json::Map::new());
     }
@@ -857,12 +883,16 @@ fn parse_kimi_code_session(
                     .map(flatten_content)
                     .unwrap_or_default();
 
-                if role == "user"
+                // The echo of the held-back turn.prompt: emit exactly once.
+                // "user" and "human" are both user-role spellings in the
+                // wild, and prompt/echo text can differ by surrounding
+                // whitespace (multi-part inputs join with '\n'), so compare
+                // trimmed.
+                if matches!(role.as_str(), "user" | "human")
                     && pending_prompt
                         .as_ref()
-                        .is_some_and(|(pending_text, _, _)| *pending_text == text)
+                        .is_some_and(|(pending_text, _, _)| pending_text.trim() == text.trim())
                 {
-                    // The echo of the held-back turn.prompt: emit exactly once.
                     flush_pending_prompt(&mut messages, &mut pending_prompt);
                     continue;
                 }
@@ -882,7 +912,6 @@ fn parse_kimi_code_session(
                 }
             }
             "context.append_loop_event" => {
-                flush_pending_prompt(&mut messages, &mut pending_prompt);
                 let Some(event) = val.get("event") else {
                     continue;
                 };
@@ -890,6 +919,14 @@ fn parse_kimi_code_session(
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+
+                // Bookkeeping loop events can arrive between a turn.prompt
+                // and its context.append_message echo; only content-bearing
+                // events force the pending prompt out (in order, ahead of
+                // the assistant content).
+                if !matches!(event_type, "step.begin" | "step.end") {
+                    flush_pending_prompt(&mut messages, &mut pending_prompt);
+                }
 
                 match event_type {
                     "content.part" => {
@@ -967,10 +1004,20 @@ fn parse_kimi_code_session(
                             &result_text,
                             is_error,
                         ) {
-                            tracing::debug!(
-                                tool_call_id,
-                                "kimi tool.result without matching tool.call"
-                            );
+                            // Out-of-order result, duplicate toolCallId, or a
+                            // call whose slot already holds a result: emit as
+                            // a standalone tool message instead of dropping
+                            // real output (fresh-eyes finding, cass#351).
+                            messages.push(NormalizedMessage {
+                                idx: 0,
+                                role: "tool".to_string(),
+                                author: None,
+                                created_at: created,
+                                content: format!("[Tool result: {tool_call_id}] {result_text}"),
+                                extra: val,
+                                invocations: Vec::new(),
+                                snippets: Vec::new(),
+                            });
                         }
                     }
                     // step.begin / step.end and unknown loop events carry no
@@ -979,11 +1026,11 @@ fn parse_kimi_code_session(
                 }
             }
             // llm.request, usage.record, and unknown top-level types are
-            // bookkeeping. They still end any pending prompt: the echo (when
-            // present) always directly follows its turn.prompt.
-            _ => {
-                flush_pending_prompt(&mut messages, &mut pending_prompt);
-            }
+            // bookkeeping and can legitimately arrive between a turn.prompt
+            // and its context.append_message echo — the pending prompt must
+            // survive them or the dedup only works under strict adjacency
+            // and the prompt duplicates (fresh-eyes finding, cass#351).
+            _ => {}
         }
     }
 
@@ -1843,19 +1890,15 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn kimi_session_roots_from_env_override_is_probed_first() {
+    fn kimi_session_roots_from_env_override_replaces_defaults() {
+        // KIMI_CODE_HOME pins the home — matching the detection registry's
+        // env_override_roots semantics and pi_agent's PI_CODING_AGENT_DIR
+        // contract, so detect() and scan() agree on which trees exist.
         let roots = KimiConnector::kimi_session_roots_from(
             Some(PathBuf::from("/custom/kimi-home")),
             Some(Path::new("/home/u")),
         );
-        assert_eq!(
-            roots,
-            vec![
-                PathBuf::from("/custom/kimi-home/sessions"),
-                PathBuf::from("/home/u/.kimi-code/sessions"),
-                PathBuf::from("/home/u/.kimi/sessions"),
-            ]
-        );
+        assert_eq!(roots, vec![PathBuf::from("/custom/kimi-home/sessions")]);
     }
 
     #[test]
@@ -1880,6 +1923,148 @@ mod tests {
     #[test]
     fn kimi_session_roots_from_empty_without_override_or_home() {
         assert!(KimiConnector::kimi_session_roots_from(None, None).is_empty());
+    }
+
+    // =========================================================================
+    // Fresh-eyes regression tests (cass#351 adversarial review)
+    // =========================================================================
+
+    /// Bookkeeping events (`step.begin`, `llm.request`, `usage.record`) can
+    /// arrive between a `turn.prompt` and its `context.append_message` echo;
+    /// the pair must still collapse to one user message. The echo may also
+    /// differ by surrounding whitespace and may use the `human` role spelling.
+    #[test]
+    fn modern_prompt_echo_dedup_survives_bookkeeping_whitespace_and_human_role() {
+        let tmp = TempDir::new().unwrap();
+        let storage = create_kimi_code_storage(&tmp);
+        write_modern_wire_file(
+            &storage,
+            "wd",
+            "sess-dedup-hard",
+            "main",
+            &[
+                r#"{"type":"turn.prompt","input":[{"type":"text","text":"Fix the bug\n"}],"time":"2026-01-01T00:00:00Z"}"#,
+                r#"{"type":"context.append_loop_event","event":{"type":"step.begin"},"time":"2026-01-01T00:00:00Z"}"#,
+                r#"{"type":"llm.request","time":"2026-01-01T00:00:00Z"}"#,
+                r#"{"type":"context.append_message","message":{"role":"human","content":[{"type":"text","text":"Fix the bug"}]},"time":"2026-01-01T00:00:01Z"}"#,
+                r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"On it."}},"time":"2026-01-01T00:00:02Z"}"#,
+            ],
+        );
+
+        let ctx =
+            ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(storage.clone())], None);
+        let convs = KimiConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let user_count = convs[0]
+            .messages
+            .iter()
+            .filter(|m| m.role == "user" || m.role == "human")
+            .count();
+        assert_eq!(
+            user_count,
+            1,
+            "prompt + delayed whitespace-variant human echo must collapse to one message: {:?}",
+            convs[0]
+                .messages
+                .iter()
+                .map(|m| (&m.role, &m.content))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A tool.result arriving before its call, or after the call's slot is
+    /// already filled, must surface as a standalone tool message instead of
+    /// vanishing; the first attached result must not be clobbered.
+    #[test]
+    fn modern_out_of_order_and_duplicate_tool_results_are_not_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let storage = create_kimi_code_storage(&tmp);
+        write_modern_wire_file(
+            &storage,
+            "wd",
+            "sess-tool-order",
+            "main",
+            &[
+                r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"call_1","result":{"output":"EARLY RESULT"}},"time":"2026-01-01T00:00:00Z"}"#,
+                r#"{"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"call_1","name":"ReadFile","args":{"path":"a.rs"}},"time":"2026-01-01T00:00:01Z"}"#,
+                r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"call_1","result":{"output":"FIRST ATTACHED"}},"time":"2026-01-01T00:00:02Z"}"#,
+                r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"call_1","result":{"output":"SECOND RESULT"}},"time":"2026-01-01T00:00:03Z"}"#,
+            ],
+        );
+
+        let ctx =
+            ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(storage.clone())], None);
+        let convs = KimiConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let messages = &convs[0].messages;
+
+        // The early and duplicate results each surface as standalone tool
+        // messages.
+        let standalone: Vec<_> = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            standalone.iter().any(|c| c.contains("EARLY RESULT")),
+            "early result must not vanish: {standalone:?}"
+        );
+        assert!(
+            standalone.iter().any(|c| c.contains("SECOND RESULT")),
+            "duplicate result must not clobber or vanish: {standalone:?}"
+        );
+
+        // The call keeps the FIRST attached result.
+        let call = messages
+            .iter()
+            .find(|m| !m.invocations.is_empty())
+            .expect("tool.call message");
+        assert_eq!(
+            call.extra
+                .pointer("/cass/tool_result/content")
+                .and_then(serde_json::Value::as_str),
+            Some("FIRST ATTACHED"),
+            "first attached result must win"
+        );
+    }
+
+    /// `~/.kimi` symlinked to `~/.kimi-code` (a plausible migration shim)
+    /// must not double-index the same physical sessions with colliding
+    /// `external_ids`.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_legacy_home_does_not_double_index() {
+        let tmp = TempDir::new().unwrap();
+        let storage = create_kimi_code_storage(&tmp);
+        write_modern_wire_file(
+            &storage,
+            "wd",
+            "sess-symlink",
+            "main",
+            &[
+                r#"{"type":"turn.prompt","input":[{"type":"text","text":"hello"}],"time":"2026-01-01T00:00:00Z"}"#,
+            ],
+        );
+        std::os::unix::fs::symlink(tmp.path().join(".kimi-code"), tmp.path().join(".kimi"))
+            .unwrap();
+
+        // Both homes resolve through explicit roots at the fake home dir; the
+        // canonical-identity dedup must collapse them to one scan root.
+        let ctx = ScanContext::with_roots(
+            PathBuf::new(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            None,
+        );
+        let convs = KimiConnector::new().scan(&ctx).unwrap();
+        assert_eq!(
+            convs.len(),
+            1,
+            "symlinked homes must not duplicate sessions: {:?}",
+            convs
+                .iter()
+                .map(|c| (&c.external_id, &c.source_path))
+                .collect::<Vec<_>>()
+        );
     }
 
     // =========================================================================

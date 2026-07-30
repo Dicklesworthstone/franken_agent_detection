@@ -192,16 +192,25 @@ impl PiAgentConnector {
                 // the session (…/<timestamp>_<uuid>/<AgentName>.jsonl); each
                 // is a complete session document with its own `session`
                 // header, so it parses like any main transcript. Accept a
-                // .jsonl either named like a session or living inside a
-                // session-named directory. Non-session strays degrade
-                // harmlessly: every line fails JSON/schema parsing and the
-                // file yields no conversation.
-                let parent_is_session_dir = entry
-                    .path()
-                    .parent()
-                    .and_then(|parent| parent.file_name())
-                    .and_then(|dir| dir.to_str())
-                    .is_some_and(|dir| dir.contains('_'));
+                // .jsonl either named like a session, or living inside a
+                // session directory — recognized by its `_` marker AND the
+                // main transcript `<dir>.jsonl` sitting beside it. The
+                // sibling requirement matters: workspace-slug directories
+                // preserve underscores from the original cwd (encode_cwd
+                // only rewrites `/`, `\`, `:`), so "parent contains `_`"
+                // alone would sweep stray .jsonl exports under any project
+                // whose path contains an underscore (fresh-eyes finding).
+                let parent_is_session_dir = entry.path().parent().is_some_and(|parent| {
+                    let has_session_marker = parent
+                        .file_name()
+                        .and_then(|dir| dir.to_str())
+                        .is_some_and(|dir| dir.contains('_'));
+                    has_session_marker && {
+                        let mut main_transcript = parent.as_os_str().to_owned();
+                        main_transcript.push(".jsonl");
+                        Path::new(&main_transcript).is_file()
+                    }
+                });
                 if name.contains('_') || parent_is_session_dir {
                     out.push(entry.path().to_path_buf());
                 }
@@ -954,6 +963,15 @@ mod tests {
         // (slug has no underscore, name has no underscore).
         fs::write(slug.join("notes.jsonl"), "{}").unwrap();
 
+        // Workspace slugs preserve underscores from the original cwd
+        // (encode_cwd only rewrites path separators), so a slug directory
+        // with an underscore must NOT turn its stray .jsonl files into
+        // session candidates — it lacks the sibling main transcript that
+        // marks a real omp session directory.
+        let underscore_slug = dir.path().join("sessions").join("--data-projects-my_app--");
+        fs::create_dir_all(&underscore_slug).unwrap();
+        fs::write(underscore_slug.join("export.jsonl"), "{}").unwrap();
+
         let files = PiAgentConnector::session_files(dir.path());
         let names: Vec<_> = files
             .iter()
@@ -962,11 +980,15 @@ mod tests {
         assert_eq!(
             files.len(),
             3,
-            "main + two sub-agent transcripts: {names:?}"
+            "main + two sub-agent transcripts only: {names:?}"
         );
         assert!(names.contains(&"BenchBatch1.jsonl"));
         assert!(names.contains(&"BenchBatch2.jsonl"));
         assert!(!names.contains(&"notes.jsonl"));
+        assert!(
+            !names.contains(&"export.jsonl"),
+            "stray .jsonl under an underscore-bearing workspace slug must stay excluded"
+        );
     }
 
     #[test]
