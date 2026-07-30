@@ -1535,6 +1535,14 @@ mod tests {
         assert!(kimi.contains(&"~/.kimi/sessions".to_string()));
         assert!(kimi.contains(&"~/.kimi".to_string()));
 
+        // Oh My Pi (`omp`) shares the pi_agent connector; without these
+        // probe entries an omp-only machine reports pi_agent not detected
+        // (cass#351 investigation fallout).
+        let pi_agent = by_slug.get("pi_agent").expect("pi_agent paths");
+        assert!(pi_agent.contains(&"~/.pi/agent/sessions".to_string()));
+        assert!(pi_agent.contains(&"~/.omp/agent/sessions".to_string()));
+        assert!(pi_agent.contains(&"~/.omp/agent".to_string()));
+
         let cline = by_slug.get("cline").expect("cline paths");
         assert!(
             cline.contains(&"~/.config/Code/User/globalStorage/saoudrizwan.claude-dev".to_string())
