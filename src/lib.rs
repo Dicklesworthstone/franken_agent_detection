@@ -289,6 +289,13 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root).join("sessions")])
         }
+        "kimi" => {
+            let root = read("KIMI_CODE_HOME")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root).join("sessions")])
+        }
         "openhands" => {
             let root = read("CASS_OPENHANDS_DATA_ROOT")?;
             if root.is_empty() {
@@ -641,6 +648,11 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".hermes"]);
         }
         "kimi" => {
+            // Modern Kimi Code (0.28+) stores sessions under ~/.kimi-code/;
+            // probe it first so detection surfaces the current layout. The
+            // legacy ~/.kimi/ layout is retained for older installs.
+            maybe_push(&mut out, &[".kimi-code", "sessions"]);
+            maybe_push(&mut out, &[".kimi-code"]);
             maybe_push(&mut out, &[".kimi", "sessions"]);
             maybe_push(&mut out, &[".kimi"]);
         }
@@ -664,6 +676,13 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         }
         "pi_agent" => {
             maybe_push(&mut out, &[".pi", "agent", "sessions"]);
+            // Oh My Pi (`omp`) is a pi-mono derivative sharing the wire
+            // format; the connector already scans ~/.omp/agent, but detection
+            // is registry-driven, so an omp-only machine reported the
+            // pi_agent connector as not detected without these (cass#351
+            // investigation fallout).
+            maybe_push(&mut out, &[".omp", "agent", "sessions"]);
+            maybe_push(&mut out, &[".omp", "agent"]);
         }
         "qwen" => {
             maybe_push(&mut out, &[".qwen", "tmp"]);
@@ -1105,7 +1124,12 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".grok"]),
                 ],
                 "hermes" => vec![tilde(&[".hermes", "state.db"]), tilde(&[".hermes"])],
-                "kimi" => vec![tilde(&[".kimi", "sessions"]), tilde(&[".kimi"])],
+                "kimi" => vec![
+                    tilde(&[".kimi-code", "sessions"]),
+                    tilde(&[".kimi-code"]),
+                    tilde(&[".kimi", "sessions"]),
+                    tilde(&[".kimi"]),
+                ],
                 "opencode" => vec![
                     // Direct path to the v1.2+ SQLite database — probed first
                     // so display/diagnostics surface the data file (not the
@@ -1120,7 +1144,11 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".openhands", "conversations"]),
                     tilde(&[".openhands"]),
                 ],
-                "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
+                "pi_agent" => vec![
+                    tilde(&[".pi", "agent", "sessions"]),
+                    tilde(&[".omp", "agent", "sessions"]),
+                    tilde(&[".omp", "agent"]),
+                ],
                 "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],
                 "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],
                 "windsurf" => vec![tilde(&[".windsurf"]), tilde(&[".config", "windsurf"])],
@@ -1500,6 +1528,12 @@ mod tests {
         assert!(grok.contains(&"~/.grok/sessions".to_string()));
         assert!(grok.contains(&"~/.grok/auth.json".to_string()));
         assert!(grok.contains(&"~/.grok".to_string()));
+
+        let kimi = by_slug.get("kimi").expect("kimi paths");
+        assert!(kimi.contains(&"~/.kimi-code/sessions".to_string()));
+        assert!(kimi.contains(&"~/.kimi-code".to_string()));
+        assert!(kimi.contains(&"~/.kimi/sessions".to_string()));
+        assert!(kimi.contains(&"~/.kimi".to_string()));
 
         let cline = by_slug.get("cline").expect("cline paths");
         assert!(
