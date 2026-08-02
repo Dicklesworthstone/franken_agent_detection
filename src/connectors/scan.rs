@@ -126,8 +126,15 @@ impl ScanRoot {
     }
 }
 
+/// A cheap "still alive" tick a connector may call periodically during a long
+/// internal scan (e.g. decoding a large SQLite store) so the host's stall
+/// watchdog observes liveness BEFORE the first conversation is yielded
+/// (cass#373 Variant A). `Send + Sync` so it can ride the (thread-crossing)
+/// `ScanContext`; typically wired to the host's per-activity progress tick.
+pub type ScanProgressTick = Arc<dyn Fn() + Send + Sync>;
+
 /// Shared scan context parameters.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ScanContext {
     /// Primary data directory (cass internal state).
     pub data_dir: PathBuf,
@@ -138,6 +145,23 @@ pub struct ScanContext {
 
     /// High-water mark for incremental indexing (milliseconds since epoch).
     pub since_ts: Option<i64>,
+
+    /// Optional liveness tick for long pre-first-yield scans (cass#373 Variant A).
+    pub progress_tick: Option<ScanProgressTick>,
+}
+
+impl std::fmt::Debug for ScanContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanContext")
+            .field("data_dir", &self.data_dir)
+            .field("scan_roots", &self.scan_roots)
+            .field("since_ts", &self.since_ts)
+            .field(
+                "progress_tick",
+                &self.progress_tick.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
 }
 
 impl ScanContext {
@@ -148,6 +172,7 @@ impl ScanContext {
             data_dir,
             scan_roots: Vec::new(),
             since_ts,
+            progress_tick: None,
         }
     }
 
@@ -162,7 +187,15 @@ impl ScanContext {
             data_dir,
             scan_roots,
             since_ts,
+            progress_tick: None,
         }
+    }
+
+    /// Attach a liveness tick called periodically during long scans (cass#373).
+    #[must_use]
+    pub fn with_progress_tick(mut self, tick: ScanProgressTick) -> Self {
+        self.progress_tick = Some(tick);
+        self
     }
 
     /// Legacy accessor for backward compatibility.

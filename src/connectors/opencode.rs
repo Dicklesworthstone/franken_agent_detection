@@ -39,6 +39,22 @@ use frankensqlite::{Connection, Row, SqliteValue, params};
 /// SQLite's default 999-parameter ceiling. (#372: incremental opencode scans
 /// load only the changed sessions' messages/parts instead of the whole DB.)
 const OPENCODE_SQL_IN_CHUNK: usize = 800;
+
+/// Emit a scan liveness tick every N decoded rows during a large sqlite scan so
+/// the host stall watchdog sees progress before the first conversation is
+/// yielded (cass#373 Variant A). Frequent enough that a multi-minute full scan
+/// never leaves a >120s silent gap; cheap enough to be noise otherwise.
+const OPENCODE_SCAN_TICK_EVERY: usize = 2000;
+
+/// Call `tick` (if present) once every `OPENCODE_SCAN_TICK_EVERY` rows.
+#[inline]
+fn opencode_scan_tick(tick: Option<&(dyn Fn() + Send + Sync)>, row_index: usize) {
+    if row_index % OPENCODE_SCAN_TICK_EVERY == 0
+        && let Some(tick) = tick
+    {
+        tick();
+    }
+}
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -456,6 +472,7 @@ impl OpenCodeConnector {
     fn extract_from_sqlite(
         db_path: &Path,
         since_ts: Option<i64>,
+        progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<Vec<NormalizedConversation>> {
         let conn = open_with_flags(
             db_path.to_string_lossy().as_ref(),
@@ -510,11 +527,12 @@ impl OpenCodeConnector {
         });
 
         let mut messages_by_session =
-            Self::load_sqlite_messages_by_session(&conn, keep_session_ids.as_ref())?;
+            Self::load_sqlite_messages_by_session(&conn, keep_session_ids.as_ref(), progress_tick)?;
         let mut convs = Vec::new();
         let mut seen_ids = HashSet::new();
 
-        for session in sessions {
+        for (session_index, session) in sessions.into_iter().enumerate() {
+            opencode_scan_tick(progress_tick, session_index);
             if !seen_ids.insert(session.id.clone()) {
                 continue;
             }
@@ -579,6 +597,7 @@ impl OpenCodeConnector {
     fn load_sqlite_messages_by_session(
         conn: &Connection,
         keep_session_ids: Option<&HashSet<String>>,
+        progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<HashMap<String, Vec<NormalizedMessage>>> {
         // Load the message rows first (no ORDER BY — they are re-sorted per
         // session below), restricted to the kept sessions on an incremental
@@ -623,11 +642,12 @@ impl OpenCodeConnector {
         let kept_message_ids: Option<HashSet<String>> =
             keep_session_ids.map(|_| rows.iter().map(|row| row.id.clone()).collect());
         let mut parts_by_message =
-            Self::load_sqlite_parts_by_message(conn, kept_message_ids.as_ref())?;
+            Self::load_sqlite_parts_by_message(conn, kept_message_ids.as_ref(), progress_tick)?;
 
         let mut pending_by_session: HashMap<String, Vec<PendingSqliteMessage>> = HashMap::new();
 
-        for row in rows {
+        for (row_index, row) in rows.into_iter().enumerate() {
+            opencode_scan_tick(progress_tick, row_index);
             let msg_data: SqliteMessageData = match serde_json::from_str(&row.data_json) {
                 Ok(d) => d,
                 Err(e) => {
@@ -709,6 +729,7 @@ impl OpenCodeConnector {
     fn load_sqlite_parts_by_message(
         conn: &Connection,
         message_ids: Option<&HashSet<String>>,
+        progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<HashMap<String, Vec<PartInfo>>> {
         // No ORDER BY — parts are re-sorted per message below. On an incremental
         // scan only the kept messages' parts are read/decoded (#372: the `part`
@@ -738,7 +759,8 @@ impl OpenCodeConnector {
         };
 
         let mut parts_by_message: HashMap<String, Vec<PartInfo>> = HashMap::new();
-        for (message_id, row) in rows {
+        for (row_index, (message_id, row)) in rows.into_iter().enumerate() {
+            opencode_scan_tick(progress_tick, row_index);
             match serde_json::from_str::<SqlitePartData>(&row) {
                 Ok(part_data) => {
                     parts_by_message
@@ -951,7 +973,7 @@ impl Connector for OpenCodeConnector {
             if !scanned_dbs.insert(canonical) {
                 continue;
             }
-            match Self::extract_from_sqlite(&db, ctx.since_ts) {
+            match Self::extract_from_sqlite(&db, ctx.since_ts, ctx.progress_tick.as_deref()) {
                 Ok(sqlite_convs) => {
                     tracing::debug!(
                         "opencode sqlite: found {} sessions in {}",
@@ -3088,7 +3110,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-1"));
         assert_eq!(convs[0].title.as_deref(), Some("Test Session"));
@@ -3156,7 +3178,7 @@ mod tests {
         drop(conn);
 
         // Full scan sees every session.
-        let full = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let full = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         let full_ids: HashSet<String> =
             full.iter().filter_map(|c| c.external_id.clone()).collect();
         assert_eq!(
@@ -3169,7 +3191,7 @@ mod tests {
 
         // Incremental at the cutoff: known-old sessions are skipped without
         // decoding their parts; the recent + unknown-time-recent survive.
-        let inc = OpenCodeConnector::extract_from_sqlite(&db_path, Some(cutoff)).unwrap();
+        let inc = OpenCodeConnector::extract_from_sqlite(&db_path, Some(cutoff), None).unwrap();
         let inc_ids: HashSet<String> = inc.iter().filter_map(|c| c.external_id.clone()).collect();
         assert_eq!(
             inc_ids,
@@ -3196,11 +3218,49 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_extract_calls_progress_tick_during_scan() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["s", "s"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["m", "s", r#"{"role":"user"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params!["p", "m", "s", r#"{"type":"text","text":"hi"}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let tick = move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        };
+        let convs =
+            OpenCodeConnector::extract_from_sqlite(&db_path, None, Some(&tick)).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert!(
+            ticks.load(Ordering::Relaxed) >= 1,
+            "the scan progress tick must fire while decoding (cass#373 Variant A)"
+        );
+    }
+
+    #[test]
     fn sqlite_extract_empty_db() {
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert!(convs.is_empty());
     }
 
@@ -3219,7 +3279,7 @@ mod tests {
         // Session with no messages should be skipped
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert!(convs.is_empty());
     }
 
@@ -3267,7 +3327,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.contains("Let me check that."));
         assert!(convs[0].messages[0].content.contains("[Tool Output]"));
@@ -3306,7 +3366,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 2);
     }
 
@@ -3356,7 +3416,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 2);
 
         let sess_a = convs
@@ -3439,7 +3499,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 1);
         // Epoch seconds should be normalized to milliseconds
         assert_eq!(convs[0].started_at, Some(1_700_000_000_000));
@@ -3476,7 +3536,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].metadata["source"], "sqlite");
         assert_eq!(convs[0].metadata["project_id"], "proj-meta");
