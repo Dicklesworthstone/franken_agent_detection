@@ -32,8 +32,29 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
+use frankensqlite::compat::{ConnectionExt, OpenFlags, ParamValue, RowExt, open_with_flags};
 use frankensqlite::{Connection, Row, SqliteValue, params};
+
+/// Max ids bound into a single `... IN (?, ?, …)` chunk. Kept well under
+/// SQLite's default 999-parameter ceiling. (#372: incremental opencode scans
+/// load only the changed sessions' messages/parts instead of the whole DB.)
+const OPENCODE_SQL_IN_CHUNK: usize = 800;
+
+/// Emit a scan liveness tick every N decoded rows during a large sqlite scan so
+/// the host stall watchdog sees progress before the first conversation is
+/// yielded (cass#373 Variant A). Frequent enough that a multi-minute full scan
+/// never leaves a >120s silent gap; cheap enough to be noise otherwise.
+const OPENCODE_SCAN_TICK_EVERY: usize = 2000;
+
+/// Call `tick` (if present) once every `OPENCODE_SCAN_TICK_EVERY` rows.
+#[inline]
+fn opencode_scan_tick(tick: Option<&(dyn Fn() + Send + Sync)>, row_index: usize) {
+    if row_index % OPENCODE_SCAN_TICK_EVERY == 0
+        && let Some(tick) = tick
+    {
+        tick();
+    }
+}
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -451,6 +472,7 @@ impl OpenCodeConnector {
     fn extract_from_sqlite(
         db_path: &Path,
         since_ts: Option<i64>,
+        progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<Vec<NormalizedConversation>> {
         let conn = open_with_flags(
             db_path.to_string_lossy().as_ref(),
@@ -481,11 +503,36 @@ impl OpenCodeConnector {
             )
             .with_context(|| "failed to query OpenCode sessions")?;
 
-        let mut messages_by_session = Self::load_sqlite_messages_by_session(&conn)?;
+        // #372: on an incremental scan, restrict the (expensive) message/part
+        // decode to the sessions that could possibly clear the cutoff, instead
+        // of decoding the whole DB and filtering afterwards. The predicate is
+        // exactly the one the post-decode filter below applies via `ended_at`
+        // (which prefers `session.time_updated`): keep a session iff its update
+        // time is unknown — in which case the per-message time filter still
+        // decides — or at/after the cutoff. Sessions whose known update time is
+        // before the cutoff are dropped here without loading their messages or
+        // parts, and the post-decode filter remains as a correctness backstop.
+        let keep_session_ids: Option<HashSet<String>> = since_ts.map(|since| {
+            sessions
+                .iter()
+                .filter(|session| {
+                    session
+                        .time_updated_raw
+                        .as_ref()
+                        .and_then(normalize_sqlite_ts_value)
+                        .map_or(true, |updated| updated >= since)
+                })
+                .map(|session| session.id.clone())
+                .collect()
+        });
+
+        let mut messages_by_session =
+            Self::load_sqlite_messages_by_session(&conn, keep_session_ids.as_ref(), progress_tick)?;
         let mut convs = Vec::new();
         let mut seen_ids = HashSet::new();
 
-        for session in sessions {
+        for (session_index, session) in sessions.into_iter().enumerate() {
+            opencode_scan_tick(progress_tick, session_index);
             if !seen_ids.insert(session.id.clone()) {
                 continue;
             }
@@ -549,26 +596,58 @@ impl OpenCodeConnector {
 
     fn load_sqlite_messages_by_session(
         conn: &Connection,
+        keep_session_ids: Option<&HashSet<String>>,
+        progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<HashMap<String, Vec<NormalizedMessage>>> {
-        let mut parts_by_message = Self::load_sqlite_parts_by_message(conn)?;
-        let rows: Vec<SqliteMessageRow> = conn.query_map_collect(
-            "SELECT session_id, id, data, time_created
-             FROM message
-             ORDER BY session_id ASC, time_created ASC, id ASC",
-            params![],
-            |row| {
-                Ok(SqliteMessageRow {
-                    session_id: row.get_typed(0)?,
-                    id: row.get_typed(1)?,
-                    data_json: row.get_typed(2)?,
-                    time_created_raw: optional_sqlite_value(row, 3),
-                })
-            },
-        )?;
+        // Load the message rows first (no ORDER BY — they are re-sorted per
+        // session below), restricted to the kept sessions on an incremental
+        // scan so old sessions' messages are never read or decoded (#372).
+        let rows: Vec<SqliteMessageRow> = match keep_session_ids {
+            None => conn.query_map_collect(
+                "SELECT session_id, id, data, time_created FROM message",
+                params![],
+                |row| {
+                    Ok(SqliteMessageRow {
+                        session_id: row.get_typed(0)?,
+                        id: row.get_typed(1)?,
+                        data_json: row.get_typed(2)?,
+                        time_created_raw: optional_sqlite_value(row, 3),
+                    })
+                },
+            )?,
+            Some(ids) => {
+                let id_list: Vec<&String> = ids.iter().collect();
+                let mut rows: Vec<SqliteMessageRow> = Vec::new();
+                for chunk in id_list.chunks(OPENCODE_SQL_IN_CHUNK) {
+                    let placeholders = vec!["?"; chunk.len()].join(",");
+                    let sql = format!(
+                        "SELECT session_id, id, data, time_created FROM message WHERE session_id IN ({placeholders})"
+                    );
+                    let bind: Vec<ParamValue> =
+                        chunk.iter().map(|id| ParamValue::from(id.as_str())).collect();
+                    rows.extend(conn.query_map_collect(&sql, &bind, |row| {
+                        Ok(SqliteMessageRow {
+                            session_id: row.get_typed(0)?,
+                            id: row.get_typed(1)?,
+                            data_json: row.get_typed(2)?,
+                            time_created_raw: optional_sqlite_value(row, 3),
+                        })
+                    })?);
+                }
+                rows
+            }
+        };
+
+        // Decode only the parts belonging to the messages we actually loaded.
+        let kept_message_ids: Option<HashSet<String>> =
+            keep_session_ids.map(|_| rows.iter().map(|row| row.id.clone()).collect());
+        let mut parts_by_message =
+            Self::load_sqlite_parts_by_message(conn, kept_message_ids.as_ref(), progress_tick)?;
 
         let mut pending_by_session: HashMap<String, Vec<PendingSqliteMessage>> = HashMap::new();
 
-        for row in rows {
+        for (row_index, row) in rows.into_iter().enumerate() {
+            opencode_scan_tick(progress_tick, row_index);
             let msg_data: SqliteMessageData = match serde_json::from_str(&row.data_json) {
                 Ok(d) => d,
                 Err(e) => {
@@ -647,17 +726,41 @@ impl OpenCodeConnector {
         Ok(messages_by_session)
     }
 
-    fn load_sqlite_parts_by_message(conn: &Connection) -> Result<HashMap<String, Vec<PartInfo>>> {
-        let rows: Vec<(String, String)> = conn.query_map_collect(
-            "SELECT message_id, data
-             FROM part
-             ORDER BY message_id ASC, time_created ASC, id ASC",
-            params![],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-        )?;
+    fn load_sqlite_parts_by_message(
+        conn: &Connection,
+        message_ids: Option<&HashSet<String>>,
+        progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<HashMap<String, Vec<PartInfo>>> {
+        // No ORDER BY — parts are re-sorted per message below. On an incremental
+        // scan only the kept messages' parts are read/decoded (#372: the `part`
+        // table is the largest, so this is the dominant saving).
+        let rows: Vec<(String, String)> = match message_ids {
+            None => conn.query_map_collect(
+                "SELECT message_id, data FROM part",
+                params![],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?,
+            Some(ids) => {
+                let id_list: Vec<&String> = ids.iter().collect();
+                let mut rows: Vec<(String, String)> = Vec::new();
+                for chunk in id_list.chunks(OPENCODE_SQL_IN_CHUNK) {
+                    let placeholders = vec!["?"; chunk.len()].join(",");
+                    let sql = format!(
+                        "SELECT message_id, data FROM part WHERE message_id IN ({placeholders})"
+                    );
+                    let bind: Vec<ParamValue> =
+                        chunk.iter().map(|id| ParamValue::from(id.as_str())).collect();
+                    rows.extend(conn.query_map_collect(&sql, &bind, |row| {
+                        Ok((row.get_typed(0)?, row.get_typed(1)?))
+                    })?);
+                }
+                rows
+            }
+        };
 
         let mut parts_by_message: HashMap<String, Vec<PartInfo>> = HashMap::new();
-        for (message_id, row) in rows {
+        for (row_index, (message_id, row)) in rows.into_iter().enumerate() {
+            opencode_scan_tick(progress_tick, row_index);
             match serde_json::from_str::<SqlitePartData>(&row) {
                 Ok(part_data) => {
                     parts_by_message
@@ -870,7 +973,7 @@ impl Connector for OpenCodeConnector {
             if !scanned_dbs.insert(canonical) {
                 continue;
             }
-            match Self::extract_from_sqlite(&db, ctx.since_ts) {
+            match Self::extract_from_sqlite(&db, ctx.since_ts, ctx.progress_tick.as_deref()) {
                 Ok(sqlite_convs) => {
                     tracing::debug!(
                         "opencode sqlite: found {} sessions in {}",
@@ -3007,7 +3110,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-1"));
         assert_eq!(convs[0].title.as_deref(), Some("Test Session"));
@@ -3020,11 +3123,144 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_extract_incremental_skips_old_sessions_without_dropping_new() {
+        use std::collections::HashSet;
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+
+        let insert = |sid: &str, updated_ms: Option<i64>, msg_created_ms: i64, text: &str| {
+            match updated_ms {
+                Some(u) => conn
+                    .execute_compat(
+                        "INSERT INTO session (id, title, time_updated) VALUES (?1, ?2, ?3)",
+                        params![sid, sid, u],
+                    )
+                    .unwrap(),
+                None => conn
+                    .execute_compat(
+                        "INSERT INTO session (id, title, time_updated) VALUES (?1, ?2, NULL)",
+                        params![sid, sid],
+                    )
+                    .unwrap(),
+            };
+            conn.execute_compat(
+                "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+                params![
+                    format!("{sid}-m"),
+                    sid,
+                    format!(r#"{{"role":"user","time":{{"created":{msg_created_ms}}}}}"#)
+                ],
+            )
+            .unwrap();
+            conn.execute_compat(
+                "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    format!("{sid}-p"),
+                    format!("{sid}-m"),
+                    sid,
+                    format!(r#"{{"type":"text","text":"{text}"}}"#)
+                ],
+            )
+            .unwrap();
+        };
+
+        let old_ms = 1_700_000_000_000_i64;
+        let new_ms = 1_700_000_900_000_i64;
+        let cutoff = 1_700_000_500_000_i64;
+
+        insert("old", Some(old_ms), old_ms, "old content");
+        insert("new", Some(new_ms), new_ms, "new content");
+        // No session time -> the keep filter must fall through to the per-message
+        // time filter (kept when recent, dropped when old).
+        insert("null-recent", None, new_ms, "null recent content");
+        insert("null-old", None, old_ms, "null old content");
+        drop(conn);
+
+        // Full scan sees every session.
+        let full = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        let full_ids: HashSet<String> =
+            full.iter().filter_map(|c| c.external_id.clone()).collect();
+        assert_eq!(
+            full_ids,
+            ["old", "new", "null-recent", "null-old"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+
+        // Incremental at the cutoff: known-old sessions are skipped without
+        // decoding their parts; the recent + unknown-time-recent survive.
+        let inc = OpenCodeConnector::extract_from_sqlite(&db_path, Some(cutoff), None).unwrap();
+        let inc_ids: HashSet<String> = inc.iter().filter_map(|c| c.external_id.clone()).collect();
+        assert_eq!(
+            inc_ids,
+            ["new", "null-recent"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            "incremental keeps updated>=cutoff and unknown-time+recent-msg, drops the rest"
+        );
+
+        // The kept session's content is byte-identical to the full-scan version:
+        // the decode-skip must not corrupt or lose a kept session's messages.
+        let new_full = full
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("new"))
+            .unwrap();
+        let new_inc = inc
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("new"))
+            .unwrap();
+        assert_eq!(new_inc.messages.len(), new_full.messages.len());
+        assert_eq!(new_inc.messages[0].content, new_full.messages[0].content);
+        assert_eq!(new_inc.messages[0].content, "new content");
+    }
+
+    #[test]
+    fn sqlite_extract_calls_progress_tick_during_scan() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute_compat(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["s", "s"],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["m", "s", r#"{"role":"user"}"#],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params!["p", "m", "s", r#"{"type":"text","text":"hi"}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let tick = move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        };
+        let convs =
+            OpenCodeConnector::extract_from_sqlite(&db_path, None, Some(&tick)).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert!(
+            ticks.load(Ordering::Relaxed) >= 1,
+            "the scan progress tick must fire while decoding (cass#373 Variant A)"
+        );
+    }
+
+    #[test]
     fn sqlite_extract_empty_db() {
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert!(convs.is_empty());
     }
 
@@ -3043,7 +3279,7 @@ mod tests {
         // Session with no messages should be skipped
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert!(convs.is_empty());
     }
 
@@ -3091,7 +3327,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.contains("Let me check that."));
         assert!(convs[0].messages[0].content.contains("[Tool Output]"));
@@ -3130,7 +3366,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 2);
     }
 
@@ -3180,7 +3416,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 2);
 
         let sess_a = convs
@@ -3263,7 +3499,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 1);
         // Epoch seconds should be normalized to milliseconds
         assert_eq!(convs[0].started_at, Some(1_700_000_000_000));
@@ -3300,7 +3536,7 @@ mod tests {
 
         drop(conn);
 
-        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].metadata["source"], "sqlite");
         assert_eq!(convs[0].metadata["project_id"], "proj-meta");
