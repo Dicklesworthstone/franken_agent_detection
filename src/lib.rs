@@ -310,6 +310,15 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root).join("data").join("sessions")])
         }
+        "kimi" => {
+            // Current Kimi Code CLI honors $KIMI_CODE_HOME (default ~/.kimi-code)
+            // and stores transcripts under its `sessions/` subtree.
+            let root = read("KIMI_CODE_HOME")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root).join("sessions")])
+        }
         _ => None,
     }
 }
@@ -641,6 +650,10 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".hermes"]);
         }
         "kimi" => {
+            // Current Kimi Code CLI (default $KIMI_CODE_HOME = ~/.kimi-code).
+            maybe_push(&mut out, &[".kimi-code", "sessions"]);
+            maybe_push(&mut out, &[".kimi-code"]);
+            // Legacy Kimi CLI layout (~/.kimi/sessions).
             maybe_push(&mut out, &[".kimi", "sessions"]);
             maybe_push(&mut out, &[".kimi"]);
         }
@@ -1105,7 +1118,12 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".grok"]),
                 ],
                 "hermes" => vec![tilde(&[".hermes", "state.db"]), tilde(&[".hermes"])],
-                "kimi" => vec![tilde(&[".kimi", "sessions"]), tilde(&[".kimi"])],
+                "kimi" => vec![
+                    tilde(&[".kimi-code", "sessions"]),
+                    tilde(&[".kimi-code"]),
+                    tilde(&[".kimi", "sessions"]),
+                    tilde(&[".kimi"]),
+                ],
                 "opencode" => vec![
                     // Direct path to the v1.2+ SQLite database — probed first
                     // so display/diagnostics surface the data file (not the
