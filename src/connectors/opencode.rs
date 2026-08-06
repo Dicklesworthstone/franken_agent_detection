@@ -623,8 +623,10 @@ impl OpenCodeConnector {
                     let sql = format!(
                         "SELECT session_id, id, data, time_created FROM message WHERE session_id IN ({placeholders})"
                     );
-                    let bind: Vec<ParamValue> =
-                        chunk.iter().map(|id| ParamValue::from(id.as_str())).collect();
+                    let bind: Vec<ParamValue> = chunk
+                        .iter()
+                        .map(|id| ParamValue::from(id.as_str()))
+                        .collect();
                     rows.extend(conn.query_map_collect(&sql, &bind, |row| {
                         Ok(SqliteMessageRow {
                             session_id: row.get_typed(0)?,
@@ -735,11 +737,11 @@ impl OpenCodeConnector {
         // scan only the kept messages' parts are read/decoded (#372: the `part`
         // table is the largest, so this is the dominant saving).
         let rows: Vec<(String, String)> = match message_ids {
-            None => conn.query_map_collect(
-                "SELECT message_id, data FROM part",
-                params![],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-            )?,
+            None => {
+                conn.query_map_collect("SELECT message_id, data FROM part", params![], |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?))
+                })?
+            }
             Some(ids) => {
                 let id_list: Vec<&String> = ids.iter().collect();
                 let mut rows: Vec<(String, String)> = Vec::new();
@@ -748,8 +750,10 @@ impl OpenCodeConnector {
                     let sql = format!(
                         "SELECT message_id, data FROM part WHERE message_id IN ({placeholders})"
                     );
-                    let bind: Vec<ParamValue> =
-                        chunk.iter().map(|id| ParamValue::from(id.as_str())).collect();
+                    let bind: Vec<ParamValue> = chunk
+                        .iter()
+                        .map(|id| ParamValue::from(id.as_str()))
+                        .collect();
                     rows.extend(conn.query_map_collect(&sql, &bind, |row| {
                         Ok((row.get_typed(0)?, row.get_typed(1)?))
                     })?);
@@ -3179,8 +3183,7 @@ mod tests {
 
         // Full scan sees every session.
         let full = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
-        let full_ids: HashSet<String> =
-            full.iter().filter_map(|c| c.external_id.clone()).collect();
+        let full_ids: HashSet<String> = full.iter().filter_map(|c| c.external_id.clone()).collect();
         assert_eq!(
             full_ids,
             ["old", "new", "null-recent", "null-old"]
@@ -3246,8 +3249,7 @@ mod tests {
         let tick = move || {
             counter.fetch_add(1, Ordering::Relaxed);
         };
-        let convs =
-            OpenCodeConnector::extract_from_sqlite(&db_path, None, Some(&tick)).unwrap();
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, Some(&tick)).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(
             ticks.load(Ordering::Relaxed) >= 1,
