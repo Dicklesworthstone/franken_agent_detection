@@ -23,8 +23,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
-use frankensqlite::{Connection, params};
+use frankensqlite::compat::{OpenFlags, RowExt};
+use frankensqlite::params;
+
+use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::env_path_nonempty;

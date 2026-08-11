@@ -33,6 +33,14 @@ pub mod path_trie;
 pub mod pi_agent;
 pub mod qwen;
 pub mod scan;
+#[cfg(any(
+    feature = "cursor",
+    feature = "opencode",
+    feature = "goose",
+    feature = "hermes",
+    feature = "crush"
+))]
+pub mod sqlite_sync;
 pub mod token_extraction;
 pub mod utils;
 pub mod vibe;

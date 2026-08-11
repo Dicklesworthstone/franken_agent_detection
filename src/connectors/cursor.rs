@@ -29,8 +29,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
-use frankensqlite::{Connection, params};
+use frankensqlite::compat::{OpenFlags, RowExt};
+use frankensqlite::params;
+
+use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
@@ -1288,7 +1290,7 @@ impl Connector for CursorConnector {
 mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
-    use frankensqlite::compat::ConnectionExt;
+    use crate::connectors::sqlite_sync::ConnectionExt;
     use frankensqlite::params;
     use serde_json::json;
     use std::collections::HashSet;
@@ -2064,7 +2066,9 @@ mod tests {
         let result = connector.scan(&ctx);
 
         assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        let got = result.unwrap();
+        for c in &got { eprintln!("DBGX conv id={:?} title={:?} ws={:?}", c.external_id, c.title, c.workspace); }
+        assert!(got.is_empty());
     }
 
     #[test]

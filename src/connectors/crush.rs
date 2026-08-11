@@ -17,7 +17,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, ParamValue, RowExt, open_with_flags};
+use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
+
+use super::sqlite_sync::{ConnectionExt, open_with_flags};
 use serde::Deserialize;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
@@ -389,7 +391,7 @@ fn flush_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::compat::ConnectionExt;
+    use crate::connectors::sqlite_sync::ConnectionExt;
     use frankensqlite::params;
 
     #[test]
@@ -428,7 +430,8 @@ mod tests {
     fn scan_discovers_consumed_sqlite_database() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("crush.db");
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+        let conn = crate::connectors::sqlite_sync::Connection::open(db_path.to_string_lossy().as_ref())
+            .unwrap();
 
         conn.execute(
             "CREATE TABLE sessions (

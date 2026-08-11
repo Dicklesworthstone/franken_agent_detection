@@ -22,8 +22,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
-use frankensqlite::{Connection, Row, SqliteValue, params};
+use frankensqlite::compat::{OpenFlags, RowExt};
+use frankensqlite::{Row, SqliteValue, params};
+
+use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
