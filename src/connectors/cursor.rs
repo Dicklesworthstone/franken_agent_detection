@@ -2066,9 +2066,7 @@ mod tests {
         let result = connector.scan(&ctx);
 
         assert!(result.is_ok());
-        let got = result.unwrap();
-        for c in &got { eprintln!("DBGX conv id={:?} title={:?} ws={:?}", c.external_id, c.title, c.workspace); }
-        assert!(got.is_empty());
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
