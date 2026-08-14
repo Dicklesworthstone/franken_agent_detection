@@ -33,10 +33,12 @@ aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
-frankensqlite = { version = "0.2.1", package = "fsqlite", optional = true }
-# Drives fsqlite 0.2's async (!Send) engine futures to completion behind the
+frankensqlite = { version = "0.3.0", package = "fsqlite", optional = true }
+# Drives fsqlite's async (!Send) engine futures to completion behind the
 # connectors' synchronous API surface (see connectors/sqlite_sync.rs).
-asupersync = { version = "0.3.10", default-features = false, optional = true }
+# fsqlite 0.3 names asupersync 0.4.x types in its public API, so the two
+# must move in lockstep (asupersync 0.3.x and 0.4.x are non-interchangeable).
+asupersync = { version = "0.4.3", default-features = false, optional = true }
 
 [features]
 default = []
