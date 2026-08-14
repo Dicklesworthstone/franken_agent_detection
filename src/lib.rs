@@ -137,6 +137,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "grok",
     "hermes",
     "kimi",
+    "muse",
     "opencode",
     "openclaw",
     "openhands",
@@ -167,6 +168,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "grok" | "grok-cli" | "grok-build" | "xai-grok" => Some("grok"),
         "hermes" | "hermes-agent" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
+        "muse" | "muse-code" | "muse_code" | "musecode" | "meta-muse" => Some("muse"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
         "openhands" | "open-hands" => Some("openhands"),
@@ -316,6 +318,13 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                 return None;
             }
             Some(vec![PathBuf::from(root).join("data").join("sessions")])
+        }
+        "muse" => {
+            let root = read("CASS_MUSE_DATA_ROOT")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root)])
         }
         _ => None,
     }
@@ -655,6 +664,18 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".kimi-code"]);
             maybe_push(&mut out, &[".kimi", "sessions"]);
             maybe_push(&mut out, &[".kimi"]);
+        }
+        "muse" => {
+            // Meta's Muse Code CLI (Aug 2026). Layout per a field report
+            // (issue #15): XDG data dir holds sessions, XDG config holds
+            // auth. Probe the sessions tree first (highest-signal), then
+            // auth.json (present once authenticated, survives session
+            // wipes), then the parents. macOS placement is unverified —
+            // XDG paths only until confirmed.
+            maybe_push(&mut out, &[".local", "share", "muse", "sessions"]);
+            maybe_push(&mut out, &[".config", "muse", "auth.json"]);
+            maybe_push(&mut out, &[".local", "share", "muse"]);
+            maybe_push(&mut out, &[".config", "muse"]);
         }
         "opencode" => {
             // The canonical v1.2+ SQLite database. Probed first so diagnostic
@@ -1130,6 +1151,12 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".kimi", "sessions"]),
                     tilde(&[".kimi"]),
                 ],
+                "muse" => vec![
+                    tilde(&[".local", "share", "muse", "sessions"]),
+                    tilde(&[".config", "muse", "auth.json"]),
+                    tilde(&[".local", "share", "muse"]),
+                    tilde(&[".config", "muse"]),
+                ],
                 "opencode" => vec![
                     // Direct path to the v1.2+ SQLite database — probed first
                     // so display/diagnostics surface the data file (not the
@@ -1528,6 +1555,12 @@ mod tests {
         assert!(grok.contains(&"~/.grok/sessions".to_string()));
         assert!(grok.contains(&"~/.grok/auth.json".to_string()));
         assert!(grok.contains(&"~/.grok".to_string()));
+
+        let muse = by_slug.get("muse").expect("muse paths");
+        assert!(muse.contains(&"~/.local/share/muse/sessions".to_string()));
+        assert!(muse.contains(&"~/.config/muse/auth.json".to_string()));
+        assert!(muse.contains(&"~/.local/share/muse".to_string()));
+        assert!(muse.contains(&"~/.config/muse".to_string()));
 
         let kimi = by_slug.get("kimi").expect("kimi paths");
         assert!(kimi.contains(&"~/.kimi-code/sessions".to_string()));
