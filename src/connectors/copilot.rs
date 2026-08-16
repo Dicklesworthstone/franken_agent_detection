@@ -1,6 +1,20 @@
 //! Connector for GitHub Copilot Chat session logs.
 //!
-//! GitHub Copilot Chat stores conversation history in VS Code's globalStorage:
+//! ## Native VS Code chat-session storage (the primary history)
+//!
+//! VS Code's own chat store holds the bulk of Copilot Chat history and is
+//! workspace-scoped (issue #16). It is handled by the
+//! [`copilot_vscode`](super::copilot_vscode) module and covers, per product
+//! root (`Code`, `Code - Insiders`, `VSCodium`) on Linux/macOS/Windows:
+//! - `User/workspaceStorage/<id>/chatSessions/*.json|*.jsonl`
+//! - `User/globalStorage/emptyWindowChatSessions/*.json|*.jsonl`
+//! - `User/globalStorage/transferredChatSessions/*.json|*.jsonl`
+//! - legacy `state.vscdb` (`interactive.sessions`) with the `copilot-vscdb`
+//!   cargo feature
+//!
+//! ## Converted/extension globalStorage JSON
+//!
+//! Converted or extension-produced JSON may also live in globalStorage:
 //! - Linux: ~/.config/Code/User/globalStorage/github.copilot-chat/
 //! - macOS: ~/Library/Application Support/Code/User/globalStorage/github.copilot-chat/
 //! - Windows: %APPDATA%/Code/User/globalStorage/github.copilot-chat/
@@ -53,6 +67,7 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use super::copilot_vscode;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
@@ -317,6 +332,29 @@ impl CopilotConnector {
         files
     }
 
+    /// Bases handed to the native VS Code chat-session store scanner
+    /// (issue #16). Explicit scan roots are expanded by the
+    /// [`copilot_vscode`] module itself; in default-detection mode the
+    /// platform `User` roots are probed unless `data_dir` explicitly targets
+    /// either store family.
+    fn native_scan_bases(ctx: &ScanContext) -> Vec<ScanRoot> {
+        if !ctx.use_default_detection() {
+            return ctx.scan_roots.clone();
+        }
+        if ctx.data_dir.exists() && copilot_vscode::looks_like_native_store(&ctx.data_dir) {
+            return vec![ScanRoot::local(ctx.data_dir.clone())];
+        }
+        if ctx.data_dir.exists() && Self::looks_like_copilot_storage(&ctx.data_dir) {
+            // data_dir pins the scan to the extension/CLI store only.
+            return Vec::new();
+        }
+        copilot_vscode::default_user_roots()
+            .into_iter()
+            .filter(|path| path.exists())
+            .map(ScanRoot::local)
+            .collect()
+    }
+
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots: Vec<ScanRoot> = Vec::new();
 
@@ -364,6 +402,11 @@ impl CopilotConnector {
                 );
             }
         }
+        // Native VS Code chat-session stores (issue #16).
+        out.extend(copilot_vscode::discover_native(
+            &Self::native_scan_bases(ctx),
+            ctx.since_ts,
+        ));
         out
     }
 
@@ -1048,10 +1091,6 @@ impl Connector for CopilotConnector {
             .into_iter()
             .map(|root| root.path)
             .collect();
-
-        if roots.is_empty() {
-            return Ok(Vec::new());
-        }
 
         let mut all_conversations = Vec::new();
 

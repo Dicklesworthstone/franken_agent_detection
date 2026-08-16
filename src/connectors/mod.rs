@@ -13,6 +13,7 @@ pub mod cline;
 pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;
+pub(crate) mod copilot_vscode;
 #[cfg(feature = "crush")]
 pub mod crush;
 #[cfg(feature = "cursor")]
@@ -39,7 +40,8 @@ pub mod scan;
     feature = "opencode",
     feature = "goose",
     feature = "hermes",
-    feature = "crush"
+    feature = "crush",
+    feature = "copilot-vscdb"
 ))]
 pub mod sqlite_sync;
 pub mod token_extraction;
