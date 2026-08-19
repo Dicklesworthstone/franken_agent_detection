@@ -25,3 +25,8 @@ fad_illustration.png
 
 # NTM session state
 .ntm/
+
+# Skill-loop / repo-janitor scratch
+.skill-loop-progress.md
+.skill-loop-progress-*.md
+
