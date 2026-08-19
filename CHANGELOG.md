@@ -8,22 +8,84 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Repository: <https://github.com/Dicklesworthstone/franken_agent_detection>
 Crate: <https://crates.io/crates/franken-agent-detection>
 
-> **Release vs. tag:** v0.1.1 and v0.1.3 are the published crates.io releases.
-> v0.1.2 exists as a git tag but was never published to crates.io. No formal
-> GitHub Releases have been created. v0.1.0 was never published
-> (crates.io rejected it due to wildcard dependency versions).
+> **Release vs. tag:** GitHub Releases exist for
+> [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4),
+> [`v0.1.5`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.5),
+> [`v0.1.6`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.6),
+> [`v0.1.7`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7),
+> [`v0.1.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9),
+> and [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10)
+> (latest, published 2026-08-16). `v0.1.1`, `v0.1.2`, and `v0.1.3` are git tags;
+> they do **not** have GitHub Release pages — do not invent them. `v0.1.2` was
+> never published to crates.io. `v0.1.0` was never published (crates.io
+> rejected wildcard dependency versions). There is no `v0.1.8` tag or Release.
+> In-tree Cargo is `0.1.10`.
+
+Scope window: 2026-02-15 through HEAD
+[`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
+(2026-08-19). Current Unreleased window is since GitHub Release
+[`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10).
+
+## Version Timeline
+
+| Version | Kind | Date | Summary |
+|---------|------|------|---------|
+| `main` @ [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666) | Unreleased `main` tip | 2026-08-19 | VS Code native Copilot store (#16); janitor moved `UPGRADE_LOG.md` to `docs/planning/`. |
+| [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10) | GitHub Release | 2026-08-16 | Muse Code, Grok Build, Kimi current layout, Oh My Pi, OpenCode scan perf. |
+| [`v0.1.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9) | GitHub Release | 2026-07-02 | Codex `output_text` / `response_item` tool-call capture (#13). |
+| [`v0.1.7`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7) | GitHub Release | 2026-05-17 | See Release page; not reconstructed as a wave in this file. |
+| [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4)–[`v0.1.6`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.6) | GitHub Releases | 2026-05-16 | See Release pages; not reconstructed as waves in this file. |
+| `v0.1.3` / `v0.1.2` / `v0.1.1` | Git tags (not GitHub Releases) | 2026-03-22 / 2026-03-02 / 2026-02-22 | Tag-only; no Release pages. |
+| `v0.1.0` | Unpublished | 2026-02-15 | crates.io rejected wildcard dependency versions. |
 
 ---
 
-## [Unreleased] -- since v0.1.3
+## [Unreleased] -- since v0.1.10
+
+Current window after the [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10)
+GitHub Release (tag [`f68fc8b`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/f68fc8bb0efe8027a99531b90c555a77bc6fabd7),
+2026-08-14; Release published 2026-08-16) through HEAD
+[`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
+(2026-08-19): 3 non-merge commits.
 
 ### Added
 
+- **VS Code native Copilot chat-session store** ([#16](https://github.com/Dicklesworthstone/franken_agent_detection/issues/16)).
+  Scan now covers VS Code's native Copilot chat-session store in addition to
+  the existing Copilot surfaces.
+
+  [`c8816ff`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/c8816fff484378f362dd517f1f0dd9691c8aeb5a)
+
+### Janitor docs-reorg (2026-08-19)
+
+`UPGRADE_LOG.md` moved to
+[`docs/planning/UPGRADE_LOG.md`](docs/planning/UPGRADE_LOG.md).
+Skill-loop scratch is gitignored. No connector behavior change.
+
+**Representative commits**
+- [`80bd71f`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/80bd71fa90b21c440d43d0569bd0740c7ef08132) — `chore(janitor): untrack skill-loop scratch; move root planning docs into docs/planning/`
+- [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666) — `chore(janitor): relocate remaining root reports and planning docs`
+
+---
+
+## [0.1.10] -- 2026-08-14
+
+GitHub Release [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10)
+published 2026-08-16. Tag points at
+[`f68fc8b`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/f68fc8bb0efe8027a99531b90c555a77bc6fabd7).
+Cargo is `0.1.10`.
+
+### Added
+
+- **Muse Code (Meta) connector** per
+  [#15](https://github.com/Dicklesworthstone/franken_agent_detection/issues/15)
+  field report.
+  [`f68fc8b`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/f68fc8bb0efe8027a99531b90c555a77bc6fabd7)
+
 - **Grok Build connector (`GrokConnector`)** — full parser + factory for
   xAI's official `grok` coding CLI
-  (Dicklesworthstone/coding_agent_session_search#328), building on the
-  detection scaffolding below. Reads `$GROK_HOME/sessions/` (default
-  `~/.grok/sessions/`), whose layout is
+  (Dicklesworthstone/coding_agent_session_search#328). Reads `$GROK_HOME/sessions/`
+  (default `~/.grok/sessions/`), whose layout is
   `sessions/<percent-encoded-cwd>/<session-uuid>/`: `updates.jsonl` (the ACP
   session-update stream the CLI's own docs call the authoritative
   conversation log) is the primary read path, `summary.json` supplies
@@ -45,23 +107,34 @@ Crate: <https://crates.io/crates/franken-agent-detection>
   sidecars) included, with synthetic-fixture tests for chunk coalescing,
   tool-call lifecycle, the chat-history fallback, cwd decoding, and
   scan-root flexibility.
+  [`e90eb77`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/e90eb77744a67c43381bd61a1ef8d95efc4ae10a)
 
-- **Grok (xAI) added to the detection inventory.** xAI's Grok CLI / Grok
-  Build TUI keeps its state under `~/.grok/` (sessions, auth, hooks). Added
-  `grok` to `KNOWN_CONNECTORS`, taught `canonical_connector_slug` the
-  `grok-cli` / `grok-build` / `xai-grok` aliases, and wired up
-  `default_probe_roots` for `~/.grok/sessions`, `~/.grok/auth.json`, and
-  `~/.grok`. Conformance test updated so `default_probe_paths_tilde_covers_expected_roots`
-  asserts the new probe roots.
+- **Kimi Code current layout** alongside legacy `~/.kimi`, including the
+  current event schema (cass#351).
+  [`f685a69`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/f685a69b9ed77f51f05256dd0e35852e16a7817b)
 
-  Note: this lands detection-level support (presence, probe roots) only.
-  A full conversation/normalization connector for Grok session data is
-  deferred — Grok's session format is JSON-on-disk but the schema is still
-  evolving, so adding a connector now would invite churn.
+- **Oh My Pi (`omp`) sessions** on the `pi_agent` connector: probe roots and
+  sub-agent transcripts. `PI_SESSIONS_DIR` is honored; unsupported V2/SQLite
+  stores diagnose instead of silently dropping.
+  [`1a25887`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/1a258873315644914e81d637d651673ac9211e3b)
+
+### Changed
+
+- **OpenCode incremental SQLite scan** skips old sessions' message/part decode
+  (cass#372). Optional `ScanContext` progress-tick for long scans (cass#373).
+  Remote-root scans never pull local canonical DBs (cass#357).
+  [`63b19eb`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/63b19eb846262b8cc15877c2577519f82263fbcd)
+
+- **fsqlite 0.2 async engine** bridged through an asupersync sync wrapper;
+  lockstep bump to fsqlite 0.3.0 + asupersync 0.4.3.
+  [`530d8a9`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/530d8a91081e4c5cd45651789312c6dcbafd4afa)
 
 ---
 
 ## [0.1.9] -- 2026-06-30
+
+GitHub Release [`v0.1.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9)
+(published 2026-07-02).
 
 ### Fixed
 
@@ -241,13 +314,25 @@ Initial public release. No git tag. Not published to crates.io (rejected due to 
 | 0.1.1 | aider, amp, chatgpt, clawdbot, openclaw, pi_agent, vibe | 16 |
 | 0.1.2 | continue, goose | 18 |
 | 0.1.3 | copilot_cli, kimi, qwen | 21 |
+| 0.1.10 | grok, muse, kimi-current-layout, pi_agent omp | (plus VS Code native Copilot store on Unreleased) |
 
 > Note: The `github-copilot` connector (VS Code Copilot Chat) was in the
 > detection registry since v0.1.0; the full session-parsing implementation
 > (`copilot.rs`) was added in v0.1.1, and the separate `copilot_cli` connector
-> for `gh copilot` CLI event logs arrived in v0.1.3.
+> for `gh copilot` CLI event logs arrived in v0.1.3. VS Code's native Copilot
+> chat-session store landed after `v0.1.10` (Unreleased, issue #16).
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.1.3...HEAD
+> `v0.1.4`–`v0.1.7` exist as GitHub Releases (2026-05-16 / 2026-05-17) and are
+> listed above in the Release-vs-tag note. They are not reconstructed as
+> capability-wave sections in this file.
+
+[Unreleased]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10
+[0.1.9]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9
+[0.1.7]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7
+[0.1.6]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.6
+[0.1.5]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.5
+[0.1.4]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4
 [0.1.3]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/fa960bcdc294c9f7e16eafc5cbaf43b972c95eab...v0.1.1
