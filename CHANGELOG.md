@@ -48,6 +48,16 @@ GitHub Release (tag [`f68fc8b`](https://github.com/Dicklesworthstone/franken_age
 [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
 (2026-08-19): 3 non-merge commits.
 
+### Delivered capability
+
+- VS Code native Copilot chat-session store is now a scan surface (#16).
+- `UPGRADE_LOG.md` lives under `docs/planning/`; skill-loop scratch is gitignored.
+
+### Closed workstreams
+
+- [#16](https://github.com/Dicklesworthstone/franken_agent_detection/issues/16) VS Code native Copilot store.
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/franken_agent_detection/blob/main/.beads/issues.jsonl).
+
 ### Added
 
 - **VS Code native Copilot chat-session store** ([#16](https://github.com/Dicklesworthstone/franken_agent_detection/issues/16)).
