@@ -459,12 +459,34 @@ pub fn scan_homes(
     ctx: &super::ScanContext,
     agent_slug: &'static str,
 ) -> Result<Vec<NormalizedConversation>> {
+    let tagged: Vec<(PathBuf, Option<String>)> =
+        homes.iter().map(|home| (home.clone(), None)).collect();
+    scan_homes_tagged(&tagged, ctx, agent_slug)
+}
+
+/// Like [`scan_homes`], but each home carries optional profile provenance.
+///
+/// Provenance covers Oh My Pi named profiles: when a home is tagged, every
+/// conversation parsed from it gets `metadata.profile = "<name>"` so
+/// downstream consumers can reconstruct `omp --profile <name> --resume <id>`
+/// instead of losing the profile after normalization
+/// (`franken_agent_detection#17`).
+///
+/// Dedup is first-wins across the whole list: a session file reachable
+/// through two homes (symlinks, overlapping roots) keeps the provenance of
+/// the first home that reached it, so callers should order roots
+/// most-specific first.
+pub fn scan_homes_tagged(
+    homes: &[(PathBuf, Option<String>)],
+    ctx: &super::ScanContext,
+    agent_slug: &'static str,
+) -> Result<Vec<NormalizedConversation>> {
     use crate::connectors::file_modified_since;
 
     let mut convs = Vec::new();
     let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
 
-    for home in homes {
+    for (home, profile) in homes {
         let files = session_files(home);
         if files.is_empty() {
             continue;
@@ -483,7 +505,15 @@ pub fn scan_homes(
                 continue;
             }
 
-            if let Some(conversation) = parse_session_file(&file, &sessions, agent_slug) {
+            if let Some(mut conversation) = parse_session_file(&file, &sessions, agent_slug) {
+                if let Some(profile) = profile {
+                    if let Some(meta) = conversation.metadata.as_object_mut() {
+                        meta.insert(
+                            "profile".to_string(),
+                            serde_json::Value::String(profile.clone()),
+                        );
+                    }
+                }
                 convs.push(conversation);
             }
         }

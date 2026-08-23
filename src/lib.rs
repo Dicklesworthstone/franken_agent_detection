@@ -705,13 +705,22 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".openhands"]);
         }
         "omp" => {
-            // Oh My Pi (`omp`, https://omp.sh) pins its store to
-            // ~/.omp/agent; there is no relocation env var in the CLI, so
-            // these are the canonical roots. Probe the sessions directory
-            // first (highest-signal), then the parent so detection still
-            // fires for fresh installs that haven't created a session yet.
+            // Oh My Pi (`omp`, https://omp.sh) v18 resolves its store via
+            // profiles + XDG (see connectors::omp). Probe the sessions
+            // directory first (highest-signal), then the parent so
+            // detection still fires for fresh installs that haven't
+            // created a session yet, then named-profile and XDG homes.
             maybe_push(&mut out, &[".omp", "agent", "sessions"]);
             maybe_push(&mut out, &[".omp", "agent"]);
+            maybe_push(&mut out, &[".omp", "profiles"]);
+            if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+                let app = PathBuf::from(xdg).join("omp");
+                out.push(app.join("sessions"));
+                out.push(app);
+            } else {
+                maybe_push(&mut out, &[".local", "share", "omp", "sessions"]);
+                maybe_push(&mut out, &[".local", "share", "omp"]);
+            }
         }
         "pi_agent" => {
             maybe_push(&mut out, &[".pi", "agent", "sessions"]);
@@ -1183,10 +1192,16 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".openhands"]),
                 ],
                 "omp" => vec![
-                    // Oh My Pi (`omp`, https://omp.sh) canonical store; the
-                    // dedicated omp connector owns these roots.
+                    // Oh My Pi (`omp`, https://omp.sh) canonical stores; the
+                    // dedicated omp connector owns these roots. Remote
+                    // probes are static paths, so named profiles use the
+                    // profiles parent and XDG uses the conventional
+                    // ~/.local/share location.
                     tilde(&[".omp", "agent", "sessions"]),
                     tilde(&[".omp", "agent"]),
+                    tilde(&[".omp", "profiles"]),
+                    tilde(&[".local", "share", "omp", "sessions"]),
+                    tilde(&[".local", "share", "omp"]),
                 ],
                 "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
                 "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],

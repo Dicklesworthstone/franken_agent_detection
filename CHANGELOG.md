@@ -30,7 +30,7 @@ Scope window: 2026-02-15 through HEAD
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| `main` @ [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666) | Unreleased `main` tip | 2026-08-19 | VS Code native Copilot store (#16); janitor moved `UPGRADE_LOG.md` to `docs/planning/`. |
+| [`v0.2.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.0) | GitHub Release | 2026-08-23 | First-class Oh My Pi (`omp`) connector; shared pi-family wire parser; dep refresh (aes-gcm 0.11, base64 0.23, fsqlite 0.3.8 + asupersync 0.4.9). |
 | [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10) | GitHub Release | 2026-08-16 | Muse Code, Grok Build, Kimi current layout, Oh My Pi, OpenCode scan perf. |
 | [`v0.1.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9) | GitHub Release | 2026-07-02 | Codex `output_text` / `response_item` tool-call capture (#13). |
 | [`v0.1.7`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7) | GitHub Release | 2026-05-17 | See Release page; not reconstructed as a wave in this file. |
@@ -40,7 +40,54 @@ Scope window: 2026-02-15 through HEAD
 
 ---
 
-## [Unreleased] -- since v0.1.10
+## [0.2.0] -- 2026-08-23
+
+First-class Oh My Pi (`omp`) support plus dependency refresh.
+
+### Added
+
+- **Oh My Pi (`omp`, <https://omp.sh>) connector** — `OmpConnector` is now a
+  first-class connector slug instead of a piggyback surface on `pi_agent`.
+  omp pins its session store to `~/.omp/agent/` (no relocation env var in
+  the CLI itself), so detection probes `~/.omp/agent/sessions` first and the
+  parent second; `CASS_OMP_DATA_ROOT` overrides detection for tests and CI,
+  and the aliases `oh-my-pi` / `omp` both canonicalize to `omp`. Scanning
+  covers main transcripts
+  (`sessions/<safe-path>/<timestamp>_<uuid>.jsonl`) and sub-agent
+  transcripts (`<timestamp>_<uuid>/<AgentName>.jsonl`), handles omp's
+  standalone `title` entries (preferred over the session-header title) and
+  bare-`model` `model_change` records, and stamps conversations with
+  `agent_slug: "omp"`.
+- **Named-profile provenance for omp homes**
+  (`franken_agent_detection#17`): profile-aware scan entry points tag every
+  conversation with `metadata.profile` so consumers can reconstruct
+  `omp --profile <name> --resume <id>`; `OMP_PROFILE` takes precedence over
+  legacy `PI_PROFILE`, mirroring upstream `resolveProfileEnv`.
+- **Shared pi-family wire parser** (`connectors/pi_wire.rs`): the JSONL v3
+  traversal/parsing primitives moved out of `pi_agent.rs` into one module
+  consumed by both the `pi_agent` and `omp` connectors, so the two
+  distributions can no longer drift apart at the parser level.
+
+### Changed
+
+- **`pi_agent` is scoped back to `~/.pi/agent`** (behavior change): with omp
+  owned by its own connector, `pi_agent` no longer walks `.omp` trees by
+  default. Machines with both distributions now get correctly attributed
+  conversations per slug instead of double-counted sessions; explicit scan
+  roots are unaffected.
+- Dependencies refreshed: `aes-gcm` 0.10 → 0.11 (with the deprecated
+  `Nonce::from_slice` call migrated to `TryFrom` + `&nonce` decrypt),
+  `base64` 0.22 → 0.23, `serial_test` 3 → 4, and the SQLite engine pair
+  moved in lockstep (`fsqlite` 0.3.8 with `asupersync` 0.4.9).
+
+### Fixed
+
+- Restored the `"open-claw"` alias arm in `canonical_connector_slug` that an
+  insertion during this window accidentally dropped.
+- omp root discovery existence-gates its expansion candidates so unrelated
+  explicit scan roots cannot fabricate phantom `.omp/...` probe paths.
+
+---
 
 Current window after the [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10)
 GitHub Release (tag [`f68fc8b`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/f68fc8bb0efe8027a99531b90c555a77bc6fabd7),
