@@ -593,9 +593,7 @@ fn parse_session(session_file: &Path) -> Option<NormalizedConversation> {
                             if !call_ids.is_empty() {
                                 extra.insert(
                                     "tool_call_ids".to_string(),
-                                    Value::Array(
-                                        call_ids.into_iter().map(Value::String).collect(),
-                                    ),
+                                    Value::Array(call_ids.into_iter().map(Value::String).collect()),
                                 );
                             }
                             push_message(
@@ -822,6 +820,9 @@ mod tests {
         .expect("serialize envelope")
     }
 
+    // Fixture builder: the owned Value reads naturally at call sites and is
+    // only borrowed by the envelope macro.
+    #[allow(clippy::needless_pass_by_value)]
     fn run_event(sequence: i64, event: serde_json::Value) -> String {
         envelope(
             sequence,
@@ -840,8 +841,14 @@ mod tests {
                 &json!({"record": {"workspace_root": workspace, "build": "0.1.0-R708.1"}}),
             ),
             envelope(2, "session.opened.observed", &json!({})),
-            run_event(3, json!({"kind": "started", "prompt": "Fix the failing test"})),
-            run_event(4, json!({"kind": "model_request_configured", "model": "muse-spark-1.2"})),
+            run_event(
+                3,
+                json!({"kind": "started", "prompt": "Fix the failing test"}),
+            ),
+            run_event(
+                4,
+                json!({"kind": "model_request_configured", "model": "muse-spark-1.2"}),
+            ),
             run_event(
                 5,
                 json!({
@@ -917,7 +924,10 @@ mod tests {
         write_lines(
             &sub_log,
             &[
-                run_event(1, json!({"kind": "started", "prompt": "Search the repo for usages"})),
+                run_event(
+                    1,
+                    json!({"kind": "started", "prompt": "Search the repo for usages"}),
+                ),
                 run_event(
                     2,
                     json!({
@@ -1001,10 +1011,7 @@ mod tests {
 
         // Tool result joined + correlated.
         assert!(conv.messages[2].content.contains("it_works"));
-        assert_eq!(
-            conv.messages[2].extra["tool_call_ids"],
-            json!(["call-1"])
-        );
+        assert_eq!(conv.messages[2].extra["tool_call_ids"], json!(["call-1"]));
 
         // Usage summed once from model_completed only (no
         // goal_usage_attribution double count), reasoning not added on top.
@@ -1050,12 +1057,18 @@ mod tests {
     #[test]
     fn sequence_order_wins_over_file_order() {
         let temp = TempDir::new().expect("tempdir");
-        let log = temp.path().join("sessions/2026/08/05/s1").join(SESSION_FILE);
+        let log = temp
+            .path()
+            .join("sessions/2026/08/05/s1")
+            .join(SESSION_FILE);
         // Assistant line written BEFORE the user line; sequence says otherwise.
         write_lines(
             &log,
             &[
-                run_event(5, json!({"kind": "assistant_message_committed", "text": "answer"})),
+                run_event(
+                    5,
+                    json!({"kind": "assistant_message_committed", "text": "answer"}),
+                ),
                 run_event(2, json!({"kind": "started", "prompt": "question"})),
             ],
         );
@@ -1068,7 +1081,10 @@ mod tests {
     #[test]
     fn malformed_lines_are_skipped_not_fatal() {
         let temp = TempDir::new().expect("tempdir");
-        let log = temp.path().join("sessions/2026/08/05/s2").join(SESSION_FILE);
+        let log = temp
+            .path()
+            .join("sessions/2026/08/05/s2")
+            .join(SESSION_FILE);
         write_lines(
             &log,
             &[
@@ -1076,7 +1092,10 @@ mod tests {
                 "{\"payload_type\":42}".to_string(), // wrong type
                 "{\"no_payload_type\":true,\"payload\":{}}".to_string(),
                 run_event(1, json!({"kind": "started", "prompt": "still parses"})),
-                run_event(2, json!({"kind": "assistant_message_committed", "text": "yes"})),
+                run_event(
+                    2,
+                    json!({"kind": "assistant_message_committed", "text": "yes"}),
+                ),
             ],
         );
         let conv = parse_session(&log).expect("conversation despite noise");
@@ -1086,11 +1105,18 @@ mod tests {
     #[test]
     fn telemetry_only_transcript_yields_nothing() {
         let temp = TempDir::new().expect("tempdir");
-        let log = temp.path().join("sessions/2026/08/05/s3").join(SESSION_FILE);
+        let log = temp
+            .path()
+            .join("sessions/2026/08/05/s3")
+            .join(SESSION_FILE);
         write_lines(
             &log,
             &[
-                envelope(1, "runtime.session.metadata", &json!({"record": {"workspace_root": "/w"}})),
+                envelope(
+                    1,
+                    "runtime.session.metadata",
+                    &json!({"record": {"workspace_root": "/w"}}),
+                ),
                 run_event(2, json!({"kind": "resource_usage_sampled", "rss": 1})),
                 envelope(3, "session.end", &json!({"reason": "completed"})),
             ],

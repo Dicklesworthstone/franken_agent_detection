@@ -430,8 +430,9 @@ mod tests {
     fn scan_discovers_consumed_sqlite_database() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("crush.db");
-        let conn = crate::connectors::sqlite_sync::Connection::open(db_path.to_string_lossy().as_ref())
-            .unwrap();
+        let conn =
+            crate::connectors::sqlite_sync::Connection::open(db_path.to_string_lossy().as_ref())
+                .unwrap();
 
         conn.execute(
             "CREATE TABLE sessions (
