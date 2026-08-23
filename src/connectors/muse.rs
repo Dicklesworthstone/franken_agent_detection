@@ -820,6 +820,9 @@ mod tests {
         .expect("serialize envelope")
     }
 
+    // Fixture builder: the owned Value reads naturally at call sites and is
+    // only borrowed by the envelope macro.
+    #[allow(clippy::needless_pass_by_value)]
     fn run_event(sequence: i64, event: serde_json::Value) -> String {
         envelope(
             sequence,

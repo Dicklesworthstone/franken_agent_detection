@@ -36,8 +36,8 @@
 //!    - `{"kind":1,"k":[…],"v":…}` — set value at key path
 //!    - `{"kind":2,"k":[…],"v":[…]?,"i":n?}` — array push; `i` truncates first
 //!    - `{"kind":3,"k":[…]}` — delete at key path
-//!    A truncated final line is a normal artifact of an interrupted append and
-//!    is tolerated; malformed interior lines are skipped-and-logged.
+//!      A truncated final line is a normal artifact of an interrupted append
+//!      and is tolerated; malformed interior lines are skipped-and-logged.
 //!
 //! ## Provider filtering
 //!
@@ -89,7 +89,7 @@ const STORE_STATE_DB: &str = "vscode-state-db";
 
 /// Native storage generation, ordered by parse priority (newest first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum NativeFormat {
+pub enum NativeFormat {
     /// `<session-id>.jsonl` append log (VS Code 1.109+).
     AppendLog,
     /// `<session-id>.json` flat serialized session (March 2025 – 1.108).
@@ -101,7 +101,7 @@ pub(crate) enum NativeFormat {
 /// One native chat-session source file, plus enough context to resolve the
 /// owning workspace.
 #[derive(Debug, Clone)]
-pub(crate) struct NativeSource {
+pub struct NativeSource {
     pub format: NativeFormat,
     pub path: PathBuf,
     /// Which store family the file came from (metadata label).
@@ -116,7 +116,7 @@ pub(crate) struct NativeSource {
 // ---------------------------------------------------------------------------
 
 /// Default VS Code `User` roots probed when no explicit scan roots are given.
-pub(crate) fn default_user_roots() -> Vec<PathBuf> {
+pub fn default_user_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(home) = dirs::home_dir() {
         for product in PRODUCT_DIRS {
@@ -141,7 +141,7 @@ pub(crate) fn default_user_roots() -> Vec<PathBuf> {
 
 /// Whether a path clearly points into VS Code's native chat storage (used to
 /// honor a `data_dir` that targets the native store directly).
-pub(crate) fn looks_like_native_store(path: &Path) -> bool {
+pub fn looks_like_native_store(path: &Path) -> bool {
     let named = |name: &str| {
         path.components().any(|component| {
             let segment = component.as_os_str().to_string_lossy();
@@ -306,7 +306,7 @@ fn push_source_for_file(out: &mut Vec<NativeSource>, file: &Path) {
 /// Accepts a session file, a session container, a `workspaceStorage` /
 /// `globalStorage` / `User` / product directory, a platform config directory
 /// (`.config`, `Application Support`, `AppData/Roaming`), or a home-like root.
-pub(crate) fn native_sources_under(base: &Path) -> Vec<NativeSource> {
+pub fn native_sources_under(base: &Path) -> Vec<NativeSource> {
     let mut out = Vec::new();
     if base.is_file() {
         push_source_for_file(&mut out, base);
@@ -404,14 +404,16 @@ fn apply_set(state: &mut Value, path: &[Value], value: Value) -> bool {
     let Some(arr) = parent.as_array_mut() else {
         return false;
     };
-    if idx < arr.len() {
-        arr[idx] = value;
-        true
-    } else if idx == arr.len() {
-        arr.push(value);
-        true
-    } else {
-        false
+    match idx.cmp(&arr.len()) {
+        std::cmp::Ordering::Less => {
+            arr[idx] = value;
+            true
+        }
+        std::cmp::Ordering::Equal => {
+            arr.push(value);
+            true
+        }
+        std::cmp::Ordering::Greater => false,
     }
 }
 
@@ -493,7 +495,7 @@ fn apply_push(
 /// malformed *final* line is tolerated silently as a truncated append (the
 /// normal crash/power-loss artifact for this format); malformed or
 /// inapplicable interior entries are skipped-and-logged.
-pub(crate) fn replay_append_log(content: &str, path: &Path) -> Option<Value> {
+pub fn replay_append_log(content: &str, path: &Path) -> Option<Value> {
     let lines: Vec<&str> = content
         .lines()
         .map(str::trim)
@@ -593,7 +595,7 @@ fn agent_is_copilot(agent: &Value) -> bool {
 
 /// Admit only sessions whose serialized metadata identifies GitHub Copilot.
 /// The native store is shared by all chat providers (issue #16).
-pub(crate) fn session_is_copilot(session: &Value) -> bool {
+pub fn session_is_copilot(session: &Value) -> bool {
     if session
         .get("responderUsername")
         .and_then(Value::as_str)
@@ -617,7 +619,7 @@ pub(crate) fn session_is_copilot(session: &Value) -> bool {
 
 /// Minimal percent-decoding for `file://` URIs (no external dependency).
 fn percent_decode(input: &str) -> String {
-    fn hex_val(byte: u8) -> Option<u8> {
+    const fn hex_val(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -663,7 +665,7 @@ fn parse_file_uri(uri: &str) -> Option<PathBuf> {
 
 /// Resolve the workspace folder for a `workspaceStorage/<id>` directory from
 /// its `workspace.json` sidecar.
-pub(crate) fn workspace_for_storage_dir(storage_dir: &Path) -> Option<PathBuf> {
+pub fn workspace_for_storage_dir(storage_dir: &Path) -> Option<PathBuf> {
     let raw = fs::read_to_string(storage_dir.join("workspace.json")).ok()?;
     let val: Value = serde_json::from_str(&raw).ok()?;
     let uri = val
@@ -764,7 +766,10 @@ fn response_content(response: &Value) -> (String, Vec<NormalizedInvocation>) {
 ///
 /// Returns `None` for sessions that are not Copilot's (shared store) or that
 /// carry no conversation content.
-pub(crate) fn session_to_conversation(
+// Staged for issue #16 wiring; refactoring an unwired parser into smaller
+// functions now would churn call sites that may still move.
+#[allow(clippy::too_many_lines)]
+pub fn session_to_conversation(
     session: &Value,
     source_path: &Path,
     store: &'static str,
@@ -1088,10 +1093,7 @@ fn parse_source(
 
 /// Scan every native source reachable from `bases`, deduplicating session ids
 /// across storage generations and duplicated trees.
-pub(crate) fn scan_native(
-    bases: &[ScanRoot],
-    since_ts: Option<i64>,
-) -> Vec<NormalizedConversation> {
+pub fn scan_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<NormalizedConversation> {
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut seen_sessions: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
@@ -1109,10 +1111,7 @@ pub(crate) fn scan_native(
 
 /// Discover the native source files `scan_native` would consume, plus the
 /// `workspace.json` sidecars consulted for workspace resolution.
-pub(crate) fn discover_native(
-    bases: &[ScanRoot],
-    since_ts: Option<i64>,
-) -> Vec<DiscoveredSourceFile> {
+pub fn discover_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<DiscoveredSourceFile> {
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut seen_sidecars: HashSet<PathBuf> = HashSet::new();
     let mut out = Vec::new();

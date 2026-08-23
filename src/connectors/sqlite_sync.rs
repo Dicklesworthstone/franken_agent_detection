@@ -1,4 +1,4 @@
-//! Synchronous bridge over the async FrankenSQLite 0.2 engine API.
+//! Synchronous bridge over the async `FrankenSQLite` 0.2 engine API.
 //!
 //! fsqlite 0.2 made every engine entry point `async` with `!Send` futures
 //! (the engine is `Rc<RefCell<..>>` internally). The connectors are fully

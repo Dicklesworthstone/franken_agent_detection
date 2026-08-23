@@ -393,7 +393,7 @@ pub fn parse_session_file(
         external_id,
         title,
         workspace: session_cwd,
-        source_path: source_path.clone(),
+        source_path,
         started_at,
         ended_at,
         metadata,
