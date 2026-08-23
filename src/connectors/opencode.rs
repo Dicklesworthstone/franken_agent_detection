@@ -3190,7 +3190,7 @@ mod tests {
             full_ids,
             ["old", "new", "null-recent", "null-old"]
                 .iter()
-                .map(str::to_string)
+                .copied().map(str::to_string)
                 .collect()
         );
 
@@ -3200,7 +3200,7 @@ mod tests {
         let inc_ids: HashSet<String> = inc.iter().filter_map(|c| c.external_id.clone()).collect();
         assert_eq!(
             inc_ids,
-            ["new", "null-recent"].iter().map(str::to_string).collect(),
+            ["new", "null-recent"].iter().copied().map(str::to_string).collect(),
             "incremental keeps updated>=cutoff and unknown-time+recent-msg, drops the rest"
         );
 

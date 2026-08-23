@@ -126,11 +126,13 @@ impl ScanRoot {
     }
 }
 
-/// A cheap "still alive" tick a connector may call during a long internal
-/// scan so the host's stall watchdog observes liveness BEFORE the first
-/// conversation is yielded (cass#373 Variant A) — e.g. while decoding a
-/// large SQLite store. `Send + Sync` so it can ride the (thread-crossing)
+/// A cheap "still alive" tick a connector may call during a long internal scan.
+///
+/// Lets the host's stall watchdog observe liveness BEFORE the first
+/// conversation is yielded (cass#373 Variant A) — e.g. while decoding a large
+/// SQLite store. `Send + Sync` so it can ride the (thread-crossing)
 /// `ScanContext`; typically wired to the host's per-activity progress tick.
+pub type ScanProgressTick = Arc<dyn Fn() + Send + Sync>;
 
 /// Shared scan context parameters.
 #[derive(Clone)]
