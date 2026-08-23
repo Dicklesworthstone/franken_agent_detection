@@ -67,8 +67,9 @@ use serde_json::{Map, Value};
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanRoot};
 use super::utils::dedupe_path_key;
 use super::{file_modified_since, parse_timestamp};
-use crate::types::{NormalizedConversation, NormalizedInvocation, NormalizedMessage,
-    reindex_messages};
+use crate::types::{
+    NormalizedConversation, NormalizedInvocation, NormalizedMessage, reindex_messages,
+};
 
 /// VS Code product directories that host a `User` tree.
 const PRODUCT_DIRS: &[&str] = &["Code", "Code - Insiders", "VSCodium"];
@@ -217,11 +218,7 @@ fn collect_session_container(
     }
 }
 
-fn push_state_db(
-    out: &mut Vec<NativeSource>,
-    db: PathBuf,
-    workspace_dir: Option<&Path>,
-) {
+fn push_state_db(out: &mut Vec<NativeSource>, db: PathBuf, workspace_dir: Option<&Path>) {
     if cfg!(feature = "copilot-vscdb") && db.is_file() {
         out.push(NativeSource {
             format: NativeFormat::StateDb,
@@ -274,8 +271,7 @@ fn push_source_for_file(out: &mut Vec<NativeSource>, file: &Path) {
     if dir_name(file) == Some("state.vscdb") {
         let workspace_dir = file.parent().and_then(|storage_dir| {
             storage_dir.parent().and_then(|root| {
-                (dir_name(root) == Some("workspaceStorage"))
-                    .then(|| storage_dir.to_path_buf())
+                (dir_name(root) == Some("workspaceStorage")).then(|| storage_dir.to_path_buf())
             })
         });
         push_state_db(out, file.to_path_buf(), workspace_dir.as_deref());
@@ -577,10 +573,7 @@ pub(crate) fn replay_append_log(content: &str, path: &Path) -> Option<Value> {
 // ---------------------------------------------------------------------------
 
 fn agent_is_copilot(agent: &Value) -> bool {
-    if let Some(ext) = agent
-        .pointer("/extensionId/value")
-        .and_then(Value::as_str)
-    {
+    if let Some(ext) = agent.pointer("/extensionId/value").and_then(Value::as_str) {
         if ext.to_ascii_lowercase().starts_with("github.copilot") {
             return true;
         }
@@ -838,7 +831,9 @@ pub(crate) fn session_to_conversation(
             messages.push(NormalizedMessage {
                 idx: 0,
                 role: "user".to_string(),
-                author: requester.map(String::from).or_else(|| Some("user".to_string())),
+                author: requester
+                    .map(String::from)
+                    .or_else(|| Some("user".to_string())),
                 created_at: ts,
                 content: user_text,
                 extra: Value::Object(extra),
@@ -1018,7 +1013,10 @@ fn collect_sources(bases: &[ScanRoot]) -> Vec<(ScanRoot, NativeSource)> {
     out
 }
 
-fn parse_source(source: &NativeSource, seen_sessions: &mut HashSet<String>) -> Vec<NormalizedConversation> {
+fn parse_source(
+    source: &NativeSource,
+    seen_sessions: &mut HashSet<String>,
+) -> Vec<NormalizedConversation> {
     let workspace = source
         .workspace_dir
         .as_deref()
@@ -1083,7 +1081,10 @@ fn parse_source(source: &NativeSource, seen_sessions: &mut HashSet<String>) -> V
 
 /// Scan every native source reachable from `bases`, deduplicating session ids
 /// across storage generations and duplicated trees.
-pub(crate) fn scan_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<NormalizedConversation> {
+pub(crate) fn scan_native(
+    bases: &[ScanRoot],
+    since_ts: Option<i64>,
+) -> Vec<NormalizedConversation> {
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut seen_sessions: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
@@ -1243,9 +1244,15 @@ mod tests {
             r#"{"folder": "file:///home/octocat/proj%20x"}"#,
         );
         write_file(
-            &storage_dir.join("chatSessions").join(format!("{WS_SESSION_ID}.json")),
-            &copilot_session(WS_SESSION_ID, "Explain this borrow error", "Clone before the loop.")
-                .to_string(),
+            &storage_dir
+                .join("chatSessions")
+                .join(format!("{WS_SESSION_ID}.json")),
+            &copilot_session(
+                WS_SESSION_ID,
+                "Explain this borrow error",
+                "Clone before the loop.",
+            )
+            .to_string(),
         );
         // Harness noise that must never be parsed as a session.
         write_file(&storage_dir.join("chatSessions/.DS_Store"), "junk");
@@ -1558,7 +1565,9 @@ mod tests {
         });
         assert!(session_is_copilot(&by_agent));
         // No evidence at all — never attribute.
-        assert!(!session_is_copilot(&json!({"sessionId": "d", "requests": []})));
+        assert!(!session_is_copilot(
+            &json!({"sessionId": "d", "requests": []})
+        ));
     }
 
     #[test]
@@ -1575,13 +1584,9 @@ mod tests {
                 "response": [{"value": "Use .sort()."}]
             }]
         });
-        let conv = session_to_conversation(
-            &session,
-            Path::new("/db/state.vscdb"),
-            STORE_STATE_DB,
-            None,
-        )
-        .expect("legacy session parses");
+        let conv =
+            session_to_conversation(&session, Path::new("/db/state.vscdb"), STORE_STATE_DB, None)
+                .expect("legacy session parses");
         assert_eq!(conv.messages.len(), 2);
         assert_eq!(conv.messages[0].content, "How do I sort a vec?");
         assert_eq!(conv.messages[1].content, "Use .sort().");
@@ -1675,7 +1680,10 @@ mod tests {
             // Index metadata key that must never be treated as a transcript.
             conn.execute_compat(
                 "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
-                params!["chat.ChatSessionStore.index", "{\"version\":1,\"entries\":{}}"],
+                params![
+                    "chat.ChatSessionStore.index",
+                    "{\"version\":1,\"entries\":{}}"
+                ],
             )
             .expect("insert index");
         }

@@ -21,8 +21,7 @@ use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, ScanContext, ScanRoot};
 use super::{Connector, franken_detection_for_connector, utils::dedupe_path_key};
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
-
+use crate::types::{DetectionResult, NormalizedConversation};
 /// A Pi session store format that the `pi_agent` connector does not index.
 ///
 /// `pi_agent_rust` supports three on-disk session formats: the default JSONL
@@ -161,13 +160,6 @@ impl PiAgentConnector {
         super::pi_wire::sessions_dir(home)
     }
 
-    /// Find all session JSONL files under the sessions directory. Delegates
-    /// to the shared pi-family traversal in [`super::pi_wire::session_files`]
-    /// (including Oh My Pi sub-agent transcript acceptance).
-    fn session_files(root: &Path) -> Vec<PathBuf> {
-        super::pi_wire::session_files(root)
-    }
-
     fn append_explicit_homes(
         homes: &mut Vec<PathBuf>,
         base: &Path,
@@ -185,13 +177,6 @@ impl PiAgentConnector {
         }
     }
 
-    /// Flatten pi-agent message content to a searchable string. Delegates to
-    /// the shared pi-family implementation in
-    /// [`super::pi_wire::flatten_message_content`], which documents the
-    /// supported content-block shapes.
-    fn flatten_message_content(content: &Value) -> String {
-        super::pi_wire::flatten_message_content(content)
-    }
     fn looks_like_root(path: &Path) -> bool {
         path.join("sessions").exists()
             || path
@@ -204,9 +189,7 @@ impl PiAgentConnector {
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let is_pi_agent_dir = ctx.data_dir.to_str().is_some_and(|s| {
-            s.contains(".pi/agent")
-                || s.ends_with("/pi-agent")
-                || s.ends_with("\\pi-agent")
+            s.contains(".pi/agent") || s.ends_with("/pi-agent") || s.ends_with("\\pi-agent")
         });
 
         let mut homes: Vec<ScanRoot> = Vec::new();
@@ -378,6 +361,7 @@ impl Connector for PiAgentConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::pi_wire::{flatten_message_content, session_files};
     use crate::connectors::scan::ScanRoot;
     use serde_json::json;
     use std::fs;
@@ -407,7 +391,7 @@ mod tests {
     #[test]
     fn flatten_message_content_handles_string() {
         let content = json!("Simple string content");
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert_eq!(result, "Simple string content");
     }
 
@@ -417,7 +401,7 @@ mod tests {
             {"type": "text", "text": "First paragraph"},
             {"type": "text", "text": "Second paragraph"}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.contains("First paragraph"));
         assert!(result.contains("Second paragraph"));
     }
@@ -427,7 +411,7 @@ mod tests {
         let content = json!([
             {"type": "thinking", "thinking": "Let me analyze this..."}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.contains("[Thinking]"));
         assert!(result.contains("Let me analyze this..."));
     }
@@ -437,7 +421,7 @@ mod tests {
         let content = json!([
             {"type": "toolCall", "name": "read_file", "arguments": {"path": "/test.rs"}}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.contains("[Tool: read_file]"));
         assert!(result.contains("path=/test.rs"));
     }
@@ -447,7 +431,7 @@ mod tests {
         let content = json!([
             {"type": "toolCall", "name": "get_status", "arguments": {}}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert_eq!(result, "[Tool: get_status]");
     }
 
@@ -458,7 +442,7 @@ mod tests {
             {"type": "image", "url": "data:image/png;base64,..."},
             {"type": "text", "text": "End of message"}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.contains("Here's an image:"));
         assert!(result.contains("End of message"));
         assert!(!result.contains("data:image"));
@@ -472,7 +456,7 @@ mod tests {
             {"type": "toolCall", "name": "bash", "arguments": {"command": "ls"}},
             {"type": "text", "text": "Done!"}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.contains("Let me help:"));
         assert!(result.contains("[Thinking] Analyzing..."));
         assert!(result.contains("[Tool: bash]"));
@@ -482,7 +466,7 @@ mod tests {
     #[test]
     fn flatten_message_content_returns_empty_for_null() {
         let content = json!(null);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.is_empty());
     }
 
@@ -493,7 +477,7 @@ mod tests {
                 "a": "1", "b": "2", "c": "3", "d": "4", "e": "5"
             }}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         // Should contain at most 3 arguments
         let arg_count = result.matches('=').count();
         assert!(arg_count <= 3);
@@ -512,7 +496,7 @@ mod tests {
         // Valid session file format: <timestamp>_<uuid>.jsonl
         fs::write(sessions.join("2025-12-01T10-00-00_abc123.jsonl"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         assert_eq!(files.len(), 1);
     }
 
@@ -525,7 +509,7 @@ mod tests {
         fs::write(sessions.join("2025-12-01_abc123.json"), "{}").unwrap();
         fs::write(sessions.join("config.txt"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         assert_eq!(files.len(), 0);
     }
 
@@ -538,7 +522,7 @@ mod tests {
         // Missing underscore between timestamp and uuid
         fs::write(sessions.join("2025-12-01.jsonl"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         assert_eq!(files.len(), 0);
     }
 
@@ -550,7 +534,7 @@ mod tests {
 
         fs::write(nested.join("2025-12-01T10-00-00_uuid1.jsonl"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         assert_eq!(files.len(), 1);
     }
 
@@ -585,7 +569,7 @@ mod tests {
         fs::create_dir_all(&underscore_slug).unwrap();
         fs::write(underscore_slug.join("export.jsonl"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         let names: Vec<_> = files
             .iter()
             .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
@@ -607,7 +591,7 @@ mod tests {
     #[test]
     fn session_files_returns_empty_when_no_sessions_dir() {
         let dir = TempDir::new().unwrap();
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         assert_eq!(files.len(), 0);
     }
 
@@ -621,7 +605,7 @@ mod tests {
         fs::write(nested.join("2025-12-01T10-00-00_aaaa.jsonl"), "{}").unwrap();
         fs::write(nested.join("2025-12-01T10-00-00_mmmm.jsonl"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         let mut sorted = files.clone();
         sorted.sort();
         assert_eq!(files, sorted);

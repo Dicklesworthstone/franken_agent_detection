@@ -54,22 +54,14 @@ impl OmpConnector {
         Self::default_homes_from(dirs::home_dir().as_deref())
     }
 
-    /// True when `path` plausibly names an omp agent home or sessions
-    /// directory: either it carries a `sessions` child, is itself called
-    /// `sessions` beneath an `.omp` tree, or its string form contains the
-    /// canonical `.omp/agent` marker.
+    /// True when `path` plausibly names an omp store: either an explicit
+    /// `sessions` directory handed over by a caller, or any path carrying
+    /// the canonical `.omp` marker.
     fn looks_like_root(path: &Path) -> bool {
-        if path.join("sessions").exists() || path.file_name().is_some_and(|n| n == "sessions") {
-            let marker_ok = path
-                .to_str()
-                .is_some_and(|s| s.contains(".omp"))
-                // A bare `sessions` directory handed to us as an explicit
-                // scan root is accepted too; callers that mean another
-                // connector's data never reach this connector.
-                || path.file_name().is_some_and(|n| n == "sessions");
-            return marker_ok;
+        if path.file_name().is_some_and(|n| n == "sessions") {
+            return true;
         }
-        path.to_str().is_some_and(|s| s.contains(".omp/agent"))
+        path.to_str().is_some_and(|s| s.contains(".omp"))
     }
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
@@ -93,7 +85,6 @@ impl OmpConnector {
             for scan_root in &ctx.scan_roots {
                 let candidates = [
                     scan_root.path.clone(),
-                    scan_root.path.join(".omp"),
                     scan_root.path.join(".omp/agent"),
                     scan_root.path.join(".omp/agent/sessions"),
                 ];
@@ -152,7 +143,9 @@ mod tests {
     use crate::connectors::scan::ScanRoot;
     use serde_json::json;
     use std::fs;
-    use tempfile::TempDir;
+
+    const SESSION_STEM: &str = "2026-08-23T17-54-58-682Z_01a02fc2-ebfa-72f6-af9a-d40ae5078aa4";
+    const WORKSPACE_CWD: &str = "/Users/jemanuel/projects/franken_agent_detection";
 
     // =====================================================
     // Constructor Tests
@@ -174,7 +167,7 @@ mod tests {
 
     #[test]
     fn default_homes_pin_the_canonical_omp_agent_dir() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         assert_eq!(
             OmpConnector::default_homes_from(Some(dir.path())),
             vec![dir.path().join(".omp/agent")]
@@ -192,7 +185,7 @@ mod tests {
 
     #[test]
     fn looks_like_root_accepts_omp_agent_and_sessions_dirs() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let agent = dir.path().join(".omp").join("agent");
         fs::create_dir_all(agent.join("sessions")).unwrap();
 
@@ -208,7 +201,7 @@ mod tests {
 
     #[test]
     fn source_roots_use_default_home_when_ctx_data_dir_is_unrelated() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let ctx = ScanContext::local_default(dir.path().join("cass-state"), None);
         let roots = OmpConnector::source_roots(&ctx);
         assert_eq!(roots.len(), 1);
@@ -217,7 +210,7 @@ mod tests {
 
     #[test]
     fn source_roots_prefer_an_omp_shaped_data_dir() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let agent = dir.path().join(".omp").join("agent");
         fs::create_dir_all(&agent).unwrap();
 
@@ -229,13 +222,10 @@ mod tests {
 
     #[test]
     fn source_roots_expand_explicit_scan_roots_to_omp_layouts() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
 
-        // Root that directly contains sessions (e.g. a mounted ~/.omp tree).
-        let direct = dir.path().join("home-with-omp").join(".omp");
-        fs::create_dir_all(direct.join("agent").join("sessions")).unwrap();
-
-        // Root whose `.omp/agent/sessions` must be discovered by expansion.
+        // Root whose `.omp/agent/sessions` tree must be discovered by
+        // expansion (a typical remote-home scan root).
         let nested = dir.path().join("another-home");
         fs::create_dir_all(
             nested
@@ -248,10 +238,7 @@ mod tests {
 
         let ctx = ScanContext::with_roots(
             dir.path().join("cass-state"),
-            vec![
-                ScanRoot::local(direct.parent().unwrap().to_path_buf()),
-                ScanRoot::local(nested),
-            ],
+            vec![ScanRoot::local(nested.clone())],
             None,
         );
 
@@ -261,26 +248,49 @@ mod tests {
             .collect();
         paths.sort();
 
+        // Both the agent home and its sessions subtree qualify; scans
+        // deduplicate files reached through overlapping roots.
         assert_eq!(
             paths,
             vec![
+                nested.join(".omp").join("agent"),
                 nested.join(".omp").join("agent").join("sessions"),
-                direct.join("agent").join("sessions"),
             ]
         );
     }
 
     #[test]
-    fn source_roots_treat_file_roots_as_their_parent() {
-        let dir = TempDir::new().unwrap();
-        let file_root = dir.path().join("session.jsonl");
+    fn source_roots_accept_a_bare_sessions_dir_as_explicit_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sessions = dir.path().join("anywhere").join("sessions");
+        fs::create_dir_all(sessions.join("--proj--")).unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().join("state"),
+            vec![ScanRoot::local(sessions.clone())],
+            None,
+        );
+        let roots = OmpConnector::source_roots(&ctx);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, sessions);
+    }
+
+    #[test]
+    fn source_roots_demote_file_roots_to_their_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sessions = dir.path().join(".omp").join("agent").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let file_root = sessions.join(format!("{SESSION_STEM}.jsonl"));
         fs::write(&file_root, "{}").unwrap();
 
-        let ctx = ScanContext::local_default(file_root.clone(), None);
+        let ctx = ScanContext::with_roots(
+            dir.path().join("state"),
+            vec![ScanRoot::local(file_root)],
+            None,
+        );
         let roots = OmpConnector::source_roots(&ctx);
-        // Not omp-shaped and no explicit roots: falls back to the default
-        // home rather than treating the file as a home.
-        assert_eq!(roots[0].path, dirs::home_dir().unwrap().join(".omp/agent"));
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, sessions);
     }
 
     // =====================================================
@@ -292,8 +302,8 @@ mod tests {
         let connector = OmpConnector::new();
         let detection = connector.detect();
         // On machines without ~/.omp this reports not-found with evidence;
-        // on omp hosts it reports detected. Either way the evidence list is
-        // populated by franken detection.
+        // on omp hosts it reports detected. Either way franken detection
+        // populates the evidence list.
         assert!(!detection.evidence.is_empty());
     }
 
@@ -301,23 +311,26 @@ mod tests {
     // scan()/discovery fixture tests (shared wire parser via omp roots)
     // =====================================================
 
-    /// Build a realistic omp session tree: workspace slug directory, a main
-    /// transcript named `<timestamp>_<uuid>.jsonl`, plus a sub-agent
-    /// transcript inside the sibling `<timestamp>_<uuid>/` directory.
-    fn write_omp_fixture(home: &Path) -> TempDir {
-        let slug = home.join("sessions").join("-projects-franken_agent_detection");
-        let session_stem = "2026-08-23T17-54-58-682Z_01a02fc2-ebfa-72f6-af9a-d40ae5078aa4";
-        fs::create_dir_all(slug.join(session_stem)).unwrap();
+    /// Build a realistic omp session tree under an agent home: workspace slug
+    /// directory, a main transcript named `<timestamp>_<uuid>.jsonl`, plus a
+    /// sub-agent transcript inside the sibling `<timestamp>_<uuid>/` directory.
+    ///
+    /// The main transcript exercises the omp wire-format extensions: a
+    /// standalone `title` entry and a `model_change` record with the bare
+    /// `model` field.
+    fn write_omp_fixture(agent_home: &Path) {
+        let slug = agent_home
+            .join("sessions")
+            .join("-projects-franken_agent_detection");
+        fs::create_dir_all(slug.join(SESSION_STEM)).unwrap();
 
-        // Main transcript: title entry + session header + user message +
-        // assistant reply with a tool call, exercising the omp extensions.
-        let main = json!({"type":"title","v":1,"title":"Add omp.sh support to project","source":"auto","updatedAt":"2026-08-23T17:57:16.363Z"});
+        let title_entry = json!({"type":"title","v":1,"title":"Add omp.sh support to project","source":"auto","updatedAt":"2026-08-23T17:57:16.363Z"});
         let header = json!({
             "type": "session",
             "version": 3,
             "id": "01a02fc2-ebfa-72f6-af9a-d40ae5078aa4",
             "timestamp": "2026-08-23T17:54:58.682Z",
-            "cwd": "/Users/jemanuel/projects/franken_agent_detection",
+            "cwd": WORKSPACE_CWD,
         });
         let model_change = json!({
             "type": "model_change",
@@ -346,18 +359,18 @@ mod tests {
         });
         let transcript = format!(
             "{}\n{}\n{}\n{}\n{}\n",
-            main, header, model_change, user_msg, assistant_msg
+            title_entry, header, model_change, user_msg, assistant_msg
         );
-        fs::write(slug.join(format!("{session_stem}.jsonl")), transcript).unwrap();
+        fs::write(slug.join(format!("{SESSION_STEM}.jsonl")), transcript).unwrap();
 
         // Sub-agent transcript inside the session directory: own session
-        // header, single user message.
+        // header, single user message, no underscore in its file name.
         let sub_header = json!({
             "type": "session",
             "version": 3,
             "id": "sub-0001",
             "timestamp": "2026-08-23T17:56:00.000Z",
-            "cwd": "/Users/jemanuel/projects/franken_agent_detection",
+            "cwd": WORKSPACE_CWD,
         });
         let sub_msg = json!({
             "type": "message",
@@ -366,21 +379,28 @@ mod tests {
             "message": {"role": "user", "content": [{"type": "text", "text": "Sub-agent task"}]},
         });
         fs::write(
-            slug.join(session_stem).join("BenchBatch1.jsonl"),
+            slug.join(SESSION_STEM).join("BenchBatch1.jsonl"),
             format!("{sub_header}\n{sub_msg}\n"),
         )
         .unwrap();
+    }
 
-        TempDir::new().unwrap()
+    fn fixture_ctx(agent_home: &Path) -> ScanContext {
+        ScanContext::with_roots(
+            PathBuf::from("/nonexistent-cass-state"),
+            vec![ScanRoot::local(agent_home.to_path_buf())],
+            None,
+        )
     }
 
     #[test]
-    fn scan_reads_main_and_subagent_transcripts_from_default_homes() {
-        let real_home = dirs::home_dir().expect("home dir");
+    fn scan_reads_main_and_subagent_transcripts_from_live_store() {
+        let Some(real_home) = dirs::home_dir() else {
+            return;
+        };
         let agent = real_home.join(".omp").join("agent");
-        // Only run against the real store when it exists; otherwise assert
-        // the graceful empty path.
         if !agent.join("sessions").exists() {
+            // Graceful empty path on machines without omp.
             let ctx = ScanContext::local_default(PathBuf::from("/nonexistent"), None);
             let convs = OmpConnector::new().scan(&ctx).expect("scan should succeed");
             assert!(convs.is_empty());
@@ -405,44 +425,45 @@ mod tests {
 
     #[test]
     fn scan_parses_titles_models_and_tool_calls_via_explicit_roots() {
-        let scratch = write_omp_fixture(Path::new("/tmp"));
-        let home = scratch.path().join("omp-home");
-        std::mem::forget(scratch); // keep fixture alive until assertions end
-        let fixture = write_omp_fixture(&home);
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = dir.path().join(".omp").join("agent");
+        write_omp_fixture(&agent);
 
-        let agent = home.join(".omp").join("agent");
-        let ctx = ScanContext::with_roots(
-            PathBuf::from("/nonexistent"),
-            vec![ScanRoot::local(agent.clone())],
-            None,
-        );
-        let mut convs = OmpConnector::new().scan(&ctx).expect("scan should succeed");
+        let mut convs = OmpConnector::new()
+            .scan(&fixture_ctx(&agent))
+            .expect("scan should succeed");
         convs.sort_by(|a, b| a.external_id.cmp(&b.external_id));
 
         assert_eq!(convs.len(), 2, "main transcript + sub-agent transcript");
 
-        // Main transcript conversation.
+        // Main transcript conversation: omp `title` entry wins over the
+        // first-user-message fallback.
         let main = convs
             .iter()
             .find(|conv| conv.title.as_deref() == Some("Add omp.sh support to project"))
-            .expect("main conversation with omp title-entry title");
+            .expect("main conversation with title-entry title");
         assert_eq!(main.agent_slug, "omp");
-        assert_eq!(main.workspace.as_deref(), Some(Path::new("/Users/jemanuel/projects/franken_agent_detection")));
+        assert_eq!(main.workspace.as_deref(), Some(Path::new(WORKSPACE_CWD)));
         assert_eq!(
             main.metadata["source"], "omp",
             "metadata must attribute sessions to the omp connector"
         );
-        assert_eq!(main.metadata["model_id"], "openrouter/stealth/ox-alpha",
-            "bare-model model_change entries must update tracked model");
+        assert_eq!(
+            main.metadata["model_id"], "openrouter/stealth/ox-alpha",
+            "bare-model model_change entries must update tracked model"
+        );
         let roles: Vec<&str> = main.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant"]);
         let assistant = &main.messages[1];
-        assert_eq!(assistant.author.as_deref(), Some("openrouter/stealth/ox-alpha"));
+        assert_eq!(
+            assistant.author.as_deref(),
+            Some("openrouter/stealth/ox-alpha")
+        );
         assert_eq!(assistant.invocations.len(), 1);
         assert_eq!(assistant.invocations[0].name, "read");
         assert_eq!(assistant.invocations[0].call_id.as_deref(), Some("fc_123"));
 
-        // Sub-agent transcript conversation.
+        // Sub-agent transcript becomes its own conversation.
         let sub = convs
             .iter()
             .find(|conv| conv.messages.iter().any(|m| m.content == "Sub-agent task"))
@@ -450,30 +471,51 @@ mod tests {
         assert_eq!(sub.agent_slug, "omp");
         assert!(
             sub.source_path.ends_with("BenchBatch1.jsonl"),
-            "sub-agent transcript should be its own conversation"
+            "sub-agent transcript should be indexed as its own conversation"
         );
-        drop(fixture);
+
+        // External ids are sessions-relative paths.
+        assert!(
+            main.external_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("-projects-franken_agent_detection/")),
+            "external id should be sessions-relative, got {:?}",
+            main.external_id
+        );
     }
 
     #[test]
     fn discovery_matches_scan_sources_on_fixture() {
-        let scratch = write_omp_fixture(Path::new("/tmp"));
-        let home = scratch.path().join("omp-home-discovery");
-        let _fixture = write_omp_fixture(&home);
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = dir.path().join(".omp").join("agent");
+        write_omp_fixture(&agent);
 
-        let agent = home.join(".omp").join("agent");
+        crate::connectors::assert_discovery_covers_scan_sources(
+            &OmpConnector::new(),
+            &fixture_ctx(&agent),
+        );
+    }
+
+    #[test]
+    fn scan_respects_since_ts_filtering() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = dir.path().join(".omp").join("agent");
+        write_omp_fixture(&agent);
+
+        // A high-water mark far in the future excludes everything.
         let ctx = ScanContext::with_roots(
             PathBuf::from("/nonexistent"),
             vec![ScanRoot::local(agent)],
-            None,
+            Some(i64::MAX / 2),
         );
-        crate::connectors::assert_discovery_covers_scan_sources(&OmpConnector::new(), &ctx);
+        let convs = OmpConnector::new().scan(&ctx).expect("scan should succeed");
+        assert!(convs.is_empty());
     }
 
     #[test]
     fn scan_handles_missing_and_empty_roots_gracefully() {
-        let dir = TempDir::new().unwrap();
-        // Explicit root without any omp layout.
+        let dir = tempfile::TempDir::new().unwrap();
+        // Explicit root without any omp layout yields nothing and no error.
         let empty_root = dir.path().join("not-omp");
         fs::create_dir_all(&empty_root).unwrap();
         let ctx = ScanContext::with_roots(
@@ -484,9 +526,95 @@ mod tests {
         let convs = OmpConnector::new().scan(&ctx).expect("scan should succeed");
         assert!(convs.is_empty());
 
-        // Default-detection context pointing at nothing.
+        // Default-detection context pointing at nothing likewise.
         let ctx = ScanContext::local_default(dir.path().join("state"), None);
         let convs = OmpConnector::new().scan(&ctx).expect("scan should succeed");
         assert!(convs.is_empty());
+    }
+
+    // =====================================================
+    // omp-specific wire extensions through the shared parser
+    // =====================================================
+
+    #[test]
+    fn title_entry_overrides_header_title_and_message_fallback() {
+        let parsed = super::super::pi_wire::parse_session_file;
+        let dir = tempfile::TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // Title entry present → wins over header title and message text.
+        let file = sessions.join("2026-08-23T10-00-00_alpha.jsonl");
+        fs::write(
+            &file,
+            format!(
+                "{}\n{}\n{}\n",
+                json!({"type":"title","title":"Entry title"}),
+                json!({"type":"session","version":3,"id":"x","timestamp":"2026-08-23T10:00:00Z","cwd":"/w","title":"Header title"}),
+                json!({"type":"message","timestamp":"2026-08-23T10:00:05Z","message":{"role":"user","content":"User text"}}),
+            ),
+        )
+        .unwrap();
+        let conv = parsed(&file, &sessions, "omp").expect("parses");
+        assert_eq!(conv.title.as_deref(), Some("Entry title"));
+
+        // No title entry → header title used.
+        let file2 = sessions.join("2026-08-23T10-00-01_beta.jsonl");
+        fs::write(
+            &file2,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session","version":3,"id":"y","timestamp":"2026-08-23T10:00:00Z","cwd":"/w","title":"Header only"}),
+                json!({"type":"message","timestamp":"2026-08-23T10:00:05Z","message":{"role":"user","content":"User text"}}),
+            ),
+        )
+        .unwrap();
+        let conv2 = parsed(&file2, &sessions, "omp").expect("parses");
+        assert_eq!(conv2.title.as_deref(), Some("Header only"));
+
+        // Neither → first user message line, truncated to 100 chars.
+        let long_text = "x".repeat(250);
+        let file3 = sessions.join("2026-08-23T10-00-02_gamma.jsonl");
+        fs::write(
+            &file3,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session","version":3,"id":"z","timestamp":"2026-08-23T10:00:00Z"}),
+                json!({"type":"message","timestamp":"2026-08-23T10:00:05Z","message":{"role":"user","content":long_text}}),
+            ),
+        )
+        .unwrap();
+        let conv3 = parsed(&file3, &sessions, "omp").expect("parses");
+        assert_eq!(conv3.title.map(|t| t.chars().count()), Some(100));
+
+        // Files without usable messages parse to None.
+        let file4 = sessions.join("2026-08-23T10-00-03_delta.jsonl");
+        fs::write(&file4, "{\"type\":\"model_change\"}\n").unwrap();
+        assert!(parsed(&file4, &sessions, "omp").is_none());
+    }
+
+    #[test]
+    fn model_change_bare_model_field_updates_tracked_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let file = sessions.join("2026-08-23T11-00-00_eps.jsonl");
+        fs::write(
+            &file,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                json!({"type":"session","version":3,"id":"m","timestamp":"2026-08-23T11:00:00Z","cwd":"/w"}),
+                json!({"type":"model_change","timestamp":"2026-08-23T11:00:01Z","provider":"openrouter","modelId":"first-model"}),
+                json!({"type":"model_change","timestamp":"2026-08-23T11:00:02Z","model":"second-model"}),
+                json!({"type":"message","timestamp":"2026-08-23T11:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}),
+            ),
+        )
+        .unwrap();
+
+        let conv =
+            super::super::pi_wire::parse_session_file(&file, &sessions, "omp").expect("parses");
+        assert_eq!(conv.messages[0].author.as_deref(), Some("second-model"));
+        assert_eq!(conv.metadata["model_id"], "second-model");
+        assert_eq!(conv.metadata["provider"], "openrouter");
     }
 }

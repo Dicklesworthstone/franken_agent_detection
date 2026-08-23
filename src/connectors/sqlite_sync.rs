@@ -32,11 +32,13 @@ thread_local! {
 
 /// Drive a `!Send` fsqlite future to completion on the calling thread.
 fn drive<T>(future: impl Future<Output = T>) -> T {
-    let runtime = DRIVER.with(|slot| slot.borrow_mut().take()).unwrap_or_else(|| {
-        RuntimeBuilder::current_thread()
-            .build()
-            .expect("failed to build FrankenSQLite sync-bridge runtime")
-    });
+    let runtime = DRIVER
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_else(|| {
+            RuntimeBuilder::current_thread()
+                .build()
+                .expect("failed to build FrankenSQLite sync-bridge runtime")
+        });
     let output = runtime.block_on(future);
     DRIVER.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -96,7 +98,12 @@ pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, Frank
 /// Synchronous form of [`frankensqlite::compat::ConnectionExt`].
 pub trait ConnectionExt {
     /// Execute a query that returns exactly one row, mapping it with `f`.
-    fn query_row_map<T, F>(&self, sql: &str, params: &[ParamValue], f: F) -> Result<T, FrankenError>
+    fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        f: F,
+    ) -> Result<T, FrankenError>
     where
         F: FnOnce(&Row) -> Result<T, FrankenError>;
 
@@ -119,7 +126,12 @@ impl ConnectionExt for Connection {
     where
         F: FnOnce(&Row) -> Result<T, FrankenError>,
     {
-        drive(AsyncConnectionExt::query_row_map(&self.inner, sql, params, f))
+        drive(AsyncConnectionExt::query_row_map(
+            &self.inner,
+            sql,
+            params,
+            f,
+        ))
     }
 
     fn query_map_collect<T, F>(
@@ -131,7 +143,12 @@ impl ConnectionExt for Connection {
     where
         F: FnMut(&Row) -> Result<T, FrankenError>,
     {
-        drive(AsyncConnectionExt::query_map_collect(&self.inner, sql, params, f))
+        drive(AsyncConnectionExt::query_map_collect(
+            &self.inner,
+            sql,
+            params,
+            f,
+        ))
     }
 
     fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {

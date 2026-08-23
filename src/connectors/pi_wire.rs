@@ -222,8 +222,14 @@ pub fn parse_session_file(
                 // Session header - extract metadata
                 session_id = val.get("id").and_then(|v| v.as_str()).map(String::from);
                 session_cwd = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-                provider = val.get("provider").and_then(|v| v.as_str()).map(String::from);
-                model_id = val.get("modelId").and_then(|v| v.as_str()).map(String::from);
+                provider = val
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                model_id = val
+                    .get("modelId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 header_title = val
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -342,7 +348,10 @@ pub fn parse_session_file(
             "model_change" => {
                 // Track model changes (useful metadata). pi-mono writes
                 // `provider` + `modelId`; omp writes a bare `model`.
-                provider = val.get("provider").and_then(|v| v.as_str()).map(String::from);
+                provider = val
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 model_id = val
                     .get("modelId")
                     .and_then(|v| v.as_str())
@@ -353,7 +362,6 @@ pub fn parse_session_file(
                 // Skip thinking_level_change and unknown types
             }
         }
-
     }
 
     if messages.is_empty() {
@@ -368,11 +376,7 @@ pub fn parse_session_file(
             .find(|m| m.role == "user")
             .map(|m| first_line_truncated(&m.content))
     });
-    let title = title.or_else(|| {
-        messages
-            .first()
-            .map(|m| first_line_truncated(&m.content))
-    });
+    let title = title.or_else(|| messages.first().map(|m| first_line_truncated(&m.content)));
     // Build metadata
     let metadata = serde_json::json!({
         "source": agent_slug,
@@ -395,7 +399,13 @@ pub fn parse_session_file(
 }
 
 fn first_line_truncated(content: &str) -> String {
-    content.lines().next().unwrap_or(content).chars().take(100).collect()
+    content
+        .lines()
+        .next()
+        .unwrap_or(content)
+        .chars()
+        .take(100)
+        .collect()
 }
 
 /// Discover deduplicated session files across `homes`, filtered by

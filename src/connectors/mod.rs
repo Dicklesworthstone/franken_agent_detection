@@ -25,6 +25,7 @@ pub mod goose;
 pub mod grok;
 #[cfg(feature = "hermes")]
 pub mod hermes;
+pub mod kimi;
 pub mod muse;
 pub mod omp;
 pub mod openclaw;
@@ -32,6 +33,7 @@ pub mod openclaw;
 pub mod opencode;
 pub mod openhands;
 pub mod path_trie;
+pub mod pi_agent;
 pub mod pi_wire;
 pub mod qwen;
 pub mod scan;
