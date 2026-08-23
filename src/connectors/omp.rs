@@ -169,7 +169,11 @@ impl OmpConnector {
             let cfg_name = env("PI_CONFIG_DIR")
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| ".omp".to_string());
-            let base = home.join(cfg_name);
+            // Upstream resolves the config root via Node `path.join(home,
+            // name)`, which keeps even an absolute-looking override *under*
+            // home; Rust `Path::join` would replace the whole path, so
+            // strip leading separators to preserve upstream semantics.
+            let base = home.join(cfg_name.trim_start_matches(['/', '\\']));
             out.push((base.join("agent"), None));
             for (name, dir) in Self::enumerate_profiles(&base.join("profiles")) {
                 out.push((dir.join("agent"), Some(name)));
@@ -414,9 +418,18 @@ mod tests {
     #[test]
     fn v18_roots_honor_pi_config_dir_rename() {
         let dir = tempfile::TempDir::new().unwrap();
-        let roots =
-            OmpConnector::v18_roots_from(Some(dir.path()), &env_of(&[("PI_CONFIG_DIR", ".pi2")]));
+        let pairs = [("PI_CONFIG_DIR", ".pi2")];
+        let roots = OmpConnector::v18_roots_from(Some(dir.path()), &env_of(&pairs));
         assert_eq!(roots, vec![(dir.path().join(".pi2").join("agent"), None)]);
+
+        // Node path.join keeps an absolute-looking name under home; the
+        // Rust port must not let it escape.
+        let abs_pairs = [("PI_CONFIG_DIR", "/etc/omp-cfg")];
+        let roots = OmpConnector::v18_roots_from(Some(dir.path()), &env_of(&abs_pairs));
+        assert_eq!(
+            roots,
+            vec![(dir.path().join("etc/omp-cfg").join("agent"), None)]
+        );
     }
 
     #[test]
