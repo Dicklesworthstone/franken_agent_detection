@@ -347,16 +347,19 @@ pub fn parse_session_file(
             }
             "model_change" => {
                 // Track model changes (useful metadata). pi-mono writes
-                // `provider` + `modelId`; omp writes a bare `model`.
-                provider = val
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                model_id = val
+                // `provider` + `modelId`; omp writes a bare `model`. A
+                // record lacking one field must not erase the previously
+                // tracked value.
+                if let Some(p) = val.get("provider").and_then(|v| v.as_str()) {
+                    provider = Some(p.to_string());
+                }
+                if let Some(m) = val
                     .get("modelId")
                     .and_then(|v| v.as_str())
                     .or_else(|| val.get("model").and_then(|v| v.as_str()))
-                    .map(String::from);
+                {
+                    model_id = Some(m.to_string());
+                }
             }
             _ => {
                 // Skip thinking_level_change and unknown types

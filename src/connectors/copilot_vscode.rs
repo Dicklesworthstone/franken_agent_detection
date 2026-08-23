@@ -58,6 +58,13 @@
 //! order — append-log, then flat JSON, then SQLite — and the first successful
 //! parse of a session id wins.
 
+// The full native-store parsing pipeline (`scan_native` and its helpers:
+// append-log replay, state.vscdb decode, session projection) is staged for
+// the copilot.rs scan-path wiring tracked by issue #16. Until that lands,
+// rustc sees the not-yet-referenced half as dead code; keep it compiled and
+// lint-clean so wiring is a one-call change.
+#![allow(dead_code)]
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};

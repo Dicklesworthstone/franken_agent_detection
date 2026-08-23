@@ -1476,35 +1476,36 @@ mod tests {
     // in addition to pi-mono at ~/.pi/agent
     // =====================================================
 
-    /// Regression for issue #174: `default_homes_from` must return BOTH
-    /// `~/.pi/agent` (pi-mono) and `~/.omp/agent` (Oh My Pi), so the
-    /// scan loop can walk both distributions without additional config.
+    /// Regression scope update: `default_homes_from` now returns ONLY
+    /// `~/.pi/agent` (upstream pi-mono). Oh My Pi (`omp`) sessions moved to
+    /// the dedicated `omp` connector, which shares this crate's wire parser;
+    /// a dual-home default here would double-scan `.omp` trees across two
+    /// connectors and misattribute their conversations.
     ///
     /// This test targets the pure function so it does not need to mutate
     /// process environment (`std::env::set_var` is `unsafe` and `forbid`den
     /// at the crate level).
     #[test]
-    fn default_homes_from_includes_both_pi_and_omp() {
+    fn default_homes_from_pins_the_upstream_pi_mono_agent_dir() {
         let sandbox = TempDir::new().unwrap();
         let home = sandbox.path();
         let homes = PiAgentConnector::default_homes_from(Some(home));
         assert_eq!(
             homes,
-            vec![home.join(".pi/agent"), home.join(".omp/agent")],
-            "default_homes_from must return pi-mono + Oh My Pi candidates"
+            vec![home.join(".pi/agent")],
+            "default_homes_from must return only the pi-mono candidate"
         );
     }
 
-    /// End-to-end regression for issue #174: populate a sandboxed home
-    /// with both `~/.pi/agent/sessions/<file>` and
-    /// `~/.omp/agent/sessions/<file>`, point the scanner at each root
-    /// explicitly via `ScanContext::with_roots`, and verify both sets
-    /// of conversations surface in a single scan result.
+    /// Ownership-boundary regression (issue #174 follow-up): with omp
+    /// sessions owned by the dedicated `omp` connector, `default_homes()`
+    /// must not include the `.omp` tree — a default-detection scan from an
+    /// unrelated data dir walks only `.pi/agent`.
     ///
     /// This exercises the same discovery path the real scanner takes
     /// under `build_scan_roots` without touching process environment.
     #[test]
-    fn scan_discovers_both_pi_and_omp_sessions_via_explicit_roots() {
+    fn default_detection_scan_does_not_reach_omp_trees() {
         let sandbox = TempDir::new().unwrap();
         let sandbox_home = sandbox.path().to_path_buf();
 
@@ -1526,36 +1527,44 @@ mod tests {
         )
         .unwrap();
 
-        let connector = PiAgentConnector::new();
-
-        // Each root is scanned independently (matching build_scan_roots).
-        let pi_root = sandbox_home.join(".pi/agent");
-        let omp_root = sandbox_home.join(".omp/agent");
-        let ctx_pi = ScanContext::with_roots(pi_root.clone(), vec![ScanRoot::local(pi_root)], None);
-        let ctx_omp =
-            ScanContext::with_roots(omp_root.clone(), vec![ScanRoot::local(omp_root)], None);
-
-        let mut convs = connector.scan(&ctx_pi).unwrap();
-        convs.extend(connector.scan(&ctx_omp).unwrap());
-
-        assert_eq!(
-            convs.len(),
-            2,
-            "expected 2 conversations (one per home), got {}",
-            convs.len()
-        );
-        let sources: std::collections::HashSet<_> = convs
-            .iter()
-            .map(|c| c.messages[0].content.clone())
-            .collect();
+        // Sandbox trees are invisible to default detection on any machine:
+        // default_homes() derives from the process home, so neither the
+        // sandboxed .pi tree nor the sandboxed .omp tree may surface from an
+        // unrelated data dir.
+        let ctx = ScanContext::local_default(sandbox.path().join("cass-state"), None);
+        let convs = PiAgentConnector::new().scan(&ctx).unwrap();
         assert!(
-            sources.contains("From pi-mono"),
-            "must include ~/.pi/agent session, found: {sources:?}"
+            convs
+                .iter()
+                .all(|c| !c.source_path.starts_with(&sandbox_home)),
+            "default detection must not reach sandboxed trees"
         );
-        assert!(
-            sources.contains("From Oh My Pi"),
-            "must include ~/.omp/agent session, found: {sources:?}"
+
+        // The pi connector still indexes its own tree when handed over
+        // explicitly (the path real scan-root wiring produces).
+        let ctx_pi = ScanContext::with_roots(
+            PathBuf::from("/nonexistent"),
+            vec![ScanRoot::local(sandbox_home.join(".pi/agent"))],
+            None,
         );
+        let pi_convs = PiAgentConnector::new().scan(&ctx_pi).unwrap();
+        assert_eq!(pi_convs.len(), 1);
+        assert_eq!(pi_convs[0].agent_slug, "pi_agent");
+        assert_eq!(pi_convs[0].messages[0].content, "From pi-mono");
+
+        // The dedicated omp connector claims the same sandbox's `.omp` tree
+        // when it is handed over explicitly.
+        let ctx_omp = ScanContext::with_roots(
+            PathBuf::from("/nonexistent"),
+            vec![ScanRoot::local(sandbox_home.join(".omp/agent"))],
+            None,
+        );
+        let omp_convs = crate::connectors::omp::OmpConnector::new()
+            .scan(&ctx_omp)
+            .unwrap();
+        assert_eq!(omp_convs.len(), 1);
+        assert_eq!(omp_convs[0].agent_slug, "omp");
+        assert_eq!(omp_convs[0].messages[0].content, "From Oh My Pi");
     }
 
     #[test]
@@ -1601,19 +1610,17 @@ mod tests {
     fn default_homes_from_empty_path_yields_relative_candidates() {
         let empty = PathBuf::new();
         let homes = PiAgentConnector::default_homes_from(Some(&empty));
-        assert_eq!(homes.len(), 2);
+        assert_eq!(homes.len(), 1, "only the pi-mono default: {homes:?}");
         assert_eq!(homes[0], PathBuf::from(".pi/agent"));
-        assert_eq!(homes[1], PathBuf::from(".omp/agent"));
     }
 
     // =====================================================
     // Issue #313 — PI_SESSIONS_DIR + unsupported store detection
     // =====================================================
 
-    /// `PI_SESSIONS_DIR` names a sessions directory directly and is honored as
-    /// a standalone root, independently of the built-in `~/.pi` + `~/.omp`
-    /// defaults (which remain present when no `PI_CODING_AGENT_DIR` override is
-    /// set). Exercised via the pure helper so no process env is mutated.
+    /// `PI_SESSIONS_DIR` names a sessions directory directly and is honored
+    /// as a standalone root, independently of the built-in `~/.pi/agent`
+    /// default. Exercised via the pure helper so no process env is mutated.
     #[test]
     fn homes_from_overrides_honors_pi_sessions_dir() {
         let home = PathBuf::from("/home/user");
@@ -1625,12 +1632,11 @@ mod tests {
             "PI_SESSIONS_DIR must be the first candidate root"
         );
         assert!(homes.contains(&home.join(".pi/agent")));
-        assert!(homes.contains(&home.join(".omp/agent")));
     }
 
     /// `PI_SESSIONS_DIR` and `PI_CODING_AGENT_DIR` are independent: the custom
     /// sessions dir is still scanned even when the agent home is pinned (and
-    /// the pin suppresses the built-in `~/.pi` + `~/.omp` defaults).
+    /// the pin suppresses the built-in `~/.pi/agent` default).
     #[test]
     fn homes_from_overrides_sessions_dir_and_coding_agent_dir_coexist() {
         let homes = PiAgentConnector::homes_from_overrides(
@@ -1647,13 +1653,14 @@ mod tests {
         );
     }
 
-    /// An empty `PI_SESSIONS_DIR=""` is treated as unset (no phantom root).
+    /// An empty `PI_SESSIONS_DIR=""` is treated as unset (no phantom root);
+    /// only the pi-mono built-in default remains.
     #[test]
     fn homes_from_overrides_empty_pi_sessions_dir_ignored() {
         let homes =
             PiAgentConnector::homes_from_overrides(Some(""), None, Some(Path::new("/home/user")));
         assert!(!homes.contains(&PathBuf::new()));
-        assert_eq!(homes.len(), 2, "only the two built-in defaults: {homes:?}");
+        assert_eq!(homes.len(), 1, "only the pi-mono built-in: {homes:?}");
     }
 
     /// A custom sessions root that contains JSONL session files *directly*

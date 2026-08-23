@@ -172,6 +172,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "muse" | "muse-code" | "muse_code" | "musecode" | "meta-muse" => Some("muse"),
         "omp" | "oh-my-pi" => Some("omp"),
         "opencode" | "open-code" => Some("opencode"),
+        "openclaw" | "open-claw" => Some("openclaw"),
         "openhands" | "open-hands" => Some("openhands"),
         "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
@@ -1318,6 +1319,30 @@ mod tests {
             .expect("gemini entry");
         assert!(gemini.detected);
         assert_eq!(gemini.root_paths, vec![gemini_root.display().to_string()]);
+    }
+
+    #[test]
+    fn omp_connector_detects_via_overrides_and_aliases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join(".omp").join("agent").join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir omp sessions");
+
+        // "oh-my-pi" alias must canonicalize to the omp connector.
+        let report = detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec!["oh-my-pi".to_string()]),
+            include_undetected: true,
+            root_overrides: vec![AgentDetectRootOverride {
+                slug: "omp".to_string(),
+                root: sessions,
+            }],
+        })
+        .expect("detect");
+
+        assert_eq!(report.summary.total_count, 1);
+        assert_eq!(report.summary.detected_count, 1);
+        let entry = &report.installed_agents[0];
+        assert_eq!(entry.slug, "omp");
+        assert!(entry.detected);
     }
 
     #[test]

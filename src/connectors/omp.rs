@@ -89,7 +89,9 @@ impl OmpConnector {
                     scan_root.path.join(".omp/agent/sessions"),
                 ];
                 for candidate in candidates {
-                    if Self::looks_like_root(&candidate) {
+                    // Existence gate: string-marker acceptance must not
+                    // fabricate phantom roots under unrelated scan roots.
+                    if candidate.exists() && Self::looks_like_root(&candidate) {
                         homes.push(scan_root.with_path(candidate));
                     }
                 }
@@ -526,8 +528,12 @@ mod tests {
         let convs = OmpConnector::new().scan(&ctx).expect("scan should succeed");
         assert!(convs.is_empty());
 
-        // Default-detection context pointing at nothing likewise.
-        let ctx = ScanContext::local_default(dir.path().join("state"), None);
+        // A nonexistent explicit root is equally harmless.
+        let ctx = ScanContext::with_roots(
+            dir.path().join("state"),
+            vec![ScanRoot::local(dir.path().join("missing-root"))],
+            None,
+        );
         let convs = OmpConnector::new().scan(&ctx).expect("scan should succeed");
         assert!(convs.is_empty());
     }
