@@ -411,23 +411,26 @@ fn first_line_truncated(content: &str) -> String {
         .collect()
 }
 
-/// Discover deduplicated session files across `homes`, filtered by
+/// Discover deduplicated session files across `roots`, filtered by
 /// `since_ts`, wrapped as primary session-log sources attributed to
 /// `agent_slug`.
+///
+/// Takes full [`super::ScanRoot`]s rather than bare paths so each discovered
+/// source keeps its scan-root provenance (`origin`, `platform`) — remote
+/// roots must not be downgraded to local during discovery.
 #[must_use]
 pub fn discover_sources(
-    homes: &[PathBuf],
+    roots: &[super::ScanRoot],
     ctx: &super::ScanContext,
     agent_slug: &'static str,
 ) -> Vec<super::DiscoveredSourceFile> {
-    use super::{DiscoveredSourceFile, DiscoveredSourceRole, ScanRoot};
+    use super::{DiscoveredSourceFile, DiscoveredSourceRole};
     use crate::connectors::file_modified_since;
 
     let mut out = Vec::new();
     let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
-    for home in homes {
-        let root = ScanRoot::local(home.clone());
-        for file in session_files(home) {
+    for root in roots {
+        for file in session_files(&root.path) {
             if !seen_session_paths.insert(dedupe_path_key(&file)) {
                 continue;
             }
@@ -437,7 +440,7 @@ pub fn discover_sources(
             out.push(
                 DiscoveredSourceFile::new(
                     agent_slug,
-                    &root,
+                    root,
                     file,
                     DiscoveredSourceRole::PrimarySessionLog,
                     true,

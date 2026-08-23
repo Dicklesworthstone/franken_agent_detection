@@ -1646,4 +1646,82 @@ mod tests {
             &"~/AppData/Roaming/Cursor/User/globalStorage/rooveterinaryinc.roo-cline".to_string()
         ));
     }
+
+    /// Registry invariants: the five registration points
+    /// (`KNOWN_CONNECTORS`, `canonical_connector_slug`,
+    /// `default_probe_roots`, `default_probe_paths_tilde`, and the factory
+    /// list) must agree exactly. Range-editing one table has twice silently
+    /// dropped a sibling row (kimi/openclaw module arms, "open-claw" alias);
+    /// this pins every table to the slug set mechanically.
+    #[test]
+    fn registry_tables_agree_exactly() {
+        let known: HashSet<&str> = KNOWN_CONNECTORS.iter().copied().collect();
+        assert!(!known.is_empty());
+
+        // 1. Every known connector resolves to itself (canonical self-arm).
+        for slug in KNOWN_CONNECTORS {
+            assert_eq!(
+                canonical_connector_slug(slug),
+                Some(*slug),
+                "connector {slug} must be its own canonical slug"
+            );
+        }
+
+        // 2. Every known connector has default probe roots.
+        for slug in KNOWN_CONNECTORS {
+            assert!(
+                !default_probe_roots(slug).is_empty(),
+                "connector {slug} must have at least one default probe root"
+            );
+        }
+
+        // 3. The tilde table covers exactly the known set — no missing rows,
+        // no orphaned rows for retired slugs.
+        let tilde_slugs: Vec<&str> = default_probe_paths_tilde()
+            .into_iter()
+            .map(|(slug, _)| slug)
+            .collect();
+        let tilde_set: HashSet<&str> = tilde_slugs.iter().copied().collect();
+        assert_eq!(
+            tilde_set,
+            known,
+            "tilde table slugs must equal KNOWN_CONNECTORS; missing={:?} extra={:?}",
+            known.difference(&tilde_set).collect::<Vec<_>>(),
+            tilde_set.difference(&known).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            tilde_slugs.len(),
+            tilde_set.len(),
+            "tilde table must not repeat a connector"
+        );
+        for (slug, paths) in default_probe_paths_tilde() {
+            assert!(!paths.is_empty(), "connector {slug} has empty tilde paths");
+        }
+
+        // 4. The compiled factory registry covers every non-detection-only
+        // connector. Detection-only slugs (no scan implementation) are
+        // enumerated here so a new full connector can't be forgotten:
+        // add it to `get_connector_factories` or to this allowlist.
+        let detection_only: HashSet<&str> = HashSet::from([
+            "chatgpt",
+            "continue",
+            "copilot",
+            "crush",
+            "cursor",
+            "github-copilot",
+            "hermes",
+            "windsurf",
+        ]);
+        let factory_slugs: HashSet<&str> =
+            get_connector_factories().iter().map(|(s, _)| *s).collect();
+        for slug in KNOWN_CONNECTORS {
+            if detection_only.contains(slug) {
+                continue;
+            }
+            assert!(
+                factory_slugs.contains(slug),
+                "connector {slug} needs a factory registration or must be listed as detection-only"
+            );
+        }
+    }
 }

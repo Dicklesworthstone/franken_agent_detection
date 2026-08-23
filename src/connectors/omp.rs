@@ -287,11 +287,13 @@ impl OmpConnector {
     }
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
-        let homes: Vec<PathBuf> = Self::source_roots(ctx)
+        // Pass full ScanRoots (profile tags don't participate in discovery)
+        // so remote-origin/platform provenance survives into each source.
+        let roots: Vec<ScanRoot> = Self::source_roots(ctx)
             .into_iter()
-            .map(|(root, _)| root.path)
+            .map(|(root, _)| root)
             .collect();
-        super::pi_wire::discover_sources(&homes, ctx, "omp")
+        super::pi_wire::discover_sources(&roots, ctx, "omp")
     }
 }
 
@@ -492,11 +494,41 @@ mod tests {
         let roots = OmpConnector::v18_roots_from(Some(dir.path()), &env);
         assert_eq!(roots[0], (session_dir.clone(), Some("work".to_string())));
     }
+    #[test]
+    fn discovery_preserves_remote_scan_root_provenance() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = dir.path().join(".omp").join("agent");
+        write_omp_fixture(&agent);
+
+        let ctx = ScanContext::with_roots(
+            PathBuf::from("/nonexistent"),
+            vec![ScanRoot::remote(
+                dir.path().to_path_buf(),
+                crate::types::Origin::remote_with_host("host-b", "host-b.example"),
+                Some(crate::types::Platform::Macos),
+            )],
+            None,
+        );
+        let sources = OmpConnector::new()
+            .discover_source_files(&ctx)
+            .expect("discovery");
+        assert_eq!(sources.len(), 2, "main + sub-agent transcripts");
+        for source in &sources {
+            assert!(
+                source.origin.is_remote(),
+                "remote provenance must survive omp discovery, got {:?}",
+                source.origin
+            );
+            assert_eq!(source.platform, Some(crate::types::Platform::Macos));
+            assert_eq!(source.provider_slug, "omp");
+        }
+    }
 
     #[test]
     fn v18_roots_include_existing_xdg_default_and_profile_stores() {
         let dir = tempfile::TempDir::new().unwrap();
         let xdg = dir.path().join("xdg-data");
+
         let app = xdg.join("omp");
         fs::create_dir_all(app.join("sessions")).unwrap();
         fs::create_dir_all(app.join("profiles").join("work").join("sessions")).unwrap();

@@ -243,11 +243,9 @@ impl PiAgentConnector {
     }
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
-        let homes: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
-        super::pi_wire::discover_sources(&homes, ctx, "pi_agent")
+        // Pass full ScanRoots so remote-origin/platform provenance survives
+        // into each discovered source.
+        super::pi_wire::discover_sources(&Self::source_roots(ctx), ctx, "pi_agent")
     }
 
     /// Detect Pi session stores under `root` that this connector cannot index.
@@ -1825,5 +1823,40 @@ mod tests {
             formats.contains("sqlite_sessions"),
             "expected SQLite diagnostic, got {diags:?}"
         );
+    }
+    /// Regression: discovery must preserve scan-root provenance. Remote
+    /// roots (`Origin::Ssh` + platform hint) must not be downgraded to local
+    /// when session files are wrapped as discovered sources — downstream
+    /// consumers key mirroring and path-mapping decisions off this.
+    #[test]
+    fn discovery_preserves_remote_scan_root_provenance() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join(".pi").join("agent").join("sessions");
+        fs::create_dir_all(sessions.join("--proj--")).unwrap();
+        fs::write(
+            sessions.join("--proj--").join("2025-12-01T10-00-00_uuid.jsonl"),
+            "{\"type\":\"session\",\"id\":\"s\",\"timestamp\":\"2025-12-01T10:00:00Z\",\"cwd\":\"/p\"}\n{\"type\":\"message\",\"timestamp\":\"2025-12-01T10:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"remote\"}}",
+        )
+        .unwrap();
+
+        let ctx = ScanContext::with_roots(
+            PathBuf::from("/nonexistent"),
+            vec![ScanRoot::remote(
+                dir.path().to_path_buf(),
+                crate::types::Origin::remote_with_host("host-a", "host-a.example"),
+                Some(crate::types::Platform::Linux),
+            )],
+            None,
+        );
+        let sources = PiAgentConnector::new()
+            .discover_source_files(&ctx)
+            .expect("discovery");
+        assert_eq!(sources.len(), 1);
+        assert!(
+            sources[0].origin.is_remote(),
+            "remote provenance must survive discovery, got {:?}",
+            sources[0].origin
+        );
+        assert_eq!(sources[0].platform, Some(crate::types::Platform::Linux));
     }
 }
