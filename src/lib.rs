@@ -57,7 +57,7 @@ pub use connectors::{
     extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
     get_connector_factories, grok::GrokConnector, kimi::KimiConnector, normalize_model,
-    openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
+    omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
     pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
@@ -138,6 +138,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "hermes",
     "kimi",
     "muse",
+    "omp",
     "opencode",
     "openclaw",
     "openhands",
@@ -169,6 +170,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "hermes" | "hermes-agent" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
         "muse" | "muse-code" | "muse_code" | "musecode" | "meta-muse" => Some("muse"),
+        "omp" | "oh-my-pi" => Some("omp"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
         "openhands" | "open-hands" => Some("openhands"),
@@ -321,6 +323,13 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
         }
         "muse" => {
             let root = read("CASS_MUSE_DATA_ROOT")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root)])
+        }
+        "omp" => {
+            let root = read("CASS_OMP_DATA_ROOT")?;
             if root.is_empty() {
                 return None;
             }
@@ -695,15 +704,17 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".openhands", "conversations"]);
             maybe_push(&mut out, &[".openhands"]);
         }
-        "pi_agent" => {
-            maybe_push(&mut out, &[".pi", "agent", "sessions"]);
-            // Oh My Pi (`omp`) is a pi-mono derivative sharing the wire
-            // format; the connector already scans ~/.omp/agent, but detection
-            // is registry-driven, so an omp-only machine reported the
-            // pi_agent connector as not detected without these (cass#351
-            // investigation fallout).
+        "omp" => {
+            // Oh My Pi (`omp`, https://omp.sh) pins its store to
+            // ~/.omp/agent; there is no relocation env var in the CLI, so
+            // these are the canonical roots. Probe the sessions directory
+            // first (highest-signal), then the parent so detection still
+            // fires for fresh installs that haven't created a session yet.
             maybe_push(&mut out, &[".omp", "agent", "sessions"]);
             maybe_push(&mut out, &[".omp", "agent"]);
+        }
+        "pi_agent" => {
+            maybe_push(&mut out, &[".pi", "agent", "sessions"]);
         }
         "qwen" => {
             maybe_push(&mut out, &[".qwen", "tmp"]);
@@ -1171,11 +1182,13 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".openhands", "conversations"]),
                     tilde(&[".openhands"]),
                 ],
-                "pi_agent" => vec![
-                    tilde(&[".pi", "agent", "sessions"]),
+                "omp" => vec![
+                    // Oh My Pi (`omp`, https://omp.sh) canonical store; the
+                    // dedicated omp connector owns these roots.
                     tilde(&[".omp", "agent", "sessions"]),
                     tilde(&[".omp", "agent"]),
                 ],
+                "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
                 "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],
                 "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],
                 "windsurf" => vec![tilde(&[".windsurf"]), tilde(&[".config", "windsurf"])],
@@ -1306,6 +1319,30 @@ mod tests {
             .expect("gemini entry");
         assert!(gemini.detected);
         assert_eq!(gemini.root_paths, vec![gemini_root.display().to_string()]);
+    }
+
+    #[test]
+    fn omp_connector_detects_via_overrides_and_aliases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join(".omp").join("agent").join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir omp sessions");
+
+        // "oh-my-pi" alias must canonicalize to the omp connector.
+        let report = detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec!["oh-my-pi".to_string()]),
+            include_undetected: true,
+            root_overrides: vec![AgentDetectRootOverride {
+                slug: "omp".to_string(),
+                root: sessions,
+            }],
+        })
+        .expect("detect");
+
+        assert_eq!(report.summary.total_count, 1);
+        assert_eq!(report.summary.detected_count, 1);
+        let entry = &report.installed_agents[0];
+        assert_eq!(entry.slug, "omp");
+        assert!(entry.detected);
     }
 
     #[test]
@@ -1568,13 +1605,15 @@ mod tests {
         assert!(kimi.contains(&"~/.kimi/sessions".to_string()));
         assert!(kimi.contains(&"~/.kimi".to_string()));
 
-        // Oh My Pi (`omp`) shares the pi_agent connector; without these
-        // probe entries an omp-only machine reports pi_agent not detected
-        // (cass#351 investigation fallout).
+        // Oh My Pi (`omp`) now has its own first-class connector; pi_agent
+        // is scoped back to the upstream pi-mono home only.
         let pi_agent = by_slug.get("pi_agent").expect("pi_agent paths");
         assert!(pi_agent.contains(&"~/.pi/agent/sessions".to_string()));
-        assert!(pi_agent.contains(&"~/.omp/agent/sessions".to_string()));
-        assert!(pi_agent.contains(&"~/.omp/agent".to_string()));
+        assert!(!pi_agent.iter().any(|p| p.contains(".omp")));
+
+        let omp = by_slug.get("omp").expect("omp paths");
+        assert!(omp.contains(&"~/.omp/agent/sessions".to_string()));
+        assert!(omp.contains(&"~/.omp/agent".to_string()));
 
         let cline = by_slug.get("cline").expect("cline paths");
         assert!(
