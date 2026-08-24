@@ -44,7 +44,24 @@ Scope window: 2026-02-15 through HEAD
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **Muse default-detection no longer ignores a Cursor-style base `data_dir`.**
+  The muse connector was the last of the three single-surface connectors
+  (with Grok and Antigravity, both fixed in 0.2.2) whose default-detection
+  scan probed the machine's real store unconditionally: a `data_dir` that is
+  itself a muse base (`sessions/` tree) or the `sessions/` dir never scoped
+  the scan, so fixture/mirror scans collected — or missed — sessions from
+  `~/.local/share/muse` depending on the machine. `CASS_MUSE_DATA_ROOT`
+  keeps precedence so CI redirection is unaffected.
+
+### Added
+
+- **Default-detection scoping regression tests** for grok, antigravity, and
+  muse: a `local_default` scan over a fixture laid out as each connector's
+  real store must index exactly the fixture's sessions, which fails on
+  pre-fix code on any machine (empty system store yields nothing to leak,
+  and the assertion pins exact source paths).
 
 ## [0.2.2] -- 2026-08-24
 
