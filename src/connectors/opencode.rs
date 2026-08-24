@@ -560,12 +560,16 @@ impl OpenCodeConnector {
             let ended_at = session_updated_ms.or(msg_ended_at).or(started_at);
 
             // Filter by since_ts in Rust (can't reliably filter in SQL when
-            // timestamp column format is unknown).
-            if let Some(since) = since_ts {
-                let latest = ended_at.or(started_at).unwrap_or(0);
-                if latest < since {
-                    continue;
-                }
+            // timestamp column format is unknown). Sessions whose timestamps
+            // are ALL unparseable must stay: pruning them on latest=0 would
+            // drop them from every incremental scan forever (the flat-file
+            // path guards this blind spot with mtimes; SQLite rows have no
+            // such fallback). Only KNOWN-old sessions are pruned.
+            if let Some(since) = since_ts
+                && let Some(latest) = ended_at.or(started_at)
+                && latest < since
+            {
+                continue;
             }
 
             let workspace = session.directory.map(PathBuf::from);
@@ -969,6 +973,13 @@ impl Connector for OpenCodeConnector {
             db_candidates.retain(|p| seen.insert(p.clone()));
         }
 
+        // Session ids seen across ALL db candidates: stale migrated copies
+        // (e.g. ~/.config/opencode/opencode.db left behind after a move to
+        // ~/.local/share) share session ids with the live store, and
+        // emitting both double-indexes every conversation. First-wins by
+        // candidate priority order (explicit/data_dir before defaults).
+        let mut seen_db_session_ids: HashSet<String> = HashSet::new();
+
         for db in db_candidates {
             if !db.is_file() {
                 continue;
@@ -981,12 +992,16 @@ impl Connector for OpenCodeConnector {
             }
             match Self::extract_from_sqlite(&db, ctx.since_ts, ctx.progress_tick.as_deref()) {
                 Ok(sqlite_convs) => {
+                    let fresh_count = sqlite_convs.len();
+                    convs.extend(sqlite_convs.into_iter().filter(|conv| {
+                        conv.external_id
+                            .as_ref()
+                            .is_none_or(|id| seen_db_session_ids.insert(id.clone()))
+                    }));
                     tracing::debug!(
-                        "opencode sqlite: found {} sessions in {}",
-                        sqlite_convs.len(),
+                        "opencode sqlite: found {fresh_count} sessions in {}",
                         db.display()
                     );
-                    convs.extend(sqlite_convs);
                 }
                 Err(e) => {
                     tracing::debug!("opencode sqlite: failed to read {}: {e}", db.display());
@@ -1280,7 +1295,11 @@ fn session_has_updates(
 fn parse_session_file(path: &Path) -> Result<SessionInfo> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("read session file {}", path.display()))?;
-    let session: SessionInfo = serde_json::from_str(&content)
+    // Editors/tools sometimes leave a UTF-8 BOM on flat-file sessions;
+    // serde_json rejects a leading U+FEFF and the whole session would be
+    // silently skipped (gemini's replay strips it for the same reason).
+    let content = content.trim_start_matches('\u{feff}');
+    let session: SessionInfo = serde_json::from_str(content)
         .with_context(|| format!("parse session JSON {}", path.display()))?;
     Ok(session)
 }
