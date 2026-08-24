@@ -86,7 +86,9 @@ pub fn percent_decode_utf8(input: &str) -> String {
         {
             let hi = (bytes[pos + 1] as char).to_digit(16).unwrap_or(0);
             let lo = (bytes[pos + 2] as char).to_digit(16).unwrap_or(0);
-            out.push((hi * 16 + lo) as u8);
+            // Both digits passed `is_ascii_hexdigit`, so the value is at
+            // most 0xFF; the fallback is unreachable.
+            out.push(u8::try_from(hi * 16 + lo).unwrap_or_default());
             pos += 3;
         } else {
             out.push(bytes[pos]);

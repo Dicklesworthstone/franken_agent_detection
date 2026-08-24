@@ -466,9 +466,9 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
 /// maps to `assistant`.
 fn normalize_amp_role(raw: Option<&str>) -> &'static str {
     match raw.map(str::to_ascii_lowercase).as_deref() {
-        Some("human") | Some("user") | Some("usermessage") => "user",
+        Some("human" | "user" | "usermessage") => "user",
         Some("system") => "system",
-        Some("toolresult") | Some("tool") => "tool",
+        Some("toolresult" | "tool") => "tool",
         _ => "assistant",
     }
 }
