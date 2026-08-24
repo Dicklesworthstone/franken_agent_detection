@@ -132,17 +132,24 @@ impl CrushConnector {
         if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             db_paths.push(ScanRoot::local(ctx.data_dir.clone()));
         } else if ctx.use_default_detection() {
-            if let Some(global) = Self::global_db_path() {
-                db_paths.push(ScanRoot::local(global));
-            }
-            db_paths.extend(
-                Self::discover_project_dbs()
-                    .into_iter()
-                    .map(ScanRoot::local),
-            );
+            // A crush.db under data_dir scopes the scan to it; only
+            // otherwise probe the global + per-project stores. Probing both
+            // polluted scoped fixture/mirror scans with the machine's real
+            // sessions (deduped by id, but still foreign content).
+            // CRUSH_SQLITE_DB keeps precedence.
             let candidate = ctx.data_dir.join("crush.db");
-            if candidate.exists() {
+            let env_override = env_path_nonempty("CRUSH_SQLITE_DB").is_some();
+            if !env_override && !ctx.data_dir.as_os_str().is_empty() && candidate.exists() {
                 db_paths.push(ScanRoot::local(candidate));
+            } else {
+                if let Some(global) = Self::global_db_path() {
+                    db_paths.push(ScanRoot::local(global));
+                }
+                db_paths.extend(
+                    Self::discover_project_dbs()
+                        .into_iter()
+                        .map(ScanRoot::local),
+                );
             }
         } else {
             let candidate = ctx.data_dir.join("crush.db");

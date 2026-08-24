@@ -235,18 +235,27 @@ impl GooseConnector {
         if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             let root = ScanRoot::local(ctx.data_dir.clone());
             candidates.push((root, ctx.data_dir.clone()));
-        } else if !ctx.data_dir.as_os_str().is_empty() {
-            let root = ScanRoot::local(ctx.data_dir.clone());
-            let db_path = root.path.join("sessions.db");
-            candidates.push((root, db_path));
-        }
-
-        if ctx.use_default_detection() {
-            if let Some(db) = Self::sqlite_db_path() {
+        } else if ctx.use_default_detection() {
+            // Mirrors scan(): a sessions.db under data_dir scopes discovery
+            // to it; only otherwise probe the system store.
+            // GOOSE_SQLITE_DB keeps precedence.
+            let candidate = (!ctx.data_dir.as_os_str().is_empty())
+                .then(|| ctx.data_dir.join("sessions.db"))
+                .filter(|p| p.is_file());
+            if let Some(db) =
+                candidate.filter(|_| env_path_nonempty("GOOSE_SQLITE_DB").is_none())
+            {
+                candidates.push((ScanRoot::local(db.clone()), db));
+            } else if let Some(db) = Self::sqlite_db_path() {
                 let root = ScanRoot::local(db.clone());
                 candidates.push((root, db));
             }
         } else {
+            if !ctx.data_dir.as_os_str().is_empty() {
+                let root = ScanRoot::local(ctx.data_dir.clone());
+                let db_path = root.path.join("sessions.db");
+                candidates.push((root, db_path));
+            }
             for scan_root in &ctx.scan_roots {
                 let mut db_paths = Vec::new();
                 Self::append_db_candidates(&mut db_paths, &scan_root.path);
@@ -607,15 +616,25 @@ impl Connector for GooseConnector {
         let mut db_paths: Vec<PathBuf> = Vec::new();
         if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             db_paths.push(ctx.data_dir.clone());
-        } else if !ctx.data_dir.as_os_str().is_empty() {
-            db_paths.push(ctx.data_dir.join("sessions.db"));
-        }
-
-        if ctx.use_default_detection() {
-            if let Some(db) = Self::sqlite_db_path() {
+        } else if ctx.use_default_detection() {
+            // Mirror the JSONL policy: a sessions.db under data_dir scopes
+            // the sqlite scan to it; only otherwise probe the system store.
+            // Probing both leaked the machine's real sessions into scoped
+            // fixture/mirror scans. GOOSE_SQLITE_DB keeps precedence.
+            let candidate = (!ctx.data_dir.as_os_str().is_empty())
+                .then(|| ctx.data_dir.join("sessions.db"))
+                .filter(|p| p.is_file());
+            if let Some(db) =
+                candidate.filter(|_| env_path_nonempty("GOOSE_SQLITE_DB").is_none())
+            {
+                db_paths.push(db);
+            } else if let Some(db) = Self::sqlite_db_path() {
                 db_paths.push(db);
             }
         } else {
+            if !ctx.data_dir.as_os_str().is_empty() {
+                db_paths.push(ctx.data_dir.join("sessions.db"));
+            }
             for scan_root in &ctx.scan_roots {
                 Self::append_db_candidates(&mut db_paths, &scan_root.path);
             }
