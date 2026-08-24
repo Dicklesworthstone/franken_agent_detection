@@ -74,7 +74,7 @@ pub(crate) fn dedupe_path_key(path: &std::path::Path) -> PathBuf {
 /// [`String::from_utf8_lossy`], which is acceptable for workspace-path
 /// best-effort inference.
 #[must_use]
-pub(crate) fn percent_decode_utf8(input: &str) -> String {
+pub fn percent_decode_utf8(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut pos = 0;

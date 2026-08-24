@@ -435,7 +435,7 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
 
         out.push(NormalizedMessage {
             idx: 0, // Will be re-assigned after filtering
-            role,
+            role: role.to_string(),
             author,
             created_at,
             content,
@@ -508,7 +508,7 @@ fn infer_workspace(val: &Value) -> Option<PathBuf> {
                     super::percent_decode_utf8(stripped)
                 } else if !uri.contains("://") {
                     // Bare path (no scheme), treat as filesystem path
-                    uri
+                    uri.to_string()
                 } else {
                     // Non-file scheme (ssh://, https://, vscode-remote://…) — skip
                     continue;
