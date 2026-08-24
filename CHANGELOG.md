@@ -40,6 +40,50 @@ Scope window: 2026-02-15 through HEAD
 
 ---
 
+## [Unreleased]
+
+Post-0.2.1 fix wave: connector correctness fixes surfaced by a cross-connector
+audit, plus registry invariant hardening. Unreleased; version not yet cut.
+
+### Fixed
+
+- **OpenCode no longer loses or duplicates sessions three ways**.
+  Sessions whose timestamps are all unparseable are kept instead of being
+  pruned forever by every incremental scan (the `since_ts` filter now applies
+  only when a timestamp actually parsed); a `seen_db_session_ids` set spans
+  all db candidates so stale migrated databases (`~/.config/opencode` vs
+  `~/.local/share`) stop double-indexing shared session ids, while
+  conversations with no `external_id` pass through uncollapsed; and a
+  leading UTF-8 BOM is trimmed before JSON parsing instead of skipping the
+  whole file.
+- **Muse unsequenced records keep append order, and workspace inheritance
+  survives unreadable lines.** A record without `sequence` used to fall back
+  to `i64::MAX - lineno`, emitting the unsequenced tail in REVERSED order
+  after every sequenced record; the two-band sort key keeps that tail after
+  all sequenced records but in file order. The subagent parent-transcript
+  workspace lookup skips an unreadable line instead of aborting, so one bad
+  region no longer erases workspace inheritance. Regression tests cover both
+  behaviors.
+- **Clawdbot dedupes session files across overlapping scan roots.** The
+  connector walked each root independently and emitted shared files once per
+  covering root; a `HashSet` of shared `dedupe_path_key`s now spans ALL
+  roots, checked before the mtime filter.
+- **ChatGPT enforces the 100MB read cap after the read too**, closing the
+  bypass where a pre-read `fs::metadata` error skipped the size guard
+  entirely.
+- **Amp threads are keyed by path, roles normalized, and workspace URIs
+  percent-decoded**; role-less Factory entries default to `assistant`
+  instead of `"unknown"`.
+- **Aider, copilot-cli, and cursor no longer silently discard sessions.**
+- **Grok detection honors `GROK_HOME`** when resolving override roots.
+
+### Added
+
+- **Registry invariant hardening**: factory slugs are canonicalized,
+  duplicate registrations are rejected, and the factory cross-check is
+  feature-aware — the slug-set drift class caught by hand during 0.2.x now
+  fails CI mechanically.
+
 ## [0.2.1] -- 2026-08-23
 
 Patch over the 0.2.0 window, from a fresh-eyes audit of everything that

@@ -1090,6 +1090,98 @@ mod tests {
     }
 
     #[test]
+    fn unsequenced_records_keep_append_order() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp
+            .path()
+            .join("sessions/2026/08/05/s4")
+            .join(SESSION_FILE);
+        // Envelope without a `sequence` field: must trail every sequenced
+        // record and preserve file order among itself. The old
+        // `i64::MAX - lineno` fallback emitted this band in REVERSE.
+        let unsequenced = |payload_type: &str, payload: serde_json::Value| -> String {
+            serde_json::to_string(&json!({
+                "schema_version": 1,
+                "stream": {"kind": "session", "id": SESSION_ID},
+                "recorded_at": BASE_US,
+                "record_type": "event",
+                "durability": "durable",
+                "payload_type": payload_type,
+                "payload": payload,
+            }))
+            .expect("serialize unsequenced envelope")
+        };
+        write_lines(
+            &log,
+            &[
+                run_event(
+                    7,
+                    json!({"kind": "assistant_message_committed", "text": "answer"}),
+                ),
+                run_event(3, json!({"kind": "started", "prompt": "question"})),
+                unsequenced(
+                    "runtime.session",
+                    json!({"kind": "run", "event": {"kind": "started", "prompt": "late-a"}}),
+                ),
+                unsequenced(
+                    "runtime.session",
+                    json!({
+                        "kind": "run",
+                        "event": {"kind": "assistant_message_committed", "text": "late-b"}
+                    }),
+                ),
+            ],
+        );
+        let conv = parse_session(&log).expect("conversation");
+        let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        // Sequenced records sort by sequence; the unsequenced tail keeps
+        // append order (late-a before late-b).
+        assert_eq!(conv.messages[0].content, "question");
+        assert_eq!(conv.messages[1].content, "answer");
+        assert_eq!(conv.messages[2].content, "late-a");
+        assert_eq!(conv.messages[3].content, "late-b");
+    }
+
+    #[test]
+    fn workspace_lookup_survives_unreadable_line() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_dir = temp.path().join("sessions/2026/08/05").join(SESSION_ID);
+        let root_log = session_dir.join(SESSION_FILE);
+        // Parent transcript: valid event, an invalid-UTF-8 region, THEN the
+        // metadata record. The workspace lookup must skip the bad line and
+        // still find the record (a hard stop would lose the workspace).
+        let mut bytes = run_event(1, json!({"kind": "started", "prompt": "question"})).into_bytes();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"\xff\xfe not valid utf-8\n");
+        bytes.extend_from_slice(
+            envelope(
+                2,
+                "runtime.session.metadata",
+                &json!({"record": {"workspace_root": "/data/projects/demo"}}),
+            )
+            .as_bytes(),
+        );
+        bytes.push(b'\n');
+        fs::create_dir_all(&session_dir).expect("mkdir");
+        fs::write(&root_log, &bytes).expect("write transcript");
+
+        // Subagent transcript with no metadata of its own (gotcha 1): the
+        // workspace must be inherited from the parent despite its bad line.
+        let sub_log = session_dir
+            .join("subagent")
+            .join(SUBAGENT_ID)
+            .join(SESSION_FILE);
+        write_lines(
+            &sub_log,
+            &[run_event(1, json!({"kind": "started", "prompt": "search"}))],
+        );
+
+        let conv = parse_session(&sub_log).expect("subagent conversation");
+        assert_eq!(conv.workspace, Some(PathBuf::from("/data/projects/demo")));
+    }
+
+    #[test]
     fn malformed_lines_are_skipped_not_fatal() {
         let temp = TempDir::new().expect("tempdir");
         let log = temp
