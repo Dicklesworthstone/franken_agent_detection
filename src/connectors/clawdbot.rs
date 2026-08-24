@@ -16,9 +16,10 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::dedupe_path_key;
 use super::{
-    Connector, dedupe_path_key, file_modified_since, flatten_content,
-    franken_detection_for_connector, parse_timestamp,
+    Connector, file_modified_since, flatten_content, franken_detection_for_connector,
+    parse_timestamp,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
