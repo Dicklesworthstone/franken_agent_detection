@@ -328,6 +328,17 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root)])
         }
+        "grok" => {
+            // Mirrors GrokConnector::base_root(): scans honor $GROK_HOME,
+            // so detection must too — otherwise a relocated install reports
+            // not-found while scan finds sessions.
+            let root = read("GROK_HOME")?;
+            if root.is_empty() {
+                return None;
+            }
+            let root = PathBuf::from(root);
+            Some(vec![root.join("sessions"), root])
+        }
         "omp" => {
             let root = read("CASS_OMP_DATA_ROOT")?;
             if root.is_empty() {
