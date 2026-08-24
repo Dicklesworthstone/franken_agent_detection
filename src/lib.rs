@@ -1722,8 +1722,9 @@ mod tests {
         // `cargo test`.
         #[cfg(feature = "connectors")]
         {
-            let detection_only: HashSet<&str> =
-                HashSet::from(["continue", "github-copilot", "windsurf"]);
+            // Slugs with no scan implementation at all (no module under
+            // `connectors/`). Everything else must register a factory.
+            let detection_only: HashSet<&str> = HashSet::from(["continue", "windsurf"]);
             let feature_gated: HashMap<&str, bool> = HashMap::from([
                 ("chatgpt", cfg!(feature = "chatgpt")),
                 ("crush", cfg!(feature = "crush")),
@@ -1732,8 +1733,23 @@ mod tests {
                 ("hermes", cfg!(feature = "hermes")),
                 ("opencode", cfg!(feature = "opencode")),
             ]);
-            let factory_slugs: HashSet<&str> =
-                get_connector_factories().iter().map(|(s, _)| *s).collect();
+            // Factory slugs are the connector-native names (e.g. `copilot`
+            // for VS Code Copilot chat, which this registry knows as
+            // `github-copilot`), so compare after canonicalising. Every
+            // factory must map into KNOWN_CONNECTORS: a factory registered
+            // under a slug the registry cannot name is unreachable from
+            // `franken_detection_for_connector`, and a slug registered twice
+            // means two factories fight over one connector.
+            let mut factory_slugs: HashSet<&str> = HashSet::new();
+            for (raw, _) in get_connector_factories() {
+                let canonical = canonical_connector_slug(raw).unwrap_or_else(|| {
+                    panic!("factory slug {raw} does not canonicalise into KNOWN_CONNECTORS")
+                });
+                assert!(
+                    factory_slugs.insert(canonical),
+                    "connector {canonical} is registered twice in the factory list (via {raw})"
+                );
+            }
             for slug in KNOWN_CONNECTORS {
                 if detection_only.contains(slug) {
                     assert!(
