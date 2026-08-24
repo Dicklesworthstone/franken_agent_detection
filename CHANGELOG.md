@@ -77,6 +77,15 @@ audit, plus registry invariant hardening. Unreleased; version not yet cut.
   instead of `"unknown"`.
 - **Aider, copilot-cli, and cursor no longer silently discard sessions.**
 - **Grok detection honors `GROK_HOME`** when resolving override roots.
+- **Cursor default-detection no longer leaks the machine's real
+  `~/.cursor/projects` into scoped scans.** When a scan's `data_dir` is
+  itself a Cursor base (fixture, mirror, or alternate install), Agent
+  transcripts were still collected from the system projects root — the one
+  connector surface that ignored the Composer root policy — duplicating or
+  polluting results on machines with local Cursor data. Agent-transcript
+  discovery now mirrors the Composer policy (`data_dir` base wins;
+  `CASS_CURSOR_PROJECTS_ROOT` still takes precedence for CI). Regression
+  test covers a combined composer + agent-transcript base.
 
 ### Added
 

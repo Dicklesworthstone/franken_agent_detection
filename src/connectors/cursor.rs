@@ -918,14 +918,24 @@ impl CursorConnector {
     }
 
     /// Roots under which to look for Agent transcripts. Mirrors the Composer
-    /// root policy: default detection uses `~/.cursor/projects`; explicit scan
-    /// roots (e.g. remote mirrors) are walked as-is.
+    /// root policy: a default-detection `data_dir` that itself looks like a
+    /// Cursor base scopes the whole scan to that base (so fixture/mirror
+    /// scans stay hermetic); otherwise default detection uses
+    /// `~/.cursor/projects`, with `CASS_CURSOR_PROJECTS_ROOT` still taking
+    /// precedence for CI; explicit scan roots (e.g. remote mirrors) are
+    /// walked as-is.
     fn agent_scan_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
-            Self::agent_projects_root()
-                .into_iter()
-                .map(ScanRoot::local)
-                .collect()
+            if Self::looks_like_base(&ctx.data_dir)
+                && env_path_nonempty("CASS_CURSOR_PROJECTS_ROOT").is_none()
+            {
+                vec![ScanRoot::local(ctx.data_dir.clone())]
+            } else {
+                Self::agent_projects_root()
+                    .into_iter()
+                    .map(ScanRoot::local)
+                    .collect()
+            }
         } else {
             ctx.scan_roots.clone()
         };
@@ -2188,6 +2198,59 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn default_detection_scopes_agent_transcripts_to_cursor_base() {
+        let dir = TempDir::new().unwrap();
+
+        // A data_dir that IS a Cursor base: one Composer conversation…
+        let cursor_dir = dir.path().join("Cursor");
+        let global_dir = cursor_dir.join("globalStorage");
+        fs::create_dir_all(&global_dir).unwrap();
+        let db_path = global_dir.join("state.vscdb");
+        let conn = create_test_db(&db_path);
+        let value = json!({ "text": "Both sources" }).to_string();
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params!["composerData:both-123", value.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        // …plus one Agent transcript under the SAME base. Default detection
+        // must scan it from HERE, not from the machine's real
+        // ~/.cursor/projects (which leaks foreign sessions into the scan and
+        // made these tests fail on machines with local Cursor data).
+        let sid = "sess-both";
+        let transcript_dir = cursor_dir
+            .join("proj-x")
+            .join(AGENT_TRANSCRIPTS_DIR)
+            .join(sid);
+        fs::create_dir_all(&transcript_dir).unwrap();
+        fs::write(
+            transcript_dir.join(format!("{sid}.jsonl")),
+            format!(
+                "{}\n",
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"from agent transcripts"}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let connector = CursorConnector::new();
+        let ctx = ScanContext::local_default(cursor_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(
+            convs.len(),
+            2,
+            "exactly the one composer conversation and the one agent transcript from this base"
+        );
+        let ids: HashSet<String> = convs.iter().filter_map(|c| c.external_id.clone()).collect();
+        assert!(
+            ids.contains(&sid.to_string()),
+            "agent transcript under a Cursor-base data_dir must be indexed from that dir, ids={ids:?}"
+        );
     }
 
     // =========================================================================
