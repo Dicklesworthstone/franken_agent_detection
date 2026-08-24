@@ -294,12 +294,14 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
                 // Track session bounds robustly even if events are out of order.
                 update_time_bounds(&mut started_at, &mut ended_at, created);
 
-                // Extract role from message.role
+                // Extract role from message.role. Role-less entries default
+                // to assistant (model-side), matching qwen's normalization;
+                // "unknown" is outside the conformance contract's role set.
                 let role = val
                     .get("message")
                     .and_then(|m| m.get("role"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                    .unwrap_or("assistant");
 
                 // Extract content from message.content
                 let content_val = val.get("message").and_then(|m| m.get("content"));
