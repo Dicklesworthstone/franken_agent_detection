@@ -1,6 +1,6 @@
 [package]
 name = "franken-agent-detection"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -29,16 +29,16 @@ once_cell = { version = "1", optional = true }
 urlencoding = { version = "2", optional = true }
 
 # --- Optional: ChatGPT encrypted conversations ---
-aes-gcm = { version = "0.10", optional = true }
-base64 = { version = "0.22", optional = true }
+aes-gcm = { version = "0.11", optional = true }
+base64 = { version = "0.23", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
-frankensqlite = { version = "0.3.0", package = "fsqlite", optional = true }
+frankensqlite = { version = "0.3.8", package = "fsqlite", optional = true }
 # Drives fsqlite's async (!Send) engine futures to completion behind the
 # connectors' synchronous API surface (see connectors/sqlite_sync.rs).
 # fsqlite 0.3 names asupersync 0.4.x types in its public API, so the two
 # must move in lockstep (asupersync 0.3.x and 0.4.x are non-interchangeable).
-asupersync = { version = "0.4.3", default-features = false, optional = true }
+asupersync = { version = "0.4.9", default-features = false, optional = true }
 
 [features]
 default = []
@@ -82,8 +82,8 @@ all-connectors = [
 ]
 
 [dev-dependencies]
-tempfile = "3"
-serial_test = "3"
+tempfile = "3.27"
+serial_test = "4"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -94,8 +94,13 @@ nursery = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# clippy::assert_is_empty landed in pedantic on the floating nightly
+# (2026-08 toolchain drift) and flags ~35 pre-existing test assertions of
+# the form `assert!(x.is_empty())` across connectors. The lint offers no
+# mechanical rewrite; keep the established assertion style until then.
+assert_is_empty = "allow"
 
-# fsqlite 0.2's async engine builds enormous debug-mode futures; at opt-level 0
+# fsqlite's async engine builds enormous debug-mode futures; at opt-level 0
 # a single statement poll can overflow a 2 MiB test-thread stack. Upstream
 # frankensqlite itself develops at `[profile.dev] opt-level = 1` for the same
 # reason. Applies to dependencies only, never this crate's own test code.

@@ -522,7 +522,7 @@ impl OpenCodeConnector {
                         .time_updated_raw
                         .as_ref()
                         .and_then(normalize_sqlite_ts_value)
-                        .map_or(true, |updated| updated >= since)
+                        .is_none_or(|updated| updated >= since)
                 })
                 .map(|session| session.id.clone())
                 .collect()
@@ -3190,7 +3190,8 @@ mod tests {
             full_ids,
             ["old", "new", "null-recent", "null-old"]
                 .iter()
-                .map(|s| s.to_string())
+                .copied()
+                .map(str::to_string)
                 .collect()
         );
 
@@ -3202,7 +3203,8 @@ mod tests {
             inc_ids,
             ["new", "null-recent"]
                 .iter()
-                .map(|s| s.to_string())
+                .copied()
+                .map(str::to_string)
                 .collect(),
             "incremental keeps updated>=cutoff and unknown-time+recent-msg, drops the rest"
         );
