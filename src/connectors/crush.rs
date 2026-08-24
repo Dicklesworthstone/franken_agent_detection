@@ -491,4 +491,65 @@ mod tests {
         assert_eq!(convs[0].source_path, db_path);
         crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
+
+    #[test]
+    fn default_detection_scopes_sqlite_to_data_dir() {
+        // A crush.db under data_dir must scope the default-detection scan
+        // to THIS store; the machine's real global/per-project stores must
+        // not leak additional conversations into the result.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("crush.db");
+        let conn =
+            crate::connectors::sqlite_sync::Connection::open(db_path.to_string_lossy().as_ref())
+                .unwrap();
+        conn.execute(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                cost REAL
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE messages (
+                session_id TEXT,
+                role TEXT,
+                parts TEXT,
+                created_at INTEGER,
+                model TEXT,
+                provider TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO sessions (id, title, prompt_tokens, completion_tokens, cost)
+             VALUES (?, ?, ?, ?, ?)",
+            params!["sess-scope", "Scoped Crush", 1_i64, 2_i64, 0.01_f64],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO messages (session_id, role, parts, created_at, model, provider)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                "sess-scope",
+                "user",
+                r#"[{"type":"text","text":"Hello Crush"}]"#,
+                1_733_000_000_000_i64,
+                "crush-model",
+                "crush"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let connector = CrushConnector::new();
+        let ctx = ScanContext::local_default(tmp.path().to_path_buf(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-scope"));
+        assert_eq!(convs[0].source_path, db_path);
+    }
 }

@@ -242,9 +242,7 @@ impl GooseConnector {
             let candidate = (!ctx.data_dir.as_os_str().is_empty())
                 .then(|| ctx.data_dir.join("sessions.db"))
                 .filter(|p| p.is_file());
-            if let Some(db) =
-                candidate.filter(|_| env_path_nonempty("GOOSE_SQLITE_DB").is_none())
-            {
+            if let Some(db) = candidate.filter(|_| env_path_nonempty("GOOSE_SQLITE_DB").is_none()) {
                 candidates.push((ScanRoot::local(db.clone()), db));
             } else if let Some(db) = Self::sqlite_db_path() {
                 let root = ScanRoot::local(db.clone());
@@ -624,9 +622,7 @@ impl Connector for GooseConnector {
             let candidate = (!ctx.data_dir.as_os_str().is_empty())
                 .then(|| ctx.data_dir.join("sessions.db"))
                 .filter(|p| p.is_file());
-            if let Some(db) =
-                candidate.filter(|_| env_path_nonempty("GOOSE_SQLITE_DB").is_none())
-            {
+            if let Some(db) = candidate.filter(|_| env_path_nonempty("GOOSE_SQLITE_DB").is_none()) {
                 db_paths.push(db);
             } else if let Some(db) = Self::sqlite_db_path() {
                 db_paths.push(db);
@@ -1519,6 +1515,73 @@ mod tests {
             convs[0].metadata.get("source").and_then(|v| v.as_str()),
             Some("sqlite")
         );
+    }
+
+    #[test]
+    fn default_detection_scopes_sqlite_to_data_dir() {
+        // A sessions.db under data_dir must scope the default-detection
+        // sqlite scan to THIS store; the machine's real ~/.goose store must
+        // not leak additional conversations into the result.
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let conn = open_test_connection(&db_path);
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                description TEXT,
+                working_dir TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                provider_name TEXT,
+                model_config_json TEXT,
+                session_type TEXT
+            );
+            CREATE TABLE messages (
+                session_id TEXT,
+                role TEXT,
+                content_json TEXT,
+                created_timestamp INTEGER,
+                tokens INTEGER,
+                metadata_json TEXT,
+                message_id TEXT PRIMARY KEY
+            );",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO sessions (id, description, working_dir, created_at, updated_at, provider_name) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "sess-scope",
+                "Scoped session",
+                "/data/projects/demo",
+                1_700_000_000_i64,
+                1_700_000_100_i64,
+                "openai"
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO messages (session_id, role, content_json, created_timestamp, tokens, metadata_json, message_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "sess-scope",
+                "assistant",
+                json!([{"type": "text", "text": "Hello from Goose!"}]).to_string(),
+                1_700_000_050_i64,
+                42_i64,
+                r#"{"model": "gpt-4o"}"#,
+                "msg-scope"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = GooseConnector
+            .scan(&ScanContext::local_default(dir.path().to_path_buf(), None))
+            .unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-scope"));
+        assert_eq!(convs[0].source_path, db_path);
     }
 
     #[test]

@@ -94,8 +94,7 @@ impl HermesConnector {
             let candidate = (!ctx.data_dir.as_os_str().is_empty())
                 .then(|| ctx.data_dir.join("state.db"))
                 .filter(|p| p.is_file());
-            if let Some(db) =
-                candidate.filter(|_| env_path_nonempty("HERMES_SQLITE_DB").is_none())
+            if let Some(db) = candidate.filter(|_| env_path_nonempty("HERMES_SQLITE_DB").is_none())
             {
                 candidates.push((ScanRoot::local(db.clone()), db));
             } else if let Some(db) = Self::sqlite_db_path() {
@@ -376,8 +375,7 @@ impl Connector for HermesConnector {
             let candidate = (!ctx.data_dir.as_os_str().is_empty())
                 .then(|| ctx.data_dir.join("state.db"))
                 .filter(|p| p.is_file());
-            if let Some(db) =
-                candidate.filter(|_| env_path_nonempty("HERMES_SQLITE_DB").is_none())
+            if let Some(db) = candidate.filter(|_| env_path_nonempty("HERMES_SQLITE_DB").is_none())
             {
                 db_paths.push(db);
             } else if let Some(db) = Self::sqlite_db_path() {
@@ -509,6 +507,84 @@ fn parse_tool_calls(json_str: Option<&str>) -> Vec<NormalizedInvocation> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn default_detection_scopes_sqlite_to_data_dir() {
+        // A state.db under data_dir must scope the default-detection scan
+        // to THIS store; the machine's real Hermes store must not leak
+        // additional conversations into the result.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("state.db");
+        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+        conn.execute(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT,
+                model TEXT,
+                title TEXT,
+                parent_session_id TEXT,
+                started_at REAL,
+                ended_at REAL,
+                end_reason TEXT,
+                message_count INTEGER,
+                tool_call_count INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER
+            );
+            CREATE TABLE messages (
+                session_id TEXT,
+                role TEXT,
+                content TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                tool_call_id TEXT,
+                reasoning TEXT,
+                timestamp REAL
+            );",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO sessions (id, source, model, title, parent_session_id, started_at, ended_at, end_reason, message_count, tool_call_count, input_tokens, output_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                "sess-scope",
+                "cli",
+                "hermes-model",
+                "Scoped session",
+                Option::<String>::None,
+                1_700_000_000.0_f64,
+                1_700_000_100.0_f64,
+                "completed",
+                1_i64,
+                0_i64,
+                10_i64,
+                5_i64
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO messages (session_id, role, content, tool_calls, tool_name, tool_call_id, reasoning, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                "sess-scope",
+                "user",
+                "Hello Hermes",
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                1_700_000_010.0_f64
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = HermesConnector
+            .scan(&ScanContext::local_default(tmp.path().to_path_buf(), None))
+            .unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-scope"));
+        assert_eq!(convs[0].source_path, db_path);
+    }
     #[test]
     fn real_to_millis_converts_epoch_seconds() {
         assert_eq!(real_to_millis(1_700_000_000.0), Some(1_700_000_000_000));
