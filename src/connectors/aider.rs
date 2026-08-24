@@ -54,7 +54,12 @@ impl AiderConnector {
             }
         }
         // Keep connector traversal deterministic across filesystems/runs.
+        // Dedup is mandatory: default mode adds both cwd and $HOME as roots,
+        // which overlap by construction, and explicit nested scan_roots can
+        // overlap too — without dedup every history under the shared prefix
+        // would be parsed (and emitted) once per covering root.
         files.sort();
+        files.dedup();
         files
     }
 

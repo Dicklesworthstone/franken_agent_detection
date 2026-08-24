@@ -258,9 +258,18 @@ impl CopilotCliConnector {
     fn parse_event_log(&self, path: &Path) -> Result<Vec<NormalizedConversation>> {
         let content = fs::read_to_string(path)?;
 
-        // If it looks like a single JSON document, try the legacy session format.
+        // Single-document dispatch is for legacy `.json` session-state files
+        // only. A ONE-LINE `events.jsonl` also starts with `{` and parses as
+        // a bare object, but parse_session_json finds no event arrays in it
+        // and returns empty — silently dropping the session. (.jsonl is
+        // always line-delimited; copilot.rs gates the same dispatch with
+        // !is_jsonl.)
+        let is_jsonl = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
         let trimmed = content.trim_start();
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if !is_jsonl && (trimmed.starts_with('{') || trimmed.starts_with('[')) {
             if let Ok(val) = serde_json::from_str::<Value>(&content) {
                 return Ok(self.parse_session_json(&val, path));
             }
