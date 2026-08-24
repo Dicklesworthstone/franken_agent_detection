@@ -30,6 +30,7 @@ Scope window: 2026-02-15 through HEAD
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.2.2`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.2) | GitHub Release | 2026-08-24 | Cross-connector audit fixes (opencode, muse, clawdbot, chatgpt, amp, aider, copilot-cli, cursor, grok); registry invariant hardening. |
 | [`v0.2.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.1) | GitHub Release | 2026-08-23 | Fresh-eyes fixes: pi-family discovery preserves scan-root provenance; registry invariant tests. |
 | [`v0.2.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.0) | GitHub Release | 2026-08-23 | First-class Oh My Pi (`omp`) connector; shared pi-family wire parser; dep refresh (aes-gcm 0.11, base64 0.23, fsqlite 0.3.8 + asupersync 0.4.9). |
 | [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10) | GitHub Release | 2026-08-16 | Muse Code, Grok Build, Kimi current layout, Oh My Pi, OpenCode scan perf. |
@@ -43,8 +44,12 @@ Scope window: 2026-02-15 through HEAD
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.2] -- 2026-08-24
+
 Post-0.2.1 fix wave: connector correctness fixes surfaced by a cross-connector
-audit, plus registry invariant hardening. Unreleased; version not yet cut.
+audit, plus registry invariant hardening.
 
 ### Fixed
 
@@ -86,6 +91,12 @@ audit, plus registry invariant hardening. Unreleased; version not yet cut.
   discovery now mirrors the Composer policy (`data_dir` base wins;
   `CASS_CURSOR_PROJECTS_ROOT` still takes precedence for CI). Regression
   test covers a combined composer + agent-transcript base.
+
+- **Antigravity and Grok default-detection scan roots are scoped the same
+  way as Cursor's** -- a scan whose `data_dir` is itself an agent base no
+  longer leaks the machine's real home-directory roots into fixture or
+  mirror scans
+  ([`5d4996e`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/5d4996e)).
 
 ### Added
 
