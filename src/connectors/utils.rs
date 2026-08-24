@@ -66,6 +66,36 @@ pub(crate) fn dedupe_path_key(path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Minimal percent-decoding for URI path components (RFC 3986).
+///
+/// Decodes `%XX` byte escapes and leaves every other byte untouched;
+/// malformed escapes (`%` not followed by two hex digits) pass through
+/// verbatim. Invalid UTF-8 in decoded output is replaced per
+/// [`String::from_utf8_lossy`], which is acceptable for workspace-path
+/// best-effort inference.
+#[must_use]
+pub(crate) fn percent_decode_utf8(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'%'
+            && pos + 2 < bytes.len()
+            && bytes[pos + 1].is_ascii_hexdigit()
+            && bytes[pos + 2].is_ascii_hexdigit()
+        {
+            let hi = (bytes[pos + 1] as char).to_digit(16).unwrap_or(0);
+            let lo = (bytes[pos + 2] as char).to_digit(16).unwrap_or(0);
+            out.push((hi * 16 + lo) as u8);
+            pos += 3;
+        } else {
+            out.push(bytes[pos]);
+            pos += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Check if a file was modified since the given timestamp.
 /// Returns true if the file should be processed (modified since timestamp or no timestamp given).
 #[must_use]
