@@ -974,6 +974,27 @@ mod tests {
     }
 
     #[test]
+    fn default_detection_scopes_to_grok_base_data_dir() {
+        let tmp = TempDir::new().expect("tempdir");
+        write_session(
+            tmp.path(),
+            &[
+                envelope(&text_chunk("user_message", "hello"), 1_784_388_056),
+                envelope(&text_chunk("agent_message", "hi there"), 1_784_388_057),
+            ],
+        );
+        let convs = GrokConnector
+            .scan(&ScanContext::local_default(tmp.path().to_path_buf(), None))
+            .expect("scan");
+        assert_eq!(
+            convs.len(),
+            1,
+            "default detection with a Grok-base data_dir must scan that base, not ~/.grok"
+        );
+        assert_eq!(convs[0].external_id.as_deref(), Some(SESSION_ID));
+    }
+    #[test]
+
     fn parses_chunked_conversation_with_tool_calls() {
         let tmp = TempDir::new().expect("tempdir");
         let lines = vec![

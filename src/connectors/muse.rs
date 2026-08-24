@@ -130,7 +130,22 @@ impl MuseConnector {
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots = if ctx.use_default_detection() {
-            vec![ScanRoot::local(Self::base_root())]
+            // Mirror the explicit-root acceptance: a default-detection
+            // data_dir that itself looks like muse storage (the
+            // `~/.local/share/muse` base with a `sessions/` tree, or the
+            // `sessions/` dir itself) scopes the scan to it, so
+            // fixture/mirror scans stay hermetic; otherwise probe the
+            // system base. `CASS_MUSE_DATA_ROOT` keeps precedence so CI
+            // redirection is unaffected.
+            let d = &ctx.data_dir;
+            let env_override = env_path_nonempty("CASS_MUSE_DATA_ROOT").is_some();
+            let looks_like_base =
+                d.join("sessions").is_dir() || d.file_name().is_some_and(|n| n == "sessions");
+            if !env_override && looks_like_base {
+                vec![ScanRoot::local(d.clone())]
+            } else {
+                vec![ScanRoot::local(Self::base_root())]
+            }
         } else {
             ctx.scan_roots.clone()
         };
@@ -962,6 +977,26 @@ mod tests {
             vec![ScanRoot::local(base.to_path_buf())],
             None,
         )
+    }
+
+    #[test]
+    fn default_detection_scopes_to_muse_base_data_dir() {
+        // build_fixture lays out the real store shape under the temp base;
+        // default detection with this base as data_dir must scan HERE, not
+        // the machine's real ~/.local/share/muse.
+        let temp = TempDir::new().expect("tempdir");
+        let (root_log, sub_log) = build_fixture(temp.path());
+
+        let convs = MuseConnector::new()
+            .scan(&ScanContext::local_default(temp.path().to_path_buf(), None))
+            .expect("scan");
+        let mut paths: Vec<&Path> = convs.iter().map(|c| c.source_path.as_path()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![root_log.as_path(), sub_log.as_path()],
+            "default detection with a muse-base data_dir must scan that base"
+        );
     }
 
     #[test]

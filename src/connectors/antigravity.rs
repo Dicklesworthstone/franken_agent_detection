@@ -145,8 +145,8 @@ impl AntigravityConnector {
             // redirection is unaffected.
             let d = &ctx.data_dir;
             let env_override = env_path_nonempty("CASS_ANTIGRAVITY_DATA_ROOT").is_some();
-            let looks_like_base = d.join("brain").is_dir()
-                || d.file_name().is_some_and(|n| n == "brain");
+            let looks_like_base =
+                d.join("brain").is_dir() || d.file_name().is_some_and(|n| n == "brain");
             if !env_override && looks_like_base {
                 vec![ScanRoot::local(d.clone())]
             } else {
@@ -813,6 +813,21 @@ mod tests {
         let convs = AntigravityConnector::new().scan(&fixture_ctx()).unwrap();
         assert_eq!(convs.len(), 1, "fixture is a single conversation");
         convs.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn default_detection_scopes_to_antigravity_base_data_dir() {
+        // The checked-in fixture base has the `brain/<uuid>` shape; default
+        // detection with this base as data_dir must scan HERE, not the
+        // machine's real ~/.gemini/antigravity-cli.
+        let ctx = ScanContext::local_default(fixture_base(), None);
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(
+            convs.len(),
+            1,
+            "default detection with an antigravity-base data_dir must scan that base"
+        );
+        assert_eq!(convs[0].external_id.as_deref(), Some(FIXTURE_UUID));
     }
 
     #[test]
