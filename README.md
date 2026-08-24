@@ -89,7 +89,7 @@ cargo add franken-agent-detection
 
 ```toml
 [dependencies]
-franken-agent-detection = "0.1.7"
+franken-agent-detection = "0.2.0"
 ```
 
 ### From source
@@ -146,7 +146,7 @@ detect_installed_agents(opts)
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `UnknownConnectors` error | Connector slug not recognized | Use known slugs (`codex`, `claude`, `gemini`, etc.) |
+| `UnknownConnectors` error | Connector slug not recognized | Use known slugs (`codex`, `claude`, `omp`, `gemini`, etc.) |
 | Empty results | No roots exist on this machine | Set `include_undetected = true` to inspect evidence |
 | Non-deterministic tests | Real home-dir probing in tests | Use `root_overrides` with temp directories |
 | Missing connector in report | Scoped connectors exclude it | Remove or expand `only_connectors` |

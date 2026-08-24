@@ -27,6 +27,7 @@ pub mod grok;
 pub mod hermes;
 pub mod kimi;
 pub mod muse;
+pub mod omp;
 pub mod openclaw;
 #[cfg(feature = "opencode")]
 pub mod opencode;
@@ -232,6 +233,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         }),
         ("aider", || Box::new(aider::AiderConnector::new())),
         ("pi_agent", || Box::new(pi_agent::PiAgentConnector::new())),
+        ("omp", || Box::new(omp::OmpConnector::new())),
         ("factory", || Box::new(factory::FactoryConnector::new())),
         ("kimi", || Box::new(kimi::KimiConnector::new())),
         ("muse", || Box::new(muse::MuseConnector::new())),
