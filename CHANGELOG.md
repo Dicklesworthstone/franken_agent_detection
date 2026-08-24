@@ -54,6 +54,17 @@ Scope window: 2026-02-15 through HEAD
   the scan, so fixture/mirror scans collected — or missed — sessions from
   `~/.local/share/muse` depending on the machine. `CASS_MUSE_DATA_ROOT`
   keeps precedence so CI redirection is unaffected.
+- **Goose, Hermes, and Crush sqlite scans no longer double-probe the
+  machine's real store in default-detection mode.** Their JSONL sides
+  already scoped a `data_dir` that held connector storage, but the sqlite
+  side pushed BOTH the `data_dir` candidate and the system store
+  (`~/.goose/sessions.db`, Hermes `state.db`, crush global + per-project
+  dbs), so scoped fixture/mirror scans collected foreign sessions from the
+  local machine. A `<connector>` db under `data_dir` now scopes the scan;
+  only otherwise does it fall through to the system store. Env overrides
+  (`GOOSE_SQLITE_DB`, `HERMES_SQLITE_DB`, `CRUSH_SQLITE_DB`) keep
+  precedence, and scan/discovery parity holds. Regression tests pin exact
+  source paths for all three.
 
 ### Added
 
@@ -79,6 +90,7 @@ audit, plus registry invariant hardening.
   conversations with no `external_id` pass through uncollapsed; and a
   leading UTF-8 BOM is trimmed before JSON parsing instead of skipping the
   whole file.
+
 - **Muse unsequenced records keep append order, and workspace inheritance
   survives unreadable lines.** A record without `sequence` used to fall back
   to `i64::MAX - lineno`, emitting the unsequenced tail in REVERSED order
