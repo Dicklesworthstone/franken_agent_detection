@@ -6,6 +6,7 @@
 //! Each line is a message object:
 //! {"role":"user|assistant|system","content":"...","timestamp":"2025-01-27T03:30:00.000Z", ...}
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::dedupe_path_key;
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -151,6 +153,10 @@ impl Connector for ClawdbotConnector {
         }
 
         let mut convs = Vec::new();
+        // Cross-root guard: overlapping explicit roots (two machine mirrors,
+        // nested roots) would otherwise parse and emit the same session
+        // file once per covering root.
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
         for mut root in roots {
             if root.is_file() {
@@ -159,6 +165,9 @@ impl Connector for ClawdbotConnector {
 
             let files = Self::session_files(&root);
             for file in files {
+                if !seen_files.insert(dedupe_path_key(&file)) {
+                    continue;
+                }
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }

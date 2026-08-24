@@ -354,8 +354,13 @@ impl CursorConnector {
 
         let prefix_len = prefix.len();
 
+        // Filter out NULL-value rows (same rationale as the composerData
+        // query in extract_from_db): Cursor inserts internal markers with
+        // no chat payload, and `row.get_typed(1)?` on NULL aborts the whole
+        // query_map_collect — silently emptying this conversation's bubble
+        // map so the entire chat is dropped as message-less.
         if let Ok(rows) = conn.query_map_collect(
-            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?",
+            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
             params![prefix.as_str(), limit.as_str()],
             |row| {
                 let key: String = row.get_typed(0)?;
@@ -459,7 +464,9 @@ impl CursorConnector {
         // Try cursorDiskKV table for composerData entries
         let composer_prefix = "composerData:";
         let composer_limit = Self::prefix_upper_bound(composer_prefix);
-        if let Ok(rows) = conn.query_map_collect(
+        // Surface query errors at warn level: a corrupted page or missing
+        // table must not be indistinguishable from a legitimately empty DB.
+        match conn.query_map_collect(
             // Filter out NULL-value rows: Cursor inserts internal markers with no
             // chat payload, and `row.get_typed(1)?` on NULL aborts the whole
             // query_map_collect — silently turning every row into zero conversations.
@@ -471,22 +478,27 @@ impl CursorConnector {
                 Ok((key, value))
             },
         ) {
-            for (key, value) in rows {
-                if let Some(conv) = Self::parse_composer_data(
-                    &key,
-                    &value,
-                    db_path,
-                    since_ts,
-                    &mut seen_ids,
-                    Some(&conn),
-                ) {
-                    convs.push(conv);
+            Ok(rows) => {
+                for (key, value) in rows {
+                    if let Some(conv) = Self::parse_composer_data(
+                        &key,
+                        &value,
+                        db_path,
+                        since_ts,
+                        &mut seen_ids,
+                        Some(&conn),
+                    ) {
+                        convs.push(conv);
+                    }
                 }
+            }
+            Err(e) => {
+                tracing::warn!(db = %db_path.display(), error = %e, "cursor: composerData query failed; conversations from this store may be missing");
             }
         }
 
         // Also try ItemTable for legacy aichat data
-        if let Ok(rows) = conn.query_map_collect(
+        match conn.query_map_collect(
             "SELECT key, value FROM ItemTable WHERE (key LIKE '%aichat%chatdata%' OR key LIKE '%composer%') AND value IS NOT NULL",
             params![],
             |row| {
@@ -495,12 +507,17 @@ impl CursorConnector {
                 Ok((key, value))
             },
         ) {
-            for (key, value) in rows {
-                if let Some(conv) =
-                    Self::parse_aichat_data(&key, &value, db_path, since_ts, &mut seen_ids)
-                {
-                    convs.push(conv);
+            Ok(rows) => {
+                for (key, value) in rows {
+                    if let Some(conv) =
+                        Self::parse_aichat_data(&key, &value, db_path, since_ts, &mut seen_ids)
+                    {
+                        convs.push(conv);
+                    }
                 }
+            }
+            Err(e) => {
+                tracing::warn!(db = %db_path.display(), error = %e, "cursor: ItemTable query failed; legacy conversations from this store may be missing");
             }
         }
 

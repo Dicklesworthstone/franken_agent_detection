@@ -30,6 +30,7 @@ Scope window: 2026-02-15 through HEAD
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.2.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.1) | GitHub Release | 2026-08-23 | Fresh-eyes fixes: pi-family discovery preserves scan-root provenance; registry invariant tests. |
 | [`v0.2.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.0) | GitHub Release | 2026-08-23 | First-class Oh My Pi (`omp`) connector; shared pi-family wire parser; dep refresh (aes-gcm 0.11, base64 0.23, fsqlite 0.3.8 + asupersync 0.4.9). |
 | [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10) | GitHub Release | 2026-08-16 | Muse Code, Grok Build, Kimi current layout, Oh My Pi, OpenCode scan perf. |
 | [`v0.1.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9) | GitHub Release | 2026-07-02 | Codex `output_text` / `response_item` tool-call capture (#13). |
@@ -40,6 +41,32 @@ Scope window: 2026-02-15 through HEAD
 
 ---
 
+## [0.2.1] -- 2026-08-23
+
+Patch over the 0.2.0 window, from a fresh-eyes audit of everything that
+shipped in it.
+
+### Fixed
+
+- **Pi-family discovery no longer downgrades remote scan roots to local**.
+  The shared `pi_wire::discover_sources` helper took bare paths and
+  re-wrapped every home in `ScanRoot::local`, so `DiscoveredSourceFile`
+  entries for remote roots lost their `Origin` (Ssh) and platform hint —
+  fields downstream consumers key mirroring and path-mapping decisions off.
+  The helper now takes full `ScanRoot`s; the `pi_agent` and `omp` callers
+  pass `source_roots()` through untouched. Regression tests on both
+  connectors prove remote provenance survives discovery end-to-end.
+
+### Added
+
+- **Registry invariant test**: all five registration points
+  (`KNOWN_CONNECTORS`, canonical alias arms, `default_probe_roots`,
+  `default_probe_paths_tilde`, the factory list) must agree exactly with one
+  slug set. Two sibling rows were silently dropped by range edits during the
+  0.2.0 window (caught by hand); this class of mistake now fails CI
+  mechanically.
+
+---
 ## [0.2.0] -- 2026-08-23
 
 First-class Oh My Pi (`omp`) support plus dependency refresh.

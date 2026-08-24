@@ -432,6 +432,19 @@ impl ChatGptConnector {
         }
 
         let content_bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        // Post-read backstop: when fs::metadata errored above (ancestor
+        // perms, TOCTOU unlink), the pre-read guard was skipped — enforce
+        // the cap on the buffer we actually hold so a metadata failure can
+        // never turn into an unbounded read + decrypt double-buffer.
+        const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+        if content_bytes.len() as u64 > MAX_FILE_BYTES {
+            tracing::warn!(
+                path = %path.display(),
+                size_bytes = content_bytes.len(),
+                "skipping large file (>100MB, post-read check)"
+            );
+            return Ok(None);
+        }
 
         // Decrypt if necessary
         let content = if is_encrypted {

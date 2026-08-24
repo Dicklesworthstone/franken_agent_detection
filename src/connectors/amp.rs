@@ -327,10 +327,11 @@ impl Connector for AmpConnector {
                                 .map(std::string::ToString::to_string)
                         });
 
-                    let key = external_id.clone().map_or_else(
-                        || format!("amp:{}", path.display()),
-                        |id| format!("amp:{id}"),
-                    );
+                    // Key on the full path: is_amp_log_file accepts any
+                    // *.json under a "threads" directory, so distinct files
+                    // frequently share a stem across roots — a stem-only key
+                    // silently dropped every thread after the first.
+                    let key = format!("amp:{}", path.display());
                     if seen_ids.insert(key) {
                         // Use per-message timestamps when available, falling back
                         // to the top-level "created" field (millisecond epoch) that
@@ -390,13 +391,16 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
 
     let mut out = Vec::new();
     for m in msgs {
-        let role = m
+        // Amp thread JSON uses several raw spellings for turns ("human",
+        // "agent", "userMessage", "assistantMsg", …). Normalize to the
+        // conformance contract's role set — downstream consumers route on
+        // user/assistant, and raw pass-through misfiles user turns.
+        let raw_role = m
             .get("role")
             .or_else(|| m.get("speaker"))
             .or_else(|| m.get("type"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("agent")
-            .to_string();
+            .and_then(|v| v.as_str());
+        let role = normalize_amp_role(raw_role);
 
         // Handle content as either string or array of content blocks
         let content = extract_content_value(m.get("content"))
@@ -431,7 +435,7 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
 
         out.push(NormalizedMessage {
             idx: 0, // Will be re-assigned after filtering
-            role,
+            role: role.to_string(),
             author,
             created_at,
             content,
@@ -451,6 +455,22 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
     crate::types::reindex_messages(&mut out);
 
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// Map an Amp raw role/speaker/type spelling onto the conformance contract's
+/// valid role set (`user`, `assistant`, `system`, `tool`, `function`).
+///
+/// Amp threads label turns "human"/"agent" (and some exports use
+/// "userMessage"/"assistantMsg"); everything model-side — including missing
+/// and unrecognized spellings, which historically defaulted to "agent" —
+/// maps to `assistant`.
+fn normalize_amp_role(raw: Option<&str>) -> &'static str {
+    match raw.map(str::to_ascii_lowercase).as_deref() {
+        Some("human" | "user" | "usermessage") => "user",
+        Some("system") => "system",
+        Some("toolresult" | "tool") => "tool",
+        _ => "assistant",
+    }
 }
 
 /// Extract text content from a value that may be a string or an array of content blocks.
@@ -483,10 +503,12 @@ fn infer_workspace(val: &Value) -> Option<PathBuf> {
         for tree in trees {
             if let Some(uri) = tree.get("uri").and_then(|u| u.as_str()) {
                 let path_str = if let Some(stripped) = uri.strip_prefix("file://") {
-                    stripped
+                    // Decode %XX escapes (e.g. `my%20project`): the URI is
+                    // wire format, the workspace is a filesystem path.
+                    super::percent_decode_utf8(stripped)
                 } else if !uri.contains("://") {
                     // Bare path (no scheme), treat as filesystem path
-                    uri
+                    uri.to_string()
                 } else {
                     // Non-file scheme (ssh://, https://, vscode-remote://…) — skip
                     continue;
@@ -798,7 +820,8 @@ mod tests {
             "messages": [{"speaker": "human", "content": "Test"}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].role, "human");
+        // Raw Amp spellings normalize onto the conformance role set.
+        assert_eq!(msgs[0].role, "user");
     }
 
     #[test]
@@ -807,7 +830,7 @@ mod tests {
             "messages": [{"type": "userMessage", "content": "Test"}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].role, "userMessage");
+        assert_eq!(msgs[0].role, "user");
     }
 
     #[test]
@@ -912,12 +935,12 @@ mod tests {
     }
 
     #[test]
-    fn extract_messages_defaults_role_to_agent() {
+    fn extract_messages_defaults_roleless_entries_to_assistant() {
         let val = json!({
             "messages": [{"content": "No role"}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].role, "agent");
+        assert_eq!(msgs[0].role, "assistant");
     }
 
     #[test]
@@ -1550,8 +1573,8 @@ mod tests {
         let ctx = ScanContext::local_default(amp_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
-        assert_eq!(convs[0].messages[0].role, "human");
-        assert_eq!(convs[0].messages[1].role, "assistantMsg");
+        assert_eq!(convs[0].messages[0].role, "user");
+        assert_eq!(convs[0].messages[1].role, "assistant");
     }
 
     #[test]

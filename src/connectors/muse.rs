@@ -222,28 +222,30 @@ fn muse_ts_to_millis(val: &Value) -> Option<i64> {
 /// One decoded `session.jsonl` envelope, holding just what the connector
 /// consumes.
 struct MuseRecord {
-    sequence: i64,
+    /// Sort key: `(0, sequence)` for records carrying the authoritative
+    /// `sequence`; `(1, file position)` for records without one. The band
+    /// keeps the unsequenced tail after every well-formed record while a
+    /// plain `i64::MAX - lineno` fallback would have emitted it in REVERSED
+    /// append order.
+    sort_key: (i64, i64),
     recorded_at_ms: Option<i64>,
     payload_type: String,
     payload: Value,
     stream_id: Option<String>,
 }
-
-/// Decode a single JSONL line into a [`MuseRecord`].
-///
 /// Strict on the envelope basics (`payload_type` string + `payload`
 /// present); tolerant elsewhere. A missing `sequence` sorts the record by
-/// its file position (biased past any well-formed sequence) rather than
-/// dropping it.
+/// its file position (after every sequenced record) rather than dropping
+/// it.
 fn parse_record(line: &str, lineno: usize) -> Option<MuseRecord> {
     let val: Value = serde_json::from_str(line).ok()?;
     let obj = val.as_object()?;
     let payload_type = obj.get("payload_type")?.as_str()?.to_string();
     let payload = obj.get("payload")?.clone();
-    let sequence = obj
-        .get("sequence")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| i64::MAX - i64::try_from(lineno).unwrap_or(0));
+    let sort_key = match obj.get("sequence").and_then(Value::as_i64) {
+        Some(seq) => (0, seq),
+        None => (1, i64::try_from(lineno).unwrap_or(i64::MAX)),
+    };
     let recorded_at_ms = obj.get("recorded_at").and_then(muse_ts_to_millis);
     let stream_id = obj
         .get("stream")
@@ -251,7 +253,7 @@ fn parse_record(line: &str, lineno: usize) -> Option<MuseRecord> {
         .and_then(Value::as_str)
         .map(String::from);
     Some(MuseRecord {
-        sequence,
+        sort_key,
         recorded_at_ms,
         payload_type,
         payload,
@@ -288,9 +290,10 @@ fn read_records(session_file: &Path) -> Vec<MuseRecord> {
             );
         }
     }
-    // `sequence` is the authoritative order per the field report; a stable
-    // sort keeps file order for ties/fallbacks.
-    records.sort_by_key(|r| r.sequence);
+    // `sequence` is the authoritative order per the field report; records
+    // without one sort after all sequenced records, in file order (the
+    // two-band key in `MuseRecord::sort_key`).
+    records.sort_by_key(|r| r.sort_key);
     records
 }
 
@@ -298,9 +301,17 @@ fn read_records(session_file: &Path) -> Vec<MuseRecord> {
 /// `payload.record.workspace_root`, if any. Used both for the session's own
 /// workspace and for subagent inheritance (gotcha 1).
 fn workspace_root_of(session_file: &Path) -> Option<PathBuf> {
-    let file = fs::File::open(session_file).ok()?;
-    for line in BufReader::new(file).lines() {
-        let line = line.ok()?;
+    let Ok(file) = fs::File::open(session_file) else {
+        tracing::debug!(transcript = %session_file.display(), "muse: cannot open transcript for workspace lookup");
+        return None;
+    };
+    for (lineno, line) in BufReader::new(file).lines().enumerate() {
+        // A single unreadable line must not abort workspace extraction for
+        // the whole transcript — skip and keep scanning.
+        let Ok(line) = line else {
+            tracing::debug!(transcript = %session_file.display(), line = lineno + 1, "muse: skipping unreadable line during workspace lookup");
+            continue;
+        };
         let line = line.trim();
         if line.is_empty() || !line.contains("runtime.session.metadata") {
             continue;

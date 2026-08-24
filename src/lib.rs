@@ -328,6 +328,17 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root)])
         }
+        "grok" => {
+            // Mirrors GrokConnector::base_root(): scans honor $GROK_HOME,
+            // so detection must too — otherwise a relocated install reports
+            // not-found while scan finds sessions.
+            let root = read("GROK_HOME")?;
+            if root.is_empty() {
+                return None;
+            }
+            let root = PathBuf::from(root);
+            Some(vec![root.join("sessions"), root])
+        }
         "omp" => {
             let root = read("CASS_OMP_DATA_ROOT")?;
             if root.is_empty() {
@@ -1698,30 +1709,66 @@ mod tests {
             assert!(!paths.is_empty(), "connector {slug} has empty tilde paths");
         }
 
-        // 4. The compiled factory registry covers every non-detection-only
-        // connector. Detection-only slugs (no scan implementation) are
-        // enumerated here so a new full connector can't be forgotten:
-        // add it to `get_connector_factories` or to this allowlist.
-        let detection_only: HashSet<&str> = HashSet::from([
-            "chatgpt",
-            "continue",
-            "copilot",
-            "crush",
-            "cursor",
-            "github-copilot",
-            "hermes",
-            "windsurf",
-        ]);
-        let factory_slugs: HashSet<&str> =
-            get_connector_factories().iter().map(|(s, _)| *s).collect();
-        for slug in KNOWN_CONNECTORS {
-            if detection_only.contains(slug) {
-                continue;
+        // 4. The compiled factory registry covers every scanning connector.
+        // Detection-only slugs (no scan implementation) are enumerated so a
+        // new full connector can't be forgotten: add it to
+        // `get_connector_factories` or to this allowlist. Connectors that
+        // live behind their own cargo feature (SQLite/crypto deps) register
+        // only when compiled in, so they are checked against `cfg!` rather
+        // than assumed present — this leg must hold for `--features
+        // connectors`, `--all-features`, and every mix in between. The
+        // factory list itself only exists with `connectors` (`default = []`),
+        // so the leg is gated; checks 1-3 still run under a plain
+        // `cargo test`.
+        #[cfg(feature = "connectors")]
+        {
+            // Slugs with no scan implementation at all (no module under
+            // `connectors/`). Everything else must register a factory.
+            let detection_only: HashSet<&str> = HashSet::from(["continue", "windsurf"]);
+            let feature_gated: HashMap<&str, bool> = HashMap::from([
+                ("chatgpt", cfg!(feature = "chatgpt")),
+                ("crush", cfg!(feature = "crush")),
+                ("cursor", cfg!(feature = "cursor")),
+                ("goose", cfg!(feature = "goose")),
+                ("hermes", cfg!(feature = "hermes")),
+                ("opencode", cfg!(feature = "opencode")),
+            ]);
+            // Factory slugs are the connector-native names (e.g. `copilot`
+            // for VS Code Copilot chat, which this registry knows as
+            // `github-copilot`), so compare after canonicalising. Every
+            // factory must map into KNOWN_CONNECTORS: a factory registered
+            // under a slug the registry cannot name is unreachable from
+            // `franken_detection_for_connector`, and a slug registered twice
+            // means two factories fight over one connector.
+            let mut factory_slugs: HashSet<&str> = HashSet::new();
+            for (raw, _) in get_connector_factories() {
+                let canonical = canonical_connector_slug(raw).unwrap_or_else(|| {
+                    panic!("factory slug {raw} does not canonicalise into KNOWN_CONNECTORS")
+                });
+                assert!(
+                    factory_slugs.insert(canonical),
+                    "connector {canonical} is registered twice in the factory list (via {raw})"
+                );
             }
-            assert!(
-                factory_slugs.contains(slug),
-                "connector {slug} needs a factory registration or must be listed as detection-only"
-            );
+            for slug in KNOWN_CONNECTORS {
+                if detection_only.contains(slug) {
+                    assert!(
+                        !factory_slugs.contains(slug),
+                        "connector {slug} has a factory and must leave the detection-only allowlist"
+                    );
+                    continue;
+                }
+                match feature_gated.get(slug) {
+                    Some(false) => assert!(
+                        !factory_slugs.contains(slug),
+                        "connector {slug} registered a factory although its cargo feature is off"
+                    ),
+                    Some(true) | None => assert!(
+                        factory_slugs.contains(slug),
+                        "connector {slug} needs a factory registration, a feature gate entry, or a detection-only listing"
+                    ),
+                }
+            }
         }
     }
 }

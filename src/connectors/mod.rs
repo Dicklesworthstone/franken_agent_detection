@@ -62,7 +62,7 @@ pub use token_extraction::{
 };
 pub use utils::{
     extract_invocations_from_content_blocks, file_modified_since, flatten_content, parse_timestamp,
-    unwrap_skill_invocations,
+    percent_decode_utf8, unwrap_skill_invocations,
 };
 pub use workspace_cache::WorkspaceCache;
 
