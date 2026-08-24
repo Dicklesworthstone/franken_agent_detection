@@ -583,7 +583,8 @@ mod tests {
             .unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-scope"));
-        assert_eq!(convs[0].source_path, db_path);
+        // Hermes derives per-session source paths as <db>/<external_id>.
+        assert_eq!(convs[0].source_path, db_path.join("sess-scope"));
     }
     #[test]
     fn real_to_millis_converts_epoch_seconds() {
