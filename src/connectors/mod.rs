@@ -33,6 +33,7 @@ pub mod opencode;
 pub mod openhands;
 pub mod path_trie;
 pub mod pi_agent;
+pub mod pi_wire;
 pub mod qwen;
 pub mod scan;
 #[cfg(any(

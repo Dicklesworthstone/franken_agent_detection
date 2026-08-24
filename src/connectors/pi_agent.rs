@@ -9,22 +9,19 @@
 //! - `message`: Contains timestamp and message object with role (user/assistant/toolResult)
 //! - `thinking_level_change`: Records thinking level changes
 //! - `model_change`: Records model/provider changes
-
+//!
+//! Wire-format traversal and parsing live in the shared pi-family module
+//! [`super::pi_wire`]; Oh My Pi (`omp`) sessions are covered by the dedicated
+//! [`super::omp`] connector, which consumes the same parser.
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::{
-    Connector, file_modified_since, franken_detection_for_connector, parse_timestamp,
-    utils::dedupe_path_key,
-};
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
-
+use super::scan::{DiscoveredSourceFile, ScanContext, ScanRoot};
+use super::{Connector, franken_detection_for_connector, utils::dedupe_path_key};
+use crate::types::{DetectionResult, NormalizedConversation};
 /// A Pi session store format that the `pi_agent` connector does not index.
 ///
 /// `pi_agent_rust` supports three on-disk session formats: the default JSONL
@@ -97,9 +94,10 @@ impl PiAgentConnector {
 
     /// All candidate pi-agent home directories in priority order.
     ///
-    /// Covers both known distributions:
-    /// - **pi-mono** (`badlogic/pi-mono`) stores at `~/.pi/agent/`.
-    /// - **Oh My Pi** (`omp` CLI) stores at `~/.omp/agent/`.
+    /// The upstream **pi-mono** distribution (`badlogic/pi-mono`) stores at
+    /// `~/.pi/agent/`. Oh My Pi (`omp`) sessions live under `~/.omp/agent/`
+    /// and are covered by the dedicated [`crate::connectors::omp`] connector,
+    /// which shares this crate's pi-family wire parsing.
     ///
     /// Explicit `PI_CODING_AGENT_DIR` overrides and becomes the sole
     /// candidate so CI and isolated setups can pin a single location.
@@ -155,70 +153,11 @@ impl PiAgentConnector {
         let mut out = Vec::new();
         if let Some(home) = home {
             out.push(home.join(".pi/agent"));
-            out.push(home.join(".omp/agent"));
         }
         out
     }
-
     fn sessions_dir(home: &Path) -> PathBuf {
-        let sessions = home.join("sessions");
-        if sessions.exists() {
-            sessions
-        } else {
-            home.to_path_buf()
-        }
-    }
-
-    /// Find all session JSONL files under the sessions directory.
-    fn session_files(root: &Path) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let sessions = Self::sessions_dir(root);
-        if !sessions.exists() {
-            return out;
-        }
-        for entry in WalkDir::new(sessions).into_iter().flatten() {
-            if entry.file_type().is_file() {
-                let name = entry.file_name().to_str().unwrap_or("");
-                let is_jsonl = Path::new(name)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"));
-                if !is_jsonl {
-                    continue;
-                }
-                // Pi-agent session files are named <timestamp>_<uuid>.jsonl.
-                // Oh My Pi (`omp`) additionally writes sub-agent transcripts
-                // as <AgentName>.jsonl inside a sibling directory named after
-                // the session (…/<timestamp>_<uuid>/<AgentName>.jsonl); each
-                // is a complete session document with its own `session`
-                // header, so it parses like any main transcript. Accept a
-                // .jsonl either named like a session, or living inside a
-                // session directory — recognized by its `_` marker AND the
-                // main transcript `<dir>.jsonl` sitting beside it. The
-                // sibling requirement matters: workspace-slug directories
-                // preserve underscores from the original cwd (encode_cwd
-                // only rewrites `/`, `\`, `:`), so "parent contains `_`"
-                // alone would sweep stray .jsonl exports under any project
-                // whose path contains an underscore (fresh-eyes finding).
-                let parent_is_session_dir = entry.path().parent().is_some_and(|parent| {
-                    let has_session_marker = parent
-                        .file_name()
-                        .and_then(|dir| dir.to_str())
-                        .is_some_and(|dir| dir.contains('_'));
-                    has_session_marker && {
-                        let mut main_transcript = parent.as_os_str().to_owned();
-                        main_transcript.push(".jsonl");
-                        Path::new(&main_transcript).is_file()
-                    }
-                });
-                if name.contains('_') || parent_is_session_dir {
-                    out.push(entry.path().to_path_buf());
-                }
-            }
-        }
-        // Keep connector traversal deterministic across filesystems/runs.
-        out.sort();
-        out
+        super::pi_wire::sessions_dir(home)
     }
 
     fn append_explicit_homes(
@@ -236,81 +175,6 @@ impl PiAgentConnector {
                 homes.push(sessions);
             }
         }
-
-        if base.file_name().is_some_and(|n| n == ".omp") {
-            let agent = base.join("agent");
-            if looks_like_root(&agent) {
-                homes.push(agent.clone());
-            }
-            let sessions = agent.join("sessions");
-            if looks_like_root(&sessions) {
-                homes.push(sessions);
-            }
-        }
-    }
-
-    /// Flatten pi-agent message content to a searchable string.
-    /// Handles the message.content array which can contain:
-    /// - `TextContent`: {type: "text", text: "..."}
-    /// - `ThinkingContent`: {type: "thinking", thinking: "..."}
-    /// - `ToolCall`: {type: "toolCall", name: "...", arguments: {...}}
-    /// - `ImageContent`: {type: "image", ...} (skip for text extraction)
-    fn flatten_message_content(content: &Value) -> String {
-        // Direct string content (simple user messages)
-        if let Some(s) = content.as_str() {
-            return s.to_string();
-        }
-
-        // Array of content blocks
-        if let Some(arr) = content.as_array() {
-            let parts: Vec<String> = arr
-                .iter()
-                .filter_map(|item| {
-                    let item_type = item.get("type").and_then(|v| v.as_str());
-
-                    match item_type {
-                        Some("text") => item.get("text").and_then(|v| v.as_str()).map(String::from),
-                        Some("thinking") => {
-                            // Include thinking content - valuable for search
-                            item.get("thinking")
-                                .and_then(|v| v.as_str())
-                                .map(|t| format!("[Thinking] {t}"))
-                        }
-                        Some("toolCall") => {
-                            // Include tool calls for searchability
-                            let name = item
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            let args = item
-                                .get("arguments")
-                                .map(|a| {
-                                    // Extract key argument values for context
-                                    a.as_object().map_or_else(String::new, |obj| {
-                                        obj.iter()
-                                            .filter_map(|(k, v)| {
-                                                v.as_str().map(|s| format!("{k}={s}"))
-                                            })
-                                            .take(3) // Limit to avoid huge strings
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    })
-                                })
-                                .unwrap_or_default();
-                            if args.is_empty() {
-                                Some(format!("[Tool: {name}]"))
-                            } else {
-                                Some(format!("[Tool: {name}] {args}"))
-                            }
-                        }
-                        _ => None, // Skip image and unknown content
-                    }
-                })
-                .collect();
-            return parts.join("\n");
-        }
-
-        String::new()
     }
 
     fn looks_like_root(path: &Path) -> bool {
@@ -318,18 +182,14 @@ impl PiAgentConnector {
             || path
                 .file_name()
                 .is_some_and(|n| n.to_str().unwrap_or("").contains("pi"))
-            || path.file_name().is_some_and(|n| n == "sessions")
-            || path.to_str().is_some_and(|s| {
-                s.contains(".pi/agent") || s.contains(".omp/agent") || s.contains("pi-agent")
-            })
+            || path
+                .to_str()
+                .is_some_and(|s| s.contains(".pi/agent") || s.contains("pi-agent"))
     }
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let is_pi_agent_dir = ctx.data_dir.to_str().is_some_and(|s| {
-            s.contains(".pi/agent")
-                || s.contains(".omp/agent")
-                || s.ends_with("/pi-agent")
-                || s.ends_with("\\pi-agent")
+            s.contains(".pi/agent") || s.ends_with("/pi-agent") || s.ends_with("\\pi-agent")
         });
 
         let mut homes: Vec<ScanRoot> = Vec::new();
@@ -354,8 +214,6 @@ impl PiAgentConnector {
                     scan_root.path.clone(),
                     scan_root.path.join(".pi/agent"),
                     scan_root.path.join(".pi/agent/sessions"),
-                    scan_root.path.join(".omp/agent"),
-                    scan_root.path.join(".omp/agent/sessions"),
                 ];
                 for candidate in candidates {
                     if Self::looks_like_root(&candidate) {
@@ -385,29 +243,9 @@ impl PiAgentConnector {
     }
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
-        let mut out = Vec::new();
-        let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
-        for root in Self::source_roots(ctx) {
-            for file in Self::session_files(&root.path) {
-                if !seen_session_paths.insert(dedupe_path_key(&file)) {
-                    continue;
-                }
-                if !file_modified_since(&file, ctx.since_ts) {
-                    continue;
-                }
-                out.push(
-                    DiscoveredSourceFile::new(
-                        "pi_agent",
-                        &root,
-                        file,
-                        DiscoveredSourceRole::PrimarySessionLog,
-                        true,
-                    )
-                    .with_fs_metadata(),
-                );
-            }
-        }
-        out
+        // Pass full ScanRoots so remote-origin/platform provenance survives
+        // into each discovered source.
+        super::pi_wire::discover_sources(&Self::source_roots(ctx), ctx, "pi_agent")
     }
 
     /// Detect Pi session stores under `root` that this connector cannot index.
@@ -496,7 +334,6 @@ impl Connector for PiAgentConnector {
         franken_detection_for_connector("pi_agent").unwrap_or_else(DetectionResult::not_found)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let homes: Vec<PathBuf> = Self::source_roots(ctx)
             .into_iter()
@@ -511,250 +348,7 @@ impl Connector for PiAgentConnector {
             store.warn();
         }
 
-        let mut convs = Vec::new();
-        let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
-
-        for home in homes {
-            let files = Self::session_files(&home);
-            if files.is_empty() {
-                continue;
-            }
-            // Hoisted out of the per-file loop so we compute the
-            // sessions_dir filesystem stat exactly once per home
-            // instead of once per session file.
-            let sessions_dir = Self::sessions_dir(&home);
-
-            for file in files {
-                // Guard against the same session file being reached through
-                // two homes (e.g. a symlink from ~/.pi/agent → ~/.omp/agent).
-                let dedupe_key = dedupe_path_key(&file);
-                if !seen_session_paths.insert(dedupe_key) {
-                    continue;
-                }
-                // Skip files not modified since last scan
-                if !file_modified_since(&file, ctx.since_ts) {
-                    continue;
-                }
-
-                let source_path = file.clone();
-
-                // Use the parent directory name + filename as external_id
-                // e.g., "--Users-foo-project--/2024-01-15T10-30-00_uuid.jsonl"
-                let external_id = source_path
-                    .strip_prefix(&sessions_dir)
-                    .ok()
-                    .and_then(|rel| rel.to_str().map(String::from))
-                    .or_else(|| {
-                        source_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .map(String::from)
-                    });
-
-                let content = match fs::read_to_string(&file) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::debug!(path = %file.display(), error = %e, "pi-agent: skipping unreadable session");
-                        continue;
-                    }
-                };
-
-                let mut messages = Vec::new();
-                let mut started_at: Option<i64> = None;
-                let mut ended_at: Option<i64> = None;
-                let mut session_cwd: Option<PathBuf> = None;
-                let mut session_id: Option<String> = None;
-                let mut provider: Option<String> = None;
-                let mut model_id: Option<String> = None;
-
-                for line in content.lines() {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let val: Value = match serde_json::from_str(line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                    match entry_type {
-                        "session" => {
-                            // Session header - extract metadata
-                            session_id = val.get("id").and_then(|v| v.as_str()).map(String::from);
-                            session_cwd =
-                                val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-                            provider = val
-                                .get("provider")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-                            model_id = val
-                                .get("modelId")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-
-                            // Parse timestamp
-                            if let Some(ts_val) = val.get("timestamp") {
-                                started_at = parse_timestamp(ts_val);
-                            }
-                        }
-                        "message" => {
-                            // Message entry - extract the nested message object
-                            let created = val.get("timestamp").and_then(parse_timestamp);
-
-                            if let Some(msg) = val.get("message") {
-                                let role = msg
-                                    .get("role")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-
-                                // Normalize role names
-                                let normalized_role = match role {
-                                    "user" => "user",
-                                    "assistant" => "assistant",
-                                    "toolResult" => "tool",
-                                    _ => role,
-                                };
-
-                                // Extract content
-                                let content_str = msg
-                                    .get("content")
-                                    .map(Self::flatten_message_content)
-                                    .unwrap_or_default();
-
-                                if content_str.trim().is_empty() {
-                                    continue;
-                                }
-
-                                // Update timestamps
-                                started_at = match (started_at, created) {
-                                    (Some(curr), Some(ts)) => Some(curr.min(ts)),
-                                    (None, Some(ts)) => Some(ts),
-                                    (other, None) => other,
-                                };
-                                ended_at = match (ended_at, created) {
-                                    (Some(curr), Some(ts)) => Some(curr.max(ts)),
-                                    (None, Some(ts)) => Some(ts),
-                                    (other, None) => other,
-                                };
-
-                                // Extract author (model) for assistant messages
-                                // Check message.model first, fall back to tracked model_id
-                                let author = if normalized_role == "assistant" {
-                                    msg.get("model")
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from)
-                                        .or_else(|| model_id.clone())
-                                } else {
-                                    None
-                                };
-
-                                let invocations = msg
-                                    .get("content")
-                                    .and_then(|c| c.as_array())
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter(|item| {
-                                                item.get("type").and_then(|t| t.as_str())
-                                                    == Some("toolCall")
-                                            })
-                                            .map(|item| {
-                                                let name = item
-                                                    .get("name")
-                                                    .and_then(|n| n.as_str())
-                                                    .unwrap_or("unknown")
-                                                    .to_string();
-                                                crate::types::NormalizedInvocation {
-                                                    kind: "tool".to_string(),
-                                                    name,
-                                                    raw_name: None,
-                                                    call_id: item
-                                                        .get("id")
-                                                        .and_then(|v| v.as_str())
-                                                        .map(String::from),
-                                                    arguments: item.get("arguments").cloned(),
-                                                }
-                                            })
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default();
-
-                                messages.push(NormalizedMessage {
-                                    idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
-                                    role: normalized_role.to_string(),
-                                    author,
-                                    created_at: created,
-                                    content: content_str,
-                                    extra: val.clone(),
-                                    invocations,
-                                    snippets: Vec::new(),
-                                });
-                            }
-                        }
-                        "model_change" => {
-                            // Track model changes (useful metadata)
-                            provider = val
-                                .get("provider")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-                            model_id = val
-                                .get("modelId")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-                        }
-                        _ => {
-                            // Skip thinking_level_change and unknown types
-                        }
-                    }
-                }
-
-                if messages.is_empty() {
-                    continue;
-                }
-
-                // Extract title from first user message
-                let title = messages
-                    .iter()
-                    .find(|m| m.role == "user")
-                    .map(|m| {
-                        m.content
-                            .lines()
-                            .next()
-                            .unwrap_or(&m.content)
-                            .chars()
-                            .take(100)
-                            .collect::<String>()
-                    })
-                    .or_else(|| {
-                        messages
-                            .first()
-                            .and_then(|m| m.content.lines().next())
-                            .map(|s| s.chars().take(100).collect())
-                    });
-
-                // Build metadata
-                let metadata = serde_json::json!({
-                    "source": "pi_agent",
-                    "session_id": session_id,
-                    "provider": provider,
-                    "model_id": model_id,
-                });
-
-                convs.push(NormalizedConversation {
-                    agent_slug: "pi_agent".to_string(),
-                    external_id,
-                    title,
-                    workspace: session_cwd,
-                    source_path: source_path.clone(),
-                    started_at,
-                    ended_at,
-                    metadata,
-                    messages,
-                });
-            }
-        }
-
-        Ok(convs)
+        super::pi_wire::scan_homes(&homes, ctx, "pi_agent")
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
@@ -765,6 +359,7 @@ impl Connector for PiAgentConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::pi_wire::{flatten_message_content, session_files};
     use crate::connectors::scan::ScanRoot;
     use serde_json::json;
     use std::fs;
@@ -794,7 +389,7 @@ mod tests {
     #[test]
     fn flatten_message_content_handles_string() {
         let content = json!("Simple string content");
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert_eq!(result, "Simple string content");
     }
 
@@ -804,7 +399,7 @@ mod tests {
             {"type": "text", "text": "First paragraph"},
             {"type": "text", "text": "Second paragraph"}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.contains("First paragraph"));
         assert!(result.contains("Second paragraph"));
     }
@@ -814,7 +409,7 @@ mod tests {
         let content = json!([
             {"type": "thinking", "thinking": "Let me analyze this..."}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.contains("[Thinking]"));
         assert!(result.contains("Let me analyze this..."));
     }
@@ -824,7 +419,7 @@ mod tests {
         let content = json!([
             {"type": "toolCall", "name": "read_file", "arguments": {"path": "/test.rs"}}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.contains("[Tool: read_file]"));
         assert!(result.contains("path=/test.rs"));
     }
@@ -834,7 +429,7 @@ mod tests {
         let content = json!([
             {"type": "toolCall", "name": "get_status", "arguments": {}}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert_eq!(result, "[Tool: get_status]");
     }
 
@@ -845,7 +440,7 @@ mod tests {
             {"type": "image", "url": "data:image/png;base64,..."},
             {"type": "text", "text": "End of message"}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.contains("Here's an image:"));
         assert!(result.contains("End of message"));
         assert!(!result.contains("data:image"));
@@ -859,7 +454,7 @@ mod tests {
             {"type": "toolCall", "name": "bash", "arguments": {"command": "ls"}},
             {"type": "text", "text": "Done!"}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.contains("Let me help:"));
         assert!(result.contains("[Thinking] Analyzing..."));
         assert!(result.contains("[Tool: bash]"));
@@ -869,7 +464,7 @@ mod tests {
     #[test]
     fn flatten_message_content_returns_empty_for_null() {
         let content = json!(null);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         assert!(result.is_empty());
     }
 
@@ -880,7 +475,7 @@ mod tests {
                 "a": "1", "b": "2", "c": "3", "d": "4", "e": "5"
             }}
         ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
+        let result = flatten_message_content(&content);
         // Should contain at most 3 arguments
         let arg_count = result.matches('=').count();
         assert!(arg_count <= 3);
@@ -899,7 +494,7 @@ mod tests {
         // Valid session file format: <timestamp>_<uuid>.jsonl
         fs::write(sessions.join("2025-12-01T10-00-00_abc123.jsonl"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         assert_eq!(files.len(), 1);
     }
 
@@ -912,7 +507,7 @@ mod tests {
         fs::write(sessions.join("2025-12-01_abc123.json"), "{}").unwrap();
         fs::write(sessions.join("config.txt"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         assert_eq!(files.len(), 0);
     }
 
@@ -925,7 +520,7 @@ mod tests {
         // Missing underscore between timestamp and uuid
         fs::write(sessions.join("2025-12-01.jsonl"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         assert_eq!(files.len(), 0);
     }
 
@@ -937,7 +532,7 @@ mod tests {
 
         fs::write(nested.join("2025-12-01T10-00-00_uuid1.jsonl"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         assert_eq!(files.len(), 1);
     }
 
@@ -972,7 +567,7 @@ mod tests {
         fs::create_dir_all(&underscore_slug).unwrap();
         fs::write(underscore_slug.join("export.jsonl"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         let names: Vec<_> = files
             .iter()
             .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
@@ -994,7 +589,7 @@ mod tests {
     #[test]
     fn session_files_returns_empty_when_no_sessions_dir() {
         let dir = TempDir::new().unwrap();
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         assert_eq!(files.len(), 0);
     }
 
@@ -1008,7 +603,7 @@ mod tests {
         fs::write(nested.join("2025-12-01T10-00-00_aaaa.jsonl"), "{}").unwrap();
         fs::write(nested.join("2025-12-01T10-00-00_mmmm.jsonl"), "{}").unwrap();
 
-        let files = PiAgentConnector::session_files(dir.path());
+        let files = session_files(dir.path());
         let mut sorted = files.clone();
         sorted.sort();
         assert_eq!(files, sorted);
@@ -1879,35 +1474,36 @@ mod tests {
     // in addition to pi-mono at ~/.pi/agent
     // =====================================================
 
-    /// Regression for issue #174: `default_homes_from` must return BOTH
-    /// `~/.pi/agent` (pi-mono) and `~/.omp/agent` (Oh My Pi), so the
-    /// scan loop can walk both distributions without additional config.
+    /// Regression scope update: `default_homes_from` now returns ONLY
+    /// `~/.pi/agent` (upstream pi-mono). Oh My Pi (`omp`) sessions moved to
+    /// the dedicated `omp` connector, which shares this crate's wire parser;
+    /// a dual-home default here would double-scan `.omp` trees across two
+    /// connectors and misattribute their conversations.
     ///
     /// This test targets the pure function so it does not need to mutate
     /// process environment (`std::env::set_var` is `unsafe` and `forbid`den
     /// at the crate level).
     #[test]
-    fn default_homes_from_includes_both_pi_and_omp() {
+    fn default_homes_from_pins_the_upstream_pi_mono_agent_dir() {
         let sandbox = TempDir::new().unwrap();
         let home = sandbox.path();
         let homes = PiAgentConnector::default_homes_from(Some(home));
         assert_eq!(
             homes,
-            vec![home.join(".pi/agent"), home.join(".omp/agent")],
-            "default_homes_from must return pi-mono + Oh My Pi candidates"
+            vec![home.join(".pi/agent")],
+            "default_homes_from must return only the pi-mono candidate"
         );
     }
 
-    /// End-to-end regression for issue #174: populate a sandboxed home
-    /// with both `~/.pi/agent/sessions/<file>` and
-    /// `~/.omp/agent/sessions/<file>`, point the scanner at each root
-    /// explicitly via `ScanContext::with_roots`, and verify both sets
-    /// of conversations surface in a single scan result.
+    /// Ownership-boundary regression (issue #174 follow-up): with omp
+    /// sessions owned by the dedicated `omp` connector, `default_homes()`
+    /// must not include the `.omp` tree — a default-detection scan from an
+    /// unrelated data dir walks only `.pi/agent`.
     ///
     /// This exercises the same discovery path the real scanner takes
     /// under `build_scan_roots` without touching process environment.
     #[test]
-    fn scan_discovers_both_pi_and_omp_sessions_via_explicit_roots() {
+    fn default_detection_scan_does_not_reach_omp_trees() {
         let sandbox = TempDir::new().unwrap();
         let sandbox_home = sandbox.path().to_path_buf();
 
@@ -1929,36 +1525,44 @@ mod tests {
         )
         .unwrap();
 
-        let connector = PiAgentConnector::new();
-
-        // Each root is scanned independently (matching build_scan_roots).
-        let pi_root = sandbox_home.join(".pi/agent");
-        let omp_root = sandbox_home.join(".omp/agent");
-        let ctx_pi = ScanContext::with_roots(pi_root.clone(), vec![ScanRoot::local(pi_root)], None);
-        let ctx_omp =
-            ScanContext::with_roots(omp_root.clone(), vec![ScanRoot::local(omp_root)], None);
-
-        let mut convs = connector.scan(&ctx_pi).unwrap();
-        convs.extend(connector.scan(&ctx_omp).unwrap());
-
-        assert_eq!(
-            convs.len(),
-            2,
-            "expected 2 conversations (one per home), got {}",
-            convs.len()
-        );
-        let sources: std::collections::HashSet<_> = convs
-            .iter()
-            .map(|c| c.messages[0].content.clone())
-            .collect();
+        // Sandbox trees are invisible to default detection on any machine:
+        // default_homes() derives from the process home, so neither the
+        // sandboxed .pi tree nor the sandboxed .omp tree may surface from an
+        // unrelated data dir.
+        let ctx = ScanContext::local_default(sandbox.path().join("cass-state"), None);
+        let convs = PiAgentConnector::new().scan(&ctx).unwrap();
         assert!(
-            sources.contains("From pi-mono"),
-            "must include ~/.pi/agent session, found: {sources:?}"
+            convs
+                .iter()
+                .all(|c| !c.source_path.starts_with(&sandbox_home)),
+            "default detection must not reach sandboxed trees"
         );
-        assert!(
-            sources.contains("From Oh My Pi"),
-            "must include ~/.omp/agent session, found: {sources:?}"
+
+        // The pi connector still indexes its own tree when handed over
+        // explicitly (the path real scan-root wiring produces).
+        let ctx_pi = ScanContext::with_roots(
+            PathBuf::from("/nonexistent"),
+            vec![ScanRoot::local(sandbox_home.join(".pi/agent"))],
+            None,
         );
+        let pi_convs = PiAgentConnector::new().scan(&ctx_pi).unwrap();
+        assert_eq!(pi_convs.len(), 1);
+        assert_eq!(pi_convs[0].agent_slug, "pi_agent");
+        assert_eq!(pi_convs[0].messages[0].content, "From pi-mono");
+
+        // The dedicated omp connector claims the same sandbox's `.omp` tree
+        // when it is handed over explicitly.
+        let ctx_omp = ScanContext::with_roots(
+            PathBuf::from("/nonexistent"),
+            vec![ScanRoot::local(sandbox_home.join(".omp/agent"))],
+            None,
+        );
+        let omp_convs = crate::connectors::omp::OmpConnector::new()
+            .scan(&ctx_omp)
+            .unwrap();
+        assert_eq!(omp_convs.len(), 1);
+        assert_eq!(omp_convs[0].agent_slug, "omp");
+        assert_eq!(omp_convs[0].messages[0].content, "From Oh My Pi");
     }
 
     #[test]
@@ -2004,19 +1608,17 @@ mod tests {
     fn default_homes_from_empty_path_yields_relative_candidates() {
         let empty = PathBuf::new();
         let homes = PiAgentConnector::default_homes_from(Some(&empty));
-        assert_eq!(homes.len(), 2);
+        assert_eq!(homes.len(), 1, "only the pi-mono default: {homes:?}");
         assert_eq!(homes[0], PathBuf::from(".pi/agent"));
-        assert_eq!(homes[1], PathBuf::from(".omp/agent"));
     }
 
     // =====================================================
     // Issue #313 — PI_SESSIONS_DIR + unsupported store detection
     // =====================================================
 
-    /// `PI_SESSIONS_DIR` names a sessions directory directly and is honored as
-    /// a standalone root, independently of the built-in `~/.pi` + `~/.omp`
-    /// defaults (which remain present when no `PI_CODING_AGENT_DIR` override is
-    /// set). Exercised via the pure helper so no process env is mutated.
+    /// `PI_SESSIONS_DIR` names a sessions directory directly and is honored
+    /// as a standalone root, independently of the built-in `~/.pi/agent`
+    /// default. Exercised via the pure helper so no process env is mutated.
     #[test]
     fn homes_from_overrides_honors_pi_sessions_dir() {
         let home = PathBuf::from("/home/user");
@@ -2028,12 +1630,11 @@ mod tests {
             "PI_SESSIONS_DIR must be the first candidate root"
         );
         assert!(homes.contains(&home.join(".pi/agent")));
-        assert!(homes.contains(&home.join(".omp/agent")));
     }
 
     /// `PI_SESSIONS_DIR` and `PI_CODING_AGENT_DIR` are independent: the custom
     /// sessions dir is still scanned even when the agent home is pinned (and
-    /// the pin suppresses the built-in `~/.pi` + `~/.omp` defaults).
+    /// the pin suppresses the built-in `~/.pi/agent` default).
     #[test]
     fn homes_from_overrides_sessions_dir_and_coding_agent_dir_coexist() {
         let homes = PiAgentConnector::homes_from_overrides(
@@ -2050,13 +1651,14 @@ mod tests {
         );
     }
 
-    /// An empty `PI_SESSIONS_DIR=""` is treated as unset (no phantom root).
+    /// An empty `PI_SESSIONS_DIR=""` is treated as unset (no phantom root);
+    /// only the pi-mono built-in default remains.
     #[test]
     fn homes_from_overrides_empty_pi_sessions_dir_ignored() {
         let homes =
             PiAgentConnector::homes_from_overrides(Some(""), None, Some(Path::new("/home/user")));
         assert!(!homes.contains(&PathBuf::new()));
-        assert_eq!(homes.len(), 2, "only the two built-in defaults: {homes:?}");
+        assert_eq!(homes.len(), 1, "only the pi-mono built-in: {homes:?}");
     }
 
     /// A custom sessions root that contains JSONL session files *directly*
@@ -2221,5 +1823,40 @@ mod tests {
             formats.contains("sqlite_sessions"),
             "expected SQLite diagnostic, got {diags:?}"
         );
+    }
+    /// Regression: discovery must preserve scan-root provenance. Remote
+    /// roots (`Origin::Ssh` + platform hint) must not be downgraded to local
+    /// when session files are wrapped as discovered sources — downstream
+    /// consumers key mirroring and path-mapping decisions off this.
+    #[test]
+    fn discovery_preserves_remote_scan_root_provenance() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join(".pi").join("agent").join("sessions");
+        fs::create_dir_all(sessions.join("--proj--")).unwrap();
+        fs::write(
+            sessions.join("--proj--").join("2025-12-01T10-00-00_uuid.jsonl"),
+            "{\"type\":\"session\",\"id\":\"s\",\"timestamp\":\"2025-12-01T10:00:00Z\",\"cwd\":\"/p\"}\n{\"type\":\"message\",\"timestamp\":\"2025-12-01T10:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"remote\"}}",
+        )
+        .unwrap();
+
+        let ctx = ScanContext::with_roots(
+            PathBuf::from("/nonexistent"),
+            vec![ScanRoot::remote(
+                dir.path().to_path_buf(),
+                crate::types::Origin::remote_with_host("host-a", "host-a.example"),
+                Some(crate::types::Platform::Linux),
+            )],
+            None,
+        );
+        let sources = PiAgentConnector::new()
+            .discover_source_files(&ctx)
+            .expect("discovery");
+        assert_eq!(sources.len(), 1);
+        assert!(
+            sources[0].origin.is_remote(),
+            "remote provenance must survive discovery, got {:?}",
+            sources[0].origin
+        );
+        assert_eq!(sources[0].platform, Some(crate::types::Platform::Linux));
     }
 }
