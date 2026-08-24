@@ -979,8 +979,11 @@ mod tests {
         write_session(
             tmp.path(),
             &[
-                envelope(&text_chunk("user_message", "hello"), 1_784_388_056),
-                envelope(&text_chunk("agent_message", "hi there"), 1_784_388_057),
+                envelope(&text_chunk("user_message_chunk", "hello"), 1_784_388_056),
+                envelope(
+                    &text_chunk("agent_message_chunk", "hi there"),
+                    1_784_388_057,
+                ),
             ],
         );
         let convs = GrokConnector
