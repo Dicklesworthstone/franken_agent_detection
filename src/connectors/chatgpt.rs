@@ -420,8 +420,9 @@ impl ChatGptConnector {
         is_encrypted: bool,
     ) -> Result<Option<NormalizedConversation>> {
         // Safety check: Don't read files larger than 100MB to avoid OOM
+        const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
         if let Ok(metadata) = fs::metadata(path)
-            && metadata.len() > 100 * 1024 * 1024
+            && metadata.len() > MAX_FILE_BYTES
         {
             tracing::warn!(
                 path = %path.display(),
@@ -436,7 +437,6 @@ impl ChatGptConnector {
         // perms, TOCTOU unlink), the pre-read guard was skipped — enforce
         // the cap on the buffer we actually hold so a metadata failure can
         // never turn into an unbounded read + decrypt double-buffer.
-        const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
         if content_bytes.len() as u64 > MAX_FILE_BYTES {
             tracing::warn!(
                 path = %path.display(),

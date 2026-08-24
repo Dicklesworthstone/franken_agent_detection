@@ -136,7 +136,22 @@ impl AntigravityConnector {
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots = if ctx.use_default_detection() {
-            vec![ScanRoot::local(Self::base_root())]
+            // Mirror the explicit-root acceptance: a default-detection
+            // data_dir that itself looks like antigravity storage (an
+            // `antigravity-cli` base with a `brain/` tree, or the `brain/`
+            // dir itself) scopes the scan to it, so fixture/mirror scans
+            // stay hermetic; otherwise probe the system base.
+            // `CASS_ANTIGRAVITY_DATA_ROOT` keeps precedence so CI
+            // redirection is unaffected.
+            let d = &ctx.data_dir;
+            let env_override = env_path_nonempty("CASS_ANTIGRAVITY_DATA_ROOT").is_some();
+            let looks_like_base = d.join("brain").is_dir()
+                || d.file_name().is_some_and(|n| n == "brain");
+            if !env_override && looks_like_base {
+                vec![ScanRoot::local(d.clone())]
+            } else {
+                vec![ScanRoot::local(Self::base_root())]
+            }
         } else {
             ctx.scan_roots.clone()
         };

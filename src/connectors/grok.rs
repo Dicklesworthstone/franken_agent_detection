@@ -99,7 +99,19 @@ impl GrokConnector {
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots = if ctx.use_default_detection() {
-            vec![ScanRoot::local(Self::base_root())]
+            // Mirror the explicit-root acceptance: a default-detection
+            // data_dir that itself resolves as Grok storage (a `$GROK_HOME`
+            // base with `sessions/`, the `sessions/` tree, or one session
+            // dir) scopes the scan to it, so fixture/mirror scans stay
+            // hermetic; otherwise probe the system base. `GROK_HOME` keeps
+            // precedence so CI redirection is unaffected.
+            let d = &ctx.data_dir;
+            let env_override = env_path_nonempty("GROK_HOME").is_some();
+            if !env_override && (d.join("sessions").is_dir() || Self::is_session_dir(d)) {
+                vec![ScanRoot::local(d.clone())]
+            } else {
+                vec![ScanRoot::local(Self::base_root())]
+            }
         } else {
             ctx.scan_roots.clone()
         };

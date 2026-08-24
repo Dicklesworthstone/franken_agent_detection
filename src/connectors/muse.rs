@@ -242,10 +242,10 @@ fn parse_record(line: &str, lineno: usize) -> Option<MuseRecord> {
     let obj = val.as_object()?;
     let payload_type = obj.get("payload_type")?.as_str()?.to_string();
     let payload = obj.get("payload")?.clone();
-    let sort_key = match obj.get("sequence").and_then(Value::as_i64) {
-        Some(seq) => (0, seq),
-        None => (1, i64::try_from(lineno).unwrap_or(i64::MAX)),
-    };
+    let sort_key = obj.get("sequence").and_then(Value::as_i64).map_or_else(
+        || (1, i64::try_from(lineno).unwrap_or(i64::MAX)),
+        |seq| (0, seq),
+    );
     let recorded_at_ms = obj.get("recorded_at").and_then(muse_ts_to_millis);
     let stream_id = obj
         .get("stream")

@@ -2248,7 +2248,7 @@ mod tests {
         );
         let ids: HashSet<String> = convs.iter().filter_map(|c| c.external_id.clone()).collect();
         assert!(
-            ids.contains(&sid.to_string()),
+            ids.contains(sid),
             "agent transcript under a Cursor-base data_dir must be indexed from that dir, ids={ids:?}"
         );
     }
