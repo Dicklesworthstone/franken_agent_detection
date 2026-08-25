@@ -1054,6 +1054,107 @@ mod tests {
     }
 
     #[test]
+    fn title_skips_injected_context_user_records() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let sessions = home.join(".codex").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"# AGENTS.md instructions for /data/projects/demo\nBe helpful."}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"user","content":"Fix the flaky test"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:02Z","payload":{"role":"assistant","content":"On it."}}
+"#;
+        fs::write(sessions.join("rollout-title.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx =
+            ScanContext::with_roots(dir.path().join("cass"), vec![ScanRoot::local(home)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn dual_stream_user_prompts_are_deduplicated() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let sessions = home.join(".codex").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // Dual-stream era: the same prompt arrives via BOTH streams.
+        let content = r#"{"type":"event_msg","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"user_message","message":"First read ALL of the AGENTS.md file"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"user","content":"First read ALL of the AGENTS.md file"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:02Z","payload":{"role":"assistant","content":"Reading it now."}}
+"#;
+        fs::write(sessions.join("rollout-dual.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx =
+            ScanContext::with_roots(dir.path().join("cass"), vec![ScanRoot::local(home)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let user_texts: Vec<&str> = convs[0]
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["First read ALL of the AGENTS.md file"],
+            "the event_msg copy of a response_item user prompt must be suppressed"
+        );
+    }
+
+    #[test]
+    fn token_count_reads_nested_last_token_usage() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let sessions = home.join(".codex").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // Real payload shape (sampled live 2026-06): usage nested under
+        // info.last_token_usage, NOT flat on the payload.
+        let usage_line = r#"{"timestamp":"2026-06-14T02:46:39.992Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":42187,"cached_input_tokens":5504,"output_tokens":733,"reasoning_output_tokens":516,"total_tokens":42920},"last_token_usage":{"input_tokens":42187,"cached_input_tokens":5504,"output_tokens":733,"reasoning_output_tokens":516,"total_tokens":42920}}}}"#;
+        let content = format!(
+            "{}\n{}\n{}\n{}\n",
+            r#"{"type":"response_item","timestamp":"2026-06-14T02:45:00.000Z","payload":{"role":"assistant","content":"Working on it."}}"#,
+            usage_line,
+            r#"{"type":"response_item","timestamp":"2026-06-14T02:47:00.000Z","payload":{"role":"assistant","content":"Done."}}"#,
+            usage_line.replace("\"input_tokens\":42187", "\"input_tokens\":500")
+        );
+        fs::write(sessions.join("rollout-tokens.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx =
+            ScanContext::with_roots(dir.path().join("cass"), vec![ScanRoot::local(home)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let with_usage: Vec<&Value> = convs[0]
+            .messages
+            .iter()
+            .filter(|m| {
+                m.extra
+                    .pointer("/cass/token_usage/input_tokens")
+                    .is_some()
+            })
+            .map(|m| &m.extra)
+            .collect();
+        assert_eq!(with_usage.len(), 2, "each turn carries its own usage");
+        let first = with_usage[0]
+            .pointer("/cass/token_usage/input_tokens")
+            .and_then(Value::as_i64);
+        let second = with_usage[1]
+            .pointer("/cass/token_usage/input_tokens")
+            .and_then(Value::as_i64);
+        assert_eq!(first, Some(42_187));
+        assert_eq!(second, Some(500));
+    }
+
+    #[test]
     fn rollout_files_finds_nested_rollouts() {
         let dir = TempDir::new().unwrap();
         let nested = dir
