@@ -487,6 +487,9 @@ fn scan_claude_with_callback_with_exclusions(
                     if line.trim().is_empty() {
                         continue;
                     }
+                    // Strip a UTF-8 BOM so the first record (often
+                    // session_meta or the first prompt) is not silently lost.
+                    let line = line.trim_start_matches('\u{feff}');
                     let Ok(val) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
@@ -541,9 +544,57 @@ fn scan_claude_with_callback_with_exclusions(
                         .or_else(|| val.get("content"));
                     let content_str = content_val.map(flatten_content).unwrap_or_default();
 
+                    // Tool results ride in user entries as
+                    // content:[{type:"tool_result", tool_use_id, content}].
+                    // flatten_content ignores those blocks, so without this
+                    // pass every result entry is dropped wholesale
+                    // (~30-40% of real entries per transcript), leaving
+                    // invocations with call_ids but no outputs anywhere.
+                    if let Some(blocks) = content_val.and_then(Value::as_array) {
+                        for block in blocks {
+                            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                                continue;
+                            }
+                            let result_text = match block.get("content") {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Array(parts)) => parts
+                                    .iter()
+                                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                _ => continue,
+                            };
+                            if result_text.trim().is_empty() {
+                                continue;
+                            }
+                            let mut tool_extra = Map::new();
+                            tool_extra.insert(
+                                "source".to_string(),
+                                Value::String("tool_result".to_string()),
+                            );
+                            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                                tool_extra.insert(
+                                    "tool_use_id".to_string(),
+                                    Value::String(id.to_string()),
+                                );
+                            }
+                            messages.push(NormalizedMessage {
+                                idx: 0,
+                                role: "tool".to_string(),
+                                author: None,
+                                created_at: created,
+                                content: result_text,
+                                extra: Value::Object(tool_extra),
+                                invocations: Vec::new(),
+                                snippets: Vec::new(),
+                            });
+                        }
+                    }
+
                     if content_str.trim().is_empty() {
                         continue;
                     }
+
 
                     let author = val
                         .get("message")
