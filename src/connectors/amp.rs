@@ -745,6 +745,53 @@ mod tests {
     }
 
     #[test]
+    fn scan_prefers_thread_id_for_external_id_with_relative_path_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("amp-store");
+        let threads = store.join("threads");
+        fs::create_dir_all(&threads).unwrap();
+
+        // A thread carrying amp's own id: that id is the identity.
+        fs::write(
+            threads.join("T-111.json"),
+            json!({
+                "id": "T-111",
+                "title": "With id",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // An export without an id: the root-relative path keeps it unique
+        // (a bare stem would collide with every other thread.json).
+        fs::write(
+            threads.join("thread.json"),
+            json!({
+                "title": "No id",
+                "messages": [{"role": "user", "content": "hello"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let connector = AmpConnector::new();
+        let ctx = ScanContext::local_default(store, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 2);
+        let with_id = convs
+            .iter()
+            .find(|c| c.title.as_deref() == Some("With id"))
+            .expect("thread with id");
+        assert_eq!(with_id.external_id.as_deref(), Some("T-111"));
+        let no_id = convs
+            .iter()
+            .find(|c| c.title.as_deref() == Some("No id"))
+            .expect("thread without id");
+        assert_eq!(no_id.external_id.as_deref(), Some("threads/thread.json"));
+    }
+
+    #[test]
     fn infer_workspace_from_cwd_key() {
         let val = json!({"cwd": "/home/user/cwd-project"});
         assert_eq!(
