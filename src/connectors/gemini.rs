@@ -1305,6 +1305,30 @@ mod tests {
     }
 
     #[test]
+    fn scan_title_skips_injected_context_user_records() {
+        let dir = TempDir::new().unwrap();
+        let hash_dir = dir.path().join("gemini_hash");
+        let chats_dir = hash_dir.join("chats");
+        fs::create_dir_all(&chats_dir).unwrap();
+
+        let session_json = r#"{
+            "sessionId": "session-ctx",
+            "messages": [
+                {"type": "user", "content": "# AGENTS.md instructions for /data/projects/demo\nBe helpful."},
+                {"type": "user", "content": "Help me with Rust"},
+                {"type": "model", "content": "Sure!"}
+            ]
+        }"#;
+        fs::write(chats_dir.join("session-ctx.json"), session_json).unwrap();
+
+        let connector = GeminiConnector::new();
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs[0].title.as_deref(), Some("Help me with Rust"));
+    }
+
+    #[test]
     fn scan_truncates_long_titles() {
         let dir = TempDir::new().unwrap();
         let hash_dir = dir.path().join("gemini_hash");
