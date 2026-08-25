@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::env_path_nonempty;
+use super::utils::{env_path_nonempty, is_injected_context_message};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
