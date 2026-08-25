@@ -526,7 +526,11 @@ impl OpenCodeConnector {
                         .time_updated_raw
                         .as_ref()
                         .and_then(normalize_sqlite_ts_value)
-                        .is_none_or(|updated| updated >= since)
+                        // Same −1s mtime-granularity slack as
+                        // file_modified_since, so a session touched within
+                        // the slack window is not skipped on every
+                        // subsequent incremental scan.
+                        .is_none_or(|updated| updated >= since.saturating_sub(1_000))
                 })
                 .map(|session| session.id.clone())
                 .collect()
@@ -571,7 +575,7 @@ impl OpenCodeConnector {
             // such fallback). Only KNOWN-old sessions are pruned.
             if let Some(since) = since_ts
                 && let Some(latest) = ended_at.or(started_at)
-                && latest < since
+                && latest < since.saturating_sub(1_000)
             {
                 continue;
             }
