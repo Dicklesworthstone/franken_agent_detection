@@ -521,6 +521,20 @@ fn scan_claude_with_callback_with_exclusions(
                     }
 
                     let entry_type = val.get("type").and_then(|v| v.as_str());
+                    // Claude's own generated title beats first-line
+                    // truncation; the entry is otherwise skipped as a
+                    // non-conversation sidecar type.
+                    if entry_type == Some("ai-title") {
+                        if let Some(title) = val
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                        {
+                            json_title = Some(title.to_string());
+                        }
+                        continue;
+                    }
                     let role_hint = val
                         .get("message")
                         .and_then(|m| m.get("role"))
