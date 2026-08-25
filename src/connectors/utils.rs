@@ -432,6 +432,41 @@ mod tests {
         assert_eq!(parse_timestamp(&val), Some(1_700_000_000_000));
     }
 
+
+    #[test]
+    fn is_injected_context_message_detects_known_wrappers() {
+        assert!(is_injected_context_message(
+            "# AGENTS.md instructions for /data/projects/demo\nDo the thing"
+        ));
+        assert!(is_injected_context_message(
+            "<environment_context>macos</environment_context>"
+        ));
+        assert!(is_injected_context_message("<session_context>\n…"));
+        assert!(is_injected_context_message("  <user_instructions>…"));
+    }
+
+    #[test]
+    fn is_injected_context_message_allows_real_prompts() {
+        assert!(!is_injected_context_message(
+            "Fix the flaky test in it.rs"
+        ));
+        // Wrapper text appearing mid-message is not an injection header.
+        assert!(!is_injected_context_message(
+            "please read the <session_context> block"
+        ));
+    }
+
+    #[test]
+    fn read_capped_enforces_size_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let small = dir.path().join("small.txt");
+        std::fs::write(&small, "tiny").unwrap();
+        assert_eq!(read_capped(&small).unwrap().as_deref(), Some("tiny"));
+
+        let big = dir.path().join("big.txt");
+        std::fs::write(&big, vec![b'a'; (MAX_SCAN_FILE_BYTES + 1) as usize]).unwrap();
+        assert!(read_capped(&big).unwrap().is_none());
+    }
     #[test]
     fn parse_timestamp_i64_microseconds() {
         // 1_700_000_000_000_000 µs == 1_700_000_000_000 ms.

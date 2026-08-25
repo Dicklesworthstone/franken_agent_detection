@@ -1031,6 +1031,63 @@ fn parse_kimi_code_session(
             // and its context.append_message echo — the pending prompt must
             // survive them or the dedup only works under strict adjacency
             // and the prompt duplicates (fresh-eyes finding, cass#351).
+            "usage.record" => {
+                // Documented event type (module header) with no published
+                // field shape; accept both a flat token record and one
+                // nested under "usage", tolerating the common cache
+                // spellings. Unknown shapes are ignored rather than
+                // guessed. Bookkeeping only: the pending turn.prompt must
+                // survive it (cass#351).
+                let block = val.get("usage").unwrap_or(&val);
+                let field = |key: &str| {
+                    block
+                        .get(key)
+                        .and_then(Value::as_i64)
+                        .or_else(|| block.pointer(&format!("/tokens/{key}")).and_then(Value::as_i64))
+                };
+                let input_tokens = field("input_tokens");
+                let output_tokens = field("output_tokens");
+                if input_tokens.is_none() && output_tokens.is_none() {
+                    continue;
+                }
+                let mut usage = serde_json::Map::new();
+                if let Some(input) = input_tokens {
+                    usage.insert("input_tokens".to_string(), Value::from(input));
+                }
+                if let Some(output) = output_tokens {
+                    usage.insert("output_tokens".to_string(), Value::from(output));
+                }
+                for read_key in ["cached_input_tokens", "cache_read_tokens"] {
+                    if let Some(cache) = field(read_key) {
+                        usage.insert("cache_read_tokens".to_string(), Value::from(cache));
+                        break;
+                    }
+                }
+                usage.insert("data_source".to_string(), Value::String("api".to_string()));
+
+                let target = messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == "assistant" && m.invocations.is_empty());
+                if let Some(message) = target {
+                    if let Some(extra_obj) = message.extra.as_object_mut() {
+                        let cass = extra_obj
+                            .entry("cass")
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        if let Some(cass_obj) = cass.as_object_mut() {
+                            cass_obj.insert(
+                                "token_usage".to_string(),
+                                Value::Object(usage),
+                            );
+                        }
+                    }
+                }
+            }
+            // llm.request and unknown top-level types are bookkeeping and
+            // can legitimately arrive between a turn.prompt and its
+            // context.append_message echo — the pending prompt must survive
+            // them or the dedup only works under strict adjacency and the
+            // prompt duplicates (fresh-eyes finding, cass#351).
             _ => {}
         }
     }

@@ -327,15 +327,28 @@ impl Connector for AmpConnector {
                         })
                     });
 
-                    let external_id = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(std::string::ToString::to_string)
+                    // Identity precedence: the thread's own `id` field is
+                    // what amp itself addresses a thread by; a bare file
+                    // stem ("thread.json") is shared by EVERY thread in a
+                    // store and collides downstream. Fall back to the
+                    // root-relative path (stable within a store), then the
+                    // lossless full path.
+                    let external_id = val
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .map(String::from)
                         .or_else(|| {
-                            val.get("id")
-                                .and_then(|v| v.as_str())
+                            path.strip_prefix(root).ok().and_then(|rel| {
+                                rel.to_str().map(|s| s.trim_start_matches('/').to_string())
+                            })
+                        })
+                        .or_else(|| {
+                            path.file_stem()
+                                .and_then(|s| s.to_str())
                                 .map(std::string::ToString::to_string)
-                        });
+                        })
+                        .or_else(|| Some(path.display().to_string()));
 
                     // Key on the full, losslessly-encoded path:
                     // is_amp_log_file accepts any *.json under a "threads"
