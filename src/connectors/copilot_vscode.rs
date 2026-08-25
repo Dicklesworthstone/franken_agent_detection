@@ -72,7 +72,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanRoot};
-use super::utils::dedupe_path_key;
+use super::utils::{dedupe_path_key, read_capped};
 use super::{file_modified_since, parse_timestamp};
 use crate::types::{
     NormalizedConversation, NormalizedInvocation, NormalizedMessage, reindex_messages,

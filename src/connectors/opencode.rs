@@ -36,6 +36,7 @@ use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
 use frankensqlite::{Row, SqliteValue, params};
 
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::utils::read_capped;
 
 /// Max ids bound into a single `... IN (?, ?, …)` chunk. Kept well under
 /// SQLite's default 999-parameter ceiling. (#372: incremental opencode scans

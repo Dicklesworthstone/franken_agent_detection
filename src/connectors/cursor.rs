@@ -37,7 +37,7 @@ use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::utils::{dedupe_path_key, env_path_nonempty, read_capped};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
