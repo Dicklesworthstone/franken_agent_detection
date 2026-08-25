@@ -65,6 +65,46 @@ Scope window: 2026-02-15 through HEAD
   (`GOOSE_SQLITE_DB`, `HERMES_SQLITE_DB`, `CRUSH_SQLITE_DB`) keep
   precedence, and scan/discovery parity holds. Regression tests pin exact
   source paths for all three.
+- **Codex token usage is captured from real rollouts again.** The
+  `token_count` reader expected flat `payload.{input_tokens,output_tokens}`
+  — a shape that exists only in a repo fixture. Every sampled real rollout
+  (2026-01..2026-08) nests per-turn usage at `payload.info.last_token_usage`,
+  so ALL codex token accounting silently dropped. The nested block is now
+  parsed (`cached_input_tokens` mapped to cache reads; cumulative
+  `info.total_token_usage` deliberately NOT attached per turn), the same
+  stale fallback in `token_extraction::extract_codex_tokens` is fixed, and a
+  regression test uses a real payload shape.
+- **Claude Code tool results are no longer dropped wholesale.** Tool
+  results ride in `type:"user"` entries as `content:[{type:"tool_result"}]`
+  blocks, which `flatten_content` ignores — so every result entry failed the
+  empty-content check and vanished (~30-40% of real entries per measured
+  transcript), leaving invocations with call_ids but zero outputs. They are
+  now emitted as first-class `role:"tool"` messages carrying `tool_use_id`.
+- **Dual-stream Codex rollouts no longer duplicate user prompts.** Files
+  from the Jan–Jun 2026 era record each prompt both as
+  `event_msg/user_message` and as a `response_item` user record (33/61
+  sampled files); the event_msg copy is now suppressed when the same text
+  arrived via response_item, and token counts no longer attach to synthetic
+  `[Tool: …]` placeholder messages.
+- **Cursor conversations are deduped across mirrored databases**, matching
+  the opencode fix: globalStorage/workspaceStorage mirrors or overlapping
+  explicit roots emitted the same composer twice. A failed Cursor bubble
+  range-query is also surfaced at warn instead of silently emptying the
+  conversation, and OpenCode SQLite queries guard NULL/BLOB id and data
+  cells (one malformed row used to abort an entire store at debug-level
+  silence) with store failures escalated to warn.
+- **The 100MB scan cap (chatgpt policy) now applies everywhere**: a shared
+  `read_capped` helper (pre-read stat + post-read backstop) covers cursor
+  agent transcripts, copilot-vscode native sessions, amp threads,
+  opencode session/message/part files, codex legacy `.json` rollouts, and
+  pi-family transcripts; UTF-8 BOMs are stripped on first-line parses in
+  codex, claude_code, kimi, and opencode message/part files so leading
+  records survive; `file://localhost/path` URIs no longer decode to bogus
+  relative paths (cursor + copilot_vscode); Copilot assistant turns keep
+  their request timestamp; amp's cross-root dedupe key is lossless;
+  pi-family homes are canonicalized once per scan so symlinked agent dirs
+  dedupe correctly; and `parse_timestamp` recognizes microsecond epochs
+  instead of reading them as milliseconds ~55 millennia out.
 
 ### Added
 
