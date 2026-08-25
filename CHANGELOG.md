@@ -96,6 +96,10 @@ Scope window: 2026-02-15 through HEAD
   warn. Codex cache hits are preserved under their own
   `cached_input_tokens` key rather than remapped onto the additive
   `cache_read_tokens` contract; Claude tool results carry `is_error`.
+  Cursor and OpenCode row-level `since_ts` filters now apply the same
+  −1s granularity slack as `file_modified_since`, closing an
+  incremental-scan window where a conversation touched right around the
+  watermark was skipped on every subsequent run.
 - **The 100MB scan cap (chatgpt policy) now applies everywhere**: a shared
   `read_capped` helper (pre-read stat + post-read backstop) covers cursor
   agent transcripts, copilot-vscode native sessions, amp threads,
