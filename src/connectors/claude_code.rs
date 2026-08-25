@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
+use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
 };
