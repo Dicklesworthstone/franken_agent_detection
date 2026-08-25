@@ -127,16 +127,33 @@ impl CodexConnector {
 
     fn is_token_usage_target_message(message: &NormalizedMessage) -> bool {
         // Attribute token_count usage to concrete assistant turns only.
-        // This avoids attaching usage to synthetic reasoning helper messages.
-        message.role == "assistant" && message.author.is_none()
+        // This avoids attaching usage to synthetic reasoning helper
+        // messages AND to the synthetic "[Tool: name]" placeholders pushed
+        // for function_call items — a token_count following a tool call
+        // belongs to the surrounding turn, not the placeholder.
+        message.role == "assistant"
+            && message.author.is_none()
+            && message.invocations.is_empty()
     }
 
     fn token_usage_from_payload(payload: &Value) -> Option<Value> {
-        let input_tokens = payload.get("input_tokens").and_then(Value::as_i64);
-        let output_tokens = payload
+        // Modern rollouts (verified against live 2026-01..2026-08 history)
+        // nest per-turn usage at `info.last_token_usage`;
+        // `info.total_token_usage` is CUMULATIVE across the session and
+        // must never be attached per turn (downstream sums would double
+        // count). Legacy shapes carried the fields directly on the payload.
+        let usage_block = payload
+            .pointer("/info/last_token_usage")
+            .filter(|block| {
+                block.get("input_tokens").is_some() || block.get("output_tokens").is_some()
+            })
+            .unwrap_or(payload);
+
+        let input_tokens = usage_block.get("input_tokens").and_then(Value::as_i64);
+        let output_tokens = usage_block
             .get("output_tokens")
             .and_then(Value::as_i64)
-            .or_else(|| payload.get("tokens").and_then(Value::as_i64));
+            .or_else(|| usage_block.get("tokens").and_then(Value::as_i64));
 
         if input_tokens.is_none() && output_tokens.is_none() {
             return None;
@@ -148,6 +165,11 @@ impl CodexConnector {
         }
         if let Some(output) = output_tokens {
             usage.insert("output_tokens".to_string(), Value::from(output));
+        }
+        // Codex reports prompt-cache hits as `cached_input_tokens`, a
+        // SUBSET of input_tokens, not additive on top of it.
+        if let Some(cache_read) = usage_block.get("cached_input_tokens").and_then(Value::as_i64) {
+            usage.insert("cache_read_tokens".to_string(), Value::from(cache_read));
         }
         usage.insert("data_source".to_string(), Value::String("api".to_string()));
 
@@ -456,6 +478,13 @@ fn scan_codex_with_callback(
             let mut started_at = None;
             let mut ended_at = None;
             let mut session_cwd: Option<PathBuf> = None;
+            // Dual-stream-era rollouts (Jan–Jun 2026) record every user
+            // prompt TWICE: once as event_msg/user_message and once as a
+            // response_item role=user (verified in 33/61 sampled files).
+            // Track both streams so the post-pass can drop the
+            // event_msg copy when the same text arrived via response_item.
+            let mut event_msg_user_idx: Vec<usize> = Vec::new();
+            let mut response_item_user_texts: HashSet<String> = HashSet::new();
 
             if ext == Some("jsonl") {
                 let f = std::fs::File::open(&file)
@@ -469,6 +498,10 @@ fn scan_codex_with_callback(
                     if line.trim().is_empty() {
                         continue;
                     }
+                    // A UTF-8 BOM on the first line would otherwise silently
+                    // drop that record (often session_meta or the first
+                    // prompt); gemini's replay strips it for the same reason.
+                    let line = line.trim_start_matches('\u{feff}');
                     let Ok(val) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
@@ -582,6 +615,10 @@ fn scan_codex_with_callback(
                                         }
 
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        if role == "user" {
+                                            response_item_user_texts
+                                                .insert(content_str.trim().to_string());
+                                        }
                                         let invocations = payload.get("content").map_or_else(
                                             Vec::new,
                                             extract_invocations_from_content_blocks,
@@ -635,6 +672,7 @@ fn scan_codex_with_callback(
                                                 invocations: Vec::new(),
                                                 snippets: Vec::new(),
                                             });
+                                            event_msg_user_idx.push(messages.len() - 1);
                                         }
                                     }
                                     Some("agent_reasoning") => {
@@ -729,11 +767,49 @@ fn scan_codex_with_callback(
                         }
                         _ => {}
                     }
+                // Drop event_msg copies of user prompts that the
+                // response_item stream already recorded (dual-stream era).
+                if !event_msg_user_idx.is_empty() && !response_item_user_texts.is_empty() {
+                    let dropped: HashSet<usize> = event_msg_user_idx
+                        .iter()
+                        .filter(|&&idx| {
+                            messages
+                                .get(idx)
+                                .is_some_and(|m| {
+                                    response_item_user_texts.contains(m.content.trim())
+                                })
+                        })
+                        .copied()
+                        .collect();
+                    if !dropped.is_empty() {
+                        let mut kept: Vec<NormalizedMessage> = Vec::with_capacity(messages.len());
+                        for (idx, message) in messages.into_iter().enumerate() {
+                            if !dropped.contains(&idx) {
+                                kept.push(message);
+                            }
+                        }
+                        messages = kept;
+                    }
                 }
-                crate::types::reindex_messages(&mut messages);
+                 crate::types::reindex_messages(&mut messages);
             } else if ext == Some("json") {
-                let content = fs::read_to_string(&file)
-                    .with_context(|| format!("read rollout {}", file.display()))?;
+                // Legacy single-file rollouts can be huge; enforce the
+                // project's 100MB scan cap (chatgpt policy).
+                let content = match read_capped(&file) {
+                    Ok(Some(content)) => content,
+                    Ok(None) => {
+                        tracing::warn!(
+                            file = %file.display(),
+                            "codex: legacy rollout exceeds the scan size cap; skipping"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(file = %file.display(), error = %e, "codex: unreadable legacy rollout");
+                        continue;
+                    }
+                };
+                let content = content.trim_start_matches('\u{feff}');
                 let val: Value = match serde_json::from_str(&content) {
                     Ok(v) => v,
                     Err(_) => continue,
