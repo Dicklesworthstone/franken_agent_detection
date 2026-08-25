@@ -433,6 +433,17 @@ impl GeminiConnector {
     }
 
     fn parse_session_file(file: &Path) -> Option<Value> {
+        // Legacy whole-file sessions load into a full JSON DOM (~4-10x the
+        // file size in RAM); enforce the project's 100MB scan cap.
+        if let Ok(metadata) = fs::metadata(file)
+            && metadata.len() > MAX_SCAN_FILE_BYTES
+        {
+            tracing::warn!(
+                path = %file.display(),
+                "gemini: session exceeds the scan size cap; skipping"
+            );
+            return None;
+        }
         let file_handle = match fs::File::open(file) {
             Ok(handle) => handle,
             Err(error) => {

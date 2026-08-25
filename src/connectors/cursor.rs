@@ -707,10 +707,12 @@ impl CursorConnector {
         let ended_at = last_updated_at
             .or_else(|| messages.iter().filter_map(|m| m.created_at).max())
             .or(created_at);
-
-        // Optimization: Skip conversations not modified since last scan
-        if let (Some(threshold), Some(ts)) = (since_ts, ended_at)
-            && ts < threshold
+        // Optimization: Skip conversations not modified since last scan.
+        // The −1s slack mirrors file_modified_since (mtime granularity):
+        // without it a conversation updated inside the slack window is
+        // skipped on every subsequent incremental scan.
+        if let (Some(since), Some(ts)) = (since_ts, ended_at)
+            && ts < since.saturating_sub(1_000)
         {
             return None;
         }
