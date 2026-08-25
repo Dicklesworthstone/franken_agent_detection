@@ -432,7 +432,6 @@ mod tests {
         assert_eq!(parse_timestamp(&val), Some(1_700_000_000_000));
     }
 
-
     #[test]
     fn is_injected_context_message_detects_known_wrappers() {
         assert!(is_injected_context_message(
@@ -447,9 +446,7 @@ mod tests {
 
     #[test]
     fn is_injected_context_message_allows_real_prompts() {
-        assert!(!is_injected_context_message(
-            "Fix the flaky test in it.rs"
-        ));
+        assert!(!is_injected_context_message("Fix the flaky test in it.rs"));
         // Wrapper text appearing mid-message is not an injection header.
         assert!(!is_injected_context_message(
             "please read the <session_context> block"

@@ -500,8 +500,7 @@ fn scan_claude_with_callback_with_exclusions(
                     .position(|c| c.as_os_str().to_str() == Some("subagents"))
                     && pos > 0
                 {
-                    parent_session_id =
-                        components[pos - 1].as_os_str().to_str().map(String::from);
+                    parent_session_id = components[pos - 1].as_os_str().to_str().map(String::from);
                 }
             }
 
@@ -891,6 +890,65 @@ mod tests {
     fn new_creates_connector() {
         let connector = ClaudeCodeConnector::new();
         let _ = connector;
+    }
+
+    #[test]
+    fn scan_marks_subagent_transcripts_with_parent_link() {
+        let base = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(base.path());
+        let session_dir = claude_dir
+            .join("projects")
+            .join("-data-projects-demo")
+            .join("11111111-2222-3333-4444-555555555555");
+        let subagents = session_dir.join("subagents").join("66666666-7777-8888-9999-000000000000");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            subagents.join("agent-abc123.jsonl"),
+            concat!(
+                r#"{"type":"assistant","sessionId":"66666666-7777-8888-9999-000000000000","message":{"role":"assistant","model":"claude-x","content":[{"type":"text","text":"subagent work"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].metadata["sidechain"], true);
+        assert_eq!(
+            convs[0].metadata["parentSessionId"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+    }
+
+    #[test]
+    fn scan_prefers_ai_title_over_first_line_truncation() {
+        let base = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(base.path());
+        let session_dir = claude_dir
+            .join("projects")
+            .join("-data-projects-demo")
+            .join("aaaa-bbbb");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("cccc-dddd.jsonl"),
+            concat!(
+                r#"{"type":"ai-title","title":"Fix the flaky auth test"}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"cccc-dddd","message":{"role":"user","content":[{"type":"text","text":"please look at the auth module and fix the flaky test"}}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Fix the flaky auth test"));
     }
 
     #[test]

@@ -7,9 +7,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{
-    dedupe_path_key, env_path_nonempty, is_injected_context_message, read_capped,
-};
+use super::utils::{dedupe_path_key, env_path_nonempty, is_injected_context_message, read_capped};
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -863,10 +861,7 @@ fn scan_codex_with_callback(
 
             let title = messages
                 .iter()
-                .find(|m| {
-                    m.role == "user"
-                        && !is_injected_context_message(&m.content)
-                })
+                .find(|m| m.role == "user" && !is_injected_context_message(&m.content))
                 .map(|m| {
                     m.content
                         .lines()
@@ -1060,10 +1055,10 @@ mod tests {
         let sessions = home.join(".codex").join("sessions");
         fs::create_dir_all(&sessions).unwrap();
 
-        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"# AGENTS.md instructions for /data/projects/demo\nBe helpful."}}
+        let content = r##"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"# AGENTS.md instructions for /data/projects/demo\nBe helpful."}}
 {"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"user","content":"Fix the flaky test"}}
 {"type":"response_item","timestamp":"2025-12-01T10:00:02Z","payload":{"role":"assistant","content":"On it."}}
-"#;
+"##;
         fs::write(sessions.join("rollout-title.jsonl"), content).unwrap();
 
         let connector = CodexConnector::new();
@@ -1136,11 +1131,7 @@ mod tests {
         let with_usage: Vec<&Value> = convs[0]
             .messages
             .iter()
-            .filter(|m| {
-                m.extra
-                    .pointer("/cass/token_usage/input_tokens")
-                    .is_some()
-            })
+            .filter(|m| m.extra.pointer("/cass/token_usage/input_tokens").is_some())
             .map(|m| &m.extra)
             .collect();
         assert_eq!(with_usage.len(), 2, "each turn carries its own usage");

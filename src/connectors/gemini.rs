@@ -593,9 +593,7 @@ fn scan_gemini_with_callback(
             // Extract title from first user message
             let title = messages
                 .iter()
-                .find(|m| {
-                    m.role == "user" && !is_injected_context_message(&m.content)
-                })
+                .find(|m| m.role == "user" && !is_injected_context_message(&m.content))
                 .map(|m| {
                     m.content
                         .lines()
@@ -1311,14 +1309,14 @@ mod tests {
         let chats_dir = hash_dir.join("chats");
         fs::create_dir_all(&chats_dir).unwrap();
 
-        let session_json = r#"{
+        let session_json = r##"{
             "sessionId": "session-ctx",
             "messages": [
                 {"type": "user", "content": "# AGENTS.md instructions for /data/projects/demo\nBe helpful."},
                 {"type": "user", "content": "Help me with Rust"},
                 {"type": "model", "content": "Sure!"}
             ]
-        }"#;
+        }"##;
         fs::write(chats_dir.join("session-ctx.json"), session_json).unwrap();
 
         let connector = GeminiConnector::new();

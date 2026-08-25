@@ -1040,10 +1040,11 @@ fn parse_kimi_code_session(
                 // survive it (cass#351).
                 let block = val.get("usage").unwrap_or(&val);
                 let field = |key: &str| {
-                    block
-                        .get(key)
-                        .and_then(Value::as_i64)
-                        .or_else(|| block.pointer(&format!("/tokens/{key}")).and_then(Value::as_i64))
+                    block.get(key).and_then(Value::as_i64).or_else(|| {
+                        block
+                            .pointer(&format!("/tokens/{key}"))
+                            .and_then(Value::as_i64)
+                    })
                 };
                 let input_tokens = field("input_tokens");
                 let output_tokens = field("output_tokens");
@@ -1075,10 +1076,7 @@ fn parse_kimi_code_session(
                             .entry("cass")
                             .or_insert_with(|| Value::Object(serde_json::Map::new()));
                         if let Some(cass_obj) = cass.as_object_mut() {
-                            cass_obj.insert(
-                                "token_usage".to_string(),
-                                Value::Object(usage),
-                            );
+                            cass_obj.insert("token_usage".to_string(), Value::Object(usage));
                         }
                     }
                 }
