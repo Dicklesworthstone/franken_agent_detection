@@ -28,8 +28,10 @@ mod conformance {
     // =========================================================================
     //
     // The parse_timestamp function must handle:
-    // - i64 milliseconds (>= 100_000_000_000)
+    // - i64 milliseconds (>= 100_000_000_000, < 100_000_000_000_000)
     // - i64 seconds (< 100_000_000_000, converted to ms)
+    // - i64 microseconds (100_000_000_000_000..=100_000_000_000_000_000,
+    //   converted to ms)
     // - f64 milliseconds and seconds
     // - ISO-8601 / RFC-3339 strings
     // - Numeric strings
@@ -276,10 +278,18 @@ mod conformance {
                     .unwrap_or_else(|err| panic!("connector {slug} discovery failed: {err}"));
 
                 for source in sources {
+                    // Known divergence: the claude connector's own emitted
+                    // identity is "claude_code" while its registry slug is
+                    // "claude" (public API; alignment is a tracked decision).
+                    // The mapping must stay EXPLICIT so any future drift
+                    // between factory slugs and provider slugs fails here.
+                    let expected_provider = match *slug {
+                        "claude" => "claude_code",
+                        other => other,
+                    };
                     assert_eq!(
-                        source.provider_slug,
-                        slug.replace("claude", "claude_code"),
-                        "connector {slug} should report its own provider slug"
+                        source.provider_slug, expected_provider,
+                        "connector {slug} should report its documented provider slug"
                     );
                     assert!(
                         !source.source_path.as_os_str().is_empty(),
@@ -527,18 +537,19 @@ mod conformance {
                 .map(|_| detect_installed_agents(&opts).expect("detection"))
                 .collect();
 
-            // All results should be identical
+            // All results should be identical. `generated_at` is wall-clock
+            // and excluded; entries and summary are compared IN FULL, so any
+            // drift in detection verdicts, evidence, or root ordering fails.
             let first = &results[0];
             for (i, result) in results.iter().enumerate() {
                 assert_eq!(
-                    result.summary.detected_count, first.summary.detected_count,
-                    "run {} has different detected_count",
+                    result.installed_agents, first.installed_agents,
+                    "run {} has different installed_agents",
                     i
                 );
                 assert_eq!(
-                    result.installed_agents.len(),
-                    first.installed_agents.len(),
-                    "run {} has different number of agents",
+                    result.summary, first.summary,
+                    "run {} has different summary",
                     i
                 );
             }
