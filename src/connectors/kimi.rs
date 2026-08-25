@@ -1712,11 +1712,6 @@ mod tests {
     }
 
     #[test]
-    fn modern_think_part_maps_to_reasoning_author() {
-        let dir = TempDir::new().unwrap();
-        let storage = create_kimi_code_storage(&dir);
-
-    #[test]
     fn modern_usage_record_attaches_token_usage_to_latest_assistant() {
         let dir = TempDir::new().unwrap();
         let storage = create_kimi_code_storage(&dir);
@@ -1749,6 +1744,11 @@ mod tests {
         assert_eq!(usage["output_tokens"], 30);
         assert_eq!(usage["data_source"], "api");
     }
+
+    #[test]
+    fn modern_think_part_maps_to_reasoning_author() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_kimi_code_storage(&dir);
 
         let lines = vec![
             r#"{"type":"turn.prompt","input":[{"type":"text","text":"Why is it slow?"}],"time":"2026-01-01T00:00:00Z"}"#,

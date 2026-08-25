@@ -900,7 +900,9 @@ mod tests {
             .join("projects")
             .join("-data-projects-demo")
             .join("11111111-2222-3333-4444-555555555555");
-        let subagents = session_dir.join("subagents").join("66666666-7777-8888-9999-000000000000");
+        let subagents = session_dir
+            .join("subagents")
+            .join("66666666-7777-8888-9999-000000000000");
         fs::create_dir_all(&subagents).unwrap();
         fs::write(
             subagents.join("agent-abc123.jsonl"),
