@@ -17,16 +17,13 @@
 //! - `model_change` entries carry a bare `model` field (pi-mono writes
 //!   `provider` + `modelId`); either spelling updates the tracked model.
 
-use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
-
+use super::utils::{dedupe_path_key, read_capped};
+use crate::types::{NormalizedConversation, NormalizedMessage};
 use anyhow::Result;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
-use super::utils::dedupe_path_key;
-use crate::types::{NormalizedConversation, NormalizedMessage};
 
 /// The sessions directory under a pi-family agent home, or the home itself
 /// when no `sessions/` child exists (older layouts scanned the home directly).
@@ -38,6 +35,12 @@ pub fn sessions_dir(home: &Path) -> PathBuf {
     } else {
         home.to_path_buf()
     }
+}
+
+/// Resolve a home path through symlinks so per-file dedupe keys stay stable
+/// regardless of whether a caller reached the store via a symlinked ancestor.
+fn dedupe_home(home: &Path) -> PathBuf {
+    std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf())
 }
 
 /// Find all session JSONL files under the given pi-family root, in
@@ -188,8 +191,18 @@ pub fn parse_session_file(
                 .map(String::from)
         });
 
-    let content = match fs::read_to_string(&source_path) {
-        Ok(c) => c,
+    // Session transcripts are append-only logs that grow without bound;
+    // enforce the project's 100MB scan cap (chatgpt policy) instead of
+    // reading an arbitrarily large file into memory.
+    let content = match read_capped(&source_path) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            tracing::debug!(
+                path = %source_path.display(),
+                "{agent_slug}: skipping session over the scan size cap"
+            );
+            return None;
+        }
         Err(e) => {
             tracing::debug!(path = %source_path.display(), error = %e, "{agent_slug}: skipping unreadable session");
             return None;
@@ -486,10 +499,18 @@ pub fn scan_homes_tagged(
 ) -> Result<Vec<NormalizedConversation>> {
     use crate::connectors::file_modified_since;
 
+    // Canonicalize each home ONCE (the doc'd "smaller root set") so the same
+    // session file reached through a symlinked home ancestor and through its
+    // real path lands on one dedupe key — leaf-only keys would emit it twice.
+    let homes: Vec<(PathBuf, Option<String>)> = homes
+        .iter()
+        .map(|(home, profile)| (dedupe_home(home), profile.clone()))
+        .collect();
+
     let mut convs = Vec::new();
     let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
 
-    for (home, profile) in homes {
+    for (home, profile) in &homes {
         let files = session_files(home);
         if files.is_empty() {
             continue;

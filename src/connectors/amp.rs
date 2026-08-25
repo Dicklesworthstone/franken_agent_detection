@@ -6,8 +6,8 @@ use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
-    Connector, extract_invocations_from_content_blocks, flatten_content,
-    franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
+    Connector, dedupe_path_key, extract_invocations_from_content_blocks, flatten_content,
+    franken_detection_for_connector, parse_timestamp, read_capped, unwrap_skill_invocations,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -261,8 +261,7 @@ impl Connector for AmpConnector {
     #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
-
+        let mut seen_ids = std::collections::HashSet::<PathBuf>::new();
         let roots: Vec<PathBuf> = Self::source_roots(ctx)
             .into_iter()
             .map(|root| root.path)
@@ -285,8 +284,18 @@ impl Connector for AmpConnector {
                 // Amp does not update file mtime when new messages are added to a thread,
                 // so mtime-based incremental indexing would miss new messages.
                 // This means Amp files are always re-read, but correctness is preserved.
-                let Ok(text) = std::fs::read_to_string(path) else {
-                    continue;
+                // Amp never bumps mtimes, so oversized threads are re-read
+                // on EVERY scan — enforce the project's 100MB cap here.
+                let text = match read_capped(path) {
+                    Ok(Some(text)) => text,
+                    Ok(None) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "amp: thread exceeds the scan size cap; skipping"
+                        );
+                        continue;
+                    }
+                    Err(_) => continue,
                 };
                 let val: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -327,11 +336,13 @@ impl Connector for AmpConnector {
                                 .map(std::string::ToString::to_string)
                         });
 
-                    // Key on the full path: is_amp_log_file accepts any
-                    // *.json under a "threads" directory, so distinct files
-                    // frequently share a stem across roots — a stem-only key
-                    // silently dropped every thread after the first.
-                    let key = format!("amp:{}", path.display());
+                    // Key on the full, losslessly-encoded path:
+                    // is_amp_log_file accepts any *.json under a "threads"
+                    // directory, so distinct files frequently share a stem
+                    // across roots — a stem-only key silently dropped every
+                    // thread after the first. PathBuf (not Display) keeps
+                    // non-UTF8 OsStr bytes intact.
+                    let key = dedupe_path_key(path);
                     if seen_ids.insert(key) {
                         // Use per-message timestamps when available, falling back
                         // to the top-level "created" field (millisecond epoch) that

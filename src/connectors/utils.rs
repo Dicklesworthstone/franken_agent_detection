@@ -48,6 +48,29 @@ pub(crate) fn path_is_excluded(path: &Path, excluded_paths: &[PathBuf]) -> bool 
         .any(|excluded| path == excluded || path.starts_with(excluded))
 }
 
+/// Maximum session-store file size connectors will read into memory
+/// (100 MiB), matching the chatgpt connector's policy.
+pub(crate) const MAX_SCAN_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Read a session-store file to a string under the project's size cap.
+///
+/// Enforces [`MAX_SCAN_FILE_BYTES`] twice — a cheap pre-read stat skips the
+/// common oversized case, and a post-read backstop covers metadata-error and
+/// grow-between-stat-and-read races (the e253bdb bypass class). Returns
+/// `Ok(None)` when the file exceeds the cap; callers decide how to log it.
+pub(crate) fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > MAX_SCAN_FILE_BYTES {
+            return Ok(None);
+        }
+    }
+    let content = std::fs::read_to_string(path)?;
+    if content.len() as u64 > MAX_SCAN_FILE_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(content))
+}
+
 /// Build a deduplication key for hot scan loops without paying the full
 /// `canonicalize()` syscall cost on every ordinary file.
 ///
@@ -121,6 +144,11 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
     if let Some(ts) = val.as_i64() {
         let ts = if (0..100_000_000_000).contains(&ts) {
             ts.saturating_mul(1000)
+        } else if (100_000_000_000_000..=100_000_000_000_000_000).contains(&ts) {
+            // Microsecond epoch: 1e14–1e17 µs spans 1973–5138. No
+            // in-scope producer emits these today, but a µs value read as
+            // milliseconds lands ~55 millennia out, so band it explicitly.
+            ts / 1000
         } else {
             ts
         };
@@ -136,6 +164,9 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
                 #[allow(clippy::cast_possible_truncation)]
                 let ts = if f < 100_000_000_000.0 {
                     (f * 1000.0).round() as i64
+                } else if (100_000_000_000_000.0..=100_000_000_000_000_000.0).contains(&f) {
+                    // Microsecond epoch (see the as_i64 branch above).
+                    (f / 1000.0).round() as i64
                 } else {
                     f.round() as i64
                 };
@@ -147,6 +178,9 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
         if let Ok(num) = s.parse::<i64>() {
             let ts = if (0..100_000_000_000).contains(&num) {
                 num.saturating_mul(1000)
+            } else if (100_000_000_000_000..=100_000_000_000_000_000).contains(&num) {
+                // Microsecond epoch (see the as_i64 branch above).
+                num / 1000
             } else {
                 num
             };
@@ -159,6 +193,9 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
             #[allow(clippy::cast_possible_truncation)]
             let ts = if (0.0..100_000_000_000.0).contains(&num) {
                 (num * 1000.0).round() as i64
+            } else if (100_000_000_000_000.0..=100_000_000_000_000_000.0).contains(&num) {
+                // Microsecond epoch (see the as_i64 branch above).
+                (num / 1000.0).round() as i64
             } else {
                 num.round() as i64
             };
@@ -373,6 +410,25 @@ mod tests {
     #[test]
     fn parse_timestamp_i64_seconds() {
         let val = json!(1_700_000_000_i64);
+        assert_eq!(parse_timestamp(&val), Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn parse_timestamp_i64_microseconds() {
+        // 1_700_000_000_000_000 µs == 1_700_000_000_000 ms.
+        let val = json!(1_700_000_000_000_000_i64);
+        assert_eq!(parse_timestamp(&val), Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn parse_timestamp_float_microseconds() {
+        let val = json!(1_700_000_000_500_000.0_f64);
+        assert_eq!(parse_timestamp(&val), Some(1_700_000_000_500));
+    }
+
+    #[test]
+    fn parse_timestamp_numeric_string_microseconds() {
+        let val = json!("1700000000000000");
         assert_eq!(parse_timestamp(&val), Some(1_700_000_000_000));
     }
 

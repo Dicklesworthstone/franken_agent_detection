@@ -359,7 +359,7 @@ impl CursorConnector {
         // no chat payload, and `row.get_typed(1)?` on NULL aborts the whole
         // query_map_collect — silently emptying this conversation's bubble
         // map so the entire chat is dropped as message-less.
-        if let Ok(rows) = conn.query_map_collect(
+        match conn.query_map_collect(
             "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
             params![prefix.as_str(), limit.as_str()],
             |row| {
@@ -368,15 +368,28 @@ impl CursorConnector {
                 Ok((key, value))
             },
         ) {
-            for (key, value) in rows {
-                // Key format: bubbleId:{composerId}:{bubbleId}
-                // Extract just the bubbleId part
-                if key.len() > prefix_len {
-                    let bubble_id = &key[prefix_len..];
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&value) {
-                        bubble_map.insert(bubble_id.to_string(), parsed);
+            Ok(rows) => {
+                for (key, value) in rows {
+                    // Key format: bubbleId:{composerId}:{bubbleId}
+                    // Extract just the bubbleId part
+                    if key.len() > prefix_len {
+                        let bubble_id = &key[prefix_len..];
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&value) {
+                            bubble_map.insert(bubble_id.to_string(), parsed);
+                        }
                     }
                 }
+            }
+            Err(e) => {
+                // A failed bubble range-query must not be silently
+                // indistinguishable from a composer with no bubbles:
+                // parse_composer_data would drop the whole chat as
+                // message-less (same class as the composerData query fix).
+                tracing::warn!(
+                    composer = %composer_id,
+                    error = %e,
+                    "cursor: bubbleData query failed; messages from this conversation may be missing"
+                );
             }
         }
 
@@ -416,6 +429,17 @@ impl CursorConnector {
             // URL decode
             let decoded = urlencoding::decode(path).ok()?;
             let mut path_str = decoded.as_ref();
+
+            // An RFC 3986 authority (`file://localhost/path`,
+            // `file://server/share`) is not part of the path: drop it when
+            // the remainder starts with a separator, so the result stays
+            // absolute instead of becoming a bogus relative path.
+            if !path_str.starts_with('/')
+                && !path_str.starts_with('\\')
+                && let Some(slash) = path_str.find(['/', '\\'])
+            {
+                path_str = &path_str[slash..];
+            }
 
             // On Windows, file:///C:/... becomes /C:/...
             // We need to strip the leading slash if it looks like a drive letter
@@ -1062,8 +1086,23 @@ impl CursorConnector {
     /// Read a JSONL transcript into per-line records, skipping blank and
     /// individually-malformed lines (warned, never fatal).
     fn read_agent_transcript_records(transcript: &Path) -> Vec<Value> {
-        let Ok(text) = std::fs::read_to_string(transcript) else {
-            return Vec::new();
+        let text = match read_capped(transcript) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                tracing::warn!(
+                    transcript = %transcript.display(),
+                    "cursor: agent transcript exceeds the scan size cap; skipping"
+                );
+                return Vec::new();
+            }
+            Err(err) => {
+                tracing::warn!(
+                    transcript = %transcript.display(),
+                    error = %err,
+                    "cursor: unreadable agent transcript"
+                );
+                return Vec::new();
+            }
         };
         let mut records = Vec::new();
         for (lineno, line) in text.lines().enumerate() {
@@ -1262,6 +1301,14 @@ impl Connector for CursorConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut all_convs = Vec::new();
+        // The same composer id can be mirrored across DBs (globalStorage vs
+        // workspaceStorage, explicit overlapping roots, backups). extract_from_db
+        // only dedupes within one store, so span a session-id set across ALL
+        // stores here — first occurrence wins (candidate order is
+        // explicit/data_dir before defaults). Conversations with no
+        // external_id pass through: dropping them would trade a duplicate bug
+        // for a loss bug. Mirrors the opencode connector's spanning dedupe.
+        let mut seen_db_session_ids: HashSet<String> = HashSet::new();
 
         // Composer (`state.vscdb` -> `composerData:*`) — unchanged behavior.
         let roots: Vec<PathBuf> = Self::source_roots(ctx)
@@ -1284,12 +1331,22 @@ impl Connector for CursorConnector {
 
                 match Self::extract_from_db(&db_path, ctx.since_ts) {
                     Ok(convs) => {
+                        let mut kept = 0;
+                        for conv in convs {
+                            match conv.external_id.as_ref() {
+                                Some(id) if !seen_db_session_ids.insert(id.clone()) => {
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                            kept += 1;
+                            all_convs.push(conv);
+                        }
                         tracing::debug!(
                             path = %db_path.display(),
-                            count = convs.len(),
+                            count = kept,
                             "cursor extracted conversations"
                         );
-                        all_convs.extend(convs);
                     }
                     Err(e) => {
                         tracing::warn!(

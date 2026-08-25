@@ -649,6 +649,15 @@ fn parse_file_uri(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let decoded = percent_decode(rest);
     let mut path = decoded.as_str();
+    // An RFC 3986 authority (`file://localhost/path`) is not path text:
+    // drop it when the remainder stays separator-led, so the result is a
+    // real absolute path instead of a bogus relative one.
+    if !path.starts_with('/')
+        && !path.starts_with('\\')
+        && let Some(slash) = path.find(['/', '\\'])
+    {
+        path = &path[slash..];
+    }
     // Windows: `file:///C:/…` decodes to `/C:/…`.
     if cfg!(windows) && path.len() > 2 {
         let chars: Vec<char> = path.chars().take(3).collect();
@@ -868,7 +877,11 @@ pub fn session_to_conversation(
                 idx: 0,
                 role: "assistant".to_string(),
                 author: Some("copilot".to_string()),
-                created_at: None,
+                // The store only offers request-level granularity; the
+                // sibling user message already carries `ts`, and dropping
+                // it here misorders assistant turns against every other
+                // connector's output.
+                created_at: ts,
                 content: assistant_text,
                 extra: Value::Object(extra),
                 invocations,
@@ -1036,7 +1049,20 @@ fn parse_source(
 
     let sessions: Vec<Value> = match source.format {
         NativeFormat::FlatJson => {
-            let Ok(raw) = fs::read_to_string(&source.path) else {
+            // Append-log sessions grow monotonically (base64 screenshots
+            // embed per turn); enforce the project's 100MB scan cap.
+            let Some(raw) = read_capped(&source.path).unwrap_or_else(|err| {
+                tracing::warn!(
+                    source = %source.path.display(),
+                    error = %err,
+                    "copilot: unreadable native chat session file"
+                );
+                None
+            }) else {
+                tracing::warn!(
+                    source = %source.path.display(),
+                    "copilot: native chat session exceeds the scan size cap; skipping"
+                );
                 return Vec::new();
             };
             match serde_json::from_str::<Value>(&raw) {
@@ -1052,7 +1078,18 @@ fn parse_source(
             }
         }
         NativeFormat::AppendLog => {
-            let Ok(raw) = fs::read_to_string(&source.path) else {
+            let Some(raw) = read_capped(&source.path).unwrap_or_else(|err| {
+                tracing::warn!(
+                    source = %source.path.display(),
+                    error = %err,
+                    "copilot: unreadable native chat session file"
+                );
+                None
+            }) else {
+                tracing::warn!(
+                    source = %source.path.display(),
+                    "copilot: append-log session exceeds the scan size cap; skipping"
+                );
                 return Vec::new();
             };
             match replay_append_log(&raw, &source.path) {
