@@ -131,9 +131,7 @@ impl CodexConnector {
         // messages AND to the synthetic "[Tool: name]" placeholders pushed
         // for function_call items — a token_count following a tool call
         // belongs to the surrounding turn, not the placeholder.
-        message.role == "assistant"
-            && message.author.is_none()
-            && message.invocations.is_empty()
+        message.role == "assistant" && message.author.is_none() && message.invocations.is_empty()
     }
 
     fn token_usage_from_payload(payload: &Value) -> Option<Value> {
@@ -168,7 +166,10 @@ impl CodexConnector {
         }
         // Codex reports prompt-cache hits as `cached_input_tokens`, a
         // SUBSET of input_tokens, not additive on top of it.
-        if let Some(cache_read) = usage_block.get("cached_input_tokens").and_then(Value::as_i64) {
+        if let Some(cache_read) = usage_block
+            .get("cached_input_tokens")
+            .and_then(Value::as_i64)
+        {
             usage.insert("cache_read_tokens".to_string(), Value::from(cache_read));
         }
         usage.insert("data_source".to_string(), Value::String("api".to_string()));
@@ -767,17 +768,16 @@ fn scan_codex_with_callback(
                         }
                         _ => {}
                     }
+                }
                 // Drop event_msg copies of user prompts that the
                 // response_item stream already recorded (dual-stream era).
                 if !event_msg_user_idx.is_empty() && !response_item_user_texts.is_empty() {
                     let dropped: HashSet<usize> = event_msg_user_idx
                         .iter()
                         .filter(|&&idx| {
-                            messages
-                                .get(idx)
-                                .is_some_and(|m| {
-                                    response_item_user_texts.contains(m.content.trim())
-                                })
+                            messages.get(idx).is_some_and(|m| {
+                                response_item_user_texts.contains(m.content.trim())
+                            })
                         })
                         .copied()
                         .collect();
@@ -791,7 +791,7 @@ fn scan_codex_with_callback(
                         messages = kept;
                     }
                 }
-                 crate::types::reindex_messages(&mut messages);
+                crate::types::reindex_messages(&mut messages);
             } else if ext == Some("json") {
                 // Legacy single-file rollouts can be huge; enforce the
                 // project's 100MB scan cap (chatgpt policy).

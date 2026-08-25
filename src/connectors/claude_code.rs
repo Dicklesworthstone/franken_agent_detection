@@ -602,7 +602,6 @@ fn scan_claude_with_callback_with_exclusions(
                         continue;
                     }
 
-
                     let author = val
                         .get("message")
                         .and_then(|m| m.get("model"))
