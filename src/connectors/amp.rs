@@ -7,10 +7,9 @@ use walkdir::WalkDir;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::{dedupe_path_key, read_capped};
 use super::{
-    Connector, dedupe_path_key, extract_invocations_from_content_blocks, flatten_content,
-    franken_detection_for_connector, parse_timestamp, read_capped, unwrap_skill_invocations,
+    Connector, extract_invocations_from_content_blocks, flatten_content,
+    franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
 pub struct AmpConnector;
 impl Default for AmpConnector {
