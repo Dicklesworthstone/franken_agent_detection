@@ -339,7 +339,7 @@ impl Connector for AmpConnector {
                         .filter(|id| !id.trim().is_empty())
                         .map(String::from)
                         .or_else(|| {
-                            path.strip_prefix(root).ok().and_then(|rel| {
+                            path.strip_prefix(&root).ok().and_then(|rel| {
                                 rel.to_str().map(|s| s.trim_start_matches('/').to_string())
                             })
                         })
@@ -350,23 +350,18 @@ impl Connector for AmpConnector {
                         })
                         .or_else(|| Some(path.display().to_string()));
 
-                    // Key on the full, losslessly-encoded path:
-                    // is_amp_log_file accepts any *.json under a "threads"
-                    // directory, so distinct files frequently share a stem
-                    // across roots — a stem-only key silently dropped every
-                    // thread after the first. PathBuf (not Display) keeps
-                    // non-UTF8 OsStr bytes intact.
+                    // Key on the full, losslessly-encoded path: is_amp_log_file
+                    // accepts any *.json under a "threads" directory, so distinct
+                    // files frequently share a stem across roots — a stem-only
+                    // key silently dropped every thread after the first.
+                    // PathBuf (not Display) keeps non-UTF8 OsStr bytes intact.
                     let key = dedupe_path_key(path);
                     if seen_ids.insert(key) {
                         // Use per-message timestamps when available, falling back
                         // to the top-level "created" field (millisecond epoch) that
                         // Amp stores on thread objects.
                         let thread_created = val.get("created").and_then(parse_timestamp);
-                        let started_at = messages
-                            .iter()
-                            .filter_map(|m| m.created_at)
-                            .min()
-                            .or(thread_created);
+                        let started_at = messages.iter().min().or(thread_created);
                         let ended_at = messages
                             .iter()
                             .filter_map(|m| m.created_at)
