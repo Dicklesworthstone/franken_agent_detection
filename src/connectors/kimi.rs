@@ -479,7 +479,8 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
             continue;
         }
 
-        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+        // Strip a UTF-8 BOM so the first record is not silently lost.
+        let Ok(val) = serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}')) else {
             continue;
         };
 

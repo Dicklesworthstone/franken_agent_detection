@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
@@ -414,6 +414,10 @@ fn scan_claude_with_callback_with_exclusions(
         .into_iter()
         .map(|root| root.path)
         .collect();
+    // Overlapping explicit roots (or a symlinked CLAUDE_CONFIG_DIR aliasing
+    // another root) reach the same transcript twice; dedupe on the
+    // lossless path key across ALL roots, first occurrence wins.
+    let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
     let mut file_count = 0;
 
@@ -443,6 +447,9 @@ fn scan_claude_with_callback_with_exclusions(
                     path = %path.display(),
                     "claude_code skipping excluded session file"
                 );
+                continue;
+            }
+            if !seen_files.insert(dedupe_path_key(&path)) {
                 continue;
             }
             let ext = path.extension().and_then(|s| s.to_str());
