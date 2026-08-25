@@ -103,7 +103,8 @@ Scope window: 2026-02-15 through HEAD
 - **The 100MB scan cap (chatgpt policy) now applies everywhere**: a shared
   `read_capped` helper (pre-read stat + post-read backstop) covers cursor
   agent transcripts, copilot-vscode native sessions, amp threads,
-  opencode session/message/part files, codex legacy `.json` rollouts, and
+  opencode session/message/part files, codex legacy `.json` rollouts,
+  gemini legacy whole-file sessions, and
   pi-family transcripts; UTF-8 BOMs are stripped on first-line parses in
   codex, claude_code, kimi, and opencode message/part files so leading
   records survive; `file://localhost/path` URIs no longer decode to bogus
