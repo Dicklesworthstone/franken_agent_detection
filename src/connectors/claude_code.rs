@@ -500,7 +500,7 @@ fn scan_claude_with_callback_with_exclusions(
                     // Strip a UTF-8 BOM so the first record (often
                     // session_meta or the first prompt) is not silently lost.
                     let line = line.trim_start_matches('\u{feff}');
-                    let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                    let Ok(val) = serde_json::from_str::<Value>(line) else {
                         continue;
                     };
 
