@@ -1194,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_uses_file_stem_as_external_id() {
+    fn scan_uses_relative_path_as_external_id_without_a_thread_id() {
         let dir = TempDir::new().unwrap();
         let amp_dir = create_amp_dir(&dir);
 
@@ -1205,7 +1205,9 @@ mod tests {
         let ctx = ScanContext::local_default(amp_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs[0].external_id, Some("my-thread-123".to_string()));
+        // No `id` field: the root-relative path is the stable identity (a
+        // bare stem is shared by every thread.json in a store).
+        assert_eq!(convs[0].external_id, Some("my-thread-123.json".to_string()));
     }
 
     #[test]

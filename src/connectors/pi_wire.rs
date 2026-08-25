@@ -499,18 +499,21 @@ pub fn scan_homes_tagged(
 ) -> Result<Vec<NormalizedConversation>> {
     use crate::connectors::file_modified_since;
 
-    // Canonicalize each home ONCE (the doc'd "smaller root set") so the same
-    // session file reached through a symlinked home ancestor and through its
-    // real path lands on one dedupe key — leaf-only keys would emit it twice.
-    let homes: Vec<(PathBuf, Option<String>)> = homes
-        .iter()
-        .map(|(home, profile)| (dedupe_home(home), profile.clone()))
-        .collect();
-
     let mut convs = Vec::new();
+    // Symlink-aliased homes (e.g. `~/.omp/agent` -> `~/Library/...`) reach
+    // the same session files twice. Canonicalizing every FILE would be far
+    // too expensive for hot scans, so resolve each home ONCE and skip a
+    // home whose canonical path was already processed; emitted paths keep
+    // the raw (first-seen) form.
+    let mut seen_homes: HashSet<PathBuf> = HashSet::new();
     let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
 
-    for (home, profile) in &homes {
+    for (home, profile) in homes {
+        let canonical_home = dedupe_home(home);
+        if !seen_homes.insert(dedupe_path_key(&canonical_home)) {
+            continue;
+        }
+
         let files = session_files(home);
         if files.is_empty() {
             continue;
@@ -518,8 +521,7 @@ pub fn scan_homes_tagged(
         let sessions = sessions_dir(home);
 
         for file in files {
-            // Guard against the same session file being reached through
-            // two homes (e.g. via symlinks).
+            // Guard against equivalent-but-differently-spelled file paths.
             let dedupe_key = dedupe_path_key(&file);
             if !seen_session_paths.insert(dedupe_key) {
                 continue;

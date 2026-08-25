@@ -105,6 +105,27 @@ Scope window: 2026-02-15 through HEAD
   pi-family homes are canonicalized once per scan so symlinked agent dirs
   dedupe correctly; and `parse_timestamp` recognizes microsecond epochs
   instead of reading them as milliseconds ~55 millennia out.
+- **Claude Code surfaces subagent provenance and its own generated
+  titles.** Transcripts under a session's `subagents/` directory now carry
+  `metadata.sidechain = true` and the parent session id, and Claude's
+  `ai-title` records are preferred over first-line truncation when naming
+  conversations.
+- **Kimi Code token accounting works.** The documented `usage.record`
+  event was parsed nowhere; it is now attached to the latest assistant
+  turn as API-sourced token usage (tolerant of flat and nested field
+  spellings), instead of being silently ignored.
+
+### Changed
+
+- **Amp conversation identity no longer uses bare file stems.** A stem
+  like `thread.json` is shared by every thread in a store and collided
+  downstream. The thread's own `id` field is preferred, falling back to
+  the root-relative path, then the full path. Downstream consumers keying
+  on slug + external_id will see new identities for id-less exports.
+- **Claude Code titles skip harness-injected context** (`# AGENTS.md`
+  instructions, `<environment_context>`, `<session_context>`,
+  `<user_instructions>` headers) via a shared helper also used by codex
+  and gemini title selection.
 
 ### Added
 

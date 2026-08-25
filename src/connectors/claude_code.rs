@@ -939,7 +939,7 @@ mod tests {
             concat!(
                 r#"{"type":"ai-title","title":"Fix the flaky auth test"}"#,
                 "\n",
-                r#"{"type":"user","sessionId":"cccc-dddd","message":{"role":"user","content":[{"type":"text","text":"please look at the auth module and fix the flaky test"}}]}}"#,
+                r#"{"type":"user","sessionId":"cccc-dddd","message":{"role":"user","content":[{"type":"text","text":"please look at the auth module and fix the flaky test"}]}}"#,
                 "\n",
             ),
         )

@@ -460,10 +460,14 @@ mod tests {
         std::fs::write(&small, "tiny").unwrap();
         assert_eq!(read_capped(&small).unwrap().as_deref(), Some("tiny"));
 
+        // Sparse file: reports as over the cap without materializing 100MB.
         let big = dir.path().join("big.txt");
-        std::fs::write(&big, vec![b'a'; (MAX_SCAN_FILE_BYTES + 1) as usize]).unwrap();
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(MAX_SCAN_FILE_BYTES + 1).unwrap();
+        drop(file);
         assert!(read_capped(&big).unwrap().is_none());
     }
+
     #[test]
     fn parse_timestamp_i64_microseconds() {
         // 1_700_000_000_000_000 µs == 1_700_000_000_000 ms.
