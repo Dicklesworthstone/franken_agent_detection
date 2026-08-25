@@ -485,6 +485,26 @@ fn scan_claude_with_callback_with_exclusions(
             let mut permission_mode: Option<String> = None;
             let mut source_kind = "claude_code";
 
+            // Subagent transcripts live at
+            // `<session>/subagents/agent-*.jsonl` and are separate
+            // conversations; surface the relationship instead of leaving the
+            // parent link implicit in the path.
+            let is_subagent_transcript = path
+                .components()
+                .any(|c| c.as_os_str().to_str() == Some("subagents"));
+            let mut parent_session_id: Option<String> = None;
+            if is_subagent_transcript {
+                let components: Vec<_> = path.components().collect();
+                if let Some(pos) = components
+                    .iter()
+                    .position(|c| c.as_os_str().to_str() == Some("subagents"))
+                    && pos > 0
+                {
+                    parent_session_id =
+                        components[pos - 1].as_os_str().to_str().map(String::from);
+                }
+            }
+
             if ext == Some("jsonl") {
                 let file = std::fs::File::open(&path)
                     .with_context(|| format!("open {}", path.display()))?;
@@ -804,7 +824,9 @@ fn scan_claude_with_callback_with_exclusions(
                     "cliSessionId": cli_session_id,
                     "gitBranch": git_branch,
                     "permissionMode": permission_mode,
-                    "bodyAvailable": source_kind != "claude_code_desktop_sidecar"
+                    "bodyAvailable": source_kind != "claude_code_desktop_sidecar",
+                    "sidechain": is_subagent_transcript,
+                    "parentSessionId": parent_session_id
                 }),
                 messages,
             })?;
