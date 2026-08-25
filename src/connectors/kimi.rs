@@ -1716,6 +1716,40 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = create_kimi_code_storage(&dir);
 
+    #[test]
+    fn modern_usage_record_attaches_token_usage_to_latest_assistant() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_kimi_code_storage(&dir);
+
+        let lines = vec![
+            r#"{"type":"turn.prompt","input":[{"type":"text","text":"Fix the bug"}],"time":"2026-01-01T00:00:00Z"}"#,
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"Fix the bug"}],"toolCalls":[],"origin":"cli"},"time":"2026-01-01T00:00:01Z"}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"Looking now."}},"time":"2026-01-01T00:00:03Z"}"#,
+            r#"{"type":"usage.record","usage":{"input_tokens":100,"output_tokens":30},"time":"2026-01-01T00:00:04Z"}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"step.begin"},"time":"2026-01-01T00:00:05Z"}"#,
+        ];
+        write_modern_wire_file(&storage, "wdk-u", "sess-tok", "main", &lines);
+        write_modern_state(
+            &storage,
+            "wdk-u",
+            "sess-tok",
+            r#"{"title":"Token session","createdAt":"2025-12-31T23:59:59Z","updatedAt":"2026-01-01T00:01:00Z","workDir":"/home/user/proj","agents":{"main":{"type":"main"}}}"#,
+        );
+
+        let connector = KimiConnector::new();
+        let ctx = ScanContext::local_default(storage, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let usage = convs[0].messages[1]
+            .extra
+            .pointer("/cass/token_usage")
+            .expect("token usage attached to latest assistant turn");
+        assert_eq!(usage["input_tokens"], 100);
+        assert_eq!(usage["output_tokens"], 30);
+        assert_eq!(usage["data_source"], "api");
+    }
+
         let lines = vec![
             r#"{"type":"turn.prompt","input":[{"type":"text","text":"Why is it slow?"}],"time":"2026-01-01T00:00:00Z"}"#,
             r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"think","text":"The user probably means the parser."}},"time":"2026-01-01T00:00:01Z"}"#,
