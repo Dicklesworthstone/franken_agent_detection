@@ -503,7 +503,7 @@ fn scan_codex_with_callback(
                     // drop that record (often session_meta or the first
                     // prompt); gemini's replay strips it for the same reason.
                     let line = line.trim_start_matches('\u{feff}');
-                    let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                    let Ok(val) = serde_json::from_str::<Value>(line) else {
                         continue;
                     };
 
@@ -810,7 +810,7 @@ fn scan_codex_with_callback(
                     }
                 };
                 let content = content.trim_start_matches('\u{feff}');
-                let val: Value = match serde_json::from_str(&content) {
+                let val: Value = match serde_json::from_str(content) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };

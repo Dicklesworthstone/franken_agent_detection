@@ -262,17 +262,13 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
     {
         // Real rollouts nest per-turn usage at info.last_token_usage
         // (info.total_token_usage is cumulative — never attach it).
-        let usage_block = payload.pointer("/info/last_token_usage");
-        if let Some(block) = usage_block {
-            input_tokens = block.get("input_tokens").and_then(Value::as_i64);
-            output_tokens = block.get("output_tokens").and_then(Value::as_i64);
-            data_source = TokenDataSource::Api;
-        } else {
-            input_tokens = payload.get("input_tokens").and_then(Value::as_i64);
-            output_tokens = payload
-                .get("output_tokens")
-                .and_then(Value::as_i64)
-                .or_else(|| payload.get("tokens").and_then(Value::as_i64));
+        let usage_block = payload.pointer("/info/last_token_usage").unwrap_or(payload);
+        input_tokens = usage_block.get("input_tokens").and_then(Value::as_i64);
+        output_tokens = usage_block
+            .get("output_tokens")
+            .and_then(Value::as_i64)
+            .or_else(|| usage_block.get("tokens").and_then(Value::as_i64));
+        if input_tokens.is_some() || output_tokens.is_some() {
             data_source = TokenDataSource::Api;
         }
     }
