@@ -1058,10 +1058,14 @@ fn parse_kimi_code_session(
                 if let Some(output) = output_tokens {
                     usage.insert("output_tokens".to_string(), Value::from(output));
                 }
-                for read_key in ["cached_input_tokens", "cache_read_tokens"] {
-                    if let Some(cache) = field(read_key) {
-                        usage.insert("cache_read_tokens".to_string(), Value::from(cache));
-                        break;
+                // Cache-field semantics are unpublished for Kimi; preserve
+                // alternate spellings VERBATIM rather than remapping onto
+                // `cache_read_tokens`, whose additive-total contract would
+                // be wrong if the source's input_tokens already includes
+                // cached tokens.
+                for cache_key in ["cached_input_tokens", "cache_read_tokens"] {
+                    if let Some(cache) = field(cache_key) {
+                        usage.insert(cache_key.to_string(), Value::from(cache));
                     }
                 }
                 usage.insert("data_source".to_string(), Value::String("api".to_string()));

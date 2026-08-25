@@ -165,12 +165,16 @@ impl CodexConnector {
             usage.insert("output_tokens".to_string(), Value::from(output));
         }
         // Codex reports prompt-cache hits as `cached_input_tokens`, a
-        // SUBSET of input_tokens, not additive on top of it.
-        if let Some(cache_read) = usage_block
+        // SUBSET of input_tokens — NOT additive like Anthropic's
+        // cache_read/cache_creation split. Remapping it onto
+        // `cache_read_tokens` would make downstream totals double-count
+        // the cached portion, so the field is preserved verbatim instead
+        // (unknown keys are ignored by total computation).
+        if let Some(cache) = usage_block
             .get("cached_input_tokens")
             .and_then(Value::as_i64)
         {
-            usage.insert("cache_read_tokens".to_string(), Value::from(cache_read));
+            usage.insert("cached_input_tokens".to_string(), Value::from(cache));
         }
         usage.insert("data_source".to_string(), Value::String("api".to_string()));
 

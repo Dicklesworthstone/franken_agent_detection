@@ -616,7 +616,7 @@ impl OpenCodeConnector {
             None => conn.query_map_collect(
                 // `data IS NOT NULL`: internal marker rows carry no payload
                 // and would abort the whole collect (see the session query).
-                "SELECT session_id, id, data, time_created FROM message WHERE data IS NOT NULL",
+                "SELECT session_id, id, data, time_created FROM message WHERE data IS NOT NULL AND session_id IS NOT NULL AND id IS NOT NULL",
                 params![],
                 |row| {
                     Ok(SqliteMessageRow {
@@ -633,7 +633,7 @@ impl OpenCodeConnector {
                 for chunk in id_list.chunks(OPENCODE_SQL_IN_CHUNK) {
                     let placeholders = vec!["?"; chunk.len()].join(",");
                     let sql = format!(
-                        "SELECT session_id, id, data, time_created FROM message WHERE data IS NOT NULL AND session_id IN ({placeholders})"
+                        "SELECT session_id, id, data, time_created FROM message WHERE data IS NOT NULL AND session_id IS NOT NULL AND id IS NOT NULL AND session_id IN ({placeholders})"
                     );
                     let bind: Vec<ParamValue> = chunk
                         .iter()
@@ -750,7 +750,7 @@ impl OpenCodeConnector {
         // table is the largest, so this is the dominant saving).
         let rows: Vec<(String, String)> = match message_ids {
             None => conn.query_map_collect(
-                "SELECT message_id, data FROM part WHERE data IS NOT NULL",
+                    "SELECT message_id, data FROM part WHERE data IS NOT NULL AND message_id IS NOT NULL",
                 params![],
                 |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )?,
@@ -760,7 +760,7 @@ impl OpenCodeConnector {
                 for chunk in id_list.chunks(OPENCODE_SQL_IN_CHUNK) {
                     let placeholders = vec!["?"; chunk.len()].join(",");
                     let sql = format!(
-                        "SELECT message_id, data FROM part WHERE data IS NOT NULL AND message_id IN ({placeholders})"
+                        "SELECT message_id, data FROM part WHERE data IS NOT NULL AND message_id IS NOT NULL AND message_id IN ({placeholders})"
                     );
                     let bind: Vec<ParamValue> = chunk
                         .iter()

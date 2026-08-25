@@ -438,7 +438,14 @@ impl CursorConnector {
                 && !path_str.starts_with('\\')
                 && let Some(slash) = path_str.find(['/', '\\'])
             {
-                path_str = &path_str[slash..];
+                // `file://C:/x` (no authority, malformed but seen in the
+                // wild) carries a DRIVE LETTER where an authority would be;
+                // stripping it would amputate the path.
+                let authority = &path_str[..slash];
+                let looks_like_drive = authority.len() == 2 && authority.as_bytes()[1] == b':';
+                if !looks_like_drive {
+                    path_str = &path_str[slash..];
+                }
             }
 
             // On Windows, file:///C:/... becomes /C:/...

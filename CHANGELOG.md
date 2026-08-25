@@ -90,9 +90,12 @@ Scope window: 2026-02-15 through HEAD
   the opencode fix: globalStorage/workspaceStorage mirrors or overlapping
   explicit roots emitted the same composer twice. A failed Cursor bubble
   range-query is also surfaced at warn instead of silently emptying the
-  conversation, and OpenCode SQLite queries guard NULL/BLOB id and data
-  cells (one malformed row used to abort an entire store at debug-level
-  silence) with store failures escalated to warn.
+  conversation, and OpenCode SQLite queries guard NULL/BLOB id, key and
+  data cells on every query variant (one malformed row used to abort an
+  entire store at debug-level silence) with store failures escalated to
+  warn. Codex cache hits are preserved under their own
+  `cached_input_tokens` key rather than remapped onto the additive
+  `cache_read_tokens` contract; Claude tool results carry `is_error`.
 - **The 100MB scan cap (chatgpt policy) now applies everywhere**: a shared
   `read_capped` helper (pre-read stat + post-read backstop) covers cursor
   agent transcripts, copilot-vscode native sessions, amp threads,
@@ -100,7 +103,8 @@ Scope window: 2026-02-15 through HEAD
   pi-family transcripts; UTF-8 BOMs are stripped on first-line parses in
   codex, claude_code, kimi, and opencode message/part files so leading
   records survive; `file://localhost/path` URIs no longer decode to bogus
-  relative paths (cursor + copilot_vscode); Copilot assistant turns keep
+  relative paths, while authority-less drive forms (`file://C:/x`) keep
+  their path intact (cursor + copilot_vscode); Copilot assistant turns keep
   their request timestamp; amp's cross-root dedupe key is lossless;
   pi-family homes are canonicalized once per scan so symlinked agent dirs
   dedupe correctly; and `parse_timestamp` recognizes microsecond epochs

@@ -656,7 +656,13 @@ fn parse_file_uri(uri: &str) -> Option<PathBuf> {
         && !path.starts_with('\\')
         && let Some(slash) = path.find(['/', '\\'])
     {
-        path = &path[slash..];
+        // `file://C:/x` (no authority) carries a DRIVE LETTER where an
+        // authority would be; stripping it would amputate the path.
+        let authority = &path[..slash];
+        let looks_like_drive = authority.len() == 2 && authority.as_bytes()[1] == b':';
+        if !looks_like_drive {
+            path = &path[slash..];
+        }
     }
     // Windows: `file:///C:/…` decodes to `/C:/…`.
     if cfg!(windows) && path.len() > 2 {

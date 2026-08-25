@@ -621,6 +621,12 @@ fn scan_claude_with_callback_with_exclusions(
                                     Value::String(id.to_string()),
                                 );
                             }
+                            // Failed tool calls are common and downstream
+                            // analytics split on them; pass the flag through
+                            // when Claude recorded one.
+                            if let Some(is_error) = block.get("is_error").and_then(Value::as_bool) {
+                                tool_extra.insert("is_error".to_string(), Value::from(is_error));
+                            }
                             messages.push(NormalizedMessage {
                                 idx: 0,
                                 role: "tool".to_string(),
