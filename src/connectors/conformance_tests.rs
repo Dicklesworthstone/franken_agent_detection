@@ -310,7 +310,6 @@ mod conformance {
     mod schema_conformance {
         use super::*;
 
-        #[allow(dead_code)]
         fn validate_conversation(conv: &NormalizedConversation, connector_slug: &str) {
             // agent_slug must not be empty
             assert!(
@@ -357,7 +356,6 @@ mod conformance {
             }
         }
 
-        #[allow(dead_code)]
         fn validate_message(msg: &NormalizedMessage, connector_slug: &str) {
             // Role must be one of the standard roles
             let valid_roles = ["user", "assistant", "system", "tool", "function"];
@@ -441,6 +439,51 @@ mod conformance {
                 parsed.is_ok(),
                 "NormalizedConversation should deserialize from JSON"
             );
+        }
+        #[test]
+        fn checked_in_fixture_stores_produce_schema_conformant_conversations() {
+            // Contract 3 made real: every conversation produced from a
+            // checked-in fixture store must satisfy the schema validators
+            // below. Without this, `validate_conversation`/`validate_message`
+            // were dead code and the schema contract gated nothing.
+            let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let fixtures: &[(&str, &str)] = &[
+                ("antigravity", "fixtures/antigravity"),
+                ("codex", "fixtures/codex"),
+                ("openhands", "fixtures/openhands"),
+            ];
+
+            for (slug, rel) in fixtures {
+                let root = manifest.join(rel);
+                assert!(
+                    root.exists(),
+                    "checked-in fixture store missing: {}",
+                    root.display()
+                );
+                let ctx = ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root)], None);
+
+                let matched = get_connector_factories()
+                    .into_iter()
+                    .find(|(factory_slug, _)| factory_slug == slug);
+                let Some((_, factory)) = matched else {
+                    panic!("no registered factory for fixture connector {slug}");
+                };
+
+                let convs = factory().scan(&ctx).unwrap_or_else(|err| {
+                    panic!("{slug}: scan of checked-in fixture failed: {err}")
+                });
+                assert!(
+                    !convs.is_empty(),
+                    "{slug}: checked-in fixture store yielded no conversations"
+                );
+
+                for conv in &convs {
+                    validate_conversation(conv, slug);
+                    for msg in &conv.messages {
+                        validate_message(msg, slug);
+                    }
+                }
+            }
         }
     }
 
