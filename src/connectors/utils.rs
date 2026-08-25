@@ -71,6 +71,25 @@ pub(crate) fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
     Ok(Some(content))
 }
 
+/// True when a user message is harness-injected context rather than a
+/// human-authored prompt (`# AGENTS.md instructions …`,
+/// `<environment_context>`, `<session_context>`, `<user_instructions>`).
+///
+/// Used for TITLE selection only: the records stay in the timeline, but
+/// letting them seed a conversation title yields boilerplate for a large
+/// share of real sessions (3/12 recently-modified codex sessions sampled).
+#[must_use]
+pub(crate) fn is_injected_context_message(content: &str) -> bool {
+    const PREFIXES: [&str; 4] = [
+        "# AGENTS.md instructions",
+        "<environment_context>",
+        "<session_context>",
+        "<user_instructions>",
+    ];
+    let trimmed = content.trim_start();
+    PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix))
+}
+
 /// Build a deduplication key for hot scan loops without paying the full
 /// `canonicalize()` syscall cost on every ordinary file.
 ///
