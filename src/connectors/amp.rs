@@ -10,6 +10,7 @@ use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
     franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
 };
+use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
 pub struct AmpConnector;
 impl Default for AmpConnector {
