@@ -59,6 +59,7 @@
 //! ]
 //! ```
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -1132,6 +1133,31 @@ impl Connector for CopilotConnector {
                     }
                 }
             }
+        }
+
+        // Native VS Code chat-session stores (issue #16) are the primary
+        // history surface and are advertised by discover_sources — they
+        // must be SCANNED too. Previously scan_native had zero production
+        // callers: every native conversation was invisible to scan() while
+        // discovery flagged its files required_for_reconstruction.
+        let native_conversations = copilot_vscode::scan_native(
+            &Self::native_scan_bases(ctx),
+            ctx.since_ts,
+        );
+
+        // Cross-surface dedupe by external id: a session present both as a
+        // native entry and as an extension-store export emits once (the
+        // extension copy is scanned first, matching discovery order).
+        let mut seen_surface_ids: HashSet<String> = all_conversations
+            .iter()
+            .filter_map(|c| c.external_id.clone())
+            .collect();
+        for conversation in native_conversations {
+            match conversation.external_id.as_ref() {
+                Some(id) if !seen_surface_ids.insert(id.clone()) => continue,
+                _ => {}
+            }
+            all_conversations.push(conversation);
         }
 
         Ok(all_conversations)
