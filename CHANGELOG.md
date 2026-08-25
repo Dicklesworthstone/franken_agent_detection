@@ -143,6 +143,13 @@ Scope window: 2026-02-15 through HEAD
   real store must index exactly the fixture's sessions, which fails on
   pre-fix code on any machine (empty system store yields nothing to leak,
   and the assertion pins exact source paths).
+- **Schema conformance contract is enforced, not decorative.** The
+  `validate_conversation`/`validate_message` checkers were dead code — the
+  "Schema Conformance" contract gated nothing. A new conformance test
+  scans each checked-in fixture store (antigravity, codex, openhands) and
+  validates every produced conversation and message against it: non-empty
+  slug/source path, sequential message indices, standard roles,
+  well-formed invocation kinds, and consistent time bounds.
 
 ## [0.2.2] -- 2026-08-24
 
