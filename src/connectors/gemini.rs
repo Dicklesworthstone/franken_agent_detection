@@ -593,7 +593,9 @@ fn scan_gemini_with_callback(
             // Extract title from first user message
             let title = messages
                 .iter()
-                .find(|m| m.role == "user")
+                .find(|m| {
+                    m.role == "user" && !is_injected_context_message(&m.content)
+                })
                 .map(|m| {
                     m.content
                         .lines()
