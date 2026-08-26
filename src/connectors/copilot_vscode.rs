@@ -109,6 +109,9 @@ pub struct NativeSource {
     /// `workspaceStorage/<id>` directory, when workspace-scoped; used to read
     /// the sibling `workspace.json` for workspace resolution.
     pub workspace_dir: Option<PathBuf>,
+    /// File mtime in milliseconds since Unix epoch, for generation-priority
+    /// tiebreaking. Populated by `collect_sources`, not at construction.
+    pub modified_at_ms: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,12 +1044,26 @@ fn sessions_from_state_db(_db_path: &Path) -> Vec<Value> {
 fn collect_sources(bases: &[ScanRoot]) -> Vec<(ScanRoot, NativeSource)> {
     let mut out: Vec<(ScanRoot, NativeSource)> = Vec::new();
     for base in bases {
-        for source in native_sources_under(&base.path) {
+        for mut source in native_sources_under(&base.path) {
+            // Capture mtime for the generation tiebreak below.
+            source.modified_at_ms = std::fs::metadata(&source.path)
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| i64::try_from(duration.as_millis()).ok());
             out.push((base.clone(), source));
         }
     }
-    // Newest generation first so migration copies dedupe toward it.
-    out.sort_by(|(_, a), (_, b)| a.format.cmp(&b.format).then_with(|| a.path.cmp(&b.path)));
+    // Newest generation first so migration copies dedupe toward it. The
+    // mtime tiebreak (newer wins) prevents ASCII path order from handing
+    // ties to the wrong tree — e.g. `Code - Insiders/…` sorting before
+    // `Code/…` because space < slash, shadowing the stable install's
+    // copy of the same session with a stale Insiders one.
+    out.sort_by(|(_, a), (_, b)| {
+        a.format
+            .cmp(&b.format)
+            .then_with(|| b.modified_at_ms.cmp(&a.modified_at_ms))
+            .then_with(|| a.path.cmp(&b.path))
+    });
     out
 }
 
