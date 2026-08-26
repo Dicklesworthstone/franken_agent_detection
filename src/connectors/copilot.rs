@@ -1140,10 +1140,8 @@ impl Connector for CopilotConnector {
         // must be SCANNED too. Previously scan_native had zero production
         // callers: every native conversation was invisible to scan() while
         // discovery flagged its files required_for_reconstruction.
-        let native_conversations = copilot_vscode::scan_native(
-            &Self::native_scan_bases(ctx),
-            ctx.since_ts,
-        );
+        let native_conversations =
+            copilot_vscode::scan_native(&Self::native_scan_bases(ctx), ctx.since_ts);
 
         // Cross-surface dedupe by external id: a session present both as a
         // native entry and as an extension-store export emits once (the

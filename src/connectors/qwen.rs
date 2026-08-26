@@ -248,8 +248,9 @@ fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
             return Ok(None);
         }
         Err(e) => {
-            return Err(anyhow::Error::new(e)
-                .context(format!("read qwen session {}", path.display())));
+            return Err(
+                anyhow::Error::new(e).context(format!("read qwen session {}", path.display()))
+            );
         }
     };
 

@@ -110,13 +110,19 @@ impl ClawdbotConnector {
     }
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
-        let mut out = Vec::new();
+        // Same cross-root dedupe scan() applies: overlapping or
+        // symlink-aliased roots must not produce duplicate discovered
+        // sources (double mirroring downstream).
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
         for mut root in Self::source_roots(ctx) {
             if root.path.is_file() {
                 let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
                 root = root.with_path(parent);
             }
             for file in Self::session_files(&root.path) {
+                if !seen_files.insert(dedupe_path_key(&file)) {
+                    continue;
+                }
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }
