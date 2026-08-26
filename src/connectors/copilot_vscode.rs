@@ -144,7 +144,7 @@ pub fn default_user_roots() -> Vec<PathBuf> {
 pub fn looks_like_native_store(path: &Path) -> bool {
     let named = |name: &str| {
         path.components().any(|component| {
-            let segment = component.as_os_str().to_string_lossy();
+            let segment = component.as_os_str().to_string_lossy().to_lowercase();
             segment == name
         })
     };
@@ -986,8 +986,11 @@ fn sessions_from_state_db(db_path: &Path) -> Vec<Value> {
     // Avoid lock errors when VS Code is running.
     let _ = conn.execute("PRAGMA busy_timeout = 5000;");
 
+    // CAST(value AS TEXT): a BLOB-typed value would fail get_typed::<String>
+    // and abort the whole collect; the legacy generation would then vanish
+    // indistinguishably from "no legacy sessions".
     let rows = conn.query_map_collect(
-        "SELECT value FROM ItemTable WHERE key = 'interactive.sessions' AND value IS NOT NULL",
+        "SELECT CAST(value AS TEXT) FROM ItemTable WHERE key = 'interactive.sessions' AND value IS NOT NULL",
         params![],
         |row| {
             let value: String = row.get_typed(0)?;
@@ -995,6 +998,9 @@ fn sessions_from_state_db(db_path: &Path) -> Vec<Value> {
         },
     );
     let Ok(rows) = rows else {
+        tracing::warn!(
+            "copilot: legacy state-db sessions query failed; legacy sessions may be missing"
+        );
         return Vec::new();
     };
 
