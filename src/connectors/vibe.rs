@@ -14,7 +14,10 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use std::collections::HashSet;
+
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::dedupe_path_key;
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -123,12 +126,18 @@ impl VibeConnector {
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         let mut out = Vec::new();
+        // Same cross-root dedupe as scan(): overlapping or symlink-aliased
+        // roots must not produce duplicate discovered sources.
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
         for mut root in Self::source_roots(ctx) {
             if root.path.is_file() {
                 let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
                 root = root.with_path(parent);
             }
             for file in Self::session_files(&root.path) {
+                if !seen_files.insert(dedupe_path_key(&file)) {
+                    continue;
+                }
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }
@@ -210,6 +219,10 @@ impl Connector for VibeConnector {
             return Ok(Vec::new());
         }
 
+        // Overlapping or symlink-aliased roots reach the same session file
+        // twice; dedupe across ALL roots on the lossless path key.
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+
         let mut convs = Vec::new();
 
         for mut root in roots {
@@ -219,6 +232,9 @@ impl Connector for VibeConnector {
 
             let files = Self::session_files(&root);
             for file in files {
+                if !seen_files.insert(dedupe_path_key(&file)) {
+                    continue;
+                }
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }
