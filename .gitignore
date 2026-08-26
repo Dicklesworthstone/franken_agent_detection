@@ -30,3 +30,5 @@ fad_illustration.png
 .skill-loop-progress.md
 .skill-loop-progress-*.md
 
+# br doctor per-run artifacts
+.doctor/
