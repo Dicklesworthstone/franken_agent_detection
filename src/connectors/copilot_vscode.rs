@@ -224,6 +224,7 @@ fn collect_session_container(
             path,
             store,
             workspace_dir: workspace_dir.map(Path::to_path_buf),
+            modified_at_ms: None,
         });
     }
 }
@@ -235,6 +236,7 @@ fn push_state_db(out: &mut Vec<NativeSource>, db: PathBuf, workspace_dir: Option
             path: db,
             store: STORE_STATE_DB,
             workspace_dir: workspace_dir.map(Path::to_path_buf),
+            modified_at_ms: None,
         });
     }
 }
@@ -301,6 +303,7 @@ fn push_source_for_file(out: &mut Vec<NativeSource>, file: &Path) {
         path: file.to_path_buf(),
         store,
         workspace_dir,
+        modified_at_ms: None,
     });
 }
 
@@ -684,14 +687,41 @@ fn parse_file_uri(uri: &str) -> Option<PathBuf> {
 /// Resolve the workspace folder for a `workspaceStorage/<id>` directory from
 /// its `workspace.json` sidecar.
 pub fn workspace_for_storage_dir(storage_dir: &Path) -> Option<PathBuf> {
-    let raw = fs::read_to_string(storage_dir.join("workspace.json")).ok()?;
-    let val: Value = serde_json::from_str(&raw).ok()?;
+    let raw = match fs::read_to_string(storage_dir.join("workspace.json")) {
+        Ok(raw) => raw,
+        Err(err) => {
+            tracing::debug!(
+                dir = %storage_dir.display(),
+                %err,
+                "copilot: unreadable workspace.json sidecar"
+            );
+            return None;
+        }
+    };
+    let val: Value = match serde_json::from_str(&raw) {
+        Ok(val) => val,
+        Err(err) => {
+            tracing::debug!(
+                dir = %storage_dir.display(),
+                %err,
+                "copilot: malformed workspace.json sidecar"
+            );
+            return None;
+        }
+    };
     let uri = val
         .get("folder")
         .or_else(|| val.get("workspace"))
         .or_else(|| val.get("configuration"))
-        .and_then(Value::as_str)?;
-    parse_file_uri(uri)
+        // Multi-root workspaces store a `folders` array; take the first.
+        .or_else(|| {
+            val.get("folders")
+                .and_then(Value::as_array)
+                .and_then(|folders| folders.first())
+        })
+        .and_then(|entry| entry.get("uri").and_then(Value::as_str).or(entry.as_str()))
+        .map(String::from)?;
+    parse_file_uri(&uri)
 }
 
 // ---------------------------------------------------------------------------
@@ -808,15 +838,22 @@ pub fn session_to_conversation(
         return None;
     }
 
+    // Identity precedence: the session's own `sessionId` field; otherwise
+    // the file stem qualified by its container directory. A bare stem is
+    // shared by every session across `chatSessions/`,
+    // `emptyWindowChatSessions/`, and `transferredChatSessions/` — two
+    // id-less sessions in different containers would silently collapse.
     let external_id = session
         .get("sessionId")
         .and_then(Value::as_str)
         .map(String::from)
         .or_else(|| {
-            source_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(String::from)
+            let stem = source_path.file_stem()?.to_str()?;
+            let container = source_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())?;
+            Some(format!("{container}/{stem}"))
         });
 
     let explicit_title = session
