@@ -217,10 +217,7 @@ impl AiderConnector {
             // initialised state dirs; also exclude when the data_dir IS
             // (or is under) a directory explicitly named for cass state.
             let is_cass_db_dir = data_root.join("agent_search.db").exists()
-                || data_root
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains("cass");
+                || data_root.to_string_lossy().to_lowercase().contains("cass");
 
             if let Ok(override_root) = dotenvy::var("CASS_AIDER_DATA_ROOT")
                 && !override_root.trim().is_empty()
