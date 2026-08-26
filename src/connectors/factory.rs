@@ -48,11 +48,22 @@ impl FactoryConnector {
 
     /// Decode a workspace path slug back to a path.
     /// e.g., `-Users-alice-Dev-myproject` -> `/Users/alice/Dev/myproject`
+    ///
+    /// The decoded candidate is only returned when it exists on disk;
+    /// otherwise the lossy `-`→`/` mapping (which mangles hyphenated
+    /// directory names) would fabricate a plausible-looking but wrong
+    /// workspace path. Returns `None` for slugs that don't decode to a
+    /// real directory — downstream grouping falls back to metadata.
     fn decode_workspace_slug(slug: &str) -> Option<PathBuf> {
-        if slug.starts_with('-') {
-            // Replace leading dash and internal dashes with path separators
-            let path_str = slug.replacen('-', "/", 1).replace('-', "/");
-            Some(PathBuf::from(path_str))
+        if !slug.starts_with('-') {
+            return None;
+        }
+        let path_str = slug.replacen('-', "/", 1).replace('-', "/");
+        let candidate = PathBuf::from(&path_str);
+        // Only trust the reconstruction when the target actually exists;
+        // hyphenated dir names make the dash-to-slash mapping ambiguous.
+        if candidate.is_dir() {
+            Some(candidate)
         } else {
             None
         }

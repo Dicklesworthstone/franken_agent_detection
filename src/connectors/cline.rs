@@ -185,7 +185,16 @@ impl ClineConnector {
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let override_root = Self::normalize_root_path(&ctx.data_dir);
         let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
-            if Self::looks_like_storage(&override_root) {
+            // A data_dir that names an extension dir scopes directly; a
+            // data_dir that is a VS Code base (globalStorage, User,
+            // Code variant, platform root) derives its ext dirs via the
+            // same expansion explicit roots get, so a mirrored base is
+            // not silently ignored in favor of the live machine.
+            let mut derived = Vec::new();
+            Self::append_explicit_roots(&mut derived, &override_root);
+            if !derived.is_empty() {
+                derived.into_iter().map(ScanRoot::local).collect()
+            } else if Self::looks_like_storage(&override_root) {
                 vec![ScanRoot::local(override_root)]
             } else {
                 Self::storage_roots()
