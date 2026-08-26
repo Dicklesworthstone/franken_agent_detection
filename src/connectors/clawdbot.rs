@@ -45,8 +45,18 @@ impl ClawdbotConnector {
     }
 
     fn looks_like_clawdbot_storage(path: &Path) -> bool {
-        let path_str = path.to_string_lossy().to_lowercase();
-        path_str.contains("clawdbot") && path_str.contains("sessions")
+        // Structural, not substring-based: a `.clawdbot` dir with
+        // `sessions/`, the `sessions/` dir whose parent is `.clawdbot`, or
+        // the sessions dir itself. A substring test hijacked default
+        // detection onto lookalikes such as `/backup/clawdbot-sessions-old`,
+        // silently missing real `~/.clawdbot/sessions`.
+        if path.file_name().is_some_and(|n| n == ".clawdbot") && path.join("sessions").is_dir() {
+            return true;
+        }
+        path.file_name().is_some_and(|n| n == "sessions")
+            && path
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".clawdbot"))
     }
 
     pub(crate) fn session_files(root: &Path) -> Vec<PathBuf> {

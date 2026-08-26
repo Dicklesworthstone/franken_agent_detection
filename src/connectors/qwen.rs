@@ -47,8 +47,19 @@ impl QwenConnector {
     }
 
     fn looks_like_qwen_storage(path: &Path) -> bool {
-        let path_str = path.to_string_lossy().to_lowercase();
-        path_str.contains(".qwen") && path_str.contains("tmp")
+        // Structural, not substring-based: a `.qwen` directory containing
+        // `tmp/`, or a `tmp/` directory whose parent is `.qwen`.
+        // (`~/.qwen/tmp` is the session root.) A substring test
+        // mis-scoped default detection onto lookalike directories such as
+        // `/data/tmp-mirror/.qwen-tools`, silently finding nothing.
+        if path.file_name().is_some_and(|n| n == "tmp")
+            && path
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".qwen"))
+        {
+            return true;
+        }
+        path.file_name().is_some_and(|n| n == ".qwen") && path.join("tmp").is_dir()
     }
 
     fn append_qwen_roots(roots: &mut Vec<PathBuf>, base: &Path) {

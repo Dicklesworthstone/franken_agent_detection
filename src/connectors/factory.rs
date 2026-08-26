@@ -225,8 +225,26 @@ impl Connector for FactoryConnector {
 
 /// Check if a directory looks like Factory storage
 fn looks_like_factory_storage(path: &Path) -> bool {
-    let path_str = path.to_string_lossy().to_lowercase();
-    path_str.contains("factory") && path_str.contains("sessions")
+    // Structural, not substring-based: a `.factory` dir with `sessions/`,
+    // the `sessions/` dir whose parent is `.factory`, or a dir containing
+    // session JSONLs directly (explicit single-dir scans). A substring
+    // test hijacked default detection onto lookalikes such as
+    // `/home/u/factory-reset/sessions-archive`, silently missing real
+    // `~/.factory/sessions`.
+    let is_factory_sessions = path.file_name().is_some_and(|n| n == "sessions")
+        && path
+            .parent()
+            .is_some_and(|p| p.file_name().is_some_and(|n| n == ".factory"));
+    if is_factory_sessions || path.file_name().is_some_and(|n| n == ".factory") {
+        return true;
+    }
+    // A directory that directly holds session JSONLs also counts, so an
+    // explicit single-store scan keeps working regardless of its name.
+    std::fs::read_dir(path).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+    })
 }
 
 fn update_time_bounds(started_at: &mut Option<i64>, ended_at: &mut Option<i64>, ts: Option<i64>) {

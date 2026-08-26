@@ -37,7 +37,6 @@ impl VibeConnector {
     pub const fn new() -> Self {
         Self
     }
-
     fn sessions_root() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_default()
@@ -47,8 +46,24 @@ impl VibeConnector {
     }
 
     fn looks_like_vibe_storage(path: &Path) -> bool {
-        let path_str = path.to_string_lossy().to_lowercase();
-        path_str.contains(".vibe") && path_str.contains("logs") && path_str.contains("session")
+        // Structural parent-chain check: `<...>/.vibe/logs/session`.
+        // A substring test mis-scoped default detection onto lookalikes
+        // such as `/home/u/.vibe-backup/logs/session-archive`.
+        let matches_layout = path.file_name().is_some_and(|n| n == "session")
+            && path
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == "logs"))
+            && path
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".vibe"));
+        let is_logs_dir = path.file_name().is_some_and(|n| n == "logs")
+            && path
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".vibe"));
+        let is_vibe_dir = path.file_name().is_some_and(|n| n == ".vibe")
+            && path.join("logs").join("session").is_dir();
+        matches_layout || is_logs_dir || is_vibe_dir
     }
 
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {

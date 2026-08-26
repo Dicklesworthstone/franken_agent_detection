@@ -114,6 +114,13 @@ Scope window: 2026-02-15 through HEAD
   pi-family homes are canonicalized once per scan so symlinked agent dirs
   dedupe correctly; and `parse_timestamp` recognizes microsecond epochs
   instead of reading them as milliseconds ~55 millennia out.
+- **Substring storage predicates replaced with structural checks**
+  (qwen, clawdbot, vibe, factory): default detection no longer
+  mis-scopes onto lookalike directories such as
+  `/home/u/.vibe-backup/logs/session-archive` or
+  `/home/u/factory-reset/sessions-archive`, which previously hijacked
+  the scan away from the real store and silently emitted nothing for
+  this connector.
 - **Claude Code surfaces subagent provenance and its own generated
   titles.** Transcripts under a session's `subagents/` directory now carry
   `metadata.sidechain = true` and the parent session id, and Claude's
