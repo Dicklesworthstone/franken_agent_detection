@@ -18,11 +18,12 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::read_capped;
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
-    parse_timestamp, read_capped, utils::dedupe_path_key,
+    parse_timestamp, utils::dedupe_path_key,
 };
-
+use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 pub struct QwenConnector;
 
 impl Default for QwenConnector {

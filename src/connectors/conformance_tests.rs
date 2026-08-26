@@ -283,9 +283,10 @@ mod conformance {
                     // "claude" (public API; alignment is a tracked decision).
                     // The mapping must stay EXPLICIT so any future drift
                     // between factory slugs and provider slugs fails here.
-                    let expected_provider = match *slug {
-                        "claude" => "claude_code",
-                        other => other,
+                    let expected_provider: &str = if *slug == *"claude" {
+                        "claude_code"
+                    } else {
+                        slug
                     };
                     assert_eq!(
                         source.provider_slug, expected_provider,

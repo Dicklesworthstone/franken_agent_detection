@@ -114,6 +114,7 @@ impl ClawdbotConnector {
         // symlink-aliased roots must not produce duplicate discovered
         // sources (double mirroring downstream).
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = Vec::new();
         for mut root in Self::source_roots(ctx) {
             if root.path.is_file() {
                 let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
@@ -216,7 +217,7 @@ impl Connector for ClawdbotConnector {
                     }
 
                     let line = line.trim_start_matches('\u{feff}');
-                    let val: Value = match serde_json::from_str(&line) {
+                    let val: Value = match serde_json::from_str(line) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };

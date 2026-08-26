@@ -6,9 +6,10 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::read_capped;
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
-    franken_detection_for_connector, parse_timestamp, read_capped, utils::dedupe_path_key,
+    franken_detection_for_connector, parse_timestamp, utils::dedupe_path_key,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 

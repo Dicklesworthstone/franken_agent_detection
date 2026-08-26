@@ -150,6 +150,20 @@ Scope window: 2026-02-15 through HEAD
   validates every produced conversation and message against it: non-empty
   slug/source path, sequential message indices, standard roles,
   well-formed invocation kinds, and consistent time bounds.
+- **Second fresh-eyes sweep across the copilot family and six mid-tier
+  connectors.** The VS Code native chat-store pipeline — advertised by
+  discovery with `required_for_reconstruction` but never called from
+  `scan()` — is now scanned, with cross-surface external-id dedupe;
+  qwen default detection scopes exclusively instead of scanning both the
+  pinned mirror AND live `~/.qwen/tmp`; cline, aider, and qwen enforce
+  the 100MB scan cap on their largest reads; vibe and clawdbot discovery
+  dedupe across overlapping/symlinked roots like their scans do; Claude
+  tool results carry `is_error`; copilot-vscode legacy state-db failures
+  warn instead of vanishing; native-store segment matching is
+  case-insensitive so a case-altered mirrored `data_dir` still pins; BOM
+  first-record loss fixed in factory/clawdbot/vibe; and detection
+  determinism now compares full agent vectors rather than just counts.
+  Copilot CLI dual-ingestion cleanup is tracked separately (bead).
 
 ## [0.2.2] -- 2026-08-24
 

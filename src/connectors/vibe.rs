@@ -277,7 +277,7 @@ impl Connector for VibeConnector {
                     }
 
                     let line = line.trim_start_matches('\u{feff}');
-                    let val: Value = match serde_json::from_str(&line) {
+                    let val: Value = match serde_json::from_str(line) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };

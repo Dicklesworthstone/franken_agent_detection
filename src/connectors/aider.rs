@@ -14,7 +14,8 @@ use serde_json::json;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::{Connector, file_modified_since, franken_detection_for_connector, read_capped};
+use super::utils::read_capped;
+use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
 pub struct AiderConnector;
