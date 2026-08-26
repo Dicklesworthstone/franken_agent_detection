@@ -27,6 +27,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::read_capped;
 use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -256,7 +257,18 @@ impl CopilotCliConnector {
     /// fields) and assemble them into a single conversation per session file.
     #[allow(clippy::too_many_lines)]
     fn parse_event_log(&self, path: &Path) -> Result<Vec<NormalizedConversation>> {
-        let content = fs::read_to_string(path)?;
+        // Event logs accumulate; enforce the project's 100MB scan cap.
+        let content = match read_capped(path) {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "copilot_cli: event log exceeds the scan size cap; skipping"
+                );
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // Single-document dispatch is for legacy `.json` session-state files
         // only. A ONE-LINE `events.jsonl` also starts with `{` and parses as

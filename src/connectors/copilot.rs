@@ -389,7 +389,19 @@ impl CopilotConnector {
     /// 2. Single conversation object
     /// 3. Object with a "conversations" key containing an array
     fn parse_conversation_file(path: &Path) -> Result<Vec<NormalizedConversation>> {
-        let content = fs::read_to_string(path)?;
+        // Conversation exports can grow large; enforce the project's
+        // 100MB scan cap.
+        let content = match read_capped(path) {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "copilot: conversation file exceeds the scan size cap; skipping"
+                );
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e.into()),
+        };
         let val: Value = serde_json::from_str(&content)?;
         let mut conversations = Vec::new();
 

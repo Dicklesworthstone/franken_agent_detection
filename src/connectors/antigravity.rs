@@ -53,7 +53,7 @@ use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::utils::{dedupe_path_key, env_path_nonempty, read_capped};
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -216,7 +216,8 @@ impl AntigravityConnector {
     /// Read a transcript file into per-step JSON records, tolerating blank lines
     /// and individual malformed lines (skipped + logged, never fatal).
     fn read_transcript_records(transcript: &Path) -> Vec<Value> {
-        let Ok(text) = fs::read_to_string(transcript) else {
+        // Transcripts accumulate; enforce the project's 100MB scan cap.
+        let Some(text) = read_capped(transcript).ok().flatten() else {
             return Vec::new();
         };
         let mut records = Vec::new();
