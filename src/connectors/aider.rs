@@ -42,6 +42,19 @@ impl AiderConnector {
             for entry in WalkDir::new(root)
                 .max_depth(5)
                 .into_iter()
+                .filter_entry(|e| {
+                    // Warn when the depth cutoff silently prunes a subtree
+                    // (the entry itself would have been visited but its
+                    // children won't be).
+                    if e.depth() == 5 && e.file_type().is_dir() {
+                        tracing::debug!(
+                            path = %e.path().display(),
+                            "aider: depth cutoff at level 5 may skip deeper history files"
+                        );
+                    }
+                    true
+                })
+                .into_iter()
                 .flatten()
                 .filter(|e| e.file_type().is_file())
             {
@@ -198,7 +211,16 @@ impl AiderConnector {
                 ctx.data_dir.clone()
             };
 
-            let is_cass_db_dir = data_root.join("agent_search.db").exists();
+            // Guard against ingesting archived/copied aider histories that
+            // live inside the cass state dir as phantom live conversations.
+            // The agent_search.db marker alone misses fresh/partly-
+            // initialised state dirs; also exclude when the data_dir IS
+            // (or is under) a directory explicitly named for cass state.
+            let is_cass_db_dir = data_root.join("agent_search.db").exists()
+                || data_root
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("cass");
 
             if let Ok(override_root) = dotenvy::var("CASS_AIDER_DATA_ROOT")
                 && !override_root.trim().is_empty()
