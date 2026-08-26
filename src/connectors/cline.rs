@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
-    franken_detection_for_connector, parse_timestamp,
+    franken_detection_for_connector, parse_timestamp, read_capped,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -340,8 +340,14 @@ impl Connector for ClineConnector {
                     continue;
                 }
 
-                let data = match fs::read_to_string(&file) {
-                    Ok(d) => d,
+                // Task logs embed base64 screenshots and routinely reach
+                // tens of MB; enforce the project's 100MB scan cap.
+                let data = match read_capped(&file) {
+                    Ok(Some(d)) => d.trim_start_matches('\u{feff}').to_string(),
+                    Ok(None) => {
+                        tracing::debug!(path = %file.display(), "cline: file exceeds the scan size cap; skipping");
+                        continue;
+                    }
                     Err(e) => {
                         tracing::debug!(path = %file.display(), error = %e, "cline: skipping unreadable file");
                         continue;

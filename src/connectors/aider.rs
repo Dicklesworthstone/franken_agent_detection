@@ -14,7 +14,7 @@ use serde_json::json;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::{Connector, file_modified_since, franken_detection_for_connector};
+use super::{Connector, file_modified_since, franken_detection_for_connector, read_capped};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
 pub struct AiderConnector;
@@ -65,7 +65,20 @@ impl AiderConnector {
 
     #[allow(clippy::unused_self)]
     fn parse_chat_history(&self, path: &Path) -> Result<NormalizedConversation> {
-        let content = fs::read_to_string(path)?;
+        // History files accumulate for years; enforce the project's 100MB
+        // scan cap. The BOM strip keeps the first prompt from being
+        // misread into the system preamble (U+FEFF is not whitespace).
+        let content = match read_capped(path) {
+            Ok(Some(content)) => content.trim_start_matches('\u{feff}').to_string(),
+            Ok(None) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "aider: history exceeds the scan size cap; skipping"
+                );
+                return Err(anyhow::anyhow!("history exceeds scan size cap"));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let mut messages = Vec::new();
         let mut current_role = "system";
         let mut current_content = String::new();
