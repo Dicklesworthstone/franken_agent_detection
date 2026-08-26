@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -7,7 +8,7 @@ use serde_json::Value;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
-    franken_detection_for_connector, parse_timestamp, read_capped,
+    franken_detection_for_connector, parse_timestamp, read_capped, utils::dedupe_path_key,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -292,6 +293,10 @@ impl Connector for ClineConnector {
         }
 
         let mut convs = Vec::new();
+        // Overlapping roots (Code + Cursor sync, ancestor symlinks) reach
+        // the same task directory twice; dedupe across ALL roots on the
+        // lossless path key so the same task is never parsed twice.
+        let mut seen_task_dirs: HashSet<PathBuf> = HashSet::new();
         for root in roots {
             if !root.exists() {
                 continue;
@@ -308,6 +313,9 @@ impl Connector for ClineConnector {
                 let Ok(entry) = entry else { continue };
                 let path = entry.path();
                 if !path.is_dir() {
+                    continue;
+                }
+                if !seen_task_dirs.insert(dedupe_path_key(&path)) {
                     continue;
                 }
                 let task_id = path
