@@ -54,7 +54,6 @@ impl AiderConnector {
                     }
                     true
                 })
-                .into_iter()
                 .flatten()
                 .filter(|e| e.file_type().is_file())
             {

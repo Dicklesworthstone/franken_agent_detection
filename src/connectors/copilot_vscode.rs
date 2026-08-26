@@ -1084,6 +1084,7 @@ fn collect_sources(bases: &[ScanRoot]) -> Vec<(ScanRoot, NativeSource)> {
         for mut source in native_sources_under(&base.path) {
             // Capture mtime for the generation tiebreak below.
             source.modified_at_ms = std::fs::metadata(&source.path)
+                .ok()
                 .and_then(|meta| meta.modified().ok())
                 .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|duration| i64::try_from(duration.as_millis()).ok());
