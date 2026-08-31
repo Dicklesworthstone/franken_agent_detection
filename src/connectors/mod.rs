@@ -14,6 +14,7 @@ pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;
 pub(crate) mod copilot_vscode;
+pub mod devin;
 #[cfg(feature = "crush")]
 pub mod crush;
 #[cfg(feature = "cursor")]
@@ -247,6 +248,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         }),
         ("qwen", || Box::new(qwen::QwenConnector::new())),
         ("grok", || Box::new(grok::GrokConnector::new())),
+        ("devin", || Box::new(devin::DevinConnector::new())),
     ];
     #[cfg(feature = "opencode")]
     v.push(("opencode", || Box::new(opencode::OpenCodeConnector::new())));

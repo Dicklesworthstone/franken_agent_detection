@@ -52,7 +52,7 @@ pub use connectors::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot,
     WorkspaceCache, aider::AiderConnector, amp::AmpConnector, antigravity::AntigravityConnector,
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
-    codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
+    codex::CodexConnector, devin::DevinConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
     estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,
     extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
@@ -130,6 +130,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "copilot_cli",
     "crush",
     "cursor",
+    "devin",
     "factory",
     "gemini",
     "github-copilot",
@@ -162,6 +163,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "copilot_cli" | "copilot-cli" | "gh-copilot" => Some("copilot_cli"),
         "crush" | "charm-crush" => Some("crush"),
         "cursor" => Some("cursor"),
+        "devin" | "devin-cli" => Some("devin"),
         "factory" | "factory-droid" => Some("factory"),
         "gemini" | "gemini-cli" => Some("gemini"),
         "github-copilot" | "copilot" => Some("github-copilot"),
@@ -536,6 +538,11 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
                 &["Library", "Application Support", "Cursor", "User"],
             );
             maybe_push(&mut out, &["AppData", "Roaming", "Cursor", "User"]);
+        }
+        "devin" => {
+            maybe_push(&mut out, &[".local", "bin", "devin"]);
+            maybe_push(&mut out, &[".local", "share", "devin"]);
+            maybe_push(&mut out, &[".local", "share", "devin", "cli"]);
         }
         "factory" => {
             maybe_push(&mut out, &[".factory"]);
@@ -1069,6 +1076,11 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".config", "Cursor", "User"]),
                     tilde(&["Library", "Application Support", "Cursor", "User"]),
                     tilde(&["AppData", "Roaming", "Cursor", "User"]),
+                ],
+                "devin" => vec![
+                    tilde(&[".local", "bin", "devin"]),
+                    tilde(&[".local", "share", "devin"]),
+                    tilde(&[".local", "share", "devin", "cli"]),
                 ],
                 "factory" => vec![
                     tilde(&[".factory"]),

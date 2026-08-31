@@ -73,6 +73,7 @@ use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
 };
+use super::utils::read_capped;
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
 pub struct CopilotConnector;
