@@ -1068,7 +1068,7 @@ fn sessions_from_state_db(db_path: &Path) -> Vec<Value> {
 }
 
 #[cfg(not(feature = "copilot-vscdb"))]
-fn sessions_from_state_db(_db_path: &Path) -> Vec<Value> {
+const fn sessions_from_state_db(_db_path: &Path) -> Vec<Value> {
     Vec::new()
 }
 

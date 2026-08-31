@@ -60,7 +60,6 @@
 //! ```
 
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -147,13 +146,9 @@ impl CopilotConnector {
             .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
             .collect();
 
-        if segments
+        segments
             .iter()
             .any(|segment| segment == "github.copilot-chat" || segment == "copilot-chat")
-        {
-            return true;
-        }
-        false
     }
 
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
@@ -763,6 +758,7 @@ impl Connector for CopilotConnector {
 mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
+    use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
 

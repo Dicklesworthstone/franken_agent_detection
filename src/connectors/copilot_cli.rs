@@ -18,7 +18,6 @@
 //! Copilot Chat JSON files) so that CLI-specific event logs are discovered and
 //! indexed independently.
 
-use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
@@ -818,6 +817,7 @@ impl Connector for CopilotCliConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     fn write_file(dir: &Path, filename: &str, content: &str) -> PathBuf {

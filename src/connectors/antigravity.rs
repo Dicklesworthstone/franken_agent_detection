@@ -45,7 +45,6 @@
 //! best-effort message keyed off `source`, with the raw `type` kept in
 //! `extra.agy_type`. (See the agy version-compatibility guard work.)
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
