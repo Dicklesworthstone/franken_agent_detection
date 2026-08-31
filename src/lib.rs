@@ -58,8 +58,8 @@ pub use connectors::{
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
     get_connector_factories, grok::GrokConnector, kimi::KimiConnector, normalize_model,
     omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
-    pi_agent::PiAgentConnector, prime_agent::PrimeAgentConnector, qwen::QwenConnector,
-    token_extraction, vibe::VibeConnector,
+    kiro::KiroConnector, pi_agent::PiAgentConnector, prime_agent::PrimeAgentConnector,
+    qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -139,6 +139,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "grok",
     "hermes",
     "kimi",
+    "kiro",
     "muse",
     "omp",
     "opencode",
@@ -173,6 +174,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "grok" | "grok-cli" | "grok-build" | "xai-grok" => Some("grok"),
         "hermes" | "hermes-agent" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
+        "kiro" | "kiro-cli" | "kirocli" => Some("kiro"),
         "muse" | "muse-code" | "muse_code" | "musecode" | "meta-muse" => Some("muse"),
         "omp" | "oh-my-pi" => Some("omp"),
         "opencode" | "open-code" => Some("opencode"),
@@ -768,6 +770,10 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".prime", "agent", "sessions"]);
             maybe_push(&mut out, &[".prime", "agent"]);
         }
+        "kiro" => {
+            maybe_push(&mut out, &[".kiro", "sessions", "cli"]);
+            maybe_push(&mut out, &[".kiro"]);
+        }
         "qwen" => {
             maybe_push(&mut out, &[".qwen", "tmp"]);
             maybe_push(&mut out, &[".qwen"]);
@@ -1256,6 +1262,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".prime", "agent", "sessions"]),
                     tilde(&[".prime", "agent"]),
                 ],
+                "kiro" => vec![tilde(&[".kiro", "sessions", "cli"]), tilde(&[".kiro"])],
                 "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],
                 "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],
                 "windsurf" => vec![tilde(&[".windsurf"]), tilde(&[".config", "windsurf"])],

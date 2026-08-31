@@ -27,6 +27,7 @@ pub mod grok;
 #[cfg(feature = "hermes")]
 pub mod hermes;
 pub mod kimi;
+pub mod kiro;
 pub mod muse;
 pub mod omp;
 pub mod openclaw;
@@ -241,6 +242,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("omp", || Box::new(omp::OmpConnector::new())),
         ("factory", || Box::new(factory::FactoryConnector::new())),
         ("kimi", || Box::new(kimi::KimiConnector::new())),
+        ("kiro", || Box::new(kiro::KiroConnector::new())),
         ("muse", || Box::new(muse::MuseConnector::new())),
         ("openclaw", || Box::new(openclaw::OpenClawConnector::new())),
         ("openhands", || {
