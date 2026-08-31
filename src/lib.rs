@@ -58,7 +58,8 @@ pub use connectors::{
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
     get_connector_factories, grok::GrokConnector, kimi::KimiConnector, normalize_model,
     omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
-    pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,
+    pi_agent::PiAgentConnector, prime_agent::PrimeAgentConnector, qwen::QwenConnector,
+    token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -144,6 +145,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "openclaw",
     "openhands",
     "pi_agent",
+    "prime_agent",
     "qwen",
     "vibe",
     "windsurf",
@@ -177,6 +179,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "openclaw" | "open-claw" => Some("openclaw"),
         "openhands" | "open-hands" => Some("openhands"),
         "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
+        "prime_agent" | "prime-agent" | "primeagent" => Some("prime_agent"),
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
         "vibe" | "vibe-cli" => Some("vibe"),
         "windsurf" => Some("windsurf"),
@@ -311,6 +314,24 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
         }
         "pi_agent" => {
             let root = read("PI_CODING_AGENT_DIR")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root).join("sessions")])
+        }
+        "prime_agent" => {
+            // Prime's own precedence: PRIME_AGENT_SESSION_DIR (direct
+            // sessions dir) > legacy PRIME_AGENT_CODING_AGENT_SESSION_DIR >
+            // PRIME_AGENT_CODING_AGENT_DIR (agent home; sessions beneath).
+            if let Some(dir) = read("PRIME_AGENT_SESSION_DIR").filter(|v| !v.is_empty()) {
+                return Some(vec![PathBuf::from(dir)]);
+            }
+            if let Some(dir) =
+                read("PRIME_AGENT_CODING_AGENT_SESSION_DIR").filter(|v| !v.is_empty())
+            {
+                return Some(vec![PathBuf::from(dir)]);
+            }
+            let root = read("PRIME_AGENT_CODING_AGENT_DIR")?;
             if root.is_empty() {
                 return None;
             }
@@ -742,6 +763,10 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         }
         "pi_agent" => {
             maybe_push(&mut out, &[".pi", "agent", "sessions"]);
+        }
+        "prime_agent" => {
+            maybe_push(&mut out, &[".prime", "agent", "sessions"]);
+            maybe_push(&mut out, &[".prime", "agent"]);
         }
         "qwen" => {
             maybe_push(&mut out, &[".qwen", "tmp"]);
@@ -1227,6 +1252,10 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".local", "share", "omp"]),
                 ],
                 "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
+                "prime_agent" => vec![
+                    tilde(&[".prime", "agent", "sessions"]),
+                    tilde(&[".prime", "agent"]),
+                ],
                 "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],
                 "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],
                 "windsurf" => vec![tilde(&[".windsurf"]), tilde(&[".config", "windsurf"])],

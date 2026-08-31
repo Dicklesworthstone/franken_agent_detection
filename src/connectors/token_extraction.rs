@@ -325,6 +325,48 @@ pub fn extract_tokens_for_agent(
     let extracted = match agent_slug {
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
+        // Prime Agent assistant messages carry a full usage block
+        // (`input`/`output`/`cacheRead`/`cacheWrite`), which the connector
+        // preserves under `extra.usage`. Child-usage attribution entries are
+        // deliberately NOT summed here: Prime folds them into the parent
+        // assistant aggregate on reload, so counting them again would double
+        // count.
+        "prime_agent" => {
+            let model_name = extra
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let provider = extra
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    model_name
+                        .as_deref()
+                        .map(|name| normalize_model(name).provider)
+                });
+            let usage = extra.get("usage");
+            let read = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
+            let input_tokens = read("input");
+            let output_tokens = read("output");
+            let cache_read_tokens = read("cacheRead");
+            let cache_creation_tokens = read("cacheWrite");
+            let has_api_data = input_tokens.is_some() || output_tokens.is_some();
+            ExtractedTokenUsage {
+                model_name,
+                provider,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                data_source: if has_api_data {
+                    TokenDataSource::Api
+                } else {
+                    TokenDataSource::Estimated
+                },
+                ..Default::default()
+            }
+        }
         "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" | "antigravity" => {
             let model_name = extra
                 .get("model")

@@ -36,6 +36,7 @@ pub mod openhands;
 pub mod path_trie;
 pub mod pi_agent;
 pub mod pi_wire;
+pub mod prime_agent;
 pub mod qwen;
 pub mod scan;
 #[cfg(any(
@@ -234,6 +235,9 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         }),
         ("aider", || Box::new(aider::AiderConnector::new())),
         ("pi_agent", || Box::new(pi_agent::PiAgentConnector::new())),
+        ("prime_agent", || {
+            Box::new(prime_agent::PrimeAgentConnector::new())
+        }),
         ("omp", || Box::new(omp::OmpConnector::new())),
         ("factory", || Box::new(factory::FactoryConnector::new())),
         ("kimi", || Box::new(kimi::KimiConnector::new())),
