@@ -49,6 +49,7 @@ pub mod shelley;
     feature = "hermes",
     feature = "crush",
     feature = "shelley",
+    feature = "openclaw-sqlite",
     feature = "copilot-vscdb"
 ))]
 pub mod sqlite_sync;

@@ -78,6 +78,11 @@ shelley = [
     "dep:base64",
     "dep:url",
 ]
+# OpenClaw 2.0 (v2026.8.1+): per-agent SQLite transcript store at
+# agents/<agent>/agent/openclaw-agent.sqlite (transcript_events rows). Legacy
+# JSONL sessions need no SQLite and remain available with the base
+# `connectors` feature.
+openclaw-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync"]
 # Copilot legacy generation: pre-March-2025 VS Code chat sessions stored in
 # workspace/global `state.vscdb` (`ItemTable` key `interactive.sessions`).
 # The newer flat-JSON and append-log `chatSessions` generations need no SQLite
@@ -93,6 +98,7 @@ all-connectors = [
     "hermes",
     "crush",
     "shelley",
+    "openclaw-sqlite",
     "copilot-vscdb",
 ]
 
