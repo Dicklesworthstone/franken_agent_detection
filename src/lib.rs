@@ -37,6 +37,8 @@ pub use types::{
 pub use connectors::chatgpt::ChatGptConnector;
 #[cfg(feature = "crush")]
 pub use connectors::crush::CrushConnector;
+#[cfg(feature = "shelley")]
+pub use connectors::shelley::ShelleyConnector;
 #[cfg(feature = "cursor")]
 pub use connectors::cursor::CursorConnector;
 #[cfg(feature = "goose")]
@@ -148,6 +150,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "pi_agent",
     "prime_agent",
     "qwen",
+    "shelley",
     "vibe",
     "windsurf",
 ];
@@ -183,6 +186,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
         "prime_agent" | "prime-agent" | "primeagent" => Some("prime_agent"),
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
+        "shelley" | "shelley-db" => Some("shelley"),
         "vibe" | "vibe-cli" => Some("vibe"),
         "windsurf" => Some("windsurf"),
         _ => None,
@@ -774,6 +778,16 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".kiro", "sessions", "cli"]);
             maybe_push(&mut out, &[".kiro"]);
         }
+        "shelley" => {
+            // Display/probe hints only: Shelley detection never trusts bare
+            // path existence — entry_from_detect routes the slug through
+            // schema-aware admission (cass gh#415).
+            maybe_push(&mut out, &[".config", "shelley", "shelley.db"]);
+            if let Some(cwd_db) = cwd_join(&["shelley.db"]) {
+                out.push(cwd_db);
+            }
+            maybe_push(&mut out, &["shelley.db"]);
+        }
         "qwen" => {
             maybe_push(&mut out, &[".qwen", "tmp"]);
             maybe_push(&mut out, &[".qwen"]);
@@ -829,7 +843,70 @@ fn detect_roots(
     }
 }
 
+/// Schema-aware detection for Shelley: path existence is never sufficient
+/// because any SQLite file could be named `shelley.db` (and a real Shelley
+/// database can have any name). Candidates are opened read-only and admitted
+/// only on the Shelley schema signature (cass gh#415).
+fn shelley_detection_entry(roots: Option<&[PathBuf]>) -> InstalledAgentDetectionEntry {
+    #[cfg(feature = "shelley")]
+    {
+        let mut detected = false;
+        let mut evidence: Vec<String> = Vec::new();
+        let mut root_paths: Vec<String> = Vec::new();
+        let candidates: Vec<(PathBuf, bool)> = roots.map_or_else(
+            connectors::shelley::detection_candidates,
+            |roots| roots.iter().map(|root| (root.clone(), true)).collect(),
+        );
+        if candidates.is_empty() {
+            evidence.push("no Shelley candidate databases available".to_string());
+        }
+        for (path, explicit) in candidates {
+            let file = if path.is_dir() {
+                path.join("shelley.db")
+            } else {
+                path
+            };
+            let file_display = file.display().to_string();
+            if !file.is_file() {
+                evidence.push(format!("candidate missing: {file_display}"));
+                continue;
+            }
+            match connectors::shelley::probe_candidate(&file, explicit) {
+                Ok(()) => {
+                    detected = true;
+                    root_paths.push(file_display.clone());
+                    evidence.push(format!("schema-admitted Shelley database: {file_display}"));
+                }
+                Err(err) => {
+                    evidence.push(format!("candidate rejected ({file_display}): {err:#}"));
+                }
+            }
+        }
+        InstalledAgentDetectionEntry {
+            slug: "shelley".to_string(),
+            detected,
+            evidence,
+            root_paths,
+        }
+    }
+    #[cfg(not(feature = "shelley"))]
+    {
+        let _ = roots;
+        InstalledAgentDetectionEntry {
+            slug: "shelley".to_string(),
+            detected: false,
+            evidence: vec!["compiled without the `shelley` cargo feature".to_string()],
+            root_paths: Vec::new(),
+        }
+    }
+}
+
 fn entry_from_detect(slug: &'static str) -> InstalledAgentDetectionEntry {
+    if slug == "shelley" {
+        // Never path-existence-only for Shelley; CASS_SHELLEY_DB is handled
+        // inside the schema-aware candidate expansion.
+        return shelley_detection_entry(None);
+    }
     if let Some(override_roots) = env_override_roots(slug) {
         return detect_roots(slug, &override_roots, "env");
     }
@@ -838,6 +915,9 @@ fn entry_from_detect(slug: &'static str) -> InstalledAgentDetectionEntry {
 }
 
 fn entry_from_override(slug: &'static str, roots: &[PathBuf]) -> InstalledAgentDetectionEntry {
+    if slug == "shelley" {
+        return shelley_detection_entry(Some(roots));
+    }
     detect_roots(slug, roots, "override")
 }
 
@@ -1263,6 +1343,12 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".prime", "agent"]),
                 ],
                 "kiro" => vec![tilde(&[".kiro", "sessions", "cli"]), tilde(&[".kiro"])],
+                // Shelley intentionally has NO remote tilde probes: a live
+                // SQLite database plus WAL cannot be SSH-synced as one
+                // consistent bundle yet (cass gh#415). The explicit arm (vs
+                // the wildcard) documents that this emptiness is deliberate.
+                #[allow(clippy::match_same_arms)]
+                "shelley" => vec![],
                 "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],
                 "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],
                 "windsurf" => vec![tilde(&[".windsurf"]), tilde(&[".config", "windsurf"])],
@@ -1754,7 +1840,12 @@ mod tests {
             "tilde table must not repeat a connector"
         );
         for (slug, paths) in default_probe_paths_tilde() {
-            assert!(!paths.is_empty(), "connector {slug} has empty tilde paths");
+            // Shelley's arm is intentionally empty: no safe remote
+            // export/sync of a live SQLite database exists yet (cass gh#415).
+            assert!(
+                !paths.is_empty() || slug == "shelley",
+                "connector {slug} has empty tilde paths"
+            );
         }
 
         // 4. The compiled factory registry covers every scanning connector.
@@ -1780,6 +1871,7 @@ mod tests {
                 ("goose", cfg!(feature = "goose")),
                 ("hermes", cfg!(feature = "hermes")),
                 ("opencode", cfg!(feature = "opencode")),
+                ("shelley", cfg!(feature = "shelley")),
             ]);
             // Factory slugs are the connector-native names (e.g. `copilot`
             // for VS Code Copilot chat, which this registry knows as

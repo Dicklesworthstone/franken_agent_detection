@@ -40,12 +40,15 @@ pub mod pi_wire;
 pub mod prime_agent;
 pub mod qwen;
 pub mod scan;
+#[cfg(feature = "shelley")]
+pub mod shelley;
 #[cfg(any(
     feature = "cursor",
     feature = "opencode",
     feature = "goose",
     feature = "hermes",
     feature = "crush",
+    feature = "shelley",
     feature = "copilot-vscdb"
 ))]
 pub mod sqlite_sync;
@@ -268,5 +271,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
     v.push(("crush", || Box::new(crush::CrushConnector::new())));
     #[cfg(feature = "hermes")]
     v.push(("hermes", || Box::new(hermes::HermesConnector::new())));
+    #[cfg(feature = "shelley")]
+    v.push(("shelley", || Box::new(shelley::ShelleyConnector::new())));
     v
 }

@@ -31,6 +31,8 @@ urlencoding = { version = "2", optional = true }
 # --- Optional: ChatGPT encrypted conversations ---
 aes-gcm = { version = "0.11", optional = true }
 base64 = { version = "0.23", optional = true }
+blake3 = { version = "1", optional = true }
+url = { version = "2", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
 frankensqlite = { version = "0.3.8", package = "fsqlite", optional = true }
@@ -64,6 +66,18 @@ goose = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 hermes = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 # Crush: SQLite database access for Charm's Crush agent
 crush = ["connectors", "dep:frankensqlite", "dep:asupersync"]
+# Shelley (boldsoftware/shelley): schema-aware read-only access to Shelley's
+# one-database-many-conversations shelley.db (WAL mode; cass gh#415). fts5 is
+# required because Shelley's schema declares an FTS5 messages index.
+shelley = [
+    "connectors",
+    "dep:frankensqlite",
+    "frankensqlite/fts5",
+    "dep:asupersync",
+    "dep:blake3",
+    "dep:base64",
+    "dep:url",
+]
 # Copilot legacy generation: pre-March-2025 VS Code chat sessions stored in
 # workspace/global `state.vscdb` (`ItemTable` key `interactive.sessions`).
 # The newer flat-JSON and append-log `chatSessions` generations need no SQLite
@@ -78,6 +92,7 @@ all-connectors = [
     "goose",
     "hermes",
     "crush",
+    "shelley",
     "copilot-vscdb",
 ]
 

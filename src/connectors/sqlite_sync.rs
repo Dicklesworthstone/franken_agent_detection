@@ -74,6 +74,33 @@ impl Connection {
     pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
         drive(self.inner.execute_batch(sql))
     }
+
+    /// Run `f` inside one deferred read transaction so every query it issues
+    /// observes a single coherent committed snapshot, then end the
+    /// transaction promptly (a held read transaction blocks the writer's WAL
+    /// checkpoint).
+    ///
+    /// On success the transaction is committed (a no-op for reads); if `f`
+    /// or the commit fails, the transaction is rolled back best-effort.
+    pub fn read_transaction<T, E>(&self, f: impl FnOnce(&Self) -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<FrankenError>,
+    {
+        self.execute("BEGIN DEFERRED;").map_err(E::from)?;
+        match f(self) {
+            Ok(value) => {
+                if let Err(err) = self.execute("COMMIT;") {
+                    let _ = self.execute("ROLLBACK;");
+                    return Err(E::from(err));
+                }
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = self.execute("ROLLBACK;");
+                Err(err)
+            }
+        }
+    }
 }
 
 impl Drop for Connection {
