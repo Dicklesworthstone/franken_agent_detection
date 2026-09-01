@@ -40,7 +40,10 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 use super::utils::dedupe_path_key;
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
@@ -346,6 +349,19 @@ impl Connector for KiroConnector {
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
         for root in Self::source_roots(ctx) {
             for file in Self::session_files(&root.path) {
@@ -355,8 +371,44 @@ impl Connector for KiroConnector {
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }
+                // Pre-parse identity, mirrored from discover_source_files()
+                // (FAD#22). The .json sidecar feeds title/cwd projection, so
+                // its fingerprint is part of what authorizes a future skip.
+                let discovered = DiscoveredSourceFile::new(
+                    "kiro",
+                    &root,
+                    file.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata();
+                let sidecar = file.with_extension("json");
+                let sidecar_discovered = sidecar.exists().then(|| {
+                    DiscoveredSourceFile::new(
+                        "kiro",
+                        &root,
+                        sidecar,
+                        DiscoveredSourceRole::MetadataSidecar,
+                        false,
+                    )
+                    .with_fs_metadata()
+                });
+                if !hooks.should_scan(&discovered) {
+                    continue;
+                }
                 if let Some(conversation) = Self::parse_session_file(&root, &file) {
                     on_conversation(conversation)?;
+                    let changed = discovered.fs_metadata_changed()
+                        || sidecar_discovered
+                            .as_ref()
+                            .is_some_and(DiscoveredSourceFile::fs_metadata_changed);
+                    if !changed {
+                        hooks.complete(&SourceCompletion {
+                            source: discovered,
+                            required_sidecars: sidecar_discovered.into_iter().collect(),
+                            conversations_emitted: 1,
+                        })?;
+                    }
                 }
             }
         }

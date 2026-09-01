@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 use super::utils::{dedupe_path_key, env_path_nonempty, is_injected_context_message, read_capped};
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
@@ -407,15 +410,20 @@ fn tool_output_text(payload: &Value) -> String {
     flatten_content(output)
 }
 
-#[allow(clippy::too_many_lines)]
 fn scan_codex_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    let roots: Vec<PathBuf> = CodexConnector::source_roots(ctx)
-        .into_iter()
-        .map(|root| root.path)
-        .collect();
+    scan_codex_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_codex_with_hooks(
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
+    let roots: Vec<ScanRoot> = CodexConnector::source_roots(ctx);
 
     if roots.is_empty() {
         return Ok(());
@@ -425,13 +433,14 @@ fn scan_codex_with_callback(
 
     for root in roots {
         let explicit_file = root
+            .path
             .is_file()
-            .then_some(root.clone())
+            .then_some(root.path.clone())
             .filter(|path| CodexConnector::is_rollout_file(path));
         let home = explicit_file
             .as_ref()
             .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| root.clone());
+            .unwrap_or_else(|| root.path.clone());
         if !home.exists() {
             continue;
         }
@@ -454,6 +463,18 @@ fn scan_codex_with_callback(
                 FileScanMetadata::Process(metadata) => metadata,
                 FileScanMetadata::Skip => continue,
             };
+            // Pre-parse identity, mirrored from discover_sources() (FAD#22).
+            let discovered = DiscoveredSourceFile::new(
+                "codex",
+                &root,
+                file.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&discovered) {
+                continue;
+            }
             let file_size_bytes = file_metadata.as_ref().map(std::fs::Metadata::len);
             let compact_message_extra =
                 CodexConnector::should_compact_large_message_extra(file_size_bytes);
@@ -893,6 +914,16 @@ fn scan_codex_with_callback(
                 metadata: serde_json::json!({"source": if ext == Some("json") { "rollout_json" } else { "rollout" }}),
                 messages,
             })?;
+
+            // Source complete: the rollout's conversation was delivered.
+            // Withheld when the file changed while being parsed.
+            if !discovered.fs_metadata_changed() {
+                hooks.complete(&SourceCompletion {
+                    source: discovered,
+                    required_sidecars: Vec::new(),
+                    conversations_emitted: 1,
+                })?;
+            }
         }
     }
 
@@ -927,6 +958,19 @@ impl Connector for CodexConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         scan_codex_with_callback(ctx, on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_codex_with_hooks(ctx, hooks, on_conversation)
     }
 }
 
