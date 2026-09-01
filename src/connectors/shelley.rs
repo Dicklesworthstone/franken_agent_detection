@@ -51,7 +51,10 @@ use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
 };
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 
 /// Pre-deserialization cap for a raw JSON column value.
 const MAX_RAW_FIELD_BYTES: usize = 8 * 1024 * 1024;
@@ -274,6 +277,7 @@ impl ShelleyConnector {
 
     fn scan_candidates(
         ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         let mut seen_external: HashSet<String> = HashSet::new();
@@ -302,13 +306,64 @@ impl ShelleyConnector {
                     Err(_) => continue,
                 }
             }
+            // Pre-parse source identity, constructed exactly like
+            // discover_sources() with size/mtime observed BEFORE the database
+            // is opened (FAD#22). The predicate runs before admission so an
+            // unchanged database is skipped without even being opened.
+            let discovered = DiscoveredSourceFile::new(
+                "shelley",
+                &candidate.root,
+                db.clone(),
+                DiscoveredSourceRole::SqliteDatabase,
+                true,
+            )
+            .with_fs_metadata();
+            let wal = sidecar_path(&db, "-wal");
+            let wal_discovered = wal.is_file().then(|| {
+                DiscoveredSourceFile::new(
+                    "shelley",
+                    &candidate.root,
+                    wal,
+                    DiscoveredSourceRole::MetadataSidecar,
+                    true,
+                )
+                .with_fs_metadata()
+            });
+            if !hooks.should_scan(&discovered) {
+                tracing::debug!(
+                    "shelley: host ledger skipped unchanged database {}",
+                    db.display()
+                );
+                continue;
+            }
             match scan_one_database(&db, candidate.kind, ctx.since_ts) {
                 Ok(convs) => {
+                    let mut emitted = 0usize;
                     for conv in convs {
                         let key = conv.external_id.clone().unwrap_or_default();
                         if seen_external.insert(key) {
                             on_conversation(conv)?;
+                            emitted += 1;
                         }
+                    }
+                    // Source complete only after EVERY conversation from this
+                    // database was delivered, and only when neither the
+                    // database nor its WAL changed while we were reading.
+                    let changed = discovered.fs_metadata_changed()
+                        || wal_discovered
+                            .as_ref()
+                            .is_some_and(DiscoveredSourceFile::fs_metadata_changed);
+                    if changed {
+                        tracing::debug!(
+                            "shelley: {} changed during scan; completion withheld",
+                            db.display()
+                        );
+                    } else if emitted > 0 {
+                        hooks.complete(&SourceCompletion {
+                            source: discovered,
+                            required_sidecars: wal_discovered.into_iter().collect(),
+                            conversations_emitted: emitted,
+                        })?;
                     }
                 }
                 Err(err) => {
@@ -336,7 +391,7 @@ impl Connector for ShelleyConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
-        Self::scan_candidates(ctx, &mut |conv| {
+        Self::scan_candidates(ctx, &mut SourceScanHooks::default(), &mut |conv| {
             convs.push(conv);
             Ok(())
         })?;
@@ -352,7 +407,20 @@ impl Connector for ShelleyConnector {
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        Self::scan_candidates(ctx, on_conversation)
+        Self::scan_candidates(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        Self::scan_candidates(ctx, hooks, on_conversation)
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
@@ -2551,5 +2619,202 @@ mod tests {
                 .collect::<String>();
         assert!(!serialized.contains("DRAFTSECRET"));
         assert!(!serialized.contains("QUEUEDSECRET"));
+    }
+
+    /// Fixture with TWO conversations in one database — the multi-conversation
+    /// single-source case that makes naive per-conversation completion unsafe.
+    fn two_conversation_fixture(dir: &Path) -> PathBuf {
+        let db_path = build_fixture(dir, "multi.db", false);
+        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+        insert_conv(&conn, "c1", Some("first"));
+        insert_msg(&conn, "c1", 1, "user", Some(&llm_text(0, "alpha")), None, None, None);
+        insert_conv(&conn, "c2", Some("second"));
+        insert_msg(&conn, "c2", 1, "user", Some(&llm_text(0, "beta")), None, None, None);
+        drop(conn);
+        db_path
+    }
+
+    #[test]
+    fn source_boundaries_complete_only_after_all_conversations() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = two_conversation_fixture(tmp.path());
+        let connector = ShelleyConnector::new();
+        assert!(connector.supports_source_boundaries());
+        let ctx = ScanContext::local_default(db_path.clone(), None);
+
+        let mut completions: Vec<SourceCompletion> = Vec::new();
+        // `emitted` is read by the completion hook and advanced by the
+        // conversation callback, which coexist — share it via Cell.
+        let emitted = std::cell::Cell::new(0usize);
+        let seen_before_completion = std::cell::Cell::new(0usize);
+        {
+            let mut on_complete = |completion: &SourceCompletion| {
+                completions.push(completion.clone());
+                seen_before_completion.set(emitted.get());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    emitted.set(emitted.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let emitted = emitted.get();
+        let seen_before_completion = seen_before_completion.get();
+        assert_eq!(emitted, 2);
+        assert_eq!(completions.len(), 1, "one database => one completion");
+        assert_eq!(
+            seen_before_completion, 2,
+            "completion must fire only after BOTH conversations were delivered"
+        );
+        let completion = &completions[0];
+        assert_eq!(completion.conversations_emitted, 2);
+        assert_eq!(completion.source.provider_slug, "shelley");
+        assert_eq!(completion.source.role, DiscoveredSourceRole::SqliteDatabase);
+
+        // Identity must match discover_source_files() exactly.
+        let discovered = connector.discover_source_files(&ctx).unwrap();
+        let primary = &discovered[0];
+        assert_eq!(completion.source.source_path, primary.source_path);
+        assert_eq!(completion.source.provider_slug, primary.provider_slug);
+        assert_eq!(completion.source.origin, primary.origin);
+        assert_eq!(completion.source.size_bytes, primary.size_bytes);
+        assert_eq!(completion.source.modified_at_ms, primary.modified_at_ms);
+        // Required sidecars carry the WAL when one exists on disk.
+        let wal_on_disk = sidecar_path(&db_path, "-wal").is_file();
+        assert_eq!(
+            completion.required_sidecars.is_empty(),
+            !wal_on_disk,
+            "required sidecars must mirror the on-disk WAL presence"
+        );
+    }
+
+    #[test]
+    fn cancellation_between_conversations_withholds_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = two_conversation_fixture(tmp.path());
+        let connector = ShelleyConnector::new();
+        let ctx = ScanContext::local_default(db_path.clone(), None);
+
+        let mut completions = 0usize;
+        let mut emitted = 0usize;
+        {
+            let mut on_complete = |_c: &SourceCompletion| {
+                completions += 1;
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            let result = connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                emitted += 1;
+                if emitted == 1 {
+                    anyhow::bail!("host cancelled mid-source");
+                }
+                Ok(())
+            });
+            assert!(result.is_err(), "cancellation must propagate");
+        }
+        assert_eq!(emitted, 1);
+        assert_eq!(
+            completions, 0,
+            "a cancelled source must never emit a completion event"
+        );
+    }
+
+    #[test]
+    fn skip_predicate_suppresses_parse_and_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = two_conversation_fixture(tmp.path());
+        let connector = ShelleyConnector::new();
+        let ctx = ScanContext::local_default(db_path.clone(), None);
+
+        let mut asked: Vec<PathBuf> = Vec::new();
+        let mut completions = 0usize;
+        let mut emitted = 0usize;
+        {
+            let mut should_scan = |source: &DiscoveredSourceFile| {
+                asked.push(source.source_path.clone());
+                false
+            };
+            let mut on_complete = |_c: &SourceCompletion| {
+                completions += 1;
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: Some(&mut should_scan),
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    emitted += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(asked.len(), 1, "predicate consulted once per candidate");
+        assert!(
+            asked[0].ends_with("multi.db"),
+            "predicate sees the pre-parse source identity"
+        );
+        assert_eq!(emitted, 0, "skipped source emits no conversations");
+        assert_eq!(completions, 0, "skipped source emits no completion");
+    }
+
+    #[test]
+    fn resume_after_skip_produces_same_conversations_as_clean_scan() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = two_conversation_fixture(tmp.path());
+        let connector = ShelleyConnector::new();
+        let ctx = ScanContext::local_default(db_path.clone(), None);
+
+        // Clean scan: record the completion fingerprint and conversations.
+        let mut ledger: Option<SourceCompletion> = None;
+        let mut clean_ids: Vec<String> = Vec::new();
+        {
+            let mut on_complete = |completion: &SourceCompletion| {
+                ledger = Some(completion.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conv| {
+                    clean_ids.push(conv.external_id.clone().unwrap_or_default());
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let ledger = ledger.expect("clean scan must complete the source");
+        assert_eq!(clean_ids.len(), 2);
+
+        // Resume: the ledger fingerprint still matches => everything skipped.
+        let mut resumed = 0usize;
+        {
+            let mut should_scan = |source: &DiscoveredSourceFile| {
+                !(source.source_path == ledger.source.source_path
+                    && source.size_bytes == ledger.source.size_bytes
+                    && source.modified_at_ms == ledger.source.modified_at_ms)
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: Some(&mut should_scan),
+                on_source_complete: None,
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    resumed += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(resumed, 0, "unchanged source must be fully skipped on resume");
     }
 }

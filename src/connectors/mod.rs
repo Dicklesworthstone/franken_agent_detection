@@ -61,7 +61,10 @@ pub mod workspace_cache;
 mod conformance_tests;
 
 pub use path_trie::PathTrie;
-pub use scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+pub use scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 pub use token_extraction::{
     ExtractedTokenUsage, ModelInfo, TokenDataSource, estimate_tokens_from_content,
     extract_claude_code_tokens, extract_codex_tokens, extract_tokens_for_agent, normalize_model,
@@ -124,6 +127,44 @@ pub trait Connector {
             on_conversation(conversation)?;
         }
         Ok(())
+    }
+
+    /// Whether `scan_with_source_boundaries()` emits trustworthy per-source
+    /// lifecycle events (FAD#22).
+    ///
+    /// `false` (the default) means the connector cannot prove source
+    /// boundaries; hosts must keep conservative resume behavior for it.
+    fn supports_source_boundaries(&self) -> bool {
+        false
+    }
+
+    /// Streaming scan with a per-source lifecycle for resumable ingestion
+    /// (FAD#22; cass gh#426).
+    ///
+    /// Contract for implementations that return `true` from
+    /// `supports_source_boundaries()`:
+    /// - source identity (provider slug, scan root, origin, canonical path,
+    ///   observed size/mtime) matches `discover_source_files()` exactly, with
+    ///   size/mtime captured BEFORE parsing begins;
+    /// - `hooks.should_scan()` runs before the source is parsed; a skipped
+    ///   source emits no conversations and no completion event;
+    /// - `hooks.complete()` fires only after EVERY conversation derived from
+    ///   that source has been delivered successfully — never on parse
+    ///   failure, conversation-callback failure, or cancellation;
+    /// - multi-file reconstruction sets name their required sidecars in the
+    ///   completion so the host knows which fingerprints authorize a skip.
+    ///
+    /// The default implementation is a truthful no-boundary fallback: it
+    /// delegates to `scan_with_callback()` and never invokes the hooks,
+    /// rather than fabricating guessed file boundaries.
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let _ = hooks;
+        self.scan_with_callback(ctx, on_conversation)
     }
 }
 

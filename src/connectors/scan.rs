@@ -287,6 +287,95 @@ impl DiscoveredSourceFile {
         }
         self
     }
+
+    /// Whether the file's current size/mtime no longer match the observation
+    /// recorded by `with_fs_metadata()` — i.e. the source changed while it
+    /// was being parsed. Used by source-boundary implementations (FAD#22) to
+    /// suppress a completion event for a file changed mid-parse; a missing
+    /// file or unreadable metadata also counts as changed.
+    #[must_use]
+    pub fn fs_metadata_changed(&self) -> bool {
+        let Ok(metadata) = std::fs::metadata(&self.source_path) else {
+            return true;
+        };
+        let size_now = Some(metadata.len());
+        let mtime_now = metadata.modified().ok().and_then(|mtime| {
+            mtime
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        });
+        size_now != self.size_bytes || mtime_now != self.modified_at_ms
+    }
+}
+
+/// Completion record for one fully-emitted source (FAD#22).
+///
+/// Emitted by `Connector::scan_with_source_boundaries()` only after EVERY
+/// conversation derived from the source has been delivered successfully.
+/// Hosts persist this identity transactionally with the final committed
+/// batch for the source, then use the pre-parse skip predicate on resume.
+#[derive(Debug, Clone)]
+pub struct SourceCompletion {
+    /// The primary source, carrying the size/mtime observed BEFORE parsing
+    /// began. Identity (provider slug, scan root, origin, canonical path)
+    /// matches `discover_source_files()` exactly.
+    pub source: DiscoveredSourceFile,
+    /// Required reconstruction sidecars whose fingerprints ALSO authorize
+    /// the completion (e.g. a SQLite WAL). A host must treat the source as
+    /// changed when any of these no longer match. Optional sidecars are
+    /// excluded.
+    pub required_sidecars: Vec<DiscoveredSourceFile>,
+    /// Conversations delivered from this source during this scan.
+    pub conversations_emitted: usize,
+}
+
+/// Host hooks for resumable per-source ingestion (FAD#22).
+///
+/// Both hooks are optional; a `Default` value never skips and never observes
+/// completions, which preserves plain full-scan semantics.
+#[derive(Default)]
+pub struct SourceScanHooks<'a> {
+    /// Cheap pre-parse predicate: return `false` to skip a discovered source
+    /// whose durable ledger fingerprint already matches. A skipped source
+    /// emits no conversations and no completion event.
+    pub should_scan_source: Option<&'a mut dyn FnMut(&DiscoveredSourceFile) -> bool>,
+    /// Invoked only after every conversation derived from the source has
+    /// been yielded successfully — never on parse failure, callback failure,
+    /// or cancellation. An error return aborts the scan.
+    #[allow(clippy::type_complexity)]
+    pub on_source_complete: Option<&'a mut dyn FnMut(&SourceCompletion) -> anyhow::Result<()>>,
+}
+
+impl SourceScanHooks<'_> {
+    /// Apply the pre-parse predicate (default: scan everything).
+    pub fn should_scan(&mut self, source: &DiscoveredSourceFile) -> bool {
+        self.should_scan_source
+            .as_mut()
+            .is_none_or(|predicate| predicate(source))
+    }
+
+    /// Deliver a completion event (default: no-op).
+    pub fn complete(&mut self, completion: &SourceCompletion) -> anyhow::Result<()> {
+        self.on_source_complete
+            .as_mut()
+            .map_or_else(|| Ok(()), |sink| sink(completion))
+    }
+}
+
+impl std::fmt::Debug for SourceScanHooks<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceScanHooks")
+            .field(
+                "should_scan_source",
+                &self.should_scan_source.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "on_source_complete",
+                &self.on_source_complete.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
 }
 
 #[cfg(test)]

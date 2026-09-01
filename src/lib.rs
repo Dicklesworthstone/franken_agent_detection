@@ -52,7 +52,7 @@ pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenData
 #[cfg(feature = "connectors")]
 pub use connectors::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot,
-    WorkspaceCache, aider::AiderConnector, amp::AmpConnector, antigravity::AntigravityConnector,
+    SourceCompletion, SourceScanHooks, WorkspaceCache, aider::AiderConnector, amp::AmpConnector, antigravity::AntigravityConnector,
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
     codex::CodexConnector, devin::DevinConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
     estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,

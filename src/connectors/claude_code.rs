@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 use super::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
 };
@@ -404,7 +407,12 @@ fn scan_claude_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    scan_claude_with_callback_with_exclusions(ctx, on_conversation, &excluded_scan_paths_from_env())
+    scan_claude_with_callback_with_exclusions(
+        ctx,
+        on_conversation,
+        &excluded_scan_paths_from_env(),
+        &mut SourceScanHooks::default(),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -412,11 +420,9 @@ fn scan_claude_with_callback_with_exclusions(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     excluded_paths: &[PathBuf],
+    hooks: &mut SourceScanHooks<'_>,
 ) -> Result<()> {
-    let roots: Vec<PathBuf> = ClaudeCodeConnector::source_roots(ctx)
-        .into_iter()
-        .map(|root| root.path)
-        .collect();
+    let roots: Vec<ScanRoot> = ClaudeCodeConnector::source_roots(ctx);
     // Overlapping explicit roots (or a symlinked CLAUDE_CONFIG_DIR aliasing
     // another root) reach the same transcript twice; dedupe on the
     // lossless path key across ALL roots, first occurrence wins.
@@ -425,11 +431,11 @@ fn scan_claude_with_callback_with_exclusions(
     let mut file_count = 0;
 
     for root in roots {
-        let explicit_file_root = root.is_file();
-        let scan_target = root.clone();
+        let explicit_file_root = root.path.is_file();
+        let scan_target = root.path.clone();
         let external_id_root = if explicit_file_root {
-            ClaudeCodeConnector::projects_root_for_explicit_file(&root)
-                .or_else(|| root.parent().map(Path::to_path_buf))
+            ClaudeCodeConnector::projects_root_for_explicit_file(&root.path)
+                .or_else(|| root.path.parent().map(Path::to_path_buf))
         } else {
             Some(scan_target.clone())
         };
@@ -457,6 +463,24 @@ fn scan_claude_with_callback_with_exclusions(
             }
             let ext = path.extension().and_then(|s| s.to_str());
             if !file_modified_since(&path, ctx.since_ts) {
+                continue;
+            }
+            // Pre-parse source identity: constructed exactly like
+            // discover_sources_with_exclusions(), with size/mtime observed
+            // BEFORE the file is opened (FAD#22).
+            let discovered = DiscoveredSourceFile::new(
+                "claude_code",
+                &root,
+                path.clone(),
+                ClaudeCodeConnector::discovered_source_role(&path),
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&discovered) {
+                tracing::debug!(
+                    path = %path.display(),
+                    "claude_code host ledger skipped unchanged source"
+                );
                 continue;
             }
             let file_size_bytes = fs::metadata(&path).ok().map(|metadata| metadata.len());
@@ -835,6 +859,22 @@ fn scan_claude_with_callback_with_exclusions(
                 }),
                 messages,
             })?;
+
+            // Source complete: the (single) conversation derived from this
+            // transcript was delivered. Suppressed when the file changed
+            // while it was being parsed — the host must re-observe it.
+            if discovered.fs_metadata_changed() {
+                tracing::debug!(
+                    path = %path.display(),
+                    "claude_code source changed during parse; completion withheld"
+                );
+            } else {
+                hooks.complete(&SourceCompletion {
+                    source: discovered,
+                    required_sidecars: Vec::new(),
+                    conversations_emitted: 1,
+                })?;
+            }
         }
     }
 
@@ -869,6 +909,24 @@ impl Connector for ClaudeCodeConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         scan_claude_with_callback(ctx, on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_claude_with_callback_with_exclusions(
+            ctx,
+            on_conversation,
+            &excluded_scan_paths_from_env(),
+            hooks,
+        )
     }
 }
 
@@ -1176,6 +1234,88 @@ mod tests {
     }
 
     #[test]
+    fn source_boundaries_complete_per_file_and_skip_on_resume() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        for name in ["a.jsonl", "b.jsonl"] {
+            fs::write(
+                claude_dir.join(name),
+                concat!(
+                    r#"{"type":"user","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Hello"}}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+        }
+
+        let connector = ClaudeCodeConnector::new();
+        assert!(connector.supports_source_boundaries());
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+
+        let mut completions: Vec<SourceCompletion> = Vec::new();
+        let mut emitted = 0usize;
+        {
+            let mut on_complete = |completion: &SourceCompletion| {
+                completions.push(completion.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    emitted += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(emitted, 2);
+        assert_eq!(completions.len(), 2, "one completion per session file");
+        for completion in &completions {
+            assert_eq!(completion.conversations_emitted, 1);
+            assert_eq!(completion.source.provider_slug, "claude_code");
+            assert!(completion.source.size_bytes.is_some());
+            assert!(completion.required_sidecars.is_empty());
+        }
+
+        // Identity matches discovery for every completed source.
+        let discovered = connector.discover_source_files(&ctx).unwrap();
+        for completion in &completions {
+            let matching = discovered
+                .iter()
+                .find(|source| source.source_path == completion.source.source_path)
+                .expect("completed source must be discoverable");
+            assert_eq!(completion.source.size_bytes, matching.size_bytes);
+            assert_eq!(completion.source.modified_at_ms, matching.modified_at_ms);
+        }
+
+        // Resume with a ledger built from the completions: nothing re-parsed.
+        let ledger: Vec<SourceCompletion> = completions;
+        let mut resumed = 0usize;
+        {
+            let mut should_scan = |source: &DiscoveredSourceFile| {
+                !ledger.iter().any(|entry| {
+                    entry.source.source_path == source.source_path
+                        && entry.source.size_bytes == source.size_bytes
+                        && entry.source.modified_at_ms == source.modified_at_ms
+                })
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: Some(&mut should_scan),
+                on_source_complete: None,
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    resumed += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(resumed, 0, "unchanged files must be skipped on resume");
+    }
+
+    #[test]
     fn scan_skips_explicitly_excluded_session_path_without_skipping_siblings() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
@@ -1202,6 +1342,7 @@ mod tests {
                 Ok(())
             },
             std::slice::from_ref(&active_session),
+            &mut SourceScanHooks::default(),
         )
         .unwrap();
 
