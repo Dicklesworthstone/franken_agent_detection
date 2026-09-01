@@ -2424,11 +2424,12 @@ mod tests {
     }
 
     #[test]
-    fn discovery_lists_database_without_sidecars() {
-        // Sidecar discovery (WAL/SHM roles) is asserted in
-        // `wal_only_row_is_visible_and_reader_does_not_mutate`, where a REAL
-        // WAL exists; a fabricated WAL stub (correctly) fails the read-only
-        // open during schema admission.
+    fn discovery_lists_database_and_engine_sidecars() {
+        // The engine's own WAL journaling may leave real -wal/-shm sidecars
+        // behind after the fixture writer closes; discovery must list the
+        // database first and each PRESENT sidecar with its role. (Fabricated
+        // stub sidecars are not usable here: a fake WAL correctly fails the
+        // read-only open during schema admission.)
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = build_fixture(tmp.path(), "d.db", false);
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
@@ -2436,13 +2437,34 @@ mod tests {
         insert_msg(&conn, "c1", 1, "user", Some(&llm_text(0, "x")), None, None, None);
         drop(conn);
 
+        let wal_path = sidecar_path(&db_path, "-wal");
+        let shm_path = sidecar_path(&db_path, "-shm");
         let connector = ShelleyConnector::new();
         let ctx = ScanContext::local_default(db_path.clone(), None);
         let sources = connector.discover_source_files(&ctx).unwrap();
-        assert_eq!(sources.len(), 1);
+
+        let expected =
+            1 + usize::from(wal_path.is_file()) + usize::from(shm_path.is_file());
+        assert_eq!(sources.len(), expected);
         assert_eq!(sources[0].role, DiscoveredSourceRole::SqliteDatabase);
         assert!(sources[0].required_for_reconstruction);
         assert_eq!(sources[0].source_path, db_path);
+        if wal_path.is_file() {
+            let wal = sources
+                .iter()
+                .find(|s| s.source_path == wal_path)
+                .expect("present WAL sidecar must be discovered");
+            assert_eq!(wal.role, DiscoveredSourceRole::MetadataSidecar);
+            assert!(wal.required_for_reconstruction);
+        }
+        if shm_path.is_file() {
+            let shm = sources
+                .iter()
+                .find(|s| s.source_path == shm_path)
+                .expect("present SHM sidecar must be discovered");
+            assert_eq!(shm.role, DiscoveredSourceRole::MetadataSidecar);
+            assert!(!shm.required_for_reconstruction);
+        }
     }
 
     #[test]
