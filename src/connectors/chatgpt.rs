@@ -88,6 +88,20 @@ impl ChatGptConnector {
         Self { encryption_key }
     }
 
+    /// Construct with an explicitly supplied AES-256 key, bypassing the
+    /// `CHATGPT_ENCRYPTION_KEY` / key-file discovery entirely.
+    ///
+    /// This is the env-free injection seam (cass qu81y): hosts and tests
+    /// that already hold key material pass it directly instead of mutating
+    /// process-global environment, which is unsound under parallel test
+    /// scheduling and leaks state on panic.
+    #[must_use]
+    pub fn with_encryption_key(key: [u8; KEY_SIZE]) -> Self {
+        Self {
+            encryption_key: Some(key),
+        }
+    }
+
     /// Load encryption key from environment variable or key file
     fn load_encryption_key() -> Option<[u8; KEY_SIZE]> {
         // Try environment variable first (base64-encoded)

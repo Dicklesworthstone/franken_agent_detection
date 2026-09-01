@@ -149,7 +149,11 @@ impl OmpConnector {
     /// Entries 1–3 are pushed unconditionally (scanning tolerates missing
     /// dirs); 4–5 are enumerated from the filesystem. Callers dedupe by
     /// canonical path, first-wins, so more-specific provenance stays ahead.
-    fn v18_roots_from(
+    // pub: the env-free injection seam for host/test precedence coverage
+    // (cass qu81y) — callers pass a pure lookup closure instead of mutating
+    // process-global OMP_*/PI_* environment.
+    #[must_use]
+    pub fn v18_roots_from(
         home: Option<&Path>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Vec<(PathBuf, Option<String>)> {
