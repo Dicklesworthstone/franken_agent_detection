@@ -51,7 +51,10 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 use super::flatten_content;
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
@@ -783,6 +786,14 @@ fn scan_grok_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    scan_grok_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
+}
+
+fn scan_grok_with_hooks(
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
     let roots = GrokConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
@@ -797,9 +808,86 @@ fn scan_grok_with_callback(
             if !GrokConnector::session_modified_since(&session_dir, ctx.since_ts) {
                 continue;
             }
+            // Pre-parse identity for the session's file set, mirrored from
+            // discover_sources() (FAD#22). The authoritative updates.jsonl is
+            // the completion's primary; chat_history.jsonl (fallback read
+            // path) and summary.json ride as sidecar fingerprints because
+            // parse_session() consults them. A session dir with NEITHER
+            // stream present has no trustworthy boundary and never completes.
+            let updates = session_dir.join("updates.jsonl");
+            let chat_history = session_dir.join("chat_history.jsonl");
+            let summary = session_dir.join("summary.json");
+            let primary = if updates.is_file() {
+                Some(
+                    DiscoveredSourceFile::new(
+                        AGENT_SLUG,
+                        &root,
+                        updates,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                )
+            } else if chat_history.is_file() {
+                Some(
+                    DiscoveredSourceFile::new(
+                        AGENT_SLUG,
+                        &root,
+                        chat_history.clone(),
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        false,
+                    )
+                    .with_fs_metadata(),
+                )
+            } else {
+                None
+            };
+            let mut sidecars: Vec<DiscoveredSourceFile> = Vec::new();
+            if let Some(primary) = primary.as_ref() {
+                if chat_history.is_file() && primary.source_path != chat_history {
+                    sidecars.push(
+                        DiscoveredSourceFile::new(
+                            AGENT_SLUG,
+                            &root,
+                            chat_history.clone(),
+                            DiscoveredSourceRole::PrimarySessionLog,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+                if summary.is_file() {
+                    sidecars.push(
+                        DiscoveredSourceFile::new(
+                            AGENT_SLUG,
+                            &root,
+                            summary,
+                            DiscoveredSourceRole::MetadataSidecar,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+                if !hooks.should_scan(primary) {
+                    continue;
+                }
+            }
             if let Some(conversation) = parse_session(&session_dir) {
                 on_conversation(conversation)
                     .with_context(|| format!("emit grok conversation {}", session_dir.display()))?;
+                if let Some(primary) = primary {
+                    let changed = primary.fs_metadata_changed()
+                        || sidecars
+                            .iter()
+                            .any(DiscoveredSourceFile::fs_metadata_changed);
+                    if !changed {
+                        hooks.complete(&SourceCompletion {
+                            source: primary,
+                            required_sidecars: sidecars,
+                            conversations_emitted: 1,
+                        })?;
+                    }
+                }
             }
         }
     }
@@ -899,6 +987,19 @@ impl Connector for GrokConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         scan_grok_with_callback(ctx, on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_grok_with_hooks(ctx, hooks, on_conversation)
     }
 }
 

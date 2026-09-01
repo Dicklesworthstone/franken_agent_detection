@@ -78,7 +78,10 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 use super::flatten_content;
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
@@ -722,6 +725,14 @@ fn scan_muse_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    scan_muse_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
+}
+
+fn scan_muse_with_hooks(
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
     let roots = MuseConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
@@ -736,10 +747,30 @@ fn scan_muse_with_callback(
             if !file_modified_since(&session_file, ctx.since_ts) {
                 continue;
             }
+            // Pre-parse identity, mirrored from discover_sources() (FAD#22).
+            let discovered = DiscoveredSourceFile::new(
+                AGENT_SLUG,
+                &root,
+                session_file.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&discovered) {
+                continue;
+            }
             if let Some(conversation) = parse_session(&session_file) {
                 on_conversation(conversation).with_context(|| {
                     format!("emit muse conversation {}", session_file.display())
                 })?;
+                // Withheld when the file changed while being parsed.
+                if !discovered.fs_metadata_changed() {
+                    hooks.complete(&SourceCompletion {
+                        source: discovered,
+                        required_sidecars: Vec::new(),
+                        conversations_emitted: 1,
+                    })?;
+                }
             }
         }
     }
@@ -806,6 +837,19 @@ impl Connector for MuseConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         scan_muse_with_callback(ctx, on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_muse_with_hooks(ctx, hooks, on_conversation)
     }
 }
 
