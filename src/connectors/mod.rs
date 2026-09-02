@@ -14,11 +14,11 @@ pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;
 pub(crate) mod copilot_vscode;
-pub mod devin;
 #[cfg(feature = "crush")]
 pub mod crush;
 #[cfg(feature = "cursor")]
 pub mod cursor;
+pub mod devin;
 pub mod factory;
 pub mod gemini;
 #[cfg(feature = "goose")]
@@ -48,6 +48,7 @@ pub mod shelley;
     feature = "goose",
     feature = "hermes",
     feature = "crush",
+    feature = "devin",
     feature = "shelley",
     feature = "openclaw-sqlite",
     feature = "copilot-vscdb"

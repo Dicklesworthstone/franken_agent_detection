@@ -1546,19 +1546,13 @@ mod tests {
             assert_eq!(conv.title, Some("Hello from sqlite".to_string()));
             assert!(conv.messages[1].content.contains("Hi!"));
             assert!(conv.messages[1].content.contains("[tool: exec]"));
-            assert_eq!(
-                conv.messages[1].author,
-                Some("claude-opus-4-5".to_string())
-            );
+            assert_eq!(conv.messages[1].author, Some("claude-opus-4-5".to_string()));
             // The events carry no timestamps of their own, so the SQLite
             // created_at column must back-fill message/session times.
             assert_eq!(conv.messages[0].created_at, Some(1_700_000_001_000));
             assert_eq!(conv.started_at, Some(1_700_000_000_000));
             assert_eq!(conv.ended_at, Some(1_700_000_002_000));
-            assert_eq!(
-                conv.workspace.as_deref(),
-                Some(Path::new("/tmp/alice"))
-            );
+            assert_eq!(conv.workspace.as_deref(), Some(Path::new("/tmp/alice")));
             assert_eq!(
                 conv.metadata.get("storage").and_then(|v| v.as_str()),
                 Some("sqlite")

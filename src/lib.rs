@@ -37,8 +37,6 @@ pub use types::{
 pub use connectors::chatgpt::ChatGptConnector;
 #[cfg(feature = "crush")]
 pub use connectors::crush::CrushConnector;
-#[cfg(feature = "shelley")]
-pub use connectors::shelley::ShelleyConnector;
 #[cfg(feature = "cursor")]
 pub use connectors::cursor::CursorConnector;
 #[cfg(feature = "goose")]
@@ -47,20 +45,23 @@ pub use connectors::goose::GooseConnector;
 pub use connectors::hermes::HermesConnector;
 #[cfg(feature = "opencode")]
 pub use connectors::opencode::OpenCodeConnector;
+#[cfg(feature = "shelley")]
+pub use connectors::shelley::ShelleyConnector;
 #[cfg(feature = "connectors")]
 pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenDataSource};
 #[cfg(feature = "connectors")]
 pub use connectors::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot,
-    SourceCompletion, SourceScanHooks, WorkspaceCache, aider::AiderConnector, amp::AmpConnector, antigravity::AntigravityConnector,
-    claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
-    codex::CodexConnector, devin::DevinConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
+    SourceCompletion, SourceScanHooks, WorkspaceCache, aider::AiderConnector, amp::AmpConnector,
+    antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
+    clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
+    copilot::CopilotConnector, copilot_cli::CopilotCliConnector, devin::DevinConnector,
     estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,
     extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
-    get_connector_factories, grok::GrokConnector, kimi::KimiConnector, normalize_model,
-    omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
-    kiro::KiroConnector, pi_agent::PiAgentConnector, prime_agent::PrimeAgentConnector,
+    get_connector_factories, grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector,
+    normalize_model, omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
+    parse_timestamp, pi_agent::PiAgentConnector, prime_agent::PrimeAgentConnector,
     qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
@@ -279,6 +280,7 @@ fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
     roots
 }
 
+#[allow(clippy::too_many_lines)]
 fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
     let read = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string());
 
@@ -296,6 +298,25 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                 return None;
             }
             Some(vec![PathBuf::from(root)])
+        }
+        "claude" => claude_env_override_roots(read("CLAUDE_CONFIG_DIR").as_deref()),
+        "devin" => {
+            // Mirrors DevinConnector's CASS_DEVIN_DATA_ROOT resolution (the
+            // sessions.db file, its `cli` dir, or the `devin` data root) so a
+            // relocated store is detected exactly where it is scanned.
+            let root = read("CASS_DEVIN_DATA_ROOT")?;
+            if root.is_empty() {
+                return None;
+            }
+            let root = PathBuf::from(root);
+            if root.extension().is_some_and(|ext| ext == "db") {
+                return Some(vec![root]);
+            }
+            Some(vec![
+                root.join("sessions.db"),
+                root.join("cli").join("sessions.db"),
+                root,
+            ])
         }
         "codex" => {
             let root = read("CODEX_HOME")?;
@@ -377,6 +398,50 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
         }
         _ => None,
     }
+}
+
+/// Claude Code detection roots when `CLAUDE_CONFIG_DIR` is set (cass #448).
+///
+/// Mirrors `ClaudeCodeConnector::projects_root_resolved`: an explicit
+/// `CLAUDE_CONFIG_DIR` REPLACES the default roots, and the connector scans
+/// `$CLAUDE_CONFIG_DIR/projects`. Both the projects dir and the config dir
+/// itself are probed so a freshly redirected profile with no sessions yet is
+/// still reported as installed (the scan then simply finds nothing).
+fn claude_env_override_roots(claude_config_dir: Option<&str>) -> Option<Vec<PathBuf>> {
+    let root = claude_config_dir?.trim();
+    if root.is_empty() {
+        return None;
+    }
+    let root = PathBuf::from(root);
+    Some(vec![root.join("projects"), root])
+}
+
+/// Claude Code default detection roots (cass #448).
+///
+/// `XDG_CONFIG_HOME` is additive, not a replacement: the connector's resolver
+/// scans `$XDG_CONFIG_HOME/claude-code/projects` when the variable is set, and
+/// `~/.claude` users who export `XDG_CONFIG_HOME` globally (common on Linux)
+/// must stay detected too.
+fn claude_default_probe_roots(
+    xdg_config_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(xdg) = xdg_config_home {
+        out.push(xdg.join("claude-code"));
+    }
+    let Some(home) = home else {
+        return out;
+    };
+    out.push(home.join(".claude"));
+    out.push(home.join(".config").join("claude"));
+    let claude_support = home
+        .join("Library")
+        .join("Application Support")
+        .join("Claude");
+    out.push(claude_support.join("claude-code-sessions"));
+    out.push(claude_support.join("local-agent-mode-sessions"));
+    out
 }
 
 #[allow(clippy::too_many_lines)]
@@ -508,26 +573,13 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             );
         }
         "claude" => {
-            maybe_push(&mut out, &[".claude"]);
-            maybe_push(&mut out, &[".config", "claude"]);
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "Claude",
-                    "claude-code-sessions",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "Claude",
-                    "local-agent-mode-sessions",
-                ],
-            );
+            let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty());
+            out.extend(claude_default_probe_roots(
+                xdg_config_home.as_deref(),
+                dirs::home_dir().as_deref(),
+            ));
         }
         "clawdbot" => {
             maybe_push(&mut out, &[".clawdbot"]);
@@ -853,10 +905,10 @@ fn shelley_detection_entry(roots: Option<&[PathBuf]>) -> InstalledAgentDetection
         let mut detected = false;
         let mut evidence: Vec<String> = Vec::new();
         let mut root_paths: Vec<String> = Vec::new();
-        let candidates: Vec<(PathBuf, bool)> = roots.map_or_else(
-            connectors::shelley::detection_candidates,
-            |roots| roots.iter().map(|root| (root.clone(), true)).collect(),
-        );
+        let candidates: Vec<(PathBuf, bool)> = roots
+            .map_or_else(connectors::shelley::detection_candidates, |roots| {
+                roots.iter().map(|root| (root.clone(), true)).collect()
+            });
         if candidates.is_empty() {
             evidence.push("no Shelley candidate databases available".to_string());
         }
@@ -1420,6 +1472,98 @@ pub fn detect_installed_agents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // cass #448: the Claude Code detection probe must agree with the
+    // connector's root resolver (CLAUDE_CONFIG_DIR, then XDG_CONFIG_HOME,
+    // then ~/.claude), otherwise a redirected install with no legacy
+    // ~/.claude is "not detected" and never scanned.
+    #[test]
+    fn claude_env_override_replaces_defaults_with_the_redirected_profile() {
+        let roots = claude_env_override_roots(Some("/srv/tenant-a")).expect("override");
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/srv/tenant-a/projects"),
+                PathBuf::from("/srv/tenant-a")
+            ]
+        );
+        assert_eq!(
+            claude_env_override_roots(Some("  ~/.claude-work  ")).expect("trimmed"),
+            vec![
+                PathBuf::from("~/.claude-work/projects"),
+                PathBuf::from("~/.claude-work")
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_env_override_ignores_unset_or_blank_config_dir() {
+        assert!(claude_env_override_roots(None).is_none());
+        assert!(claude_env_override_roots(Some("")).is_none());
+        assert!(claude_env_override_roots(Some("   ")).is_none());
+    }
+
+    #[test]
+    fn claude_default_probe_roots_add_xdg_claude_code_before_home_defaults() {
+        let home = PathBuf::from("/home/u");
+        let xdg = PathBuf::from("/home/u/xdg");
+        let roots = claude_default_probe_roots(Some(&xdg), Some(&home));
+        assert_eq!(roots[0], PathBuf::from("/home/u/xdg/claude-code"));
+        assert_eq!(roots[1], PathBuf::from("/home/u/.claude"));
+        assert!(roots.contains(&PathBuf::from("/home/u/.config/claude")));
+        assert!(roots.contains(&PathBuf::from(
+            "/home/u/Library/Application Support/Claude/claude-code-sessions"
+        )));
+        assert!(roots.contains(&PathBuf::from(
+            "/home/u/Library/Application Support/Claude/local-agent-mode-sessions"
+        )));
+        // XDG is additive: the legacy home roots survive a globally exported
+        // XDG_CONFIG_HOME.
+        let without_xdg = claude_default_probe_roots(None, Some(&home));
+        assert_eq!(&roots[1..], &without_xdg[..]);
+        assert_eq!(without_xdg[0], PathBuf::from("/home/u/.claude"));
+    }
+
+    #[test]
+    fn claude_default_probe_roots_without_home_keep_only_xdg() {
+        let xdg = PathBuf::from("/x");
+        assert_eq!(
+            claude_default_probe_roots(Some(&xdg), None),
+            vec![PathBuf::from("/x/claude-code")]
+        );
+        assert!(claude_default_probe_roots(None, None).is_empty());
+    }
+
+    #[test]
+    fn claude_detection_reports_the_redirected_profile_root() {
+        // Exercise the same `detect_roots` path `entry_from_detect` takes for
+        // an env override, against a real directory, without touching the
+        // process environment.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile = tmp.path().join("claude-cfg");
+        std::fs::create_dir_all(profile.join("projects")).expect("projects dir");
+        let roots = claude_env_override_roots(profile.to_str()).expect("override");
+        let entry = detect_roots("claude", &roots, "env");
+        assert!(entry.detected);
+        assert_eq!(
+            entry.root_paths,
+            vec![
+                profile.join("projects").display().to_string(),
+                profile.display().to_string()
+            ]
+        );
+
+        let xdg = tmp.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("claude-code").join("projects")).expect("xdg dir");
+        let missing_home = tmp.path().join("no-such-home");
+        let roots = claude_default_probe_roots(Some(&xdg), Some(&missing_home));
+        let entry = detect_roots("claude", &roots, "default");
+        assert!(entry.detected);
+        assert_eq!(
+            entry.root_paths,
+            vec![xdg.join("claude-code").display().to_string()]
+        );
+    }
 
     #[test]
     fn detect_installed_agents_can_be_scoped_to_specific_connectors() {

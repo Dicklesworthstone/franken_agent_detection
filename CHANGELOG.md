@@ -44,8 +44,33 @@ Scope window: 2026-02-15 through HEAD
 
 ## [Unreleased]
 
+### Added
+
+- **Devin CLI session scanning** (cass #449) behind the new `devin` feature.
+  The connector reads the CLI's shared read-only store
+  (`~/.local/share/devin/cli/sessions.db`; `CASS_DEVIN_DATA_ROOT` may name the
+  file, its `cli` dir, or the `devin` data root — detection honors the same
+  override). `message_nodes` is a forest of retries/edits, so each session is
+  projected along the `parent_node_id` chain ending at
+  `sessions.main_chain_id` (cycle- and depth-guarded); `hidden` sessions are
+  skipped like `devin list`; `system` nodes are dropped; assistant
+  `tool_calls` become `NormalizedInvocation`s; inline base64 `images` are
+  replaced by `[image]` markers so payloads never reach the index. Without the
+  feature the connector stays detection-only. Devin's cloud sessions are not
+  on disk and are out of scope.
+
 ### Fixed
 
+- **Claude Code detection honors `CLAUDE_CONFIG_DIR` and `XDG_CONFIG_HOME`**
+  (cass #448, follow-up to cass #214). The connector's root resolver already
+  scanned `$CLAUDE_CONFIG_DIR/projects` / `$XDG_CONFIG_HOME/claude-code/projects`,
+  but the registry probe only checked `~/.claude`, `~/.config/claude` and the
+  macOS Desktop dirs, so a redirected profile on a machine with no legacy
+  `~/.claude` reported "not detected" and was never scanned. `env_override_roots`
+  gains a `claude` arm (`CLAUDE_CONFIG_DIR` replaces the defaults, like the
+  resolver) and the default probe adds `$XDG_CONFIG_HOME/claude-code`
+  (additive, so `~/.claude` users with a global `XDG_CONFIG_HOME` stay
+  detected). In-tree Cargo is `0.2.3` (pending release).
 - **Muse default-detection no longer ignores a Cursor-style base `data_dir`.**
   The muse connector was the last of the three single-surface connectors
   (with Grok and Antigravity, both fixed in 0.2.2) whose default-detection

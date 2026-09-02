@@ -373,10 +373,7 @@ impl ShelleyConnector {
                             db.display()
                         )));
                     }
-                    tracing::debug!(
-                        "shelley: skipping candidate {}: {err:#}",
-                        db.display()
-                    );
+                    tracing::debug!("shelley: skipping candidate {}: {err:#}", db.display());
                 }
             }
         }
@@ -429,9 +426,9 @@ impl Connector for ShelleyConnector {
 }
 
 fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
-    let mut name = db.file_name().map_or_else(String::new, |f| {
-        f.to_string_lossy().into_owned()
-    });
+    let mut name = db
+        .file_name()
+        .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
     name.push_str(suffix);
     db.with_file_name(name)
 }
@@ -550,10 +547,13 @@ fn admit_database(path: &Path, kind: CandidateKind) -> Result<(Connection, Schem
         }
     }
 
-    Ok((conn, SchemaPlan {
-        conv_cols,
-        msg_cols,
-    }))
+    Ok((
+        conn,
+        SchemaPlan {
+            conv_cols,
+            msg_cols,
+        },
+    ))
 }
 
 /// Probe one candidate path for detection purposes (schema-aware; never
@@ -604,7 +604,10 @@ struct ConvRow {
     tags: Option<String>,
 }
 
-fn opt_flag(row: &frankensqlite::Row, idx: Option<usize>) -> Result<bool, frankensqlite::FrankenError> {
+fn opt_flag(
+    row: &frankensqlite::Row,
+    idx: Option<usize>,
+) -> Result<bool, frankensqlite::FrankenError> {
     idx.map_or(Ok(false), |i| {
         Ok(row.get_typed::<Option<i64>>(i)?.unwrap_or(0) != 0)
     })
@@ -640,7 +643,11 @@ fn read_ts(row: &frankensqlite::Row, idx: usize) -> Option<i64> {
 
 const fn normalize_epoch_ms(n: i64) -> i64 {
     // Values below ~1973 in ms are interpreted as epoch seconds.
-    if n.abs() < 100_000_000_000 { n.saturating_mul(1000) } else { n }
+    if n.abs() < 100_000_000_000 {
+        n.saturating_mul(1000)
+    } else {
+        n
+    }
 }
 
 fn parse_shelley_timestamp(raw: &str) -> Option<i64> {
@@ -672,7 +679,11 @@ struct ColumnPlan {
     index: HashMap<&'static str, usize>,
 }
 
-fn build_column_plan(present: &HashSet<String>, required: &[&'static str], optional: &[&'static str]) -> ColumnPlan {
+fn build_column_plan(
+    present: &HashSet<String>,
+    required: &[&'static str],
+    optional: &[&'static str],
+) -> ColumnPlan {
     let mut cols: Vec<&'static str> = Vec::new();
     cols.extend_from_slice(required);
     for col in optional {
@@ -936,7 +947,11 @@ fn conversation_metadata(
                 // Allowlist only known non-secret option keys; hook URLs and
                 // anything unrecognized stay out.
                 let mut safe = serde_json::Map::new();
-                for key in ["thinking_level", "disable_all_tools", "disable_notifications"] {
+                for key in [
+                    "thinking_level",
+                    "disable_all_tools",
+                    "disable_notifications",
+                ] {
                     if let Some(v) = opts.get(key) {
                         safe.insert(key.to_string(), v.clone());
                     }
@@ -958,10 +973,7 @@ fn conversation_metadata(
     shelley.insert("tags".into(), tags);
     shelley.insert("options".into(), options);
     shelley.insert("message_count".into(), json!(message_count));
-    shelley.insert(
-        "omitted_system_prompt_count".into(),
-        json!(omitted_system),
-    );
+    shelley.insert("omitted_system_prompt_count".into(), json!(omitted_system));
     shelley.insert(
         "omitted_carried_message_count".into(),
         json!(omitted_carried),
@@ -1070,13 +1082,15 @@ fn project_conversation(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
-            messages
-                .iter()
-                .filter(|m| m.role == "user")
-                .find_map(|m| {
-                    let line = m.content.lines().find(|l| !l.trim().is_empty())?;
-                    Some(line.trim().chars().take(MAX_TITLE_CHARS).collect::<String>())
-                })
+            messages.iter().filter(|m| m.role == "user").find_map(|m| {
+                let line = m.content.lines().find(|l| !l.trim().is_empty())?;
+                Some(
+                    line.trim()
+                        .chars()
+                        .take(MAX_TITLE_CHARS)
+                        .collect::<String>(),
+                )
+            })
         });
 
     let ended_at = messages
@@ -1094,13 +1108,7 @@ fn project_conversation(
         false,
     );
     Ok(Some(conversation_shell(
-        conv,
-        canonical,
-        namespace,
-        title,
-        ended_at,
-        metadata,
-        messages,
+        conv, canonical, namespace, title, ended_at, metadata, messages,
     )))
 }
 
@@ -1292,7 +1300,11 @@ fn project_message(row: &MsgRow, tool_names: &mut HashMap<String, String>) -> Pr
             } else {
                 "user"
             };
-            (role.to_string(), rendered.parts.join("\n"), Some("user".to_string()))
+            (
+                role.to_string(),
+                rendered.parts.join("\n"),
+                Some("user".to_string()),
+            )
         }
         "agent" => (
             "assistant".to_string(),
@@ -1382,15 +1394,8 @@ fn project_message(row: &MsgRow, tool_names: &mut HashMap<String, String>) -> Pr
             if let Some(cat) = llm.refusal_category.as_deref().filter(|c| !c.is_empty()) {
                 extra.insert("refusal_category".into(), json!(cat));
             }
-            if let Some(expl) = llm
-                .refusal_explanation
-                .as_deref()
-                .filter(|e| !e.is_empty())
-            {
-                extra.insert(
-                    "refusal_explanation".into(),
-                    json!(bound_text(expl, 4096)),
-                );
+            if let Some(expl) = llm.refusal_explanation.as_deref().filter(|e| !e.is_empty()) {
+                extra.insert("refusal_explanation".into(), json!(bound_text(expl, 4096)));
             }
         }
     }
@@ -1531,10 +1536,7 @@ fn render_blocks(
         return;
     }
     for block in blocks {
-        let is_image = block
-            .media_type
-            .as_deref()
-            .is_some_and(|m| !m.is_empty())
+        let is_image = block.media_type.as_deref().is_some_and(|m| !m.is_empty())
             && block.data.as_deref().is_some_and(|d| !d.is_empty());
 
         if is_image {
@@ -1611,7 +1613,8 @@ fn render_blocks(
                     .or_else(|| display_tool_name(row))
                     .unwrap_or_else(|| "tool".to_string());
                 let error_suffix = if block.tool_error { " (error)" } else { "" };
-                out.parts.push(format!("[Tool result: {name}]{error_suffix}"));
+                out.parts
+                    .push(format!("[Tool result: {name}]{error_suffix}"));
                 render_blocks(&block.tool_result, depth + 1, tool_names, row, out);
             }
             CONTENT_TYPE_WEB_SEARCH_SET => {
@@ -1649,12 +1652,11 @@ fn render_blocks(
                 // Unknown/forward-compatible type: keep safe visible text.
                 if let Some(text) = block.text.as_deref().filter(|t| !t.is_empty()) {
                     out.parts.push(text.to_string());
-                } else if let Some(thinking) =
-                    block.thinking.as_deref().filter(|t| !t.is_empty())
-                {
+                } else if let Some(thinking) = block.thinking.as_deref().filter(|t| !t.is_empty()) {
                     out.parts.push(format!("[Thinking]\n{thinking}"));
                 } else {
-                    out.parts.push(format!("[unsupported content type {other}]"));
+                    out.parts
+                        .push(format!("[unsupported content type {other}]"));
                 }
             }
         }
@@ -1780,7 +1782,11 @@ fn bounded_usage(usage: &Value) -> Option<Value> {
             out.insert("model".to_string(), json!(bound_text(model, 256)));
         }
     }
-    if let Some(url) = obj.get("url").and_then(Value::as_str).and_then(sanitize_url) {
+    if let Some(url) = obj
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(sanitize_url)
+    {
         out.insert("url".to_string(), json!(url));
     }
     if out.is_empty() {
@@ -1820,7 +1826,11 @@ fn bounded_other_usage(other: &Value) -> Option<Value> {
                 safe.insert("model".to_string(), json!(bound_text(model, 256)));
             }
         }
-        if let Some(url) = obj.get("url").and_then(Value::as_str).and_then(sanitize_url) {
+        if let Some(url) = obj
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(sanitize_url)
+        {
             safe.insert("url".to_string(), json!(url));
         }
         out.push(Value::Object(safe));
@@ -1970,7 +1980,16 @@ mod tests {
         let db_path = build_fixture(tmp.path(), "anything.db", false);
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         insert_conv(&conn, "c1", Some("fix-the-tests"));
-        insert_msg(&conn, "c1", 1, "user", Some(&llm_text(0, "please fix it")), None, None, None);
+        insert_msg(
+            &conn,
+            "c1",
+            1,
+            "user",
+            Some(&llm_text(0, "please fix it")),
+            None,
+            None,
+            None,
+        );
         insert_msg(
             &conn,
             "c1",
@@ -1978,7 +1997,9 @@ mod tests {
             "agent",
             Some(&llm_text(1, "on it")),
             None,
-            Some(r#"{"input_tokens":100,"output_tokens":25,"cache_read_input_tokens":7,"cost_usd":0.01,"model":"claude-opus-5"}"#),
+            Some(
+                r#"{"input_tokens":100,"output_tokens":25,"cache_read_input_tokens":7,"cost_usd":0.01,"model":"claude-opus-5"}"#,
+            ),
             Some("claude-opus-5"),
         );
         // Tool-result-only user row must normalize to role=tool.
@@ -2030,7 +2051,8 @@ mod tests {
             Some(16)
         );
         assert_eq!(
-            meta.pointer("/shelley/conversation_id").and_then(Value::as_str),
+            meta.pointer("/shelley/conversation_id")
+                .and_then(Value::as_str),
             Some("c1")
         );
         crate::connectors::assert_discovery_covers_scan_sources(
@@ -2053,7 +2075,10 @@ mod tests {
         let ctx = ScanContext::local_default(db_path.clone(), None);
         let err = connector.scan(&ctx).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("shelley"), "error should name the connector: {msg}");
+        assert!(
+            msg.contains("shelley"),
+            "error should name the connector: {msg}"
+        );
         assert!(
             msg.contains(&db_path.display().to_string()),
             "error should carry the path: {msg}"
@@ -2073,7 +2098,16 @@ mod tests {
         let db_path = build_fixture(tmp.path(), "shelley.db", false);
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         insert_conv(&conn, "c1", None);
-        insert_msg(&conn, "c1", 1, "user", Some(&llm_text(0, "hello")), None, None, None);
+        insert_msg(
+            &conn,
+            "c1",
+            1,
+            "user",
+            Some(&llm_text(0, "hello")),
+            None,
+            None,
+            None,
+        );
         drop(conn);
 
         let connector = ShelleyConnector::new();
@@ -2095,7 +2129,16 @@ mod tests {
         let db_path = build_fixture(tmp.path(), "shelley.db", true);
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         insert_conv(&conn, "c1", None);
-        insert_msg(&conn, "c1", 1, "user", Some(&llm_text(0, "hi there")), None, None, None);
+        insert_msg(
+            &conn,
+            "c1",
+            1,
+            "user",
+            Some(&llm_text(0, "hi there")),
+            None,
+            None,
+            None,
+        );
         drop(conn);
 
         let connector = ShelleyConnector::new();
@@ -2166,9 +2209,36 @@ mod tests {
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         insert_conv(&conn, "c1", Some("t"));
         // Bare system prompt row: no recognized event metadata.
-        insert_msg(&conn, "c1", 1, "system", Some(&llm_text(0, "You are Shelley. Tools: ...")), None, None, None);
-        insert_msg(&conn, "c1", 2, "user", Some(&llm_text(0, "hi")), None, None, None);
-        insert_msg(&conn, "c1", 3, "slug", Some(&llm_text(1, "a-generated-slug")), None, None, None);
+        insert_msg(
+            &conn,
+            "c1",
+            1,
+            "system",
+            Some(&llm_text(0, "You are Shelley. Tools: ...")),
+            None,
+            None,
+            None,
+        );
+        insert_msg(
+            &conn,
+            "c1",
+            2,
+            "user",
+            Some(&llm_text(0, "hi")),
+            None,
+            None,
+            None,
+        );
+        insert_msg(
+            &conn,
+            "c1",
+            3,
+            "slug",
+            Some(&llm_text(1, "a-generated-slug")),
+            None,
+            None,
+            None,
+        );
         insert_msg(
             &conn,
             "c1",
@@ -2191,9 +2261,21 @@ mod tests {
         assert_eq!(convs.len(), 1);
         let conv = &convs[0];
         assert_eq!(conv.messages.len(), 2);
-        assert!(conv.messages.iter().all(|m| !m.content.contains("You are Shelley")));
-        assert!(conv.messages.iter().all(|m| !m.content.contains("a-generated-slug")));
-        assert!(conv.messages[1].content.contains("[gitinfo] branch main at abc123"));
+        assert!(
+            conv.messages
+                .iter()
+                .all(|m| !m.content.contains("You are Shelley"))
+        );
+        assert!(
+            conv.messages
+                .iter()
+                .all(|m| !m.content.contains("a-generated-slug"))
+        );
+        assert!(
+            conv.messages[1]
+                .content
+                .contains("[gitinfo] branch main at abc123")
+        );
         assert_eq!(conv.messages[1].role, "system");
         assert_eq!(
             conv.metadata
@@ -2223,7 +2305,10 @@ mod tests {
 
         let convs = scan_path(&db_path);
         let msg = &convs[0].messages[0];
-        assert_eq!(msg.extra.get("fork_copied").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            msg.extra.get("fork_copied").and_then(Value::as_bool),
+            Some(true)
+        );
         assert!(msg.extra.get("usage").is_none());
 
         // The token extractor must return the explicit suppressed state:
@@ -2255,7 +2340,10 @@ mod tests {
             "cass": {"tool_call_count": 2}
         });
         let usage = super::super::token_extraction::extract_tokens_for_agent(
-            "shelley", &extra, "content", "assistant",
+            "shelley",
+            &extra,
+            "content",
+            "assistant",
         );
         assert_eq!(usage.input_tokens, Some(120));
         assert_eq!(usage.output_tokens, Some(30));
@@ -2277,15 +2365,22 @@ mod tests {
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         insert_conv(&conn, "cc", Some("compaction"));
         // Generation 0 original.
-        insert_msg(&conn, "cc", 1, "user", Some(&llm_text(0, "original question")), None, None, None);
+        insert_msg(
+            &conn,
+            "cc",
+            1,
+            "user",
+            Some(&llm_text(0, "original question")),
+            None,
+            None,
+            None,
+        );
         // Distillation summary (generation 1).
         conn.execute_compat(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, type, llm_data,
              user_data, created_at, generation)
              VALUES ('mc-2', 'cc', 2, 'system', NULL, ?, '2026-08-01 10:31:00', 1)",
-            params![
-                r#"{"distilled":"true","distillation_content":"Summary: fixed the bug"}"#
-            ],
+            params![r#"{"distilled":"true","distillation_content":"Summary: fixed the bug"}"#],
         )
         .unwrap();
         // Carried copy of the original (generation 1, fresh timestamp).
@@ -2323,14 +2418,21 @@ mod tests {
             1,
             "carried duplicate must be suppressed: {contents:?}"
         );
-        assert!(contents.iter().any(|c| c.contains("Summary: fixed the bug")));
+        assert!(
+            contents
+                .iter()
+                .any(|c| c.contains("Summary: fixed the bug"))
+        );
         let unmatched = conv
             .messages
             .iter()
             .find(|m| m.content.contains("never seen before"))
             .unwrap();
         assert_eq!(
-            unmatched.extra.get("unmatched_carried").and_then(Value::as_bool),
+            unmatched
+                .extra
+                .get("unmatched_carried")
+                .and_then(Value::as_bool),
             Some(true)
         );
         assert_eq!(
@@ -2347,7 +2449,16 @@ mod tests {
         let db_path = build_fixture(tmp.path(), "s.db", false);
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         insert_conv(&conn, "cd", Some("dup"));
-        insert_msg(&conn, "cd", 1, "user", Some(&llm_text(0, "one")), None, None, None);
+        insert_msg(
+            &conn,
+            "cd",
+            1,
+            "user",
+            Some(&llm_text(0, "one")),
+            None,
+            None,
+            None,
+        );
         conn.execute_compat(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, type, llm_data, created_at)
              VALUES ('dup-b', 'cd', 1, 'user', ?, '2026-08-01 10:30:01')",
@@ -2374,7 +2485,16 @@ mod tests {
         let db_path = build_fixture(tmp.path(), "s.db", false);
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         insert_conv(&conn, "c-old", Some("old-conv"));
-        insert_msg(&conn, "c-old", 1, "user", Some(&llm_text(0, "ancient history")), None, None, None);
+        insert_msg(
+            &conn,
+            "c-old",
+            1,
+            "user",
+            Some(&llm_text(0, "ancient history")),
+            None,
+            None,
+            None,
+        );
         insert_conv(&conn, "c-new", Some("new-conv"));
         conn.execute_compat(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, type, llm_data, created_at)
@@ -2416,7 +2536,16 @@ mod tests {
         let db_path = build_fixture(tmp.path(), "shelley.db", true);
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         insert_conv(&conn, "c1", None);
-        insert_msg(&conn, "c1", 1, "user", Some(&llm_text(0, "hi")), None, None, None);
+        insert_msg(
+            &conn,
+            "c1",
+            1,
+            "user",
+            Some(&llm_text(0, "hi")),
+            None,
+            None,
+            None,
+        );
         drop(conn);
 
         let connector = ShelleyConnector::new();
@@ -2452,7 +2581,16 @@ mod tests {
             .unwrap();
         assert_eq!(mode.to_ascii_lowercase(), "wal");
         insert_conv(&writer, "cw", Some("wal-conv"));
-        insert_msg(&writer, "cw", 1, "user", Some(&llm_text(0, "committed via wal")), None, None, None);
+        insert_msg(
+            &writer,
+            "cw",
+            1,
+            "user",
+            Some(&llm_text(0, "committed via wal")),
+            None,
+            None,
+            None,
+        );
 
         let wal_path = sidecar_path(&db_path, "-wal");
         assert!(
@@ -2481,7 +2619,10 @@ mod tests {
 
         let db_after = std::fs::read(&db_path).unwrap();
         let wal_after = std::fs::read(&wal_path).ok();
-        assert_eq!(db_before, db_after, "reader must not mutate the main database");
+        assert_eq!(
+            db_before, db_after,
+            "reader must not mutate the main database"
+        );
         assert_eq!(
             wal_before.as_ref().map(Vec::len),
             wal_after.as_ref().map(Vec::len),
@@ -2502,7 +2643,16 @@ mod tests {
         let db_path = build_fixture(tmp.path(), "d.db", false);
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         insert_conv(&conn, "c1", None);
-        insert_msg(&conn, "c1", 1, "user", Some(&llm_text(0, "x")), None, None, None);
+        insert_msg(
+            &conn,
+            "c1",
+            1,
+            "user",
+            Some(&llm_text(0, "x")),
+            None,
+            None,
+            None,
+        );
         drop(conn);
 
         let wal_path = sidecar_path(&db_path, "-wal");
@@ -2511,8 +2661,7 @@ mod tests {
         let ctx = ScanContext::local_default(db_path.clone(), None);
         let sources = connector.discover_source_files(&ctx).unwrap();
 
-        let expected =
-            1 + usize::from(wal_path.is_file()) + usize::from(shm_path.is_file());
+        let expected = 1 + usize::from(wal_path.is_file()) + usize::from(shm_path.is_file());
         assert_eq!(sources.len(), expected);
         assert_eq!(sources[0].role, DiscoveredSourceRole::SqliteDatabase);
         assert!(sources[0].required_for_reconstruction);
@@ -2543,8 +2692,14 @@ mod tests {
         );
         assert!(parse_shelley_timestamp("2026-08-01 10:00:00.123456789+02:00").is_some());
         assert!(parse_shelley_timestamp("2026-08-01T10:00:00.5-07:00").is_some());
-        assert_eq!(parse_shelley_timestamp("1733000000"), Some(1_733_000_000_000));
-        assert_eq!(parse_shelley_timestamp("1733000000000"), Some(1_733_000_000_000));
+        assert_eq!(
+            parse_shelley_timestamp("1733000000"),
+            Some(1_733_000_000_000)
+        );
+        assert_eq!(
+            parse_shelley_timestamp("1733000000000"),
+            Some(1_733_000_000_000)
+        );
         assert_eq!(parse_shelley_timestamp(""), None);
         assert_eq!(parse_shelley_timestamp("not a date"), None);
     }
@@ -2552,7 +2707,8 @@ mod tests {
     #[test]
     fn url_sanitization_strips_secrets_and_rejects_non_http() {
         assert_eq!(
-            sanitize_url("https://user:pass@api.example.com/v1/messages?key=sk-123#frag").as_deref(),
+            sanitize_url("https://user:pass@api.example.com/v1/messages?key=sk-123#frag")
+                .as_deref(),
             Some("https://api.example.com/v1/messages")
         );
         assert!(sanitize_url("javascript:alert(1)").is_none());
@@ -2592,8 +2748,14 @@ mod tests {
         let msg = &convs[0].messages[0];
         assert_eq!(msg.role, "system");
         assert!(msg.content.contains("The request failed."));
-        assert_eq!(msg.extra.get("error_type").and_then(Value::as_str), Some("llm_request"));
-        assert_eq!(msg.extra.get("error_retryable").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            msg.extra.get("error_type").and_then(Value::as_str),
+            Some("llm_request")
+        );
+        assert_eq!(
+            msg.extra.get("error_retryable").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2607,7 +2769,16 @@ mod tests {
             params![],
         )
         .unwrap();
-        insert_msg(&conn, "cq", 1, "user", Some(&llm_text(0, "real content")), None, None, None);
+        insert_msg(
+            &conn,
+            "cq",
+            1,
+            "user",
+            Some(&llm_text(0, "real content")),
+            None,
+            None,
+            None,
+        );
         drop(conn);
 
         let convs = scan_path(&db_path);
@@ -2627,9 +2798,27 @@ mod tests {
         let db_path = build_fixture(dir, "multi.db", false);
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         insert_conv(&conn, "c1", Some("first"));
-        insert_msg(&conn, "c1", 1, "user", Some(&llm_text(0, "alpha")), None, None, None);
+        insert_msg(
+            &conn,
+            "c1",
+            1,
+            "user",
+            Some(&llm_text(0, "alpha")),
+            None,
+            None,
+            None,
+        );
         insert_conv(&conn, "c2", Some("second"));
-        insert_msg(&conn, "c2", 1, "user", Some(&llm_text(0, "beta")), None, None, None);
+        insert_msg(
+            &conn,
+            "c2",
+            1,
+            "user",
+            Some(&llm_text(0, "beta")),
+            None,
+            None,
+            None,
+        );
         drop(conn);
         db_path
     }
@@ -2815,6 +3004,9 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(resumed, 0, "unchanged source must be fully skipped on resume");
+        assert_eq!(
+            resumed, 0,
+            "unchanged source must be fully skipped on resume"
+        );
     }
 }

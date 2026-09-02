@@ -1,6 +1,6 @@
 [package]
 name = "franken-agent-detection"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -66,6 +66,9 @@ goose = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 hermes = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 # Crush: SQLite database access for Charm's Crush agent
 crush = ["connectors", "dep:frankensqlite", "dep:asupersync"]
+# Devin CLI: read-only access to the shared ~/.local/share/devin/cli/sessions.db
+# (cass #449). Without it the devin connector is detection-only.
+devin = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 # Shelley (boldsoftware/shelley): schema-aware read-only access to Shelley's
 # one-database-many-conversations shelley.db (WAL mode; cass gh#415). fts5 is
 # required because Shelley's schema declares an FTS5 messages index.
