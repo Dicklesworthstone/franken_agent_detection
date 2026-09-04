@@ -67,7 +67,7 @@ pub use connectors::{
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentDetectOptions {
@@ -202,6 +202,29 @@ fn normalize_slug(raw: &str) -> Option<String> {
 fn canonical_or_normalized_slug(raw: &str) -> Option<String> {
     let normalized = normalize_slug(raw)?;
     Some(canonical_connector_slug(&normalized).map_or(normalized, std::string::ToString::to_string))
+}
+
+/// Expand a leading `~` in a configured path value.
+///
+/// Only a bare `~` or a `~/rest` (`~\rest` on Windows) prefix is expanded, the
+/// way agents that document tilde support in their own env overrides do it;
+/// `~user` has no portable meaning here and is preserved verbatim. When the
+/// home directory is unknown the raw value survives rather than being silently
+/// rooted at the process working directory.
+pub(crate) fn expand_leading_tilde(raw: &str, home: Option<&Path>) -> PathBuf {
+    let trimmed = raw.trim();
+    if let Some(home) = home {
+        if trimmed == "~" {
+            return home.to_path_buf();
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("~/")
+            .or_else(|| trimmed.strip_prefix("~\\"))
+        {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
 }
 
 fn home_join(parts: &[&str]) -> Option<PathBuf> {
@@ -350,19 +373,23 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             // Prime's own precedence: PRIME_AGENT_SESSION_DIR (direct
             // sessions dir) > legacy PRIME_AGENT_CODING_AGENT_SESSION_DIR >
             // PRIME_AGENT_CODING_AGENT_DIR (agent home; sessions beneath).
+            // Prime expands a leading `~` in all three, so detection must
+            // resolve the same directory the connector will scan.
+            let home = dirs::home_dir();
+            let expand = |raw: &str| expand_leading_tilde(raw, home.as_deref());
             if let Some(dir) = read("PRIME_AGENT_SESSION_DIR").filter(|v| !v.is_empty()) {
-                return Some(vec![PathBuf::from(dir)]);
+                return Some(vec![expand(&dir)]);
             }
             if let Some(dir) =
                 read("PRIME_AGENT_CODING_AGENT_SESSION_DIR").filter(|v| !v.is_empty())
             {
-                return Some(vec![PathBuf::from(dir)]);
+                return Some(vec![expand(&dir)]);
             }
             let root = read("PRIME_AGENT_CODING_AGENT_DIR")?;
             if root.is_empty() {
                 return None;
             }
-            Some(vec![PathBuf::from(root).join("sessions")])
+            Some(vec![expand(&root).join("sessions")])
         }
         "goose" => {
             let root = read("GOOSE_PATH_ROOT")?;

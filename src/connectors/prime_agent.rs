@@ -34,6 +34,7 @@ use walkdir::WalkDir;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::dedupe_path_key;
 use super::{Connector, franken_detection_for_connector, parse_timestamp};
+use crate::expand_leading_tilde;
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
     reindex_messages,
@@ -62,29 +63,6 @@ const EXCLUDED_CUSTOM_MESSAGE_TYPES: &[&str] = &[
     "compaction-outcome",
     "compaction_outcome",
 ];
-
-/// Expand a leading `~` the way Prime's own config loader does before using
-/// an override value as a path.
-///
-/// Prime expands only a leading tilde (`~` or `~/rest`); `~user` is not
-/// supported there and is left verbatim here too. When the home directory is
-/// unknown the raw value is preserved rather than silently rooted at the
-/// process working directory.
-fn expand_tilde(raw: &str, home: Option<&Path>) -> PathBuf {
-    let trimmed = raw.trim();
-    if let Some(home) = home {
-        if trimmed == "~" {
-            return home.to_path_buf();
-        }
-        if let Some(rest) = trimmed
-            .strip_prefix("~/")
-            .or_else(|| trimmed.strip_prefix("~\\"))
-        {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(trimmed)
-}
 
 pub struct PrimeAgentConnector;
 
@@ -137,13 +115,13 @@ impl PrimeAgentConnector {
         home: Option<&Path>,
     ) -> Vec<PathBuf> {
         if let Some(dir) = session_dir.filter(|s| !s.trim().is_empty()) {
-            return vec![expand_tilde(dir, home)];
+            return vec![expand_leading_tilde(dir, home)];
         }
         if let Some(dir) = legacy_session_dir.filter(|s| !s.trim().is_empty()) {
-            return vec![expand_tilde(dir, home)];
+            return vec![expand_leading_tilde(dir, home)];
         }
         if let Some(dir) = agent_dir.filter(|s| !s.trim().is_empty()) {
-            return vec![expand_tilde(dir, home).join("sessions")];
+            return vec![expand_leading_tilde(dir, home).join("sessions")];
         }
         home.map(|home| home.join(".prime").join("agent").join("sessions"))
             .into_iter()
