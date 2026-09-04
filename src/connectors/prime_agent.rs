@@ -47,6 +47,11 @@ const SUPPORTED_MAX_VERSION: i64 = 3;
 /// duplicated into SQLite; CASS's raw mirror retains the source file.
 const BOUNDED_FIELD_MAX_BYTES: usize = 2048;
 
+/// Ceiling on retained `child_usage_attributed` records. The count is always
+/// exact; only the retained sample is bounded so a deep RLM tree cannot grow
+/// conversation metadata without limit.
+const MAX_CHILD_USAGE_ENTRIES: usize = 32;
+
 /// `custom_message` extension types Prime itself excludes from useful
 /// conversation context (session command plumbing and compaction outcomes).
 const EXCLUDED_CUSTOM_MESSAGE_TYPES: &[&str] = &[
@@ -57,6 +62,29 @@ const EXCLUDED_CUSTOM_MESSAGE_TYPES: &[&str] = &[
     "compaction-outcome",
     "compaction_outcome",
 ];
+
+/// Expand a leading `~` the way Prime's own config loader does before using
+/// an override value as a path.
+///
+/// Prime expands only a leading tilde (`~` or `~/rest`); `~user` is not
+/// supported there and is left verbatim here too. When the home directory is
+/// unknown the raw value is preserved rather than silently rooted at the
+/// process working directory.
+fn expand_tilde(raw: &str, home: Option<&Path>) -> PathBuf {
+    let trimmed = raw.trim();
+    if let Some(home) = home {
+        if trimmed == "~" {
+            return home.to_path_buf();
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("~/")
+            .or_else(|| trimmed.strip_prefix("~\\"))
+        {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
 
 pub struct PrimeAgentConnector;
 
@@ -100,7 +128,8 @@ impl PrimeAgentConnector {
     /// - otherwise `~/.prime/agent/sessions`.
     ///
     /// Empty values (`FOO=""`) are treated as unset so scans never fall
-    /// through to the process working directory.
+    /// through to the process working directory. A leading `~` is expanded
+    /// against `home`, matching Prime's own override handling.
     fn session_dirs_from_overrides(
         session_dir: Option<&str>,
         legacy_session_dir: Option<&str>,
@@ -108,13 +137,13 @@ impl PrimeAgentConnector {
         home: Option<&Path>,
     ) -> Vec<PathBuf> {
         if let Some(dir) = session_dir.filter(|s| !s.trim().is_empty()) {
-            return vec![PathBuf::from(dir.trim())];
+            return vec![expand_tilde(dir, home)];
         }
         if let Some(dir) = legacy_session_dir.filter(|s| !s.trim().is_empty()) {
-            return vec![PathBuf::from(dir.trim())];
+            return vec![expand_tilde(dir, home)];
         }
         if let Some(dir) = agent_dir.filter(|s| !s.trim().is_empty()) {
-            return vec![PathBuf::from(dir.trim()).join("sessions")];
+            return vec![expand_tilde(dir, home).join("sessions")];
         }
         home.map(|home| home.join(".prime").join("agent").join("sessions"))
             .into_iter()
@@ -528,6 +557,8 @@ fn parse_session_file(path: &Path) -> Result<Option<NormalizedConversation>> {
     let mut git_state: Option<Value> = None;
     let mut agent_status: Option<Value> = None;
     let mut session_state: Option<String> = None;
+    let mut child_usage_entries: Vec<Value> = Vec::new();
+    let mut child_usage_count = 0_usize;
 
     let mut observe_timestamp = |ts: Option<i64>| {
         if let Some(ts) = ts {
@@ -805,12 +836,23 @@ fn parse_session_file(path: &Path) -> Result<Option<NormalizedConversation>> {
                     session_state = Some(state.to_string());
                 }
             }
+            "child_usage_attributed" => {
+                // RLM child sessions report their usage up to the parent.
+                // Prime folds it into the parent assistant aggregate on
+                // reload, so this is retained as explainable metadata ONLY:
+                // it never becomes a message and is never visible to
+                // `extract_tokens_for_agent`, which reads message
+                // `extra.usage` alone. Summing it would double count a child
+                // session that is also indexed from its own file.
+                child_usage_count += 1;
+                if child_usage_entries.len() < MAX_CHILD_USAGE_ENTRIES {
+                    child_usage_entries.push(sanitize_metadata_value(entry));
+                }
+            }
             // Bookkeeping that never becomes searchable turns:
             // thinking_level_change, service_tier_change, label, custom
-            // (extension state), child_usage_attributed (already folded into
-            // the parent assistant usage by Prime on reload — summing it
-            // again would double count), session_info (title, handled below
-            // in file order).
+            // (extension state), session_info (title, handled below in file
+            // order).
             _ => {}
         }
     }
@@ -900,6 +942,17 @@ fn parse_session_file(path: &Path) -> Result<Option<NormalizedConversation>> {
     }
     if let Some(state) = session_state {
         metadata.insert("session_state".into(), json!(state));
+    }
+    if child_usage_count > 0 {
+        metadata.insert(
+            "child_usage_attributed".into(),
+            json!({
+                "count": child_usage_count,
+                "retained": child_usage_entries.len(),
+                "entries": child_usage_entries,
+                "double_counting": "excluded from token extraction",
+            }),
+        );
     }
     if let Some(git) = git_state {
         metadata.insert("git_state".into(), git);
@@ -1328,5 +1381,305 @@ mod tests {
         let git = convs[0].metadata["git_state"].to_string();
         assert!(!git.contains("hunter2token"));
         assert!(git.contains("github.com/org/repo.git"));
+    }
+
+    #[test]
+    fn env_overrides_expand_a_leading_tilde() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            PrimeAgentConnector::session_dirs_from_overrides(
+                Some("~/custom/sessions"),
+                None,
+                None,
+                Some(home)
+            ),
+            vec![PathBuf::from("/home/u/custom/sessions")]
+        );
+        assert_eq!(
+            PrimeAgentConnector::session_dirs_from_overrides(
+                None,
+                Some("~/legacy/sessions"),
+                None,
+                Some(home)
+            ),
+            vec![PathBuf::from("/home/u/legacy/sessions")]
+        );
+        assert_eq!(
+            PrimeAgentConnector::session_dirs_from_overrides(None, None, Some("~"), Some(home)),
+            vec![PathBuf::from("/home/u/sessions")]
+        );
+        // `~user` is not a tilde Prime expands; keep it verbatim.
+        assert_eq!(
+            PrimeAgentConnector::session_dirs_from_overrides(
+                Some("~other/sessions"),
+                None,
+                None,
+                Some(home)
+            ),
+            vec![PathBuf::from("~other/sessions")]
+        );
+        // Without a known home the raw value survives rather than being
+        // silently rooted at the process working directory.
+        assert_eq!(
+            PrimeAgentConnector::session_dirs_from_overrides(Some("~/sessions"), None, None, None),
+            vec![PathBuf::from("~/sessions")]
+        );
+    }
+
+    #[test]
+    fn version_one_is_linear_and_v2_hook_messages_are_migrated() {
+        let tmp = TempDir::new().unwrap();
+        let dir = sessions_dir(&tmp);
+        // v1: no `version`, no tree ids — file order is the branch.
+        write_session(
+            &dir,
+            "v1.jsonl",
+            &[
+                r#"{"type":"session","id":"v1-session","timestamp":"2026-01-05T10:00:00.000Z","cwd":"/w"}"#,
+                r#"{"type":"message","timestamp":"2026-01-05T10:00:01.000Z","message":{"role":"user","content":"v1 first"}}"#,
+                r#"{"type":"message","timestamp":"2026-01-05T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"v1 second"}],"model":"gpt-4o"}}"#,
+            ],
+        );
+        // v2: `hookMessage` is the pre-v3 spelling of the `custom` role.
+        write_session(
+            &dir,
+            "v2.jsonl",
+            &[
+                r#"{"type":"session","version":2,"id":"v2-session","timestamp":"2026-01-05T10:00:00.000Z","cwd":"/w"}"#,
+                &msg("bbbb0001", None, r#"{"role":"user","content":"v2 first"}"#),
+                &msg(
+                    "bbbb0002",
+                    Some("bbbb0001"),
+                    r#"{"role":"hookMessage","customType":"my-hook","content":"hook context","display":false}"#,
+                ),
+                &msg(
+                    "bbbb0003",
+                    Some("bbbb0002"),
+                    r#"{"role":"hookMessage","customType":"session-command","content":"hidden plumbing"}"#,
+                ),
+            ],
+        );
+
+        let connector = PrimeAgentConnector::new();
+        let ctx = ScanContext::local_default(dir, None);
+        let mut convs = connector.scan(&ctx).unwrap();
+        convs.sort_by(|a, b| a.external_id.cmp(&b.external_id));
+        assert_eq!(convs.len(), 2);
+
+        let v1 = &convs[0];
+        assert_eq!(v1.external_id.as_deref(), Some("v1-session"));
+        assert_eq!(v1.metadata["session_version"], 1);
+        assert_eq!(v1.metadata["tree_integrity"], "ok");
+        assert_eq!(v1.metadata["omitted_branch_entry_count"], 0);
+        assert_eq!(v1.messages.len(), 2);
+        assert!(v1.messages[0].content.contains("v1 first"));
+        assert!(v1.messages[1].content.contains("v1 second"));
+
+        let v2 = &convs[1];
+        assert_eq!(v2.metadata["session_version"], 2);
+        let hook = v2
+            .messages
+            .iter()
+            .find(|m| m.content.contains("hook context"))
+            .expect("v2 hookMessage should be migrated to the custom role");
+        assert_eq!(hook.extra["source_role"], "custom");
+        assert_eq!(hook.extra["customType"], "my-hook");
+        assert!(
+            !v2.messages
+                .iter()
+                .any(|m| m.content.contains("hidden plumbing")),
+            "excluded custom types stay excluded under the v2 spelling"
+        );
+    }
+
+    #[test]
+    fn child_usage_attribution_is_metadata_only_and_never_double_counted() {
+        let tmp = TempDir::new().unwrap();
+        let dir = sessions_dir(&tmp);
+        write_session(
+            &dir,
+            "rlm.jsonl",
+            &[
+                HEADER,
+                &msg(
+                    "aaaa0001",
+                    None,
+                    r#"{"role":"user","content":"delegate this"}"#,
+                ),
+                &msg(
+                    "aaaa0002",
+                    Some("aaaa0001"),
+                    r#"{"role":"assistant","content":[{"type":"text","text":"delegated"}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":100,"output":40,"cacheRead":7,"cacheWrite":3},"timestamp":1767607202000}"#,
+                ),
+                r#"{"type":"child_usage_attributed","id":"aaaa0003","parentId":"aaaa0002","timestamp":"2026-01-05T10:00:03.000Z","childSessionId":"child-1","usage":{"input":9000,"output":8000}}"#,
+            ],
+        );
+
+        let connector = PrimeAgentConnector::new();
+        let ctx = ScanContext::local_default(dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+        let conv = &convs[0];
+
+        // Structured metadata only: never a searchable turn.
+        assert_eq!(conv.metadata["child_usage_attributed"]["count"], 1);
+        assert_eq!(
+            conv.metadata["child_usage_attributed"]["entries"][0]["childSessionId"],
+            "child-1"
+        );
+        assert!(!conv.messages.iter().any(|m| m.content.contains("child-1")));
+
+        // Token extraction sees the assistant's DIRECT usage only; the
+        // child's 9000/8000 is not added, so a separately indexed child file
+        // cannot be counted twice.
+        let assistant = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .unwrap();
+        let usage = crate::connectors::extract_tokens_for_agent(
+            "prime_agent",
+            &assistant.extra,
+            &assistant.content,
+            &assistant.role,
+        );
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(40));
+        assert_eq!(usage.cache_read_tokens, Some(7));
+        assert_eq!(usage.cache_creation_tokens, Some(3));
+        assert_eq!(usage.model_name.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(usage.provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn discovery_surfaces_candidates_that_parsing_rejects() {
+        let tmp = TempDir::new().unwrap();
+        let dir = sessions_dir(&tmp);
+        write_session(
+            &dir,
+            "good.jsonl",
+            &[
+                HEADER,
+                &msg("aaaa0001", None, r#"{"role":"user","content":"kept"}"#),
+            ],
+        );
+        write_session(
+            &dir,
+            "future.jsonl",
+            &[
+                r#"{"type":"session","version":99,"id":"future","timestamp":"2026-01-05T10:00:00.000Z","cwd":"/w"}"#,
+                &msg(
+                    "aaaa0001",
+                    None,
+                    r#"{"role":"user","content":"unreadable"}"#,
+                ),
+            ],
+        );
+        write_session(&dir, "torn.jsonl", &["{ not json at all"]);
+
+        let connector = PrimeAgentConnector::new();
+        let ctx = ScanContext::local_default(dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1, "only the valid session parses");
+
+        // Discovery is pre-parse: CASS must still be able to raw-mirror the
+        // files this connector refuses to normalize.
+        let discovered: Vec<PathBuf> = connector
+            .discover_source_files(&ctx)
+            .unwrap()
+            .into_iter()
+            .map(|source| source.source_path)
+            .collect();
+        for name in ["good.jsonl", "future.jsonl", "torn.jsonl"] {
+            assert!(
+                discovered.contains(&dir.join(name)),
+                "discovery should surface {name}"
+            );
+        }
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
+    }
+
+    #[test]
+    fn prime_and_pi_stores_do_not_cross_identify() {
+        use crate::connectors::pi_agent::PiAgentConnector;
+
+        let tmp = TempDir::new().unwrap();
+        let prime_sessions = sessions_dir(&tmp);
+        write_session(
+            &prime_sessions,
+            "0192aa11-0000-7000-8000-000000000001.jsonl",
+            &[
+                HEADER,
+                &msg(
+                    "aaaa0001",
+                    None,
+                    r#"{"role":"user","content":"prime work"}"#,
+                ),
+            ],
+        );
+
+        let pi_sessions = tmp.path().join(".pi/agent/sessions");
+        fs::create_dir_all(&pi_sessions).unwrap();
+        fs::write(
+            pi_sessions.join("2026-01-05T10-00-00_uuid1.jsonl"),
+            [
+                r#"{"type":"session","id":"pi-sess-1","timestamp":"2026-01-05T10:00:00Z","cwd":"/w","provider":"anthropic","modelId":"claude-3-opus"}"#,
+                r#"{"type":"message","timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"pi work"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        // A neutral data_dir: neither connector may fall back to real
+        // home-directory stores during the test.
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        // Prime, pointed at the Pi store, claims nothing.
+        let prime = PrimeAgentConnector::new();
+        let prime_on_pi = ScanContext::with_roots(
+            data_dir.clone(),
+            vec![ScanRoot::local(tmp.path().join(".pi"))],
+            None,
+        );
+        assert!(prime.scan(&prime_on_pi).unwrap().is_empty());
+        assert!(
+            prime
+                .discover_source_files(&prime_on_pi)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Pi, pointed at the Prime store, claims nothing.
+        let pi = PiAgentConnector::new();
+        let pi_on_prime = ScanContext::with_roots(
+            data_dir.clone(),
+            vec![ScanRoot::local(tmp.path().join(".prime"))],
+            None,
+        );
+        assert!(
+            pi.scan(&pi_on_prime).unwrap().is_empty(),
+            "pi_agent must not relabel Prime sessions as pi_agent"
+        );
+
+        // Each still finds its own store, with its own slug.
+        let prime_convs = prime
+            .scan(&ScanContext::with_roots(
+                data_dir.clone(),
+                vec![ScanRoot::local(tmp.path().join(".prime"))],
+                None,
+            ))
+            .unwrap();
+        assert_eq!(prime_convs.len(), 1);
+        assert_eq!(prime_convs[0].agent_slug, "prime_agent");
+
+        let pi_convs = pi
+            .scan(&ScanContext::with_roots(
+                data_dir.clone(),
+                vec![ScanRoot::local(tmp.path().join(".pi"))],
+                None,
+            ))
+            .unwrap();
+        assert_eq!(pi_convs.len(), 1);
+        assert_eq!(pi_convs[0].agent_slug, "pi_agent");
     }
 }
