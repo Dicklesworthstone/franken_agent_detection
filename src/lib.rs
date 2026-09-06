@@ -160,7 +160,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
     match slug {
         "aider" | "aider-cli" => Some("aider"),
         "amp" | "amp-cli" => Some("amp"),
-        "antigravity" | "agy" | "antigravity-cli" => Some("antigravity"),
+        "antigravity" | "agy" | "antigravity-cli" | "antigravity-ide" => Some("antigravity"),
         "chatgpt" | "chat-gpt" | "chatgpt-desktop" => Some("chatgpt"),
         "claude" | "claude-code" => Some("claude"),
         "clawdbot" | "clawd-bot" => Some("clawdbot"),
@@ -657,6 +657,12 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".config", "factory-droid"]);
         }
         "antigravity" => {
+            // Two products, two stores (cass #454): the Antigravity IDE
+            // (`~/.gemini/antigravity`) and the `agy` CLI
+            // (`~/.gemini/antigravity-cli`). The connector scans both.
+            maybe_push(&mut out, &[".gemini", "antigravity", "conversations"]);
+            maybe_push(&mut out, &[".gemini", "antigravity", "brain"]);
+            maybe_push(&mut out, &[".gemini", "antigravity"]);
             maybe_push(&mut out, &[".gemini", "antigravity-cli", "conversations"]);
             maybe_push(&mut out, &[".gemini", "antigravity-cli", "brain"]);
             maybe_push(&mut out, &[".gemini", "antigravity-cli"]);
@@ -1279,6 +1285,9 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".config", "factory-droid"]),
                 ],
                 "antigravity" => vec![
+                    tilde(&[".gemini", "antigravity", "conversations"]),
+                    tilde(&[".gemini", "antigravity", "brain"]),
+                    tilde(&[".gemini", "antigravity"]),
                     tilde(&[".gemini", "antigravity-cli", "conversations"]),
                     tilde(&[".gemini", "antigravity-cli", "brain"]),
                     tilde(&[".gemini", "antigravity-cli"]),

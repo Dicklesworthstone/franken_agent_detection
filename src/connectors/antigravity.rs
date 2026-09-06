@@ -1,9 +1,17 @@
-//! Antigravity (`agy`) connector.
+//! Antigravity connector (the Antigravity IDE and the `agy` CLI).
 //!
-//! [Antigravity](https://antigravity.google) ships the `agy` CLI, Google's
-//! successor to the Gemini CLI (`gmi`). It stores history under
-//! `~/.gemini/antigravity-cli/` (a directory it shares with — but keeps separate
-//! from — the legacy Gemini CLI, whose data lives under `~/.gemini/tmp/`):
+//! [Antigravity](https://antigravity.google) ships both an IDE and the `agy`
+//! CLI, Google's successor to the Gemini CLI (`gmi`). Each keeps its own store
+//! under `~/.gemini/` (a directory they share with — but keep separate from —
+//! the legacy Gemini CLI, whose data lives under `~/.gemini/tmp/`):
+//!
+//! - `~/.gemini/antigravity/` — the Antigravity **IDE** workspace sessions.
+//! - `~/.gemini/antigravity-cli/` — the `agy` **CLI** conversations.
+//!
+//! The two stores are structurally identical. By default the connector probes
+//! BOTH and indexes every root that exists; `CASS_ANTIGRAVITY_DATA_ROOT`
+//! replaces the pair with a single explicit base (tests / remote mirrors).
+//! Inside a base:
 //!
 //! - `conversations/<uuid>.db` — one stock-SQLite database per conversation. The
 //!   payload columns are an undocumented protobuf trajectory/steps model; this is
@@ -15,6 +23,18 @@
 //!
 //! The `<uuid>` keying `conversations/<uuid>.db` and `brain/<uuid>/` is the same
 //! id used by `agy --conversation <uuid>`.
+//!
+//! ## Provenance across the two stores
+//!
+//! Consumers key a conversation by `(agent, external_id)`, so the IDE and CLI
+//! stores must never yield the same `external_id` for different
+//! conversations. A conversation under the IDE base (`.gemini/antigravity`)
+//! is emitted with `external_id = "ide/<uuid>"`; a conversation under the CLI
+//! base (`.gemini/antigravity-cli`) — or under any base the connector cannot
+//! classify (fixtures, relocated mirrors) — keeps the bare `<uuid>` so
+//! existing archives stay stable. Every conversation additionally records
+//! `metadata.layout` (`"ide"` / `"cli"`, when classified) and
+//! `metadata.data_root` (the base directory it was read from).
 //!
 //! ## transcript.jsonl record shape
 //!
@@ -62,6 +82,68 @@ use crate::types::{
 /// Normalized agent slug emitted for every Antigravity conversation.
 const AGENT_SLUG: &str = "antigravity";
 
+/// Which Antigravity product wrote a store.
+///
+/// Classified from the on-disk location shape only — `.gemini/antigravity`
+/// is the IDE, `.gemini/antigravity-cli` is the `agy` CLI — so the answer does
+/// not depend on how the scan reached the base (default probe, env override,
+/// or an explicit root). Any other base (fixtures, relocated mirrors) is
+/// unclassified and treated like the CLI for identity purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AntigravityLayout {
+    /// The Antigravity IDE (`~/.gemini/antigravity`).
+    Ide,
+    /// The `agy` CLI (`~/.gemini/antigravity-cli`).
+    Cli,
+}
+
+impl AntigravityLayout {
+    /// The base directory name under `~/.gemini/` for this layout.
+    const fn base_dir_name(self) -> &'static str {
+        match self {
+            Self::Ide => "antigravity",
+            Self::Cli => "antigravity-cli",
+        }
+    }
+
+    /// The `metadata.layout` value for this layout.
+    const fn metadata_value(self) -> &'static str {
+        match self {
+            Self::Ide => "ide",
+            Self::Cli => "cli",
+        }
+    }
+
+    /// Classify a base directory by its `.gemini/<name>` location shape.
+    fn from_base(base: &Path) -> Option<Self> {
+        let parent_is_dot_gemini = base
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == ".gemini");
+        if !parent_is_dot_gemini {
+            return None;
+        }
+        let name = base.file_name()?;
+        [Self::Ide, Self::Cli]
+            .into_iter()
+            .find(|layout| name == layout.base_dir_name())
+    }
+
+    /// The `external_id` for a conversation `<uuid>` under this layout.
+    ///
+    /// IDE conversations are qualified (`ide/<uuid>`) so a uuid that appears
+    /// under both stores cannot collide in `(agent, external_id)`-keyed
+    /// consumers; the CLI keeps the bare `<uuid>` (the id `agy --conversation`
+    /// resumes by) so archives indexed before the IDE store was probed stay
+    /// stable.
+    fn external_id(self, uuid: &str) -> String {
+        match self {
+            Self::Ide => format!("ide/{uuid}"),
+            Self::Cli => uuid.to_string(),
+        }
+    }
+}
+
 /// Connector for the Antigravity (`agy`) coding agent.
 pub struct AntigravityConnector;
 
@@ -77,18 +159,33 @@ impl AntigravityConnector {
         Self
     }
 
-    /// Base directory holding `conversations/` and `brain/`.
+    /// Base directories holding `conversations/` and `brain/`.
     ///
-    /// Defaults to `~/.gemini/antigravity-cli`; overridable for tests / remote
-    /// mirrors via `CASS_ANTIGRAVITY_DATA_ROOT`.
-    fn base_root() -> PathBuf {
+    /// `CASS_ANTIGRAVITY_DATA_ROOT` (tests / remote mirrors) names a single
+    /// explicit base and replaces the defaults. Otherwise both product stores
+    /// are candidates — `~/.gemini/antigravity` (IDE) and
+    /// `~/.gemini/antigravity-cli` (`agy` CLI) — and the scan indexes every one
+    /// that exists (cass #454).
+    fn base_roots() -> Vec<PathBuf> {
         if let Some(explicit) = env_path_nonempty("CASS_ANTIGRAVITY_DATA_ROOT") {
-            return explicit;
+            return vec![explicit];
         }
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".gemini")
-            .join("antigravity-cli")
+        Self::default_base_roots(&dirs::home_dir().unwrap_or_default())
+    }
+
+    /// The default IDE + CLI bases under a home directory, IDE first.
+    fn default_base_roots(home: &Path) -> Vec<PathBuf> {
+        let dot_gemini = home.join(".gemini");
+        vec![
+            dot_gemini.join(AntigravityLayout::Ide.base_dir_name()),
+            dot_gemini.join(AntigravityLayout::Cli.base_dir_name()),
+        ]
+    }
+
+    /// The `<base>` directory (`brain/`'s parent) for a `brain/<uuid>`
+    /// conversation directory.
+    fn base_of_conversation_dir(conversation_dir: &Path) -> Option<&Path> {
+        conversation_dir.parent()?.parent()
     }
 
     /// Transcript path for a `brain/<uuid>` conversation directory.
@@ -127,8 +224,7 @@ impl AntigravityConnector {
     /// `<base>/conversations/<uuid>.db`).
     fn sibling_db_path(conversation_dir: &Path) -> Option<PathBuf> {
         let uuid = Self::conversation_uuid(conversation_dir)?;
-        // conversation_dir = <base>/brain/<uuid>; climb to <base>.
-        let base = conversation_dir.parent()?.parent()?;
+        let base = Self::base_of_conversation_dir(conversation_dir)?;
         let db = base.join("conversations").join(format!("{uuid}.db"));
         db.is_file().then_some(db)
     }
@@ -136,12 +232,12 @@ impl AntigravityConnector {
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots = if ctx.use_default_detection() {
             // Mirror the explicit-root acceptance: a default-detection
-            // data_dir that itself looks like antigravity storage (an
-            // `antigravity-cli` base with a `brain/` tree, or the `brain/`
-            // dir itself) scopes the scan to it, so fixture/mirror scans
-            // stay hermetic; otherwise probe the system base.
-            // `CASS_ANTIGRAVITY_DATA_ROOT` keeps precedence so CI
-            // redirection is unaffected.
+            // data_dir that itself looks like antigravity storage (a base
+            // with a `brain/` tree, or the `brain/` dir itself) scopes the
+            // scan to it, so fixture/mirror scans stay hermetic; otherwise
+            // probe the system bases (IDE and CLI). Roots that do not exist
+            // are skipped by the scan. `CASS_ANTIGRAVITY_DATA_ROOT` keeps
+            // precedence so CI redirection is unaffected.
             let d = &ctx.data_dir;
             let env_override = env_path_nonempty("CASS_ANTIGRAVITY_DATA_ROOT").is_some();
             let looks_like_base =
@@ -149,7 +245,10 @@ impl AntigravityConnector {
             if !env_override && looks_like_base {
                 vec![ScanRoot::local(d.clone())]
             } else {
-                vec![ScanRoot::local(Self::base_root())]
+                Self::base_roots()
+                    .into_iter()
+                    .map(ScanRoot::local)
+                    .collect()
             }
         } else {
             ctx.scan_roots.clone()
@@ -162,7 +261,7 @@ impl AntigravityConnector {
 
     /// Resolve every `brain/<uuid>` conversation directory reachable from a scan
     /// target. The target may be the conversation directory itself, the `brain/`
-    /// directory, or the `antigravity-cli` base directory.
+    /// directory, or a base directory (`antigravity` or `antigravity-cli`).
     fn conversation_dirs(scan_target: &Path) -> Vec<PathBuf> {
         if Self::is_conversation_dir(scan_target) {
             return vec![scan_target.to_path_buf()];
@@ -171,7 +270,7 @@ impl AntigravityConnector {
         let mut out = Vec::new();
         // The transcript sits at <conv>/.system_generated/logs/transcript.jsonl,
         // so the conversation dir is three levels above the file. From the
-        // antigravity-cli base it is at depth 5; the cap is set higher so a scan
+        // base directory it is at depth 5; the cap is set higher so a scan
         // root one or two levels above (e.g. ~ or ~/.gemini, as remote mirrors
         // can produce) still finds it. The .system_generated/logs ancestry filter
         // below keeps correctness regardless of depth — the cap only bounds cost.
@@ -528,7 +627,10 @@ fn parse_conversation(
             .unwrap_or(i64::MAX)
     });
 
-    let external_id = AntigravityConnector::conversation_uuid(conversation_dir);
+    let base = AntigravityConnector::base_of_conversation_dir(conversation_dir);
+    let layout = base.and_then(AntigravityLayout::from_base);
+    let external_id = AntigravityConnector::conversation_uuid(conversation_dir)
+        .map(|uuid| layout.unwrap_or(AntigravityLayout::Cli).external_id(&uuid));
     let model = detect_model(&records);
 
     let mut messages: Vec<NormalizedMessage> = Vec::new();
@@ -571,6 +673,21 @@ fn parse_conversation(
     metadata.insert("source".to_string(), Value::String(AGENT_SLUG.to_string()));
     if let Some(model) = model {
         metadata.insert("model".to_string(), Value::String(model));
+    }
+    // Provenance: which store (IDE vs CLI) and which base directory this
+    // conversation was read from, so identical uuids across stores stay
+    // distinguishable downstream.
+    if let Some(layout) = layout {
+        metadata.insert(
+            "layout".to_string(),
+            Value::String(layout.metadata_value().to_string()),
+        );
+    }
+    if let Some(base) = base {
+        metadata.insert(
+            "data_root".to_string(),
+            Value::String(base.to_string_lossy().into_owned()),
+        );
     }
 
     Some(NormalizedConversation {
@@ -793,7 +910,9 @@ mod tests {
 
     const FIXTURE_UUID: &str = "f1e2d3c4-b5a6-4789-9abc-def012345678";
 
-    /// The `antigravity-cli`-equivalent base directory of the checked-in fixture.
+    /// The base directory (`brain/` + `conversations/`) of the checked-in
+    /// fixture. It is not under a `.gemini/` parent, so it is deliberately
+    /// unclassified (neither IDE nor CLI).
     fn fixture_base() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
@@ -1246,6 +1365,206 @@ mod tests {
         assert_eq!(
             convs[0].external_id.as_deref(),
             Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+    // ---------------------------------------------------------------------
+    // Dual-store layout (cass #454): IDE `~/.gemini/antigravity` + CLI
+    // `~/.gemini/antigravity-cli`.
+    // ---------------------------------------------------------------------
+
+    const SHARED_UUID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    /// Write a minimal one-step transcript for `<base>/brain/<uuid>` whose user
+    /// request is `marker`, returning the conversation directory.
+    fn write_conversation(base: &Path, uuid: &str, marker: &str) -> PathBuf {
+        let conv_dir = base.join("brain").join(uuid);
+        let logs = conv_dir.join(".system_generated").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("transcript.jsonl"),
+            format!(
+                "{{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-06-11T20:14:42Z\",\"content\":\"<USER_REQUEST>\\n{marker}\\n</USER_REQUEST>\"}}\n"
+            ),
+        )
+        .unwrap();
+        conv_dir
+    }
+
+    #[test]
+    fn default_base_roots_probe_ide_then_cli_under_dot_gemini() {
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            AntigravityConnector::default_base_roots(home),
+            vec![
+                PathBuf::from("/home/someone/.gemini/antigravity"),
+                PathBuf::from("/home/someone/.gemini/antigravity-cli"),
+            ]
+        );
+    }
+
+    #[test]
+    fn layout_is_classified_from_dot_gemini_location_shape_only() {
+        assert_eq!(
+            AntigravityLayout::from_base(Path::new("/h/.gemini/antigravity")),
+            Some(AntigravityLayout::Ide)
+        );
+        assert_eq!(
+            AntigravityLayout::from_base(Path::new("/h/.gemini/antigravity-cli")),
+            Some(AntigravityLayout::Cli)
+        );
+        // A same-named directory outside `.gemini/` (fixture, relocated
+        // mirror) is unclassified rather than guessed.
+        assert_eq!(
+            AntigravityLayout::from_base(Path::new("/mirror/antigravity")),
+            None
+        );
+        assert_eq!(
+            AntigravityLayout::from_base(Path::new("/h/.gemini/antigravity-ide")),
+            None
+        );
+        assert_eq!(AntigravityLayout::from_base(&fixture_base()), None);
+    }
+
+    #[test]
+    fn external_ids_qualify_ide_and_keep_cli_bare() {
+        assert_eq!(AntigravityLayout::Ide.external_id("u-1"), "ide/u-1");
+        assert_eq!(AntigravityLayout::Cli.external_id("u-1"), "u-1");
+    }
+
+    #[test]
+    fn ide_and_cli_stores_are_both_scanned_and_same_uuid_never_collides() {
+        let tmp = TempDir::new().unwrap();
+        let dot_gemini = tmp.path().join(".gemini");
+        let ide_base = dot_gemini.join("antigravity");
+        let cli_base = dot_gemini.join("antigravity-cli");
+        // The SAME uuid under both stores must surface as two distinct
+        // conversations with different external ids.
+        write_conversation(&ide_base, SHARED_UUID, "from the IDE");
+        write_conversation(&cli_base, SHARED_UUID, "from the CLI");
+
+        // The two default probe roots, exactly as `base_roots()` produces them.
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![
+                ScanRoot::local(ide_base.clone()),
+                ScanRoot::local(cli_base.clone()),
+            ],
+            None,
+        );
+        let mut convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        convs.sort_by(|a, b| a.external_id.cmp(&b.external_id));
+        assert_eq!(convs.len(), 2, "one conversation per store");
+
+        let cli = &convs[0];
+        assert_eq!(cli.external_id.as_deref(), Some(SHARED_UUID));
+        assert_eq!(cli.metadata["layout"], "cli");
+        assert_eq!(
+            cli.metadata["data_root"],
+            cli_base.to_string_lossy().as_ref()
+        );
+        assert!(cli.source_path.starts_with(&cli_base));
+        assert_eq!(cli.messages[0].content, "from the CLI");
+
+        let ide = &convs[1];
+        assert_eq!(
+            ide.external_id.as_deref(),
+            Some(format!("ide/{SHARED_UUID}").as_str())
+        );
+        assert_eq!(ide.metadata["layout"], "ide");
+        assert_eq!(
+            ide.metadata["data_root"],
+            ide_base.to_string_lossy().as_ref()
+        );
+        assert!(ide.source_path.starts_with(&ide_base));
+        assert_eq!(ide.messages[0].content, "from the IDE");
+
+        // Discovery preserves per-root provenance for both stores.
+        let discovered = AntigravityConnector::new()
+            .discover_source_files(&ctx)
+            .unwrap();
+        let transcripts: Vec<&DiscoveredSourceFile> = discovered
+            .iter()
+            .filter(|d| d.required_for_reconstruction)
+            .collect();
+        assert_eq!(transcripts.len(), 2);
+        assert!(
+            transcripts
+                .iter()
+                .any(|d| d.scan_root == ide_base && d.source_path.starts_with(&ide_base))
+        );
+        assert!(
+            transcripts
+                .iter()
+                .any(|d| d.scan_root == cli_base && d.source_path.starts_with(&cli_base))
+        );
+        assert_discovery_covers_scan_sources(&AntigravityConnector::new(), &ctx);
+    }
+
+    #[test]
+    fn missing_ide_store_is_skipped_and_cli_store_still_indexed() {
+        let tmp = TempDir::new().unwrap();
+        let dot_gemini = tmp.path().join(".gemini");
+        let ide_base = dot_gemini.join("antigravity"); // never created
+        let cli_base = dot_gemini.join("antigravity-cli");
+        write_conversation(&cli_base, SHARED_UUID, "cli only");
+
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(ide_base), ScanRoot::local(cli_base)],
+            None,
+        );
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some(SHARED_UUID));
+        assert_eq!(convs[0].metadata["layout"], "cli");
+    }
+
+    #[test]
+    fn scan_rooted_at_shared_dot_gemini_finds_both_stores_once() {
+        // A remote mirror may root the scan one level up, at `.gemini` itself.
+        // Both stores are found, each exactly once.
+        let tmp = TempDir::new().unwrap();
+        let dot_gemini = tmp.path().join(".gemini");
+        write_conversation(
+            &dot_gemini.join("antigravity"),
+            "11111111-1111-4111-8111-111111111111",
+            "ide",
+        );
+        write_conversation(
+            &dot_gemini.join("antigravity-cli"),
+            "22222222-2222-4222-8222-222222222222",
+            "cli",
+        );
+
+        let ctx =
+            ScanContext::with_roots(dot_gemini.clone(), vec![ScanRoot::local(dot_gemini)], None);
+        let mut ids: Vec<String> = AntigravityConnector::new()
+            .scan(&ctx)
+            .unwrap()
+            .into_iter()
+            .filter_map(|c| c.external_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "22222222-2222-4222-8222-222222222222".to_string(),
+                "ide/11111111-1111-4111-8111-111111111111".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unclassified_fixture_base_keeps_bare_uuid_and_records_data_root() {
+        let conv = only_conversation();
+        assert_eq!(conv.external_id.as_deref(), Some(FIXTURE_UUID));
+        assert!(
+            conv.metadata.get("layout").is_none(),
+            "a base outside .gemini/ must not be guessed as IDE or CLI"
+        );
+        assert_eq!(
+            conv.metadata["data_root"],
+            fixture_base().to_string_lossy().as_ref()
         );
     }
 }

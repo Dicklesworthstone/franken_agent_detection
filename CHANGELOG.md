@@ -61,6 +61,21 @@ Scope window: 2026-02-15 through HEAD
 
 ### Fixed
 
+- **Antigravity detection and scanning cover the IDE store, not just the
+  `agy` CLI** (cass #454). The connector only probed
+  `~/.gemini/antigravity-cli`, so sessions written by the Antigravity IDE to
+  the structurally identical `~/.gemini/antigravity/` tree
+  (`brain/<uuid>/.system_generated/logs/transcript.jsonl` +
+  `conversations/<uuid>.db`) were never indexed unless the user found
+  `CASS_ANTIGRAVITY_DATA_ROOT`. With the override unset, both bases are now
+  probed (detection and scan) and every root that exists is indexed. Store
+  provenance is recorded so the two can never collide in
+  `(agent, external_id)`-keyed consumers: a conversation under the IDE base is
+  emitted with `external_id = "ide/<uuid>"`, the CLI (and any unclassified
+  base such as a fixture or relocated mirror) keeps the bare `<uuid>`, and
+  every conversation carries `metadata.layout` (`"ide"`/`"cli"`) and
+  `metadata.data_root`. `CASS_ANTIGRAVITY_DATA_ROOT` still replaces the pair
+  with one explicit base. `antigravity-ide` joins the slug aliases.
 - **Claude Code detection honors `CLAUDE_CONFIG_DIR` and `XDG_CONFIG_HOME`**
   (cass #448, follow-up to cass #214). The connector's root resolver already
   scanned `$CLAUDE_CONFIG_DIR/projects` / `$XDG_CONFIG_HOME/claude-code/projects`,
