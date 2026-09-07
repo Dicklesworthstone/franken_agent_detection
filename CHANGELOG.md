@@ -24,12 +24,13 @@ Crate: <https://crates.io/crates/franken-agent-detection>
 Scope window: 2026-02-15 through HEAD
 [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
 (2026-08-19). Current Unreleased window is since GitHub Release
-[`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10).
+[`v0.2.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.3).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.2.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.3) | GitHub Release | 2026-09-07 | Devin CLI connector; Antigravity IDE store, Claude `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` detection, muse/goose/hermes/crush scan scoping, Codex token usage, Claude tool results, Cursor/OpenCode dedupe, 100MB scan cap everywhere. |
 | [`v0.2.2`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.2) | GitHub Release | 2026-08-24 | Cross-connector audit fixes (opencode, muse, clawdbot, chatgpt, amp, aider, copilot-cli, cursor, grok); registry invariant hardening. |
 | [`v0.2.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.1) | GitHub Release | 2026-08-23 | Fresh-eyes fixes: pi-family discovery preserves scan-root provenance; registry invariant tests. |
 | [`v0.2.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.0) | GitHub Release | 2026-08-23 | First-class Oh My Pi (`omp`) connector; shared pi-family wire parser; dep refresh (aes-gcm 0.11, base64 0.23, fsqlite 0.3.8 + asupersync 0.4.9). |
@@ -43,6 +44,10 @@ Scope window: 2026-02-15 through HEAD
 ---
 
 ## [Unreleased]
+
+Nothing yet.
+
+## [0.2.3] -- 2026-09-07
 
 ### Added
 
@@ -85,7 +90,7 @@ Scope window: 2026-02-15 through HEAD
   gains a `claude` arm (`CLAUDE_CONFIG_DIR` replaces the defaults, like the
   resolver) and the default probe adds `$XDG_CONFIG_HOME/claude-code`
   (additive, so `~/.claude` users with a global `XDG_CONFIG_HOME` stay
-  detected). In-tree Cargo is `0.2.3` (pending release).
+  detected).
 - **Muse default-detection no longer ignores a Cursor-style base `data_dir`.**
   The muse connector was the last of the three single-surface connectors
   (with Grok and Antigravity, both fixed in 0.2.2) whose default-detection
