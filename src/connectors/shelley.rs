@@ -235,6 +235,11 @@ impl ShelleyConnector {
             if admit_database(&db, candidate.kind).is_err() {
                 continue;
             }
+            // Scan reports each conversation's `source_path` as the canonical
+            // database path; discovery (and the source completion built in
+            // scan_candidates) must name the same path, or the source-boundary
+            // contract cannot pair a conversation with its source.
+            let db = canonical_db_path(db);
             out.push(
                 DiscoveredSourceFile::new(
                     "shelley",
@@ -307,9 +312,11 @@ impl ShelleyConnector {
                 }
             }
             // Pre-parse source identity, constructed exactly like
-            // discover_sources() with size/mtime observed BEFORE the database
-            // is opened (FAD#22). The predicate runs before admission so an
-            // unchanged database is skipped without even being opened.
+            // discover_sources() — same canonical path, size/mtime observed
+            // BEFORE the database is opened (FAD#22). The predicate runs before
+            // admission so an unchanged database is skipped without even being
+            // opened.
+            let db = canonical_db_path(db);
             let discovered = DiscoveredSourceFile::new(
                 "shelley",
                 &candidate.root,
@@ -423,6 +430,14 @@ impl Connector for ShelleyConnector {
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         Ok(Self::discover_sources(ctx))
     }
+}
+
+/// The one path discovery, scan and source completions all report for a
+/// database: canonical when resolvable (a store reached through a symlink
+/// dedupes to one identity; macOS temp dirs are `/var` -> `/private/var`
+/// symlinks), otherwise the path as given. Sidecars derive from it.
+fn canonical_db_path(db: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&db).unwrap_or(db)
 }
 
 fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
@@ -2572,7 +2587,9 @@ mod tests {
     #[test]
     fn wal_only_row_is_visible_and_reader_does_not_mutate() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db_path = build_fixture(tmp.path(), "wal.db", false);
+        // Canonical so the sidecar path below matches what discovery reports
+        // (macOS temp dirs are symlinks).
+        let db_path = std::fs::canonicalize(build_fixture(tmp.path(), "wal.db", false)).unwrap();
         let writer = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         let mode: String = writer
             .query_row_map("PRAGMA journal_mode=wal;", &[], |row| {
@@ -2654,6 +2671,9 @@ mod tests {
             None,
         );
         drop(conn);
+        // Discovery reports canonical paths (matching scan), so compare against
+        // the canonical fixture path: on macOS the temp dir is a symlink.
+        let db_path = std::fs::canonicalize(&db_path).unwrap();
 
         let wal_path = sidecar_path(&db_path, "-wal");
         let shm_path = sidecar_path(&db_path, "-shm");

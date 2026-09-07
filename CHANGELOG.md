@@ -66,6 +66,16 @@ Nothing yet.
 
 ### Fixed
 
+- **Shelley discovery names the same path as scan.** `scan()` reports each
+  conversation's `source_path` as the canonical database path (a store
+  reached through a symlink dedupes to one identity), but
+  `discover_source_files()` emitted the raw candidate path, so on a
+  symlinked root the source-boundary contract could not pair a conversation
+  with its source; the WAL/SHM sidecars followed the raw path too. Discovery
+  now canonicalizes the admitted database before listing it and its
+  sidecars. Surfaced by the `scan_projects_roles_order_and_identity`
+  discovery-covers-scan assertion, which fails on macOS (`/var` →
+  `/private/var` temp dirs) and passes on Linux.
 - **Antigravity detection and scanning cover the IDE store, not just the
   `agy` CLI** (cass #454). The connector only probed
   `~/.gemini/antigravity-cli`, so sessions written by the Antigravity IDE to
