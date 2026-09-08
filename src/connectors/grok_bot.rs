@@ -492,7 +492,10 @@ mod tests {
             );
         }
         for suffix in ["", ".json", ".BLOB", ".blob.json", ".blob.blob"] {
-            assert_eq!(replica_key(Path::new(&format!("{}{suffix}", encode(KEY)))), None);
+            assert_eq!(
+                replica_key(Path::new(&format!("{}{suffix}", encode(KEY)))),
+                None
+            );
         }
     }
 
@@ -503,9 +506,10 @@ mod tests {
         let persistence = config.join("sand-client-persistence");
         let path = write_sample(&persistence);
         fs::write(
-            persistence.join(format!("{}.blob", encode(
-                &KEY.replace("transcript.replicas", "roster.last-roster"),
-            ))),
+            persistence.join(format!(
+                "{}.blob",
+                encode(&KEY.replace("transcript.replicas", "roster.last-roster"),)
+            )),
             REPORTER_SAMPLE,
         )
         .unwrap();
