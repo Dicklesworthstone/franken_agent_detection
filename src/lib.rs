@@ -41,6 +41,8 @@ pub use connectors::crush::CrushConnector;
 pub use connectors::cursor::CursorConnector;
 #[cfg(feature = "goose")]
 pub use connectors::goose::GooseConnector;
+#[cfg(feature = "grok-bot")]
+pub use connectors::grok_bot::GrokBotConnector;
 #[cfg(feature = "hermes")]
 pub use connectors::hermes::HermesConnector;
 #[cfg(feature = "opencode")]
@@ -140,6 +142,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "github-copilot",
     "goose",
     "grok",
+    "grok_bot",
     "hermes",
     "kimi",
     "kiro",
@@ -176,6 +179,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "github-copilot" | "copilot" => Some("github-copilot"),
         "goose" | "goose-ai" => Some("goose"),
         "grok" | "grok-cli" | "grok-build" | "xai-grok" => Some("grok"),
+        "grok_bot" | "grok-bot" => Some("grok_bot"),
         "hermes" | "hermes-agent" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
         "kiro" | "kiro-cli" | "kirocli" => Some("kiro"),
@@ -415,6 +419,16 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             let root = PathBuf::from(root);
             Some(vec![root.join("sessions"), root])
+        }
+        "grok_bot" => {
+            let root = read("CASS_GROK_BOT_DATA_ROOT")?;
+            if root.trim().is_empty() {
+                return None;
+            }
+            Some(vec![expand_leading_tilde(
+                &root,
+                dirs::home_dir().as_deref(),
+            )])
         }
         "omp" => {
             let root = read("CASS_OMP_DATA_ROOT")?;
@@ -790,6 +804,17 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".grok", "sessions"]);
             maybe_push(&mut out, &[".grok", "auth.json"]);
             maybe_push(&mut out, &[".grok"]);
+        }
+        "grok_bot" => {
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "Grok Bot",
+                    "sand-client-persistence",
+                ],
+            );
         }
         "hermes" => {
             maybe_push(&mut out, &[".hermes", "state.db"]);
@@ -1386,6 +1411,12 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".grok", "auth.json"]),
                     tilde(&[".grok"]),
                 ],
+                "grok_bot" => vec![tilde(&[
+                    "Library",
+                    "Application Support",
+                    "Grok Bot",
+                    "sand-client-persistence",
+                ])],
                 "hermes" => vec![tilde(&[".hermes", "state.db"]), tilde(&[".hermes"])],
                 "kimi" => vec![
                     tilde(&[".kimi-code", "sessions"]),
@@ -1932,6 +1963,10 @@ mod tests {
         assert!(grok.contains(&"~/.grok/sessions".to_string()));
         assert!(grok.contains(&"~/.grok/auth.json".to_string()));
         assert!(grok.contains(&"~/.grok".to_string()));
+        assert_eq!(
+            by_slug.get("grok_bot").expect("Grok Bot paths"),
+            &vec!["~/Library/Application Support/Grok Bot/sand-client-persistence".to_string()]
+        );
 
         let muse = by_slug.get("muse").expect("muse paths");
         assert!(muse.contains(&"~/.local/share/muse/sessions".to_string()));
@@ -2049,6 +2084,7 @@ mod tests {
                 ("crush", cfg!(feature = "crush")),
                 ("cursor", cfg!(feature = "cursor")),
                 ("goose", cfg!(feature = "goose")),
+                ("grok_bot", cfg!(feature = "grok-bot")),
                 ("hermes", cfg!(feature = "hermes")),
                 ("opencode", cfg!(feature = "opencode")),
                 ("shelley", cfg!(feature = "shelley")),

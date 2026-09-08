@@ -24,6 +24,8 @@ pub mod gemini;
 #[cfg(feature = "goose")]
 pub mod goose;
 pub mod grok;
+#[cfg(feature = "grok-bot")]
+pub mod grok_bot;
 #[cfg(feature = "hermes")]
 pub mod hermes;
 pub mod kimi;
@@ -302,6 +304,8 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("grok", || Box::new(grok::GrokConnector::new())),
         ("devin", || Box::new(devin::DevinConnector::new())),
     ];
+    #[cfg(feature = "grok-bot")]
+    v.push(("grok_bot", || Box::new(grok_bot::GrokBotConnector::new())));
     #[cfg(feature = "opencode")]
     v.push(("opencode", || Box::new(opencode::OpenCodeConnector::new())));
     #[cfg(feature = "chatgpt")]
