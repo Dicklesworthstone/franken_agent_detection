@@ -105,6 +105,7 @@ impl DevinConnector {
 
     /// Default store: `~/.local/share/devin/cli/sessions.db` on every
     /// platform (the CLI does not use the macOS `Application Support` dir).
+    #[cfg(feature = "devin")]
     fn default_database_path() -> Option<PathBuf> {
         dirs::home_dir().map(|home| {
             home.join(".local")

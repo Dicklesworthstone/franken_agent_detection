@@ -150,8 +150,37 @@ impl PrimeAgentConnector {
         is_sessions || is_agent || is_prime
     }
 
-    /// Expand one explicit base path into every Prime store form it contains.
-    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+    /// Expand store containers, but retain an owned file or subtree exactly so
+    /// explicit watch events never discover or ingest neighboring sessions.
+    fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path, session_dirs: &[PathBuf]) {
+        let is_session_file = base.is_file()
+            && base
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"));
+        if (is_session_file || base.is_dir())
+            && let Ok(resolved_base) = fs::canonicalize(base)
+        {
+            // The wire format is shared with Pi/OMP. Ownership comes from a
+            // canonical Prime store or the winning Prime environment override,
+            // never merely from a parseable session header. Resolve containment
+            // so a `..` path cannot escape a store into another provider's logs.
+            let owned = base
+                .ancestors()
+                .filter(|root| {
+                    root.file_name().is_some_and(|name| name == "sessions")
+                        && Self::looks_like_prime_storage(root)
+                })
+                .chain(session_dirs.iter().map(PathBuf::as_path))
+                .any(|root| {
+                    fs::canonicalize(root)
+                        .is_ok_and(|resolved_root| resolved_base.starts_with(resolved_root))
+                });
+            if owned {
+                roots.push(base.to_path_buf());
+                return;
+            }
+        }
         if Self::looks_like_prime_storage(base) {
             if base.file_name().is_some_and(|n| n == "sessions") {
                 roots.push(base.to_path_buf());
@@ -195,14 +224,15 @@ impl PrimeAgentConnector {
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots: Vec<ScanRoot> = Vec::new();
+        let session_dirs = Self::default_session_dirs();
         if ctx.use_default_detection() {
             if Self::looks_like_prime_storage(&ctx.data_dir) && ctx.data_dir.exists() {
                 let mut expanded = Vec::new();
-                Self::append_explicit_roots(&mut expanded, &ctx.data_dir);
+                Self::append_explicit_roots(&mut expanded, &ctx.data_dir, &session_dirs);
                 roots.extend(expanded.into_iter().map(ScanRoot::local));
             } else {
                 roots.extend(
-                    Self::default_session_dirs()
+                    session_dirs
                         .into_iter()
                         .filter(|dir| dir.exists())
                         .map(ScanRoot::local),
@@ -211,7 +241,7 @@ impl PrimeAgentConnector {
         } else {
             for scan_root in &ctx.scan_roots {
                 let mut expanded = Vec::new();
-                Self::append_explicit_roots(&mut expanded, &scan_root.path);
+                Self::append_explicit_roots(&mut expanded, &scan_root.path, &session_dirs);
                 roots.extend(expanded.into_iter().map(|path| scan_root.with_path(path)));
             }
         }
@@ -1337,6 +1367,225 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.contains("via root"));
         crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
+    }
+
+    #[test]
+    fn explicit_session_file_preserves_target_and_remote_provenance() {
+        use crate::types::{Origin, Platform};
+
+        let tmp = TempDir::new().unwrap();
+        let dir = sessions_dir(&tmp).join("older-project");
+        fs::create_dir_all(&dir).unwrap();
+        let target = write_session(
+            &dir,
+            "custom-target.JSONL",
+            &[
+                HEADER,
+                &msg("aaaa0001", None, r#"{"role":"user","content":"target"}"#),
+            ],
+        );
+        write_session(
+            &dir,
+            "unindexed-sibling.jsonl",
+            &[
+                HEADER,
+                &msg("aaaa0001", None, r#"{"role":"user","content":"sibling"}"#),
+            ],
+        );
+        let before = fs::read(&target).unwrap();
+        let origin = Origin::remote_with_host("prime-mirror", "workstation");
+        let root = ScanRoot::remote(target.clone(), origin.clone(), Some(Platform::Macos))
+            .with_rewrite("/work", "/mirrored-work");
+        let ctx = ScanContext::with_roots(tmp.path().join("cass-data"), vec![root], None);
+        let connector = PrimeAgentConnector::new();
+
+        let roots = PrimeAgentConnector::source_roots(&ctx);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, target);
+        assert_eq!(roots[0].origin, origin);
+        assert_eq!(roots[0].platform, Some(Platform::Macos));
+        assert_eq!(
+            roots[0].rewrite_workspace("/work/project", Some("prime_agent")),
+            "/mirrored-work/project"
+        );
+        let discovered = connector.discover_source_files(&ctx).unwrap();
+        assert_eq!(discovered.len(), 1, "must not capture the sibling");
+        assert_eq!(discovered[0].source_path, target);
+        assert_eq!(discovered[0].scan_root, target);
+        assert_eq!(discovered[0].provider_slug, "prime_agent");
+        assert_eq!(discovered[0].origin, origin);
+        assert_eq!(discovered[0].platform, Some(Platform::Macos));
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1, "must not ingest the sibling");
+        assert_eq!(convs[0].source_path, target);
+        assert_eq!(convs[0].agent_slug, "prime_agent");
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "target");
+        assert_eq!(fs::read(&target).unwrap(), before);
+    }
+
+    #[test]
+    fn explicit_session_roots_reject_foreign_files_and_store_escape() {
+        let tmp = TempDir::new().unwrap();
+        let prime = sessions_dir(&tmp);
+        let connector = PrimeAgentConnector::new();
+        for relative in [".pi/agent/sessions", ".omp/agent/sessions", "generic-logs"] {
+            let dir = tmp.path().join(relative);
+            fs::create_dir_all(&dir).unwrap();
+            let file = write_session(
+                &dir,
+                "foreign.jsonl",
+                &[
+                    HEADER,
+                    &msg("aaaa0001", None, r#"{"role":"user","content":"foreign"}"#),
+                ],
+            );
+            // This is a valid shared wire-format session. Its provider path,
+            // not header parse failure, must prevent Prime from claiming it.
+            assert!(parse_session_file(&file).unwrap().is_some());
+            let escaped = prime.join("../../..").join(relative).join("foreign.jsonl");
+            for path in [dir, file, escaped] {
+                let ctx = ScanContext::with_roots(
+                    tmp.path().join("cass-data"),
+                    vec![ScanRoot::local(path.clone())],
+                    None,
+                );
+                assert!(
+                    connector.discover_source_files(&ctx).unwrap().is_empty(),
+                    "must not capture {}",
+                    path.display()
+                );
+                assert!(
+                    connector.scan(&ctx).unwrap().is_empty(),
+                    "must not claim {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_configured_roots_honor_environment_precedence() {
+        const CHILD_HOME: &str = "FAD_PRIME_EXPLICIT_ROOT_TEST_HOME";
+        const WINNER: &str = "FAD_PRIME_EXPLICIT_ROOT_TEST_WINNER";
+        if let Ok(home) = dotenvy::var(CHILD_HOME) {
+            let home = PathBuf::from(home);
+            let winner = home.join(dotenvy::var(WINNER).unwrap());
+            let target = winner.join("target.jsonl");
+            let sibling = winner.join("sibling.jsonl");
+            let connector = PrimeAgentConnector::new();
+            // Ordinary default detection and explicit watch roots must resolve
+            // the same winning override, including tilde expansion.
+            let default_ctx = ScanContext::local_default(home.join("cass-data"), None);
+            let default_convs = connector.scan(&default_ctx).unwrap();
+            assert_eq!(default_convs.len(), 2);
+            assert!(
+                default_convs
+                    .iter()
+                    .all(|conv| conv.source_path == target || conv.source_path == sibling)
+            );
+            for path in [&winner, &target] {
+                let ctx = ScanContext::with_roots(
+                    home.join("cass-data"),
+                    vec![ScanRoot::local(path.clone())],
+                    None,
+                );
+                let mut expected = if path == &target {
+                    vec![target.clone()]
+                } else {
+                    vec![target.clone(), sibling.clone()]
+                };
+                expected.sort();
+                let mut discovered: Vec<_> = connector
+                    .discover_source_files(&ctx)
+                    .unwrap()
+                    .into_iter()
+                    .map(|source| source.source_path)
+                    .collect();
+                discovered.sort();
+                assert_eq!(discovered, expected, "discovery must retain exact scope");
+                let convs = connector.scan(&ctx).unwrap();
+                assert!(convs.iter().all(|conv| conv.agent_slug == "prime_agent"));
+                let mut scanned: Vec<_> = convs.into_iter().map(|conv| conv.source_path).collect();
+                scanned.sort();
+                assert_eq!(scanned, expected, "scan must retain exact scope");
+            }
+            for relative in ["selected", "legacy", "agent-home/sessions"] {
+                let root = home.join(relative);
+                if root == winner {
+                    continue;
+                }
+                for path in [root.clone(), root.join("target.jsonl")] {
+                    let ctx = ScanContext::with_roots(
+                        home.join("cass-data"),
+                        vec![ScanRoot::local(path.clone())],
+                        None,
+                    );
+                    assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
+                    assert!(
+                        connector.scan(&ctx).unwrap().is_empty(),
+                        "lower-priority override must not admit {}",
+                        path.display()
+                    );
+                }
+            }
+            return;
+        }
+
+        launch_configured_root_override_cases(CHILD_HOME, WINNER);
+    }
+
+    fn launch_configured_root_override_cases(child_home: &str, winner_key: &str) {
+        let tmp = TempDir::new().unwrap();
+        for relative in ["selected", "legacy", "agent-home/sessions"] {
+            let dir = tmp.path().join(relative);
+            fs::create_dir_all(&dir).unwrap();
+            for name in ["target.jsonl", "sibling.jsonl"] {
+                write_session(
+                    &dir,
+                    name,
+                    &[
+                        HEADER,
+                        &msg(
+                            "aaaa0001",
+                            None,
+                            r#"{"role":"user","content":"configured"}"#,
+                        ),
+                    ],
+                );
+            }
+        }
+        for (session, legacy, agent, winner) in [
+            ("~/selected", "~/legacy", "~/agent-home", "selected"),
+            ("", "~/legacy", "~/agent-home", "legacy"),
+            (" ", "", "~/agent-home", "agent-home/sessions"),
+        ] {
+            // A child test process exercises the actual environment-based
+            // public scan/discovery path without unsafe process-env mutation.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "connectors::prime_agent::tests::explicit_configured_roots_honor_environment_precedence",
+                    "--nocapture",
+                ])
+                .current_dir(tmp.path())
+                .env("HOME", tmp.path())
+                .env("USERPROFILE", tmp.path())
+                .env(child_home, tmp.path())
+                .env(winner_key, winner)
+                .env("PRIME_AGENT_SESSION_DIR", session)
+                .env("PRIME_AGENT_CODING_AGENT_SESSION_DIR", legacy)
+                .env("PRIME_AGENT_CODING_AGENT_DIR", agent)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "override case {winner}:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 
     #[test]
