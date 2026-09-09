@@ -3040,8 +3040,11 @@ mod agent_transcript_tests {
         let guessed = tmp.path().join("project/parent/my/app");
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(&guessed).unwrap();
-        let project = workspace.to_str().unwrap().replace(['/', '\\'], "-");
-        assert_eq!(project, guessed.to_str().unwrap().replace(['/', '\\'], "-"));
+        let project = workspace.to_str().unwrap().replace(['/', '\\', ':'], "-");
+        assert_eq!(
+            project,
+            guessed.to_str().unwrap().replace(['/', '\\', ':'], "-")
+        );
         let projects = tmp.path().join("cursor-projects");
         let transcript = write_transcript(&projects, &project, "stable-id", &[USER_LINE]);
         write_workspace(&transcript, workspace.to_str().unwrap());
