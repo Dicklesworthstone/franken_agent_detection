@@ -3043,12 +3043,7 @@ mod agent_transcript_tests {
         let project = workspace.to_str().unwrap().replace(['/', '\\'], "-");
         assert_eq!(project, guessed.to_str().unwrap().replace(['/', '\\'], "-"));
         let projects = tmp.path().join("cursor-projects");
-        let transcript = write_transcript(
-            &projects,
-            &project,
-            "stable-id",
-            &[USER_LINE],
-        );
+        let transcript = write_transcript(&projects, &project, "stable-id", &[USER_LINE]);
         write_workspace(&transcript, workspace.to_str().unwrap());
         let convs = CursorConnector::new().scan(&ctx_for(&projects)).unwrap();
         assert_eq!(convs.len(), 1);
