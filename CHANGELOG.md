@@ -47,6 +47,75 @@ Scope window: 2026-02-15 through HEAD
 
 Nothing yet.
 
+## [0.2.4] -- 2026-09-10
+
+A regression fix plus two connector additions. **Downstream consumers on 0.2.3
+should take this release**: 0.2.3 silently dropped workspace attribution for
+legacy Copilot CLI sessions.
+
+### Fixed
+
+- **Copilot CLI legacy `history.json` sessions lost their workspace** (cass
+  regression, found by cass's `connector_copilot` suite). Splitting the CLI
+  parser out of `copilot.rs` into `copilot_cli.rs` for 0.2.3 carried over the
+  `cwd` / `workingDirectory` / `workspace` aliases but not `workspacePath`,
+  which is the key legacy history-session-state JSON actually uses. Those
+  sessions came back with `workspace: None`, so workspace-scoped filtering and
+  search silently skipped them. The alias is restored at the end of the chain,
+  so existing precedence is unchanged: `cwd`, `workingDirectory` and
+  `workspace` still win when present. Non-string, nested and message-level
+  `workspacePath` values are rejected rather than coerced. Covered by
+  `scan_legacy_history_workspace_path_preserves_identity_and_source` and
+  `scan_legacy_workspace_path_preserves_existing_alias_precedence`, which also
+  pin source bytes, mtime, unicode titles and identity.
+- **Cursor Agent workspaces are attributed from `.workspace-trusted`, not from
+  the hyphenated project-directory slug.** Project directory names collapse
+  separators and literal hyphens, so a workspace named `parent-project/my-app`
+  and one named `parent/project/my/app` encode identically and
+  `decode_agent_workspace` had to guess. The transcript's `.workspace-trusted`
+  sidecar is now read for the explicit `workspacePath`. Unix, drive-letter and
+  UNC absolute paths are accepted (an exported source need not exist on the
+  scanning host); control characters and relative values are rejected.
+  Attribution metadata reports `workspace_trusted` or `unresolved`. The sidecar
+  is discovered as a `MetadataSidecar` and its mtime triggers a rescan even
+  when the JSONL itself is unchanged.
+- **Cursor project-slug collision comparison treats `:` as a path separator.**
+  A Windows drive prefix (`C:`) encodes to the same slug as a POSIX path with
+  extra segments, which made the guessed-vs-explicit workspace test invalid on
+  hosts whose temp path contains a drive letter.
+- **Prime watch roots stay exact and reject foreign stores.** Prime's shared
+  `source_roots` expanded an explicit JSONL file or a configured sessions
+  directory into nothing, so watch-once and live watch of
+  `PRIME_AGENT_SESSION_DIR` discovered zero sessions. `append_explicit_roots`
+  now retains an owned file or subtree when canonical containment proves it
+  lives under a Prime store or the winning environment override, including
+  tilde expansion and remote `ScanRoot` provenance. Ownership is path-based,
+  not wire-format-based: the JSONL header is shared with Pi and OMP, so a
+  parseable session is not sufficient, and both sides are canonicalized so a
+  `..` escape cannot claim another provider's logs. Pi, OMP and generic-log
+  paths stay rejected even when they hold a validly Prime-shaped session.
+
+### Added
+
+- **Grok Bot desktop replica scanning** behind the new opt-in `grok-bot`
+  feature (also included in `all-connectors`). Grok Bot stores lossy FIFO
+  transcript replicas under
+  `~/Library/Application Support/Grok Bot/sand-client-persistence`, distinct
+  from the existing Grok CLI connector, so it is registered as its own
+  `grok_bot` provider (slug aliases `grok_bot` / `grok-bot`). The connector
+  admits lowercase unpadded RFC4648 replica filenames and `schemaVersion` 1
+  `value.entries`, with an explicit message/send-message text allowlist:
+  roster, secret, approval, widget and attachment payloads are never indexed.
+  Identity is account+agent rather than session or workspace; provider entry
+  IDs are retained so hosts can reconcile FIFO rewrites, while `idx` is
+  document order within the current window only. Metadata discloses that this
+  is chat-only, incomplete rolling history. `CASS_GROK_BOT_DATA_ROOT`
+  overrides the macOS default.
+
+### Changed
+
+- `default_database_path` is gated behind the existing `devin` feature.
+
 ## [0.2.3] -- 2026-09-07
 
 ### Added
