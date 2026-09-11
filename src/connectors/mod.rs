@@ -10,6 +10,8 @@ pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
+#[cfg(feature = "codebuff")]
+pub mod codebuff;
 pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;
@@ -306,6 +308,8 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
     ];
     #[cfg(feature = "grok-bot")]
     v.push(("grok_bot", || Box::new(grok_bot::GrokBotConnector::new())));
+    #[cfg(feature = "codebuff")]
+    v.push(("codebuff", || Box::new(codebuff::CodebuffConnector::new())));
     #[cfg(feature = "opencode")]
     v.push(("opencode", || Box::new(opencode::OpenCodeConnector::new())));
     #[cfg(feature = "chatgpt")]

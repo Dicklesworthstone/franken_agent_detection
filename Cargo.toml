@@ -72,6 +72,9 @@ devin = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 # Grok Bot desktop rolling replicas. Hosts must reconcile provider entry IDs
 # across FIFO rewrites before opting into ingestion (separate from Grok CLI).
 grok-bot = ["connectors"]
+# One shared on-disk CLI lineage; Freebuff and Codebuff cannot be attributed
+# separately from their identical Manicode store.
+codebuff = ["connectors"]
 # Shelley (boldsoftware/shelley): schema-aware read-only access to Shelley's
 # one-database-many-conversations shelley.db (WAL mode; cass gh#415). fts5 is
 # required because Shelley's schema declares an FTS5 messages index.
@@ -98,6 +101,7 @@ copilot-vscdb = ["connectors", "dep:frankensqlite", "dep:asupersync"]
 all-connectors = [
     "connectors",
     "chatgpt",
+    "codebuff",
     "cursor",
     "opencode",
     "goose",

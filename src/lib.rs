@@ -35,6 +35,8 @@ pub use types::{
 // Re-export connector infrastructure at crate root.
 #[cfg(feature = "chatgpt")]
 pub use connectors::chatgpt::ChatGptConnector;
+#[cfg(feature = "codebuff")]
+pub use connectors::codebuff::CodebuffConnector;
 #[cfg(feature = "crush")]
 pub use connectors::crush::CrushConnector;
 #[cfg(feature = "cursor")]
@@ -131,6 +133,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "claude",
     "clawdbot",
     "cline",
+    "codebuff",
     "codex",
     "continue",
     "copilot_cli",
@@ -168,6 +171,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "claude" | "claude-code" => Some("claude"),
         "clawdbot" | "clawd-bot" => Some("clawdbot"),
         "cline" => Some("cline"),
+        "codebuff" | "freebuff" | "manicode" | "codebuff-lineage" => Some("codebuff"),
         "codex" | "codex-cli" => Some("codex"),
         "continue" | "continue-dev" => Some("continue"),
         "copilot_cli" | "copilot-cli" | "gh-copilot" => Some("copilot_cli"),
@@ -312,6 +316,16 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
     let read = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string());
 
     match slug {
+        "codebuff" => {
+            let root = read("CASS_CODEBUFF_DATA_ROOT")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![expand_leading_tilde(
+                &root,
+                dirs::home_dir().as_deref(),
+            )])
+        }
         "aider" => {
             let root = read("CASS_AIDER_DATA_ROOT")?;
             if root.is_empty() {
@@ -612,6 +626,9 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
                 &mut out,
                 &["Library", "Application Support", "com.openai.chat"],
             );
+        }
+        "codebuff" => {
+            maybe_push(&mut out, &[".config", "manicode", "projects"]);
         }
         "claude" => {
             let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
@@ -1097,6 +1114,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
         .iter()
         .map(|&slug| {
             let paths: Vec<String> = match slug {
+                "codebuff" => vec![tilde(&[".config", "manicode", "projects"])],
                 "aider" => vec![tilde(&[".aider.chat.history.md"]), tilde(&[".aider"])],
                 "amp" => vec![
                     tilde(&[".local", "share", "amp"]),
@@ -1539,6 +1557,41 @@ pub fn detect_installed_agents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gh423_product_aliases_resolve_to_one_shared_lineage() {
+        for alias in ["codebuff", "freebuff", "manicode", "codebuff-lineage"] {
+            assert_eq!(canonical_connector_slug(alias), Some("codebuff"));
+        }
+        assert_eq!(
+            KNOWN_CONNECTORS
+                .iter()
+                .filter(|slug| **slug == "codebuff")
+                .count(),
+            1
+        );
+        assert!(!KNOWN_CONNECTORS.contains(&"freebuff"));
+        let dir = tempfile::tempdir().unwrap();
+        let report = detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec!["freebuff".into(), "codebuff".into()]),
+            include_undetected: true,
+            root_overrides: vec![AgentDetectRootOverride {
+                slug: "freebuff".into(),
+                root: dir.path().into(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(report.installed_agents.len(), 1);
+        assert_eq!(report.installed_agents[0].slug, "codebuff");
+        #[cfg(feature = "codebuff")]
+        assert_eq!(
+            get_connector_factories()
+                .iter()
+                .filter(|(slug, _)| *slug == "codebuff")
+                .count(),
+            1
+        );
+    }
 
     // cass #448: the Claude Code detection probe must agree with the
     // connector's root resolver (CLAUDE_CONFIG_DIR, then XDG_CONFIG_HOME,
@@ -2081,6 +2134,7 @@ mod tests {
             let detection_only: HashSet<&str> = HashSet::from(["continue", "windsurf"]);
             let feature_gated: HashMap<&str, bool> = HashMap::from([
                 ("chatgpt", cfg!(feature = "chatgpt")),
+                ("codebuff", cfg!(feature = "codebuff")),
                 ("crush", cfg!(feature = "crush")),
                 ("cursor", cfg!(feature = "cursor")),
                 ("goose", cfg!(feature = "goose")),
