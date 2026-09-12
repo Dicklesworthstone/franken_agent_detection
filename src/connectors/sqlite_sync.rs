@@ -182,3 +182,59 @@ impl ConnectionExt for Connection {
         drive(AsyncConnectionExt::execute_compat(&self.inner, sql, params))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asupersync::{Cx, cx::CapMask};
+    use frankensqlite::compat::RowExt;
+
+    #[test]
+    fn nested_sql_bridge_preserves_caller_context() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let parent = Cx::current().expect("outer runtime context");
+            for restricted in [false, true] {
+                let restriction = restricted.then(|| Cx::push_restriction(CapMask::none()));
+                let caller = Cx::current().expect("caller context");
+                let assert_caller = || {
+                    let current = Cx::current().expect("restored caller context");
+                    assert_eq!(current.task_id(), caller.task_id());
+                    assert_eq!(current.region_id(), caller.region_id());
+                    assert_eq!(current.capabilities(), caller.capabilities());
+                };
+
+                let connection = Connection::open(":memory:").unwrap();
+                assert_caller();
+                connection
+                    .execute_batch("CREATE TABLE values_seen (value INTEGER); INSERT INTO values_seen VALUES (40);")
+                    .unwrap();
+                assert_caller();
+                let value = connection
+                    .query_row_map("SELECT value FROM values_seen", &[], |row| {
+                        // Row mapping runs inside drive(). A nested bridge must
+                        // use a separate runtime, then restore the mapping task.
+                        let mapping = Cx::current().expect("mapping context");
+                        let nested = Connection::open(":memory:")?;
+                        let extra: i64 = nested.query_row_map("SELECT 2", &[], |row| {
+                            row.get_typed(0)
+                        })?;
+                        drop(nested);
+                        let restored = Cx::current().expect("restored mapping context");
+                        assert_eq!(restored.task_id(), mapping.task_id());
+                        assert_eq!(restored.capabilities(), mapping.capabilities());
+                        Ok(row.get_typed::<i64>(0)? + extra)
+                    })
+                    .unwrap();
+                assert_eq!(value, 42);
+                assert_caller();
+                drop(connection);
+                assert_caller();
+                drop(restriction);
+                let restored = Cx::current().expect("restored outer runtime context");
+                assert_eq!(restored.task_id(), parent.task_id());
+                assert_eq!(restored.capabilities(), parent.capabilities());
+            }
+        });
+    }
+}

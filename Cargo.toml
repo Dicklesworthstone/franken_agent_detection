@@ -35,12 +35,12 @@ blake3 = { version = "1", optional = true }
 url = { version = "2", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
-frankensqlite = { version = "0.3.8", package = "fsqlite", optional = true }
+frankensqlite = { version = "0.4.0", package = "fsqlite", optional = true }
 # Drives fsqlite's async (!Send) engine futures to completion behind the
 # connectors' synchronous API surface (see connectors/sqlite_sync.rs).
-# fsqlite 0.3 names asupersync 0.4.x types in its public API, so the two
-# must move in lockstep (asupersync 0.3.x and 0.4.x are non-interchangeable).
-asupersync = { version = "0.4.9", default-features = false, optional = true }
+# fsqlite 0.4 names asupersync 0.5.x types in its public API, so the two
+# must move in lockstep to preserve the bridge's runtime type identity.
+asupersync = { version = "0.5.0", default-features = false, optional = true }
 
 [features]
 default = []
