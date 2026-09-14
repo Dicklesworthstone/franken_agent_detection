@@ -103,6 +103,7 @@ all-connectors = [
     "chatgpt",
     "codebuff",
     "cursor",
+    "devin",
     "opencode",
     "goose",
     "grok-bot",

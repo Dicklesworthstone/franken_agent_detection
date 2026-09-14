@@ -260,6 +260,97 @@ mod conformance {
             }
         }
 
+        // Run with --no-default-features --features all-connectors. Using
+        // --all-features would hide a missing edge in the aggregate feature.
+        #[cfg(feature = "all-connectors")]
+        #[test]
+        fn all_connectors_scans_devin_sqlite_sessions() {
+            use crate::connectors::sqlite_sync::Connection;
+
+            let retained = tempfile::Builder::new()
+                .prefix("fad-all-connectors-devin-")
+                .tempdir()
+                .expect("create Devin fixture directory")
+                .keep();
+            eprintln!("retained Devin SQLite fixture: {}", retained.display());
+            let database = retained.join("sessions.db");
+            let connection = Connection::open(database.to_string_lossy().as_ref())
+                .expect("open Devin fixture database");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE sessions (
+                        id TEXT PRIMARY KEY, title TEXT, working_directory TEXT,
+                        model TEXT, agent_mode TEXT, created_at INTEGER,
+                        last_activity_at INTEGER, main_chain_id INTEGER, hidden INTEGER
+                    );
+                    CREATE TABLE message_nodes (
+                        node_id INTEGER PRIMARY KEY, session_id TEXT,
+                        parent_node_id INTEGER, chat_message TEXT, created_at INTEGER
+                    );
+                    INSERT INTO sessions VALUES
+                        ('visible', 'Feature coverage', '/workspace/devin', 'test-model',
+                         'test', 1700000000, 1700000001, 1, 0),
+                        ('hidden', 'Retired session', '/workspace/devin', 'test-model',
+                         'test', 1700000000, 1700000001, 3, 1);
+                    INSERT INTO message_nodes VALUES
+                        (1, 'visible', NULL,
+                         '{"role":"user","content":"visible main-chain message"}', 1700000000),
+                        (2, 'visible', NULL,
+                         '{"role":"user","content":"abandoned branch"}', 1700000000),
+                        (3, 'hidden', NULL,
+                         '{"role":"user","content":"hidden session message"}', 1700000000);
+                    "#,
+                )
+                .expect("populate Devin fixture");
+            drop(connection);
+            let original_bytes = fs::read(&database).expect("read closed fixture database");
+
+            let (_, factory) = get_connector_factories()
+                .into_iter()
+                .find(|(slug, _)| *slug == "devin")
+                .expect("Devin factory must be registered");
+            let connector = factory();
+            let context =
+                ScanContext::with_roots(retained, vec![ScanRoot::local(database.clone())], None);
+            let conversations = connector.scan(&context).expect("scan Devin fixture");
+            assert_eq!(
+                conversations.len(),
+                1,
+                "all-connectors must enable scanning, with hidden sessions excluded"
+            );
+            let conversation = &conversations[0];
+            assert_eq!(conversation.agent_slug, "devin");
+            assert_eq!(conversation.external_id.as_deref(), Some("visible"));
+            assert_eq!(conversation.source_path, database.join("visible"));
+            assert_eq!(
+                conversation.workspace,
+                Some(PathBuf::from("/workspace/devin"))
+            );
+            assert_eq!(
+                conversation.messages.len(),
+                1,
+                "off-chain nodes stay excluded"
+            );
+            assert_eq!(conversation.messages[0].role, "user");
+            assert_eq!(
+                conversation.messages[0].content,
+                "visible main-chain message"
+            );
+
+            let sources = connector
+                .discover_source_files(&context)
+                .expect("discover Devin SQLite source");
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].provider_slug, "devin");
+            assert_eq!(sources[0].source_path, database);
+            assert_eq!(
+                fs::read(&database).expect("read fixture after scan and discovery"),
+                original_bytes,
+                "read-only scanning must preserve the database"
+            );
+        }
+
         #[test]
         fn all_factories_support_source_discovery_contract() {
             let temp = TempDir::new().expect("create temp dir");
