@@ -19,6 +19,7 @@
 
 use std::cell::RefCell;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use frankensqlite::FrankenError;
@@ -82,12 +83,24 @@ impl Connection {
     ///
     /// On success the transaction is committed (a no-op for reads); if `f`
     /// or the commit fails, the transaction is rolled back best-effort.
+    /// If `f` unwinds, rollback is attempted before resuming its original panic.
     pub fn read_transaction<T, E>(&self, f: impl FnOnce(&Self) -> Result<T, E>) -> Result<T, E>
     where
         E: From<FrankenError>,
     {
         self.execute("BEGIN DEFERRED;").map_err(E::from)?;
-        match f(self) {
+        // The callback is never resumed after an unwind. Keep its existing
+        // unconstrained signature while releasing this transaction before the
+        // caller can catch the panic and reuse the connection.
+        let result = match catch_unwind(AssertUnwindSafe(|| f(self))) {
+            Ok(result) => result,
+            Err(payload) => {
+                // A cleanup panic must not replace the callback's payload.
+                let _ = catch_unwind(AssertUnwindSafe(|| self.execute("ROLLBACK;")));
+                resume_unwind(payload);
+            }
+        };
+        match result {
             Ok(value) => {
                 if let Err(err) = self.execute("COMMIT;") {
                     let _ = self.execute("ROLLBACK;");
@@ -188,6 +201,145 @@ mod tests {
     use super::*;
     use asupersync::{Cx, cx::CapMask};
     use frankensqlite::compat::RowExt;
+
+    #[test]
+    fn read_transaction_rolls_back_callback_and_row_mapper_panics() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for restricted in [false, true] {
+                let restriction = restricted.then(|| Cx::push_restriction(CapMask::none()));
+                let caller = Cx::current().expect("caller context");
+                for panic_in_mapper in [false, true] {
+                    let connection = Connection::open(":memory:").unwrap();
+                    connection
+                        .execute_batch(
+                            "CREATE TABLE values_seen (value INTEGER); \
+                             INSERT INTO values_seen VALUES (1);",
+                        )
+                        .unwrap();
+                    let panic = catch_unwind(AssertUnwindSafe(|| {
+                        connection.read_transaction::<(), FrankenError>(|connection| {
+                            connection.execute("INSERT INTO values_seen VALUES (2)")?;
+                            if panic_in_mapper {
+                                return connection.query_row_map("SELECT 1", &[], |_| {
+                                    panic!("read-transaction callback panic");
+                                });
+                            }
+                            panic!("read-transaction callback panic");
+                        })
+                    }))
+                    .expect_err("callback must keep unwinding");
+                    assert_eq!(
+                        panic.downcast_ref::<&str>(),
+                        Some(&"read-transaction callback panic")
+                    );
+                    let restored = Cx::current().expect("restored caller context");
+                    assert_eq!(restored.task_id(), caller.task_id());
+                    assert_eq!(restored.region_id(), caller.region_id());
+                    assert_eq!(restored.capabilities(), caller.capabilities());
+
+                    // The same connection must admit a new transaction, and
+                    // work before the callback panic must not be committed.
+                    let values: Vec<i64> = connection
+                        .read_transaction(|connection| {
+                            connection.query_map_collect(
+                                "SELECT value FROM values_seen ORDER BY value",
+                                &[],
+                                |row| row.get_typed(0),
+                            )
+                        })
+                        .unwrap();
+                    assert_eq!(values, vec![1]);
+                    drop(connection);
+                    let restored = Cx::current().expect("caller context after close");
+                    assert_eq!(restored.task_id(), caller.task_id());
+                    assert_eq!(restored.capabilities(), caller.capabilities());
+                }
+                drop(restriction);
+            }
+        });
+    }
+
+    #[test]
+    fn read_transaction_preserves_success_and_returned_error_behavior() {
+        let connection = Connection::open(":memory:").unwrap();
+        connection
+            .execute("CREATE TABLE values_seen (value INTEGER)")
+            .unwrap();
+        let value = connection
+            .read_transaction(|connection| {
+                connection.execute("INSERT INTO values_seen VALUES (1)")?;
+                Ok::<_, FrankenError>(42)
+            })
+            .unwrap();
+        assert_eq!(value, 42);
+
+        let error = connection
+            .read_transaction::<(), FrankenError>(|connection| {
+                connection.execute("INSERT INTO values_seen VALUES (2)")?;
+                Err(FrankenError::Internal("callback error".to_owned()))
+            })
+            .unwrap_err();
+        assert!(matches!(error, FrankenError::Internal(message) if message == "callback error"));
+        let values: Vec<i64> = connection
+            .read_transaction(|connection| {
+                connection.query_map_collect(
+                    "SELECT value FROM values_seen ORDER BY value",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(values, vec![1]);
+    }
+
+    #[test]
+    fn read_transaction_preserves_panic_when_rollback_returns_an_error() {
+        let connection = Connection::open(":memory:").unwrap();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            connection.read_transaction::<(), FrankenError>(|connection| {
+                // End the transaction first so the unwind cleanup encounters
+                // a real "no transaction is active" rollback error.
+                connection.execute("ROLLBACK;")?;
+                assert!(connection.execute("ROLLBACK;").is_err());
+                panic!("original callback panic");
+            })
+        }))
+        .expect_err("rollback error must not replace the callback panic");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"original callback panic")
+        );
+        let value: i64 = connection
+            .read_transaction(|connection| {
+                connection.query_row_map("SELECT 42", &[], |row| row.get_typed(0))
+            })
+            .unwrap();
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn read_transaction_failed_begin_keeps_existing_transaction() {
+        let connection = Connection::open(":memory:").unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE values_seen (value INTEGER); \
+                 BEGIN DEFERRED; INSERT INTO values_seen VALUES (1);",
+            )
+            .unwrap();
+        let called = std::cell::Cell::new(false);
+        let result = connection.read_transaction::<(), FrankenError>(|_| {
+            called.set(true);
+            Ok(())
+        });
+        assert!(result.is_err(), "nested BEGIN must fail");
+        assert!(!called.get(), "failed BEGIN must not call the callback");
+        connection.execute("COMMIT;").unwrap();
+        let value: i64 = connection
+            .query_row_map("SELECT value FROM values_seen", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(value, 1, "the pre-existing transaction must remain owned");
+    }
 
     #[test]
     fn nested_sql_bridge_preserves_caller_context() {
