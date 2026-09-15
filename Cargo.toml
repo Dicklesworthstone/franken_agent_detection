@@ -1,6 +1,6 @@
 [package]
 name = "franken-agent-detection"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -35,7 +35,7 @@ blake3 = { version = "1", optional = true }
 url = { version = "2", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
-frankensqlite = { version = "0.4.0", package = "fsqlite", optional = true }
+frankensqlite = { version = "0.4.1", package = "fsqlite", optional = true }
 # Drives fsqlite's async (!Send) engine futures to completion behind the
 # connectors' synchronous API surface (see connectors/sqlite_sync.rs).
 # fsqlite 0.4 names asupersync 0.5.x types in its public API, so the two
