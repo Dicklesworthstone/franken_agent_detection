@@ -10,6 +10,17 @@ documentation = "https://docs.rs/franken-agent-detection"
 readme = "README.md"
 keywords = ["agent", "detection", "filesystem", "codex", "claude"]
 categories = ["development-tools", "command-line-utilities"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/fad_illustration.webp",
+    "/src/**",
+    "/fixtures/**",
+    "/tests/fixtures/**",
+]
 
 [dependencies]
 # --- Always-on (detection + connector shared) ---
