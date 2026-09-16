@@ -32,14 +32,13 @@ thread_local! {
 }
 
 /// Drive a `!Send` fsqlite future to completion on the calling thread.
-fn drive<T>(future: impl Future<Output = T>) -> T {
-    let runtime = DRIVER
-        .with(|slot| slot.borrow_mut().take())
-        .unwrap_or_else(|| {
-            RuntimeBuilder::current_thread()
-                .build()
-                .expect("failed to build FrankenSQLite sync-bridge runtime")
-        });
+fn drive<T>(future: impl Future<Output = T>) -> Result<T, FrankenError> {
+    let runtime = match DRIVER.with(|slot| slot.borrow_mut().take()) {
+        Some(runtime) => runtime,
+        None => RuntimeBuilder::current_thread().build().map_err(|error| {
+            FrankenError::Internal(format!("failed to build SQLite connector runtime: {error}"))
+        })?,
+    };
     let output = runtime.block_on(future);
     DRIVER.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -47,7 +46,7 @@ fn drive<T>(future: impl Future<Output = T>) -> T {
             *slot = Some(runtime);
         }
     });
-    output
+    Ok(output)
 }
 
 /// Synchronous wrapper over [`frankensqlite::Connection`].
@@ -62,18 +61,18 @@ impl Connection {
     /// Open (or create) a database at `path`.
     pub fn open(path: &str) -> Result<Self, FrankenError> {
         Ok(Self {
-            inner: drive(frankensqlite::Connection::open(path))?,
+            inner: drive(frankensqlite::Connection::open(path))??,
         })
     }
 
     /// Execute a single SQL statement, returning the affected row count.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        drive(self.inner.execute(sql))
+        drive(self.inner.execute(sql))?
     }
 
     /// Execute a string of semicolon-separated SQL statements.
     pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
-        drive(self.inner.execute_batch(sql))
+        drive(self.inner.execute_batch(sql))?
     }
 
     /// Run `f` inside one deferred read transaction so every query it issues
@@ -123,7 +122,9 @@ impl Drop for Connection {
         // sidecar. Closing in place on drop restores the pre-0.2 observable
         // contract that writes made through a dropped connection are visible
         // to a later read-only open.
-        drive(self.inner.close_best_effort_in_place());
+        if let Err(error) = drive(self.inner.close_best_effort_in_place()) {
+            tracing::warn!(%error, "could not drive SQLite connector close");
+        }
     }
 }
 
@@ -131,7 +132,7 @@ impl Drop for Connection {
 /// [`frankensqlite::compat::open_with_flags`]).
 pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
     Ok(Connection {
-        inner: drive(frankensqlite::compat::open_with_flags(path, flags))?,
+        inner: drive(frankensqlite::compat::open_with_flags(path, flags))??,
     })
 }
 
@@ -171,7 +172,7 @@ impl ConnectionExt for Connection {
             sql,
             params,
             f,
-        ))
+        ))?
     }
 
     fn query_map_collect<T, F>(
@@ -188,11 +189,11 @@ impl ConnectionExt for Connection {
             sql,
             params,
             f,
-        ))
+        ))?
     }
 
     fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {
-        drive(AsyncConnectionExt::execute_compat(&self.inner, sql, params))
+        drive(AsyncConnectionExt::execute_compat(&self.inner, sql, params))?
     }
 }
 
@@ -222,9 +223,11 @@ mod tests {
                             connection.execute("INSERT INTO values_seen VALUES (2)")?;
                             if panic_in_mapper {
                                 return connection.query_row_map("SELECT 1", &[], |_| {
+                                    // ubs:ignore[rust.ownership.panic-macro] — Inject unwind so the test proves mapper rollback and caller-context restoration.
                                     panic!("read-transaction callback panic");
                                 });
                             }
+                            // ubs:ignore[rust.ownership.panic-macro] — Inject callback unwind; catch_unwind below verifies the original payload survives.
                             panic!("read-transaction callback panic");
                         })
                     }))
@@ -302,6 +305,7 @@ mod tests {
                 // a real "no transaction is active" rollback error.
                 connection.execute("ROLLBACK;")?;
                 assert!(connection.execute("ROLLBACK;").is_err());
+                // ubs:ignore[rust.ownership.panic-macro] — The test requires this original unwind to survive a second rollback failure.
                 panic!("original callback panic");
             })
         }))

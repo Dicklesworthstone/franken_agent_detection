@@ -364,6 +364,7 @@ mod conformance {
                     vec![root],
                     Some(1_700_000_000_000),
                 );
+                // ubs:ignore[rust.ownership.panic-macro] — Fail the conformance test with the connector identity when discovery returns an error.
                 let sources = connector
                     .discover_source_files(&ctx)
                     .unwrap_or_else(|err| panic!("connector {slug} discovery failed: {err}"));
@@ -568,10 +569,12 @@ mod conformance {
                     .into_iter()
                     .find(|(factory_slug, _)| factory_slug == slug);
                 let Some((_, factory)) = matched else {
+                    // ubs:ignore[rust.ownership.panic-macro] — Missing registered fixture connector is a test failure, not a production fallback.
                     panic!("no registered factory for fixture connector {slug}");
                 };
 
                 let convs = factory().scan(&ctx).unwrap_or_else(|err| {
+                    // ubs:ignore[rust.ownership.panic-macro] — Preserve the fixture scan error and connector slug in the failing test.
                     panic!("{slug}: scan of checked-in fixture failed: {err}")
                 });
                 assert!(
@@ -836,6 +839,7 @@ mod conformance {
                         // Windows path; look for a doubled backslash anywhere
                         // after position 0.
                         if let Some(pos) = output[1..].find("\\\\") {
+                            // ubs:ignore[rust.ownership.panic-macro] — This property assertion reports an unexpected doubled separator with its input and offset.
                             panic!(
                                 "PathMapping({:?} -> {:?}).apply({:?}) = {:?} contains doubled `\\\\` at offset {}",
                                 from,

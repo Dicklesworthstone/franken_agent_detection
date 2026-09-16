@@ -8,28 +8,32 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Repository: <https://github.com/Dicklesworthstone/franken_agent_detection>
 Crate: <https://crates.io/crates/franken-agent-detection>
 
-> **Release vs. tag:** GitHub Releases exist for
+> **Release vs. tag:** The latest published GitHub Release is
+> [`v0.2.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.4)
+> (2026-09-10). The in-tree `0.3.0` candidate is not yet published.
+> Earlier GitHub Releases exist for
 > [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4),
 > [`v0.1.5`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.5),
 > [`v0.1.6`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.6),
 > [`v0.1.7`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7),
 > [`v0.1.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9),
 > and [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10)
-> (latest, published 2026-08-16). `v0.1.1`, `v0.1.2`, and `v0.1.3` are git tags;
+> (published 2026-08-16). `v0.1.1`, `v0.1.2`, and `v0.1.3` are git tags;
 > they do **not** have GitHub Release pages — do not invent them. `v0.1.2` was
 > never published to crates.io. `v0.1.0` was never published (crates.io
 > rejected wildcard dependency versions). There is no `v0.1.8` tag or Release.
-> In-tree Cargo is `0.1.10`.
 
 Scope window: 2026-02-15 through HEAD
 [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
-(2026-08-19). Current Unreleased window is since GitHub Release
-[`v0.2.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.3).
+(2026-08-19) for the historical reconstruction below. The current Unreleased
+window is since GitHub Release
+[`v0.2.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.4).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.2.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.4) | GitHub Release | 2026-09-10 | Copilot CLI workspace restoration, explicit Cursor workspace attribution, exact Prime watch roots, and Grok Bot desktop replicas. |
 | [`v0.2.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.3) | GitHub Release | 2026-09-07 | Devin CLI connector; Antigravity IDE store, Claude `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` detection, muse/goose/hermes/crush scan scoping, Codex token usage, Claude tool results, Cursor/OpenCode dedupe, 100MB scan cap everywhere. |
 | [`v0.2.2`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.2) | GitHub Release | 2026-08-24 | Cross-connector audit fixes (opencode, muse, clawdbot, chatgpt, amp, aider, copilot-cli, cursor, grok); registry invariant hardening. |
 | [`v0.2.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.1) | GitHub Release | 2026-08-23 | Fresh-eyes fixes: pi-family discovery preserves scan-root provenance; registry invariant tests. |
@@ -45,7 +49,31 @@ Scope window: 2026-02-15 through HEAD
 
 ## [Unreleased]
 
-Nothing yet.
+Candidate version: **0.3.0**. Publication and final validation are pending.
+
+### Added
+
+- Codebuff / Freebuff CLI transcript scanning through the shared Manicode
+  projects store, behind `codebuff` and included in `all-connectors`. The
+  connector preserves source identity, tool calls, and explicit workspace
+  metadata without guessing which product wrote the shared format.
+- An all-connectors regression exercises real Devin SQLite session discovery
+  and scanning, including source bytes and timestamp preservation.
+
+### Changed
+
+- SQLite connectors now use FrankenSQLite `0.4.1` and Asupersync `0.5.0`
+  together. Consumers must align their runtime and engine dependencies with
+  these versions; the synchronous connector API remains available.
+- The crate package explicitly includes source, fixtures, and documentation,
+  preventing remote build caches and temporary artifacts from being shipped.
+
+### Fixed
+
+- Read transactions roll back when a callback or row mapper unwinds, preserving
+  the original panic and leaving the connection usable by the caller.
+- SQLite bridge runtime construction errors propagate as `FrankenError` instead
+  of panicking. Best-effort connection close logs a runtime construction error.
 
 ## [0.2.4] -- 2026-09-10
 
@@ -725,7 +753,7 @@ Initial public release. No git tag. Not published to crates.io (rejected due to 
 > listed above in the Release-vs-tag note. They are not reconstructed as
 > capability-wave sections in this file.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.2.4...HEAD
 [0.1.10]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10
 [0.1.9]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9
 [0.1.7]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7
