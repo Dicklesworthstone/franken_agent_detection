@@ -223,12 +223,10 @@ mod tests {
                             connection.execute("INSERT INTO values_seen VALUES (2)")?;
                             if panic_in_mapper {
                                 return connection.query_row_map("SELECT 1", &[], |_| {
-                                    // ubs:ignore[rust.ownership.panic-macro] — Inject unwind so the test proves mapper rollback and caller-context restoration.
-                                    panic!("read-transaction callback panic");
+                                    panic!("read-transaction callback panic"); // ubs:ignore[rust.ownership.panic-macro] — Inject mapper unwind to prove rollback and caller-context restoration.
                                 });
                             }
-                            // ubs:ignore[rust.ownership.panic-macro] — Inject callback unwind; catch_unwind below verifies the original payload survives.
-                            panic!("read-transaction callback panic");
+                            panic!("read-transaction callback panic"); // ubs:ignore[rust.ownership.panic-macro] — catch_unwind verifies this original callback payload survives.
                         })
                     }))
                     .expect_err("callback must keep unwinding");
@@ -305,8 +303,7 @@ mod tests {
                 // a real "no transaction is active" rollback error.
                 connection.execute("ROLLBACK;")?;
                 assert!(connection.execute("ROLLBACK;").is_err());
-                // ubs:ignore[rust.ownership.panic-macro] — The test requires this original unwind to survive a second rollback failure.
-                panic!("original callback panic");
+                panic!("original callback panic"); // ubs:ignore[rust.ownership.panic-macro] — This original unwind must survive a second rollback failure.
             })
         }))
         .expect_err("rollback error must not replace the callback panic");
