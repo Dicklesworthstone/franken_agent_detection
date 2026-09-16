@@ -2153,6 +2153,7 @@ mod tests {
             let mut factory_slugs: HashSet<&str> = HashSet::new();
             for (raw, _) in get_connector_factories() {
                 let canonical = canonical_connector_slug(raw).unwrap_or_else(|| {
+                    // ubs:ignore[rust.ownership.panic-macro] — Fail this registry invariant test if a factory has no canonical public connector name.
                     panic!("factory slug {raw} does not canonicalise into KNOWN_CONNECTORS")
                 });
                 assert!(
