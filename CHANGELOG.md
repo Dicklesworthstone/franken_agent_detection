@@ -9,8 +9,8 @@ Repository: <https://github.com/Dicklesworthstone/franken_agent_detection>
 Crate: <https://crates.io/crates/franken-agent-detection>
 
 > **Release vs. tag:** The latest published GitHub Release is
-> [`v0.2.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.4)
-> (2026-09-10). The in-tree `0.3.0` candidate is not yet published.
+> [`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0)
+> (2026-09-16).
 > Earlier GitHub Releases exist for
 > [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4),
 > [`v0.1.5`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.5),
@@ -27,12 +27,13 @@ Scope window: 2026-02-15 through HEAD
 [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
 (2026-08-19) for the historical reconstruction below. The current Unreleased
 window is since GitHub Release
-[`v0.2.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.4).
+[`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0) | GitHub Release | 2026-09-16 | Shared Codebuff / Freebuff history, SQLite 0.4.1 and Asupersync 0.5 migration, unwind-safe read transactions, and bounded crate contents. |
 | [`v0.2.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.4) | GitHub Release | 2026-09-10 | Copilot CLI workspace restoration, explicit Cursor workspace attribution, exact Prime watch roots, and Grok Bot desktop replicas. |
 | [`v0.2.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.3) | GitHub Release | 2026-09-07 | Devin CLI connector; Antigravity IDE store, Claude `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` detection, muse/goose/hermes/crush scan scoping, Codex token usage, Claude tool results, Cursor/OpenCode dedupe, 100MB scan cap everywhere. |
 | [`v0.2.2`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.2) | GitHub Release | 2026-08-24 | Cross-connector audit fixes (opencode, muse, clawdbot, chatgpt, amp, aider, copilot-cli, cursor, grok); registry invariant hardening. |
@@ -49,7 +50,9 @@ window is since GitHub Release
 
 ## [Unreleased]
 
-Candidate version: **0.3.0**. Publication and final validation are pending.
+No changes yet.
+
+## [0.3.0] -- 2026-09-16
 
 ### Added
 
@@ -753,7 +756,8 @@ Initial public release. No git tag. Not published to crates.io (rejected due to 
 > listed above in the Release-vs-tag note. They are not reconstructed as
 > capability-wave sections in this file.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0
 [0.1.10]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10
 [0.1.9]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9
 [0.1.7]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7
