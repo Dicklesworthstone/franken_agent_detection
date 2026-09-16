@@ -364,6 +364,7 @@ mod conformance {
                     vec![root],
                     Some(1_700_000_000_000),
                 );
+                // ubs:ignore[rust.ownership.panic-macro] — Fail the conformance test with the connector identity when discovery returns an error.
                 let sources = connector
                     .discover_source_files(&ctx)
                     .unwrap_or_else(|err| panic!("connector {slug} discovery failed: {err}")); // ubs:ignore[rust.ownership.panic-macro] — Fail conformance with the connector identity on discovery error.
