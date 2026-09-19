@@ -1,4 +1,4 @@
-//! Regression coverage for coding_agent_session_search#486.
+//! Regression coverage for `coding_agent_session_search#486`.
 //!
 //! Exercise the public APIs with the real environment reader. Each case runs in
 //! a child test process: changing a process-global environment variable in a
@@ -137,8 +137,8 @@ fn assert_source_boundaries(connector: &CodexConnector, ctx: &ScanContext, expec
         let mut should_scan = |source: &DiscoveredSourceFile| {
             assert!(
                 expected.contains(&source.source_path),
-                "excluded source reached the pre-parse hook: {:?}",
-                source.source_path,
+                "excluded source reached the pre-parse hook: {}",
+                source.source_path.display(),
             );
             visited.push(source.source_path.clone());
             true
