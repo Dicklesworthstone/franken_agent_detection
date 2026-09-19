@@ -1,5 +1,7 @@
 //! Shared utility functions used by all connectors.
 
+mod capped;
+
 use std::path::{Path, PathBuf};
 
 /// Read an environment variable, trimming whitespace and treating empty strings as unset.
@@ -54,21 +56,12 @@ pub(crate) const MAX_SCAN_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Read a session-store file to a string under the project's size cap.
 ///
-/// Enforces [`MAX_SCAN_FILE_BYTES`] twice — a cheap pre-read stat skips the
-/// common oversized case, and a post-read backstop covers metadata-error and
-/// grow-between-stat-and-read races (the e253bdb bypass class). Returns
+/// Metadata on the opened file rejects known oversized sources cheaply. The
+/// read itself consumes at most [`MAX_SCAN_FILE_BYTES`] plus one probe byte,
+/// including when metadata fails or the source grows during the read. Returns
 /// `Ok(None)` when the file exceeds the cap; callers decide how to log it.
 pub(crate) fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.len() > MAX_SCAN_FILE_BYTES {
-            return Ok(None);
-        }
-    }
-    let content = std::fs::read_to_string(path)?;
-    if content.len() as u64 > MAX_SCAN_FILE_BYTES {
-        return Ok(None);
-    }
-    Ok(Some(content))
+    capped::read_capped(path)
 }
 
 /// True when a user message is harness-injected context rather than a
