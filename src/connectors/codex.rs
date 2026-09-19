@@ -10,7 +10,10 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, env_path_nonempty, is_injected_context_message, read_capped};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, is_injected_context_message,
+    path_is_excluded, read_capped,
+};
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -249,6 +252,7 @@ impl CodexConnector {
     }
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let excluded_paths = excluded_scan_paths_from_env();
         let roots = Self::source_roots(ctx);
         let mut out = Vec::new();
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
@@ -272,6 +276,10 @@ impl CodexConnector {
                 .map_or_else(|| Self::rollout_files(&home), |path| vec![path]);
 
             for file in files {
+                // Explicit-file roots bypass rollout_files(), so filter here.
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&file)) {
                     continue;
                 }
@@ -423,6 +431,7 @@ fn scan_codex_with_hooks(
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    let excluded_paths = excluded_scan_paths_from_env();
     let roots: Vec<ScanRoot> = CodexConnector::source_roots(ctx);
 
     if roots.is_empty() {
@@ -454,6 +463,10 @@ fn scan_codex_with_hooks(
             .unwrap_or_else(|| CodexConnector::sessions_dir(&home));
 
         for file in files {
+            // Excluded sources must not reach pre-parse hooks or completions.
+            if path_is_excluded(&file, &excluded_paths) {
+                continue;
+            }
             if !seen_files.insert(dedupe_path_key(&file)) {
                 continue;
             }
