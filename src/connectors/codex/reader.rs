@@ -23,8 +23,8 @@ impl<'a> RolloutReader<'a> {
         path: &'a Path,
         progress_tick: Option<&'a (dyn Fn() + Send + Sync)>,
     ) -> Result<Self> {
-        let file = File::open(path)
-            .with_context(|| format!("open Codex rollout {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("open Codex rollout {}", path.display()))?;
         let before = file.metadata().context("inspect opened Codex rollout")?;
         if !before.is_file() {
             return Err(io::Error::new(
@@ -55,9 +55,10 @@ impl<'a> RolloutReader<'a> {
         if self.finished {
             return Ok(None);
         }
-        let record = self.records.next_record().with_context(|| {
-            format!("read Codex rollout {}", self.path.display())
-        })?;
+        let record = self
+            .records
+            .next_record()
+            .with_context(|| format!("read Codex rollout {}", self.path.display()))?;
         if record.is_none() {
             // The caller accumulates a source privately until this validated
             // EOF. Nothing from a failed source may reach its consumer sink.
@@ -75,7 +76,12 @@ impl<'a> RolloutReader<'a> {
             )
             .into());
         }
-        let after = self.records.input.get_ref().get_ref().metadata()
+        let after = self
+            .records
+            .input
+            .get_ref()
+            .get_ref()
+            .metadata()
             .context("recheck opened Codex rollout")?;
         let named = fs::metadata(self.path).context("recheck Codex rollout path")?;
         if !same_snapshot(&self.before, &after)? || !same_snapshot(&self.before, &named)? {
@@ -129,9 +135,10 @@ impl<'a, R: BufRead> Records<'a, R> {
                 }
             }
             self.line.clear();
-            let count = self.input.read_line(&mut self.line).with_context(|| {
-                format!("read Codex JSONL line {}", self.line_number + 1)
-            })?;
+            let count = self
+                .input
+                .read_line(&mut self.line)
+                .with_context(|| format!("read Codex JSONL line {}", self.line_number + 1))?;
             if count == 0 {
                 return Ok(None);
             }
@@ -174,8 +181,14 @@ mod tests {
     fn records_keep_physical_indices_bom_crlf_and_complete_eof() {
         let bytes = "\u{feff}{\"first\":true}\r\n\nnot-json\n{\"last\":true}";
         let mut records = Records::new(Cursor::new(bytes), None);
-        assert_eq!(records.next_record().unwrap(), Some((0, serde_json::json!({"first":true}))));
-        assert_eq!(records.next_record().unwrap(), Some((3, serde_json::json!({"last":true}))));
+        assert_eq!(
+            records.next_record().unwrap(),
+            Some((0, serde_json::json!({"first":true})))
+        );
+        assert_eq!(
+            records.next_record().unwrap(),
+            Some((3, serde_json::json!({"last":true})))
+        );
         assert!(records.next_record().unwrap().is_none());
         assert_eq!(records.bytes_read, bytes.len() as u64);
     }
@@ -185,7 +198,10 @@ mod tests {
         let mut records = Records::new(Cursor::new("{}\n{\"private_marker\":"), None);
         assert!(records.next_record().unwrap().is_some());
         let error = records.next_record().unwrap_err();
-        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
         assert!(!error.to_string().contains("private_marker"));
     }
 
@@ -194,7 +210,10 @@ mod tests {
         let mut records = Records::new(Cursor::new(&b"{}\n\xff\n{}\n"[..]), None);
         assert!(records.next_record().unwrap().is_some());
         let error = records.next_record().unwrap_err();
-        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -209,16 +228,22 @@ mod tests {
                 }
             }
         }
-        let mut records = Records::new(BufReader::new(Failing(Cursor::new(b"{}\n".to_vec()))), None);
+        let mut records =
+            Records::new(BufReader::new(Failing(Cursor::new(b"{}\n".to_vec()))), None);
         assert!(records.next_record().unwrap().is_some());
         let error = records.next_record().unwrap_err();
-        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::Other);
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Other
+        );
     }
 
     #[test]
     fn liveness_ticks_include_skipped_lines_and_only_the_owning_scan() {
         let ticks = AtomicUsize::new(0);
-        let tick = || { ticks.fetch_add(1, Ordering::Relaxed); };
+        let tick = || {
+            ticks.fetch_add(1, Ordering::Relaxed);
+        };
         let bytes = "\n".repeat(PROGRESS_LINE_STRIDE * 2 + 1);
         let mut records = Records::new(Cursor::new(bytes), Some(&tick));
         assert!(records.next_record().unwrap().is_none());

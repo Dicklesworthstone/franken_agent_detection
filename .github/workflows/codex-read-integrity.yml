@@ -1,267 +1,84 @@
-name: Validate Codex read integrity
+name: Codex read integrity
 
-# Bootstrap the small, checked edit to the existing parser on a native runner.
-# This job only publishes validated Git blobs; it never changes a branch ref.
-# The integration commit replaces this bootstrap with read-only regression CI.
 on:
   push:
     branches: [main]
     paths:
+      - 'src/connectors/codex.rs'
+      - 'src/connectors/codex/**'
+      - 'src/connectors/utils.rs'
+      - 'src/connectors/utils/**'
+      - 'tests/codex_read_integrity.rs'
+      - 'tests/codex_exclusions.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - '.github/workflows/codex-read-integrity.yml'
-      - 'src/connectors/codex/reader.rs'
+  pull_request:
+    paths:
+      - 'src/connectors/codex.rs'
+      - 'src/connectors/codex/**'
+      - 'src/connectors/utils.rs'
+      - 'src/connectors/utils/**'
+      - 'tests/codex_read_integrity.rs'
+      - 'tests/codex_exclusions.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/codex-read-integrity.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  validate:
-    if: github.repository == 'Dicklesworthstone/franken_agent_detection' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
+  regression:
+    name: Read integrity and CASS consumer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout FAD under test
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Apply exact parser edit and regression contract
-        shell: bash
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test byte limits and record-reader failures
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import subprocess
-          path = Path('src/connectors/codex.rs')
-          expected = 'f4f2e25e2bd1bafa7457066135af57298ec7fa64'
-          actual = subprocess.check_output(['git', 'hash-object', str(path)], text=True).strip()
-          if actual != expected:
-              raise SystemExit(f'Refusing a stale parser edit: {actual} != {expected}')
-          source = path.read_text()
-          def replace(old, new):
-              global source
-              if source.count(old) != 1:
-                  raise SystemExit(f'Expected exactly one edit anchor: {old[:100]!r}')
-              source = source.replace(old, new, 1)
-          replace('use std::collections::HashSet;', 'mod reader;\n\nuse std::collections::HashSet;')
-          replace('use anyhow::{Context, Result};', 'use anyhow::Result;')
-          start = source.index('                let f = std::fs::File::open(&file)')
-          end = source.index('                    let entry_type = val.get("type")', start)
-          old = source[start:end]
-          if 'std::io::BufRead::lines(reader).enumerate()' not in old or len(old) > 1500:
-              raise SystemExit('Unexpected parser loop shape')
-          replace(old, '''                let mut reader = reader::RolloutReader::open(&file, ctx.progress_tick.as_deref())?;
-
-                          // Accumulate privately until the complete opened snapshot is validated.
-                          while let Some((line_idx, val)) = reader.next_record()? {
-          '''.replace('                          ', '                ', 1).replace('                          ', '                ', 1) + '\n')
-          replace('fn truncated_jsonl_mid_json_returns_partial_results()', 'fn truncated_jsonl_mid_json_requires_retry()')
-          replace('''        assert!(result.is_ok(), "truncated file should not cause an error");
-                  let convs = result.unwrap();
-                  assert_eq!(convs.len(), 1);
-                  assert_eq!(
-                      convs[0].messages.len(),
-                      1,
-                      "should yield only the 1 valid message from truncated file"
-                  );
-                  assert_eq!(convs[0].messages[0].content, "Valid");''', '''        let error = result.expect_err("unfinished input requires retry");
-                  assert_eq!(
-                      error.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
-                      Some(std::io::ErrorKind::UnexpectedEof)
-                  );''')
-          replace('fn truncated_mid_utf8_does_not_panic()', 'fn truncated_mid_utf8_requires_retry_without_panicking()')
-          replace('''        assert!(result.is_ok(), "truncated mid-UTF8 should not panic");
-                  let convs = result.unwrap();
-                  assert_eq!(convs.len(), 1);
-                  assert_eq!(convs[0].messages[0].content, "OK");''', '''        let error = result.expect_err("incomplete UTF-8 requires retry");
-                  assert_eq!(
-                      error.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
-                      Some(std::io::ErrorKind::InvalidData)
-                  );''')
-          replace('fn invalid_utf8_skips_corrupted_lines()', 'fn invalid_utf8_requires_retry_instead_of_partial_success()')
-          replace('''        assert!(result.is_ok(), "invalid UTF-8 should not cause a panic");
-                  let convs = result.unwrap();
-                  assert_eq!(convs.len(), 1);
-                  assert_eq!(
-                      convs[0].messages.len(),
-                      2,
-                      "should extract valid messages around invalid UTF-8"
-                  );
-                  assert_eq!(convs[0].messages[0].content, "Before");
-                  assert_eq!(convs[0].messages[1].content, "After");''', '''        let error = result.expect_err("invalid UTF-8 must not certify partial history");
-                  assert_eq!(
-                      error.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
-                      Some(std::io::ErrorKind::InvalidData)
-                  );''')
-          path.write_text(source)
-          Path('tests/codex_read_integrity.rs').write_text(r'''#![cfg(feature = "connectors")]
-          //! The real public connector must not deliver or complete failed reads.
-
-          use std::io::{self, Write};
-          use std::path::PathBuf;
-          use std::sync::Arc;
-          use std::sync::atomic::{AtomicBool, Ordering};
-          use franken_agent_detection::{CodexConnector, Connector, DiscoveredSourceFile, ScanContext, ScanRoot, SourceCompletion, SourceScanHooks};
-          use tempfile::TempDir;
-
-          fn record(text: &str) -> String {
-              serde_json::json!({"type":"response_item","payload":{"role":"user","content":text}}).to_string()
-          }
-
-          fn fixture(bytes: &[u8]) -> (TempDir, PathBuf, ScanContext) {
-              let root = TempDir::new().unwrap();
-              let path = root.path().join("rollout-integrity.jsonl");
-              std::fs::write(&path, bytes).unwrap();
-              let ctx = ScanContext::with_roots(root.path().join("cass"), vec![ScanRoot::local(path.clone())], None);
-              (root, path, ctx)
-          }
-
-          fn assert_kind(error: &anyhow::Error, kind: io::ErrorKind) {
-              assert_eq!(error.downcast_ref::<io::Error>().map(io::Error::kind), Some(kind), "{error:#}");
-          }
-
-          fn assert_rejected(ctx: &ScanContext, kind: io::ErrorKind) {
-              let connector = CodexConnector::new();
-              assert_kind(&connector.scan(ctx).unwrap_err(), kind);
-              let mut emitted = 0;
-              let error = connector.scan_with_callback(ctx, &mut |_| { emitted += 1; Ok(()) }).unwrap_err();
-              assert_kind(&error, kind);
-              assert_eq!(emitted, 0);
-              let mut completed = 0;
-              let mut complete = |_: &SourceCompletion| { completed += 1; Ok(()) };
-              let mut hooks = SourceScanHooks { should_scan_source: None, on_source_complete: Some(&mut complete) };
-              let error = connector.scan_with_source_boundaries(ctx, &mut hooks, &mut |_| { emitted += 1; Ok(()) }).unwrap_err();
-              assert_kind(&error, kind);
-              assert_eq!(emitted, 0);
-              assert_eq!(completed, 0);
-          }
-
-          #[test]
-          fn incomplete_tail_and_invalid_utf8_withhold_all_routes_then_retry() {
-              let prefix = format!("{}\n", record("valid prefix"));
-              for suffix in [&b"{\"type\":\"response_item\""[..], &b"\xff\n"[..], &b"\xf0\x9f"[..]] {
-                  let mut bytes = prefix.as_bytes().to_vec();
-                  bytes.extend_from_slice(suffix);
-                  let (_root, path, mut ctx) = fixture(&bytes);
-                  let kind = if suffix.starts_with(b"{") { io::ErrorKind::UnexpectedEof } else { io::ErrorKind::InvalidData };
-                  for since in [None, Some(0)] {
-                      ctx.since_ts = since;
-                      assert_rejected(&ctx, kind);
-                  }
-                  assert_eq!(std::fs::read(&path).unwrap(), bytes);
-                  std::fs::write(&path, format!("{prefix}{}", record("complete tail"))).unwrap();
-                  let mut completed = 0;
-                  let mut complete = |done: &SourceCompletion| { assert_eq!(done.conversations_emitted, 1); completed += 1; Ok(()) };
-                  let mut hooks = SourceScanHooks { should_scan_source: None, on_source_complete: Some(&mut complete) };
-                  let mut conversations = Vec::new();
-                  CodexConnector::new().scan_with_source_boundaries(&ctx, &mut hooks, &mut |c| { conversations.push(c); Ok(()) }).unwrap();
-                  assert_eq!(completed, 1);
-                  assert_eq!(conversations.len(), 1);
-                  assert_eq!(conversations[0].messages.len(), 2);
-                  assert_eq!(conversations[0].messages[1].content, "complete tail");
-              }
-          }
-
-          #[test]
-          fn oversized_rollout_is_rejected_before_its_body_or_progress_callback() {
-              let (_root, path, mut ctx) = fixture(b"");
-              std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(100 * 1024 * 1024 + 1).unwrap();
-              ctx.progress_tick = Some(Arc::new(|| panic!("oversized body must not be read")));
-              assert_rejected(&ctx, io::ErrorKind::InvalidData);
-              assert_eq!(std::fs::metadata(&path).unwrap().len(), 100 * 1024 * 1024 + 1);
-          }
-
-          #[test]
-          fn snapshot_mutations_fail_before_emission_and_stable_retry_succeeds() {
-              for mutation in ["append", "truncate", "replace"] {
-                  let original = format!("{}\n", record("opened prefix"));
-                  let (_root, path, mut ctx) = fixture(original.as_bytes());
-                  let changed = AtomicBool::new(false);
-                  let changing = path.clone();
-                  ctx.progress_tick = Some(Arc::new(move || {
-                      if changed.swap(true, Ordering::Relaxed) { return; }
-                      match mutation {
-                          "append" => { writeln!(std::fs::OpenOptions::new().append(true).open(&changing).unwrap(), "{}", record("later append")).unwrap(); }
-                          "truncate" => { std::fs::OpenOptions::new().write(true).open(&changing).unwrap().set_len(0).unwrap(); }
-                          "replace" => { std::fs::rename(&changing, changing.with_extension("retained")).unwrap(); std::fs::write(&changing, format!("{}\n", record("replacement with a different length"))).unwrap(); }
-                          _ => unreachable!(),
-                      }
-                  }));
-                  let mut emitted = 0;
-                  let mut completed = 0;
-                  let mut complete = |_: &SourceCompletion| { completed += 1; Ok(()) };
-                  let mut hooks = SourceScanHooks { should_scan_source: None, on_source_complete: Some(&mut complete) };
-                  let error = CodexConnector::new().scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| { emitted += 1; Ok(()) }).unwrap_err();
-                  assert_kind(&error, if mutation == "truncate" { io::ErrorKind::UnexpectedEof } else { io::ErrorKind::Interrupted });
-                  assert_eq!(emitted, 0);
-                  assert_eq!(completed, 0);
-                  ctx.progress_tick = None;
-                  std::fs::write(&path, original).unwrap();
-                  let conversations = CodexConnector::new().scan(&ctx).unwrap();
-                  assert_eq!(conversations.len(), 1);
-                  assert_eq!(conversations[0].messages[0].content, "opened prefix");
-              }
-          }
-
-          #[test]
-          fn host_veto_precedes_parsing_and_sink_errors_still_abort() {
-              let (_root, path, ctx) = fixture(b"\xff\n");
-              let mut visited = 0;
-              let mut predicate = |_: &DiscoveredSourceFile| { visited += 1; false };
-              let mut complete = |_: &SourceCompletion| panic!("vetoed source cannot complete");
-              let mut hooks = SourceScanHooks { should_scan_source: Some(&mut predicate), on_source_complete: Some(&mut complete) };
-              CodexConnector::new().scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| panic!("vetoed source cannot emit")).unwrap();
-              assert_eq!(visited, 1);
-              std::fs::write(&path, record("valid")).unwrap();
-              let error = CodexConnector::new().scan_with_callback(&ctx, &mut |_| anyhow::bail!("sink failure")).unwrap_err();
-              assert_eq!(error.to_string(), "sink failure");
-          }
-
-          #[test]
-          fn malformed_historical_lines_bom_and_complete_eof_remain_supported() {
-              let bytes = format!("\u{feff}{}\r\nnot-json\n\n{}", record("first"), record("last"));
-              let (_root, path, ctx) = fixture(bytes.as_bytes());
-              let conversations = CodexConnector::new().scan(&ctx).unwrap();
-              assert_eq!(conversations.len(), 1);
-              assert_eq!(conversations[0].messages.len(), 2);
-              assert_eq!(conversations[0].messages[0].content, "first");
-              assert_eq!(conversations[0].messages[1].content, "last");
-              assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
-          }
-          ''')
-          PY
-      - name: Format the three changed Rust files
-        run: cargo fmt --all
-      - name: Test base connectors and public contracts
-        run: |
-          cargo test --quiet --features connectors --lib
-          cargo test --quiet --features connectors --test codex_exclusions --test codex_read_integrity
-      - name: Strict Clippy and format check
-        run: |
-          cargo clippy --quiet --features connectors --all-targets -- -D warnings
-          cargo fmt --all -- --check
-      - name: Publish validated blobs without moving any branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import json, os, subprocess, urllib.request
-          from pathlib import Path
-          paths = ['src/connectors/codex.rs', 'src/connectors/codex/reader.rs', 'tests/codex_read_integrity.rs']
-          changed = set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())
-          untracked = set(subprocess.check_output(['git','ls-files','--others','--exclude-standard'],text=True).splitlines())
-          if (changed | untracked) - set(paths):
-              raise SystemExit(f'Unexpected modified paths: {(changed | untracked) - set(paths)}')
-          base = subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
-          blobs = []
-          for path in paths:
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/Dicklesworthstone/franken_agent_detection/git/blobs',
-                  data=json.dumps({'content':Path(path).read_text(),'encoding':'utf-8'}).encode(),
-                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'},
-                  method='POST')
-              with urllib.request.urlopen(request,timeout=30) as response:
-                  blob = json.load(response)
-              blobs.append({'path':path,'sha':blob['sha']})
-          print('CODEX_VALIDATED_BLOBS='+json.dumps({'base_commit':base,'files':blobs}))
-          PY
+          cargo test --features connectors --lib connectors::utils::capped::
+          cargo test --features connectors --lib connectors::codex::reader::
+      - name: Test real Codex scan and source-completion contracts
+        run: cargo test --features connectors --test codex_exclusions --test codex_read_integrity
+      - name: Lint the read-integrity contract
+        run: cargo clippy --features connectors --test codex_read_integrity -- -D warnings
+      # Freeze the consumer baseline so FAD changes cannot pass by accidentally
+      # testing different CASS code. The script checks Cargo selected this FAD
+      # checkout, not the consumer's older registry dependency. No source pins
+      # or lockfiles in either repository are modified by this temporary crate.
+      - name: Checkout CASS consumer baseline
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/coding_agent_session_search
+          ref: a897707f287799191798fe4cb1f569d191493870
+          path: consumer/cass
+          persist-credentials: false
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test real CASS wrapper against this FAD source
+        run: python consumer/cass/scripts/test_codex_contract.py --fad-checkout .

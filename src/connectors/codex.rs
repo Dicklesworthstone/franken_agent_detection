@@ -1,8 +1,10 @@
+mod reader;
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
@@ -526,25 +528,10 @@ fn scan_codex_with_hooks(
             let mut response_item_user_texts: HashSet<String> = HashSet::new();
 
             if ext == Some("jsonl") {
-                let f = std::fs::File::open(&file)
-                    .with_context(|| format!("open rollout {}", file.display()))?;
-                let reader = std::io::BufReader::new(f);
+                let mut reader = reader::RolloutReader::open(&file, ctx.progress_tick.as_deref())?;
 
-                for (line_idx, line_res) in std::io::BufRead::lines(reader).enumerate() {
-                    let Ok(line) = line_res else {
-                        continue;
-                    };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    // A UTF-8 BOM on the first line would otherwise silently
-                    // drop that record (often session_meta or the first
-                    // prompt); gemini's replay strips it for the same reason.
-                    let line = line.trim_start_matches('\u{feff}');
-                    let Ok(val) = serde_json::from_str::<Value>(line) else {
-                        continue;
-                    };
-
+                // Accumulate privately until the complete opened snapshot is validated.
+                while let Some((line_idx, val)) = reader.next_record()? {
                     let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let created = val.get("timestamp").and_then(parse_timestamp);
 
@@ -2363,7 +2350,7 @@ not valid json at all
     // =====================================================
 
     #[test]
-    fn truncated_jsonl_mid_json_returns_partial_results() {
+    fn truncated_jsonl_mid_json_requires_retry() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex");
         let sessions = codex_dir.join("sessions");
@@ -2377,19 +2364,17 @@ not valid json at all
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let result = connector.scan(&ctx);
 
-        assert!(result.is_ok(), "truncated file should not cause an error");
-        let convs = result.unwrap();
-        assert_eq!(convs.len(), 1);
+        let error = result.expect_err("unfinished input requires retry");
         assert_eq!(
-            convs[0].messages.len(),
-            1,
-            "should yield only the 1 valid message from truncated file"
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::UnexpectedEof)
         );
-        assert_eq!(convs[0].messages[0].content, "Valid");
     }
 
     #[test]
-    fn truncated_mid_utf8_does_not_panic() {
+    fn truncated_mid_utf8_requires_retry_without_panicking() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex");
         let sessions = codex_dir.join("sessions");
@@ -2408,14 +2393,17 @@ not valid json at all
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let result = connector.scan(&ctx);
 
-        assert!(result.is_ok(), "truncated mid-UTF8 should not panic");
-        let convs = result.unwrap();
-        assert_eq!(convs.len(), 1);
-        assert_eq!(convs[0].messages[0].content, "OK");
+        let error = result.expect_err("incomplete UTF-8 requires retry");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
     }
 
     #[test]
-    fn invalid_utf8_skips_corrupted_lines() {
+    fn invalid_utf8_requires_retry_instead_of_partial_success() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex");
         let sessions = codex_dir.join("sessions");
@@ -2436,16 +2424,13 @@ not valid json at all
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let result = connector.scan(&ctx);
 
-        assert!(result.is_ok(), "invalid UTF-8 should not cause a panic");
-        let convs = result.unwrap();
-        assert_eq!(convs.len(), 1);
+        let error = result.expect_err("invalid UTF-8 must not certify partial history");
         assert_eq!(
-            convs[0].messages.len(),
-            2,
-            "should extract valid messages around invalid UTF-8"
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
         );
-        assert_eq!(convs[0].messages[0].content, "Before");
-        assert_eq!(convs[0].messages[1].content, "After");
     }
 
     #[test]
