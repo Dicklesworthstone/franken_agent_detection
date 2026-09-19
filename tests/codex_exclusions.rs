@@ -52,7 +52,14 @@ impl Fixture {
         let expected: Vec<_> = expected_indices.iter().map(|&i| &self.files[i]).collect();
         let expected = serde_json::to_string(&expected).unwrap();
         let files = serde_json::to_string(&self.files).unwrap();
-        for mode in ["default", "home", "codex", "sessions", "files", "overlapping"] {
+        for mode in [
+            "default",
+            "home",
+            "codex",
+            "sessions",
+            "files",
+            "overlapping",
+        ] {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "codex_exclusions_child", "--nocapture"])
                 .current_dir(self.root.path())
@@ -91,7 +98,11 @@ fn context(root: &Path, files: &[PathBuf], mode: &str, since: Option<i64>) -> Sc
         }
         _ => panic!("unknown root mode: {mode}"),
     };
-    ScanContext::with_roots(data_dir, paths.into_iter().map(ScanRoot::local).collect(), since)
+    ScanContext::with_roots(
+        data_dir,
+        paths.into_iter().map(ScanRoot::local).collect(),
+        since,
+    )
 }
 
 fn assert_paths(mut actual: Vec<PathBuf>, expected: &[PathBuf], operation: &str) {
@@ -109,7 +120,10 @@ fn assert_conversations(conversations: &[NormalizedConversation], expected: &[Pa
         assert_eq!(conversation.messages[0].content, "fixture message");
     }
     assert_paths(
-        conversations.iter().map(|c| c.source_path.clone()).collect(),
+        conversations
+            .iter()
+            .map(|c| c.source_path.clone())
+            .collect(),
         expected,
         "parsed conversations",
     );
@@ -162,17 +176,18 @@ fn codex_exclusions_child() {
     let mode = std::env::var(CHILD_MODE).unwrap();
     let expected: Vec<PathBuf> =
         serde_json::from_str(&std::env::var(CHILD_EXPECTED).unwrap()).unwrap();
-    let files: Vec<PathBuf> = serde_json::from_str(
-        &std::env::var("FAD_CODEX_EXCLUSION_TEST_FILES").unwrap(),
-    )
-    .unwrap();
+    let files: Vec<PathBuf> =
+        serde_json::from_str(&std::env::var("FAD_CODEX_EXCLUSION_TEST_FILES").unwrap()).unwrap();
     let connector = CodexConnector::new();
     // Cover both a full scan and an incremental scan that admits these files.
     for since in [None, Some(0)] {
         let ctx = context(&root, &files, &mode, since);
         let discovered = connector.discover_source_files(&ctx).unwrap();
         assert_paths(
-            discovered.into_iter().map(|source| source.source_path).collect(),
+            discovered
+                .into_iter()
+                .map(|source| source.source_path)
+                .collect(),
             &expected,
             "discovery/pre-mirroring",
         );
@@ -204,13 +219,24 @@ fn codex_exclusions_exact_files_preserve_siblings() {
 #[test]
 fn codex_exclusions_parent_directory_preserves_prefix_sibling() {
     let fixture = Fixture::new();
-    fixture.run(fixture.files[0].parent().unwrap().to_str().unwrap(), &[3, 4]);
+    fixture.run(
+        fixture.files[0].parent().unwrap().to_str().unwrap(),
+        &[3, 4],
+    );
 }
 
 #[test]
 fn codex_exclusions_sessions_root() {
     let fixture = Fixture::new();
-    fixture.run(fixture.root.path().join(".codex/sessions").to_str().unwrap(), &[]);
+    fixture.run(
+        fixture
+            .root
+            .path()
+            .join(".codex/sessions")
+            .to_str()
+            .unwrap(),
+        &[],
+    );
 }
 
 #[test]
