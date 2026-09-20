@@ -1,0 +1,98 @@
+name: Validate prepared Codex prompt patch
+
+# One-shot validation of the reviewed patch before a direct main source commit.
+# This workflow creates tested blob objects, never commits or updates branches.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/codex_prompt_integrity.patch'
+      - '.github/workflows/validate-codex-prompt-patch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Prompt integrity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify reviewed base and apply exact patch
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD:src/connectors/codex.rs)" = 1e0efe8db383c2125997977567998bda5945842d
+          test ! -e src/connectors/codex/user_prompts.rs
+          test ! -e tests/codex_prompt_integrity.rs
+          git apply --check .github/patches/codex_prompt_integrity.patch
+          git apply .github/patches/codex_prompt_integrity.patch
+          cargo fmt --all
+          git diff --check
+      - name: Connector library tests
+        run: cargo test --features connectors --lib
+      - name: Public prompt, exclusion and read-integrity regressions
+        run: cargo test --features connectors --test codex_prompt_integrity --test codex_exclusions --test codex_read_integrity
+      - name: Strict connector lint checks
+        run: cargo clippy --all-targets --features connectors -- -D warnings
+      - name: Verify formatting
+        run: cargo fmt --all --check
+      - name: Retain exact validated Linux sources
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: validated-codex-prompt-sources
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            src/connectors/codex.rs
+            src/connectors/codex/user_prompts.rs
+            tests/codex_prompt_integrity.rs
+
+  stage-blobs:
+    name: Stage tested Git blobs (no branch writes)
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: validated-codex-prompt-sources
+          path: validated
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const paths = [
+              'src/connectors/codex.rs',
+              'src/connectors/codex/user_prompts.rs',
+              'tests/codex_prompt_integrity.rs',
+            ];
+            for (const path of paths) {
+              const bytes = fs.readFileSync(`validated/${path}`);
+              const {data} = await github.rest.git.createBlob({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                content: bytes.toString('base64'),
+                encoding: 'base64',
+              });
+              core.notice(`TESTED_BLOB ${path} ${data.sha}`);
+            }

@@ -1,0 +1,550 @@
+diff --git a/src/connectors/codex.rs b/src/connectors/codex.rs
+--- a/src/connectors/codex.rs
++++ b/src/connectors/codex.rs
+@@ -1,3 +1,4 @@
+ mod reader;
++mod user_prompts;
+ 
+ use std::collections::HashSet;
+@@ -523,10 +524,6 @@
+             let mut session_cwd: Option<PathBuf> = None;
+-            // Dual-stream-era rollouts (Jan–Jun 2026) record every user
+-            // prompt TWICE: once as event_msg/user_message and once as a
+-            // response_item role=user (verified in 33/61 sampled files).
+-            // Track both streams so the post-pass can drop the
+-            // event_msg copy when the same text arrived via response_item.
+-            let mut event_msg_user_idx: Vec<usize> = Vec::new();
+-            let mut response_item_user_texts: HashSet<String> = HashSet::new();
++            // Pair individual records, not all occurrences of prompt text.
++            // Capture stream/turn identity before large-message extra compaction.
++            let mut user_prompts = user_prompts::UserPrompts::default();
+ 
+             if ext == Some("jsonl") {
+@@ -645,4 +642,10 @@
+                                         if role == "user" {
+-                                            response_item_user_texts
+-                                                .insert(content_str.trim().to_string());
++                                            user_prompts.observe(
++                                                user_prompts::Stream::Response,
++                                                line_idx,
++                                                messages.len(),
++                                                &content_str,
++                                                created,
++                                                payload.get("turn_id").and_then(Value::as_str),
++                                            );
+                                         }
+@@ -682,12 +685,20 @@
+                                     Some("user_message") => {
+                                         let text = payload
+                                             .get("message")
+                                             .and_then(|v| v.as_str())
+                                             .unwrap_or("");
+                                         if !text.is_empty() {
+                                             update_time_bounds(
+                                                 &mut started_at,
+                                                 &mut ended_at,
+                                                 created,
+                                             );
++                                            user_prompts.observe(
++                                                user_prompts::Stream::Event,
++                                                line_idx,
++                                                messages.len(),
++                                                text,
++                                                created,
++                                                payload.get("turn_id").and_then(Value::as_str),
++                                            );
+                                             messages.push(NormalizedMessage {
+@@ -718,6 +729,5 @@
+                                                 snippets: Vec::new(),
+                                             });
+-                                            event_msg_user_idx.push(messages.len() - 1);
+                                         }
+                                     }
+                                     Some("agent_reasoning") => {
+@@ -795,25 +805,4 @@
+                     }
+                 }
+-                // Drop event_msg copies of user prompts that the
+-                // response_item stream already recorded (dual-stream era).
+-                if !event_msg_user_idx.is_empty() && !response_item_user_texts.is_empty() {
+-                    let dropped: HashSet<usize> = event_msg_user_idx
+-                        .iter()
+-                        .filter(|&&idx| {
+-                            messages.get(idx).is_some_and(|m| {
+-                                response_item_user_texts.contains(m.content.trim())
+-                            })
+-                        })
+-                        .copied()
+-                        .collect();
+-                    if !dropped.is_empty() {
+-                        let mut kept: Vec<NormalizedMessage> = Vec::with_capacity(messages.len());
+-                        for (idx, message) in messages.into_iter().enumerate() {
+-                            if !dropped.contains(&idx) {
+-                                kept.push(message);
+-                            }
+-                        }
+-                        messages = kept;
+-                    }
+-                }
++                user_prompts.finish(&mut messages);
+                 crate::types::reindex_messages(&mut messages);
+diff --git a/src/connectors/codex/user_prompts.rs b/src/connectors/codex/user_prompts.rs
+new file mode 100644
+--- /dev/null
++++ b/src/connectors/codex/user_prompts.rs
+@@ -0,0 +1,212 @@
++//! Pair duplicate Codex prompt records, never repeated prompt text globally.
++//!
++//! Old rollouts can write a prompt through both `event_msg/user_message` and
++//! `response_item/user`. Text is not a session-wide identity: users routinely
++//! repeat prompts such as "continue". Only neighboring physical records from
++//! opposite streams may pair, and each record can participate in one pair.
++//! Known timestamps and turn IDs must also be compatible. Ambiguous records
++//! are retained rather than borrowing a match from another turn.
++
++/// The existing dual-stream fixture has one-second timestamp precision.
++/// Keep that compatibility without matching identical prompts minutes apart.
++const MAX_PAIR_TIMESTAMP_DELTA_MS: u64 = 1_000;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Stream {
++    Event,
++    Response,
++}
++
++struct PendingPrompt {
++    stream: Stream,
++    record_index: usize,
++    message_index: usize,
++    text: String,
++    created_at: Option<i64>,
++    turn_id: Option<String>,
++}
++
++#[derive(Default)]
++pub(super) struct UserPrompts {
++    pending: Option<PendingPrompt>,
++    event_copies: Vec<usize>,
++}
++
++impl UserPrompts {
++    /// Observe a user message immediately before it is appended to the private
++    /// conversation. Physical record indices come from `RolloutReader`; skipped
++    /// records and metadata therefore also separate possible pairs.
++    #[allow(clippy::too_many_arguments)]
++    pub(super) fn observe(
++        &mut self,
++        stream: Stream,
++        record_index: usize,
++        message_index: usize,
++        text: &str,
++        created_at: Option<i64>,
++        turn_id: Option<&str>,
++    ) {
++        let text = text.trim();
++        let turn_id = turn_id.filter(|id| !id.is_empty());
++        if let Some(previous) = self.pending.take() {
++            let timestamps_match = match (previous.created_at, created_at) {
++                (Some(left), Some(right)) => {
++                    left.abs_diff(right) <= MAX_PAIR_TIMESTAMP_DELTA_MS
++                }
++                (None, None) => true,
++                _ => false,
++            };
++            if previous.stream != stream
++                && previous.record_index.checked_add(1) == Some(record_index)
++                && previous.message_index.checked_add(1) == Some(message_index)
++                && previous.text == text
++                && timestamps_match
++                && previous.turn_id.as_deref() == turn_id
++            {
++                self.event_copies.push(match stream {
++                    Stream::Event => message_index,
++                    Stream::Response => previous.message_index,
++                });
++                // Consume both sides. One response must never erase more than
++                // one event, including runs of identical prompts at one time.
++                return;
++            }
++        }
++        self.pending = Some(PendingPrompt {
++            stream,
++            record_index,
++            message_index,
++            text: text.to_owned(),
++            created_at,
++            turn_id: turn_id.map(str::to_owned),
++        });
++    }
++
++    /// Preserve message order and the response-side message with all of its
++    /// original metadata. The caller performs its existing reindexing once.
++    pub(super) fn finish<T>(self, messages: &mut Vec<T>) {
++        if self.event_copies.is_empty() {
++            return;
++        }
++        // Observations are in source order and a pair is consumed immediately,
++        // so removal indices are strictly increasing without a sort or hash.
++        let mut copies = self.event_copies.into_iter().peekable();
++        let mut index = 0;
++        messages.retain(|_| {
++            let keep = copies.peek().copied() != Some(index);
++            if !keep {
++                copies.next();
++            }
++            index += 1;
++            keep
++        });
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{Stream, UserPrompts};
++
++    fn run(streams: &[Stream]) -> Vec<usize> {
++        let mut prompts = UserPrompts::default();
++        let mut messages = Vec::new();
++        for (index, &stream) in streams.iter().enumerate() {
++            prompts.observe(stream, index, index, "continue", Some(1_000), None);
++            messages.push(index);
++        }
++        prompts.finish(&mut messages);
++        messages
++    }
++
++    #[test]
++    fn neighboring_pairs_keep_the_response_in_either_order() {
++        assert_eq!(run(&[Stream::Event, Stream::Response]), [1]);
++        assert_eq!(run(&[Stream::Response, Stream::Event]), [0]);
++    }
++
++    #[test]
++    fn one_response_cannot_consume_multiple_identical_events() {
++        assert_eq!(run(&[Stream::Event, Stream::Event, Stream::Response]), [0, 2]);
++        assert_eq!(run(&[Stream::Event, Stream::Response, Stream::Event]), [1, 2]);
++        assert_eq!(run(&[Stream::Response, Stream::Event, Stream::Event]), [0, 2]);
++    }
++
++    #[test]
++    fn same_stream_repetition_and_repeated_pairs_are_preserved() {
++        assert_eq!(run(&[Stream::Event, Stream::Event]), [0, 1]);
++        assert_eq!(run(&[Stream::Response, Stream::Response]), [0, 1]);
++        assert_eq!(
++            run(&[Stream::Event, Stream::Response, Stream::Event, Stream::Response]),
++            [1, 3]
++        );
++    }
++
++    #[test]
++    fn discarded_raw_records_and_non_user_messages_separate_pairs() {
++        for (record, message) in [(2, 1), (1, 2), (usize::MAX, 1)] {
++            let mut prompts = UserPrompts::default();
++            prompts.observe(Stream::Event, 0, 0, "continue", None, None);
++            prompts.observe(Stream::Response, record, message, "continue", None, None);
++            let mut messages = vec![0, 1, 2];
++            prompts.finish(&mut messages);
++            assert_eq!(messages, [0, 1, 2]);
++        }
++    }
++
++    #[test]
++    fn incompatible_timestamps_or_turn_ids_do_not_delete_history() {
++        let cases = [
++            (Some(0), Some(1_001), None, None),
++            (Some(i64::MIN), Some(i64::MAX), None, None),
++            (Some(1_000), None, None, None),
++            (None, Some(1_000), None, None),
++            (None, None, Some("turn-one"), Some("turn-two")),
++            (None, None, Some("turn-one"), None),
++        ];
++        for (left_time, right_time, left_turn, right_turn) in cases {
++            let mut prompts = UserPrompts::default();
++            prompts.observe(Stream::Event, 0, 0, "continue", left_time, left_turn);
++            prompts.observe(Stream::Response, 1, 1, "continue", right_time, right_turn);
++            let mut messages = vec![0, 1];
++            prompts.finish(&mut messages);
++            assert_eq!(messages, [0, 1]);
++        }
++    }
++
++    #[test]
++    fn compatible_legacy_precision_trimmed_text_and_shared_turn_pair() {
++        let mut prompts = UserPrompts::default();
++        prompts.observe(Stream::Event, 0, 0, "  日本語\n", Some(1_000), Some("t"));
++        prompts.observe(Stream::Response, 1, 1, "日本語", Some(2_000), Some("t"));
++        let mut messages = vec![0, 1];
++        prompts.finish(&mut messages);
++        assert_eq!(messages, [1]);
++    }
++
++    #[test]
++    fn exhaustive_small_streams_preserve_every_response_and_event_multiplicity() {
++        for length in 0..=12 {
++            for bits in 0..(1_usize << length) {
++                let streams: Vec<_> = (0..length)
++                    .map(|index| {
++                        if bits & (1 << index) == 0 {
++                            Stream::Event
++                        } else {
++                            Stream::Response
++                        }
++                    })
++                    .collect();
++                let retained = run(&streams);
++                let responses = streams.iter().filter(|&&s| s == Stream::Response).count();
++                let events = length - responses;
++                assert!(retained.len() >= events.max(responses));
++                assert!(retained.windows(2).all(|pair| pair[0] < pair[1]));
++                for (index, stream) in streams.iter().enumerate() {
++                    if *stream == Stream::Response {
++                        assert!(retained.contains(&index));
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/tests/codex_prompt_integrity.rs b/tests/codex_prompt_integrity.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/codex_prompt_integrity.rs
+@@ -0,0 +1,238 @@
++//! Regression coverage for session-wide text deduplication deleting real turns.
++#![cfg(feature = "connectors")]
++
++use std::fs;
++use std::io::{self, Read, Write};
++use std::path::Path;
++
++use franken_agent_detection::{
++    CodexConnector, Connector, NormalizedConversation, ScanContext, ScanRoot, SourceCompletion,
++    SourceScanHooks,
++};
++use serde_json::{Value, json};
++
++fn event(text: &str, timestamp: Option<i64>, turn: Option<&str>) -> Value {
++    json!({
++        "type": "event_msg", "timestamp": timestamp,
++        "payload": {"type": "user_message", "message": text, "turn_id": turn}
++    })
++}
++
++fn response(text: &str, timestamp: Option<i64>, turn: Option<&str>) -> Value {
++    json!({
++        "type": "response_item", "timestamp": timestamp,
++        "payload": {"type": "message", "role": "user", "turn_id": turn,
++                    "content": [{"type": "input_text", "text": text}]}
++    })
++}
++
++fn assistant(text: &str) -> Value {
++    json!({"type": "response_item", "payload": {"role": "assistant", "content": text}})
++}
++
++fn write_rollout(path: &Path, records: &[Value], compact: bool) -> io::Result<()> {
++    let mut file = fs::File::create(path)?;
++    for record in records {
++        writeln!(file, "{record}")?;
++    }
++    if compact {
++        // Trigger FAD's 32 MiB raw-extra compaction without huge JSON fixtures.
++        // A whitespace-only physical line adds no messages or parsed objects.
++        io::copy(&mut io::repeat(b' ').take(32 * 1024 * 1024), &mut file)?;
++        file.write_all(b"\n")?;
++    }
++    file.flush()
++}
++
++fn assert_prompt_history(conversations: &[NormalizedConversation], expected: &[&str]) {
++    assert_eq!(conversations.len(), 1);
++    let conversation = &conversations[0];
++    let users: Vec<_> = conversation
++        .messages
++        .iter()
++        .filter(|message| message.role == "user")
++        .map(|message| message.content.trim())
++        .collect();
++    assert_eq!(users, expected, "a response record must not erase independent prompts");
++    for (index, message) in conversation.messages.iter().enumerate() {
++        assert_eq!(message.idx, i64::try_from(index).unwrap());
++    }
++}
++
++fn assert_all_routes(records: &[Value], expected: &[&str]) {
++    let temp = tempfile::tempdir().unwrap();
++    let home = temp.path().join(".codex");
++    let sessions = home.join("sessions/2026/09/19");
++    fs::create_dir_all(&sessions).unwrap();
++    let path = sessions.join("rollout-prompts.jsonl");
++    write_rollout(&path, records, false).unwrap();
++    let original = fs::read(&path).unwrap();
++    let connector = CodexConnector::new();
++    for root in [&home, &path] {
++        for since in [None, Some(0)] {
++            let ctx = ScanContext::with_roots(
++                temp.path().join("cass"),
++                vec![ScanRoot::local(root.to_path_buf())],
++                since,
++            );
++            let collected = connector.scan(&ctx).unwrap();
++            assert_prompt_history(&collected, expected);
++            let mut streamed = Vec::new();
++            connector
++                .scan_with_callback(&ctx, &mut |conversation| {
++                    streamed.push(conversation);
++                    Ok(())
++                })
++                .unwrap();
++            assert_eq!(
++                serde_json::to_value(&streamed).unwrap(),
++                serde_json::to_value(&collected).unwrap()
++            );
++            let mut completed = Vec::new();
++            let mut bounded = Vec::new();
++            {
++                let mut complete = |done: &SourceCompletion| {
++                    assert_eq!(done.conversations_emitted, 1);
++                    completed.push(done.source.source_path.clone());
++                    Ok(())
++                };
++                let mut hooks = SourceScanHooks {
++                    should_scan_source: None,
++                    on_source_complete: Some(&mut complete),
++                };
++                connector
++                    .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
++                        bounded.push(conversation);
++                        Ok(())
++                    })
++                    .unwrap();
++            }
++            assert_eq!(completed.as_slice(), std::slice::from_ref(&path));
++            assert_eq!(
++                serde_json::to_value(&bounded).unwrap(),
++                serde_json::to_value(&collected).unwrap()
++            );
++        }
++    }
++    assert_eq!(fs::read(path).unwrap(), original, "scanning cannot edit the rollout");
++}
++
++#[test]
++fn repeated_continue_prompts_keep_the_unmirrored_middle_turn() {
++    assert_all_routes(
++        &[
++            event("continue", Some(1_700_000_000_000), None),
++            response("continue", Some(1_700_000_001_000), None),
++            assistant("first reply"),
++            event("continue", Some(1_700_000_060_000), None),
++            assistant("second reply"),
++            event("continue", Some(1_700_000_120_000), None),
++            response("continue", Some(1_700_000_121_000), None),
++            assistant("third reply"),
++        ],
++        &["continue", "continue", "continue"],
++    );
++}
++
++#[test]
++fn one_response_consumes_at_most_one_event_even_without_timestamps() {
++    for records in [
++        vec![
++            event("continue", None, None),
++            event("continue", None, None),
++            response("continue", None, None),
++        ],
++        vec![
++            event("continue", None, None),
++            response("continue", None, None),
++            event("continue", None, None),
++        ],
++        vec![
++            response("continue", None, None),
++            event("continue", None, None),
++            event("continue", None, None),
++        ],
++    ] {
++        assert_all_routes(&records, &["continue", "continue"]);
++    }
++}
++
++#[test]
++fn non_user_output_and_raw_turn_boundaries_prevent_cross_turn_matching() {
++    for boundary in [
++        assistant("turn complete"),
++        json!({"type": "event_msg", "payload": {"type": "turn_aborted"}}),
++        json!({"type": "turn_context", "payload": {"turn_id": "next-turn"}}),
++        json!({"type": "compacted", "payload": {"message": "summary"}}),
++    ] {
++        assert_all_routes(
++            &[event("continue", None, None), boundary, response("continue", None, None)],
++            &["continue", "continue"],
++        );
++    }
++}
++
++#[test]
++fn opposite_streams_with_incompatible_identity_are_retained() {
++    for (left, right) in [
++        (
++            event("continue", Some(1_700_000_000_000), None),
++            response("continue", Some(1_700_000_060_000), None),
++        ),
++        (event("continue", None, Some("one")), response("continue", None, Some("two"))),
++        (event("continue", None, Some("one")), response("continue", None, None)),
++        (event("continue", Some(1_700_000_000_000), None), response("continue", None, None)),
++    ] {
++        assert_all_routes(&[left, right], &["continue", "continue"]);
++    }
++}
++
++#[test]
++fn same_stream_repetitions_and_both_pair_orders_keep_their_multiplicity() {
++    assert_all_routes(
++        &[
++            event("event-only", None, None),
++            event("event-only", None, None),
++            assistant("separator"),
++            response("response-only", None, None),
++            response("response-only", None, None),
++            assistant("separator"),
++            event("paired", None, None),
++            response("paired", None, None),
++            response("paired", None, None),
++            event("paired", None, None),
++        ],
++        &[
++            "event-only", "event-only", "response-only", "response-only", "paired", "paired",
++        ],
++    );
++}
++
++#[test]
++fn compaction_does_not_remove_the_stream_or_turn_identity_needed_for_pairing() {
++    let temp = tempfile::tempdir().unwrap();
++    let path = temp.path().join("rollout-compacted-prompts.jsonl");
++    let records = [
++        event("continue", None, Some("one")),
++        response("continue", None, Some("two")),
++        assistant("separator"),
++        event("日本語", None, Some("three")),
++        response("日本語", None, Some("three")),
++    ];
++    write_rollout(&path, &records, true).unwrap();
++    let size_before = fs::metadata(&path).unwrap().len();
++    let ctx = ScanContext::with_roots(
++        temp.path().join("cass"),
++        vec![ScanRoot::local(path.clone())],
++        None,
++    );
++    let conversations = CodexConnector::new().scan(&ctx).unwrap();
++    assert_prompt_history(&conversations, &["continue", "continue", "日本語"]);
++    assert!(
++        conversations[0]
++            .messages
++            .iter()
++            .all(|message| message.extra.get("payload").is_none())
++    );
++    assert_eq!(fs::metadata(path).unwrap().len(), size_before);
++}
