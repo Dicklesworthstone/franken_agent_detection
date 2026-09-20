@@ -17,7 +17,9 @@
 //! - `model_change` entries carry a bare `model` field (pi-mono writes
 //!   `provider` + `modelId`); either spelling updates the tracked model.
 
-use super::utils::{dedupe_path_key, read_capped};
+use super::utils::{
+    dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+};
 use crate::types::{NormalizedConversation, NormalizedMessage};
 use anyhow::Result;
 use serde_json::Value;
@@ -440,10 +442,15 @@ pub fn discover_sources(
     use super::{DiscoveredSourceFile, DiscoveredSourceRole};
     use crate::connectors::file_modified_since;
 
+    let excluded_paths = excluded_scan_paths_from_env();
     let mut out = Vec::new();
     let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
     for root in roots {
         for file in session_files(&root.path) {
+            // Match before deduplication and per-source metadata or pre-mirroring.
+            if path_is_excluded(&file, &excluded_paths) {
+                continue;
+            }
             if !seen_session_paths.insert(dedupe_path_key(&file)) {
                 continue;
             }
@@ -499,6 +506,7 @@ pub fn scan_homes_tagged(
 ) -> Result<Vec<NormalizedConversation>> {
     use crate::connectors::file_modified_since;
 
+    let excluded_paths = excluded_scan_paths_from_env();
     let mut convs = Vec::new();
     // Symlink-aliased homes (e.g. `~/.omp/agent` -> `~/Library/...`) reach
     // the same session files twice. Canonicalizing every FILE would be far
@@ -521,6 +529,10 @@ pub fn scan_homes_tagged(
         let sessions = sessions_dir(home);
 
         for file in files {
+            // Use the same policy as discovery before the source is opened.
+            if path_is_excluded(&file, &excluded_paths) {
+                continue;
+            }
             // Guard against equivalent-but-differently-spelled file paths.
             let dedupe_key = dedupe_path_key(&file);
             if !seen_session_paths.insert(dedupe_key) {
