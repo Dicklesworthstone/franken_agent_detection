@@ -1,13 +1,28 @@
-name: Validate prepared Codex prompt patch
+name: Codex prompt integrity
 
-# One-shot validation before a direct main source commit. The final source
-# commit replaces staging with a read-only, permanent regression workflow.
-# No runner creates a commit or updates a branch.
+# Permanent, read-only regression checks for the landed production code.
+# The historical patches under .github/patches are not applied by this job.
 on:
   push:
     branches: [main]
     paths:
-      - '.github/patches/codex_prompt_integrity*.patch'
+      - 'src/**'
+      - 'tests/codex_prompt_integrity.rs'
+      - 'tests/codex_exclusions.rs'
+      - 'tests/codex_read_integrity.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/validate-codex-prompt-patch.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/codex_prompt_integrity.rs'
+      - 'tests/codex_exclusions.rs'
+      - 'tests/codex_read_integrity.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - '.github/workflows/validate-codex-prompt-patch.yml'
   workflow_dispatch:
 
@@ -16,7 +31,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   verify:
@@ -30,23 +45,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Verify reviewed base and apply exact patch
-        shell: bash
-        run: |
-          test "$(git rev-parse HEAD:src/connectors/codex.rs)" = 1e0efe8db383c2125997977567998bda5945842d
-          test ! -e src/connectors/codex/user_prompts.rs
-          test ! -e tests/codex_prompt_integrity.rs
-          git apply --check .github/patches/codex_prompt_integrity.patch
-          git apply .github/patches/codex_prompt_integrity.patch
-          git apply --check .github/patches/codex_prompt_integrity_lints.patch
-          git apply .github/patches/codex_prompt_integrity_lints.patch
-          cargo fmt --all
-          git diff --check
       - name: Complete connector library tests (Linux)
         if: runner.os == 'Linux'
         run: cargo test --features connectors --lib
@@ -54,8 +56,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # The full Windows library has unrelated path/root fixture failures.
-          # Keep this job explicitly scoped; Linux still runs every library test.
+          # This focused gate is not a claim that the full Windows library passes.
+          # Its unrelated path/root fixture failures remain visible in full runs.
           cargo test --features connectors --lib user_prompts
           cargo test --features connectors --lib connectors::codex::reader
       - name: Public prompt, exclusion and read-integrity regressions
@@ -64,47 +66,3 @@ jobs:
         run: cargo clippy --all-targets --features connectors -- -D warnings
       - name: Verify formatting
         run: cargo fmt --all --check
-      - name: Retain exact validated Linux sources
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: validated-codex-prompt-sources
-          retention-days: 1
-          if-no-files-found: error
-          path: |
-            src/connectors/codex.rs
-            src/connectors/codex/user_prompts.rs
-            tests/codex_prompt_integrity.rs
-
-  stage-blobs:
-    name: Stage tested Git blobs (no branch writes)
-    needs: verify
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: validated-codex-prompt-sources
-          path: validated
-      - uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const paths = [
-              'src/connectors/codex.rs',
-              'src/connectors/codex/user_prompts.rs',
-              'tests/codex_prompt_integrity.rs',
-            ];
-            for (const path of paths) {
-              const bytes = fs.readFileSync(`validated/${path}`);
-              const {data} = await github.rest.git.createBlob({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                content: bytes.toString('base64'),
-                encoding: 'base64',
-              });
-              core.notice(`TESTED_BLOB ${path} ${data.sha}`);
-            }

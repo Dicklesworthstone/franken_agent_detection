@@ -1,4 +1,5 @@
 mod reader;
+mod user_prompts;
 
 use std::collections::HashSet;
 use std::fs;
@@ -519,13 +520,9 @@ fn scan_codex_with_hooks(
             let mut started_at = None;
             let mut ended_at = None;
             let mut session_cwd: Option<PathBuf> = None;
-            // Dual-stream-era rollouts (Jan–Jun 2026) record every user
-            // prompt TWICE: once as event_msg/user_message and once as a
-            // response_item role=user (verified in 33/61 sampled files).
-            // Track both streams so the post-pass can drop the
-            // event_msg copy when the same text arrived via response_item.
-            let mut event_msg_user_idx: Vec<usize> = Vec::new();
-            let mut response_item_user_texts: HashSet<String> = HashSet::new();
+            // Pair individual records, not all occurrences of prompt text.
+            // Capture stream/turn identity before large-message extra compaction.
+            let mut user_prompts = user_prompts::UserPrompts::default();
 
             if ext == Some("jsonl") {
                 let mut reader = reader::RolloutReader::open(&file, ctx.progress_tick.as_deref())?;
@@ -642,8 +639,14 @@ fn scan_codex_with_hooks(
 
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
                                         if role == "user" {
-                                            response_item_user_texts
-                                                .insert(content_str.trim().to_string());
+                                            user_prompts.observe(
+                                                user_prompts::Stream::Response,
+                                                line_idx,
+                                                messages.len(),
+                                                &content_str,
+                                                created,
+                                                payload.get("turn_id").and_then(Value::as_str),
+                                            );
                                         }
                                         let invocations = payload.get("content").map_or_else(
                                             Vec::new,
@@ -684,6 +687,14 @@ fn scan_codex_with_hooks(
                                                 &mut ended_at,
                                                 created,
                                             );
+                                            user_prompts.observe(
+                                                user_prompts::Stream::Event,
+                                                line_idx,
+                                                messages.len(),
+                                                text,
+                                                created,
+                                                payload.get("turn_id").and_then(Value::as_str),
+                                            );
                                             messages.push(NormalizedMessage {
                                                 idx: 0,
                                                 role: "user".to_string(),
@@ -698,7 +709,6 @@ fn scan_codex_with_hooks(
                                                 invocations: Vec::new(),
                                                 snippets: Vec::new(),
                                             });
-                                            event_msg_user_idx.push(messages.len() - 1);
                                         }
                                     }
                                     Some("agent_reasoning") => {
@@ -794,28 +804,7 @@ fn scan_codex_with_hooks(
                         _ => {}
                     }
                 }
-                // Drop event_msg copies of user prompts that the
-                // response_item stream already recorded (dual-stream era).
-                if !event_msg_user_idx.is_empty() && !response_item_user_texts.is_empty() {
-                    let dropped: HashSet<usize> = event_msg_user_idx
-                        .iter()
-                        .filter(|&&idx| {
-                            messages.get(idx).is_some_and(|m| {
-                                response_item_user_texts.contains(m.content.trim())
-                            })
-                        })
-                        .copied()
-                        .collect();
-                    if !dropped.is_empty() {
-                        let mut kept: Vec<NormalizedMessage> = Vec::with_capacity(messages.len());
-                        for (idx, message) in messages.into_iter().enumerate() {
-                            if !dropped.contains(&idx) {
-                                kept.push(message);
-                            }
-                        }
-                        messages = kept;
-                    }
-                }
+                user_prompts.finish(&mut messages);
                 crate::types::reindex_messages(&mut messages);
             } else if ext == Some("json") {
                 // Legacy single-file rollouts can be huge; enforce the
