@@ -32,3 +32,8 @@ fad_illustration.png
 
 # br doctor per-run artifacts
 .doctor/
+
+# Local release/format/scan receipts (clippy logs, crate tarballs, sha256s)
+.gate-results/
+# RCH per-release cargo target trees dropped in the workspace
+.rch-*-target/
