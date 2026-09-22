@@ -6,7 +6,11 @@
   "tool_call_id": "call_terminal_build_0003",
   "observation": {
     "content": [
-      {"cache_prompt": false, "type": "text", "text": "ERROR: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n[The command completed with exit code 1.]"}
+      {
+        "cache_prompt": false,
+        "type": "text",
+        "text": "ERROR: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n[The command completed with exit code 1.]"
+      }
     ],
     "is_error": true,
     "command": "docker build -t uuid-service:latest .",

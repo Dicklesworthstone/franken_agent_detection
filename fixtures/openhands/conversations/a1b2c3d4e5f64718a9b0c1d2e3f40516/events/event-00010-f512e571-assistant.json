@@ -5,7 +5,11 @@
   "llm_message": {
     "role": "assistant",
     "content": [
-      {"cache_prompt": false, "type": "text", "text": "The docker daemon is not running in this sandbox, so the image build failed. I have added a Dockerfile and the surrounding structure; you can build it once docker is available with `docker build -t uuid-service:latest .`."}
+      {
+        "cache_prompt": false,
+        "type": "text",
+        "text": "The docker daemon is not running in this sandbox, so the image build failed. I have added a Dockerfile and the surrounding structure; you can build it once docker is available with `docker build -t uuid-service:latest .`."
+      }
     ],
     "thinking_blocks": []
   },

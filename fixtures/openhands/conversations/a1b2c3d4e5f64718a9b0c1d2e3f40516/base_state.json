@@ -12,13 +12,13 @@
       "usage_id": "agent"
     },
     "tools": [
-      {"name": "terminal", "params": {}},
-      {"name": "file_editor", "params": {}},
-      {"name": "task_tracker", "params": {}}
+      { "name": "terminal", "params": {} },
+      { "name": "file_editor", "params": {} },
+      { "name": "task_tracker", "params": {} }
     ],
     "include_default_tools": ["FinishTool", "ThinkTool"]
   },
-  "workspace": {"path": "/mnt/2TBSSD/Projects/uuid_service"},
+  "workspace": { "path": "/mnt/2TBSSD/Projects/uuid_service" },
   "max_iterations": 500,
   "stuck_detection": true
 }

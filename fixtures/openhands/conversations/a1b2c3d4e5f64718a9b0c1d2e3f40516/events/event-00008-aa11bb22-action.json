@@ -4,7 +4,13 @@
   "source": "agent",
   "thought": [],
   "thinking_blocks": [],
-  "action": {"command": "docker build -t uuid-service:latest .", "is_input": false, "timeout": 100.0, "reset": false, "kind": "TerminalAction"},
+  "action": {
+    "command": "docker build -t uuid-service:latest .",
+    "is_input": false,
+    "timeout": 100.0,
+    "reset": false,
+    "kind": "TerminalAction"
+  },
   "tool_name": "terminal",
   "tool_call_id": "call_terminal_build_0003",
   "tool_call": {

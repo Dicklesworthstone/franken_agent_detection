@@ -5,7 +5,11 @@
   "llm_message": {
     "role": "user",
     "content": [
-      {"cache_prompt": false, "type": "text", "text": "Take a look at the uuid_service project and tell me how it is structured."}
+      {
+        "cache_prompt": false,
+        "type": "text",
+        "text": "Take a look at the uuid_service project and tell me how it is structured."
+      }
     ],
     "thinking_blocks": []
   },
