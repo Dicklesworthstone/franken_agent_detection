@@ -17,9 +17,7 @@
 //! - `model_change` entries carry a bare `model` field (pi-mono writes
 //!   `provider` + `modelId`); either spelling updates the tracked model.
 
-use super::utils::{
-    dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped,
-};
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use crate::types::{NormalizedConversation, NormalizedMessage};
 use anyhow::Result;
 use serde_json::Value;

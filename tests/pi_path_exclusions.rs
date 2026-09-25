@@ -164,8 +164,7 @@ fn pi_exclusions_child() {
     let root = PathBuf::from(root);
     let provider = dotenvy::var(CHILD_PROVIDER).unwrap();
     let mode = dotenvy::var(CHILD_MODE).unwrap();
-    let files: Vec<PathBuf> =
-        serde_json::from_str(&dotenvy::var(CHILD_FILES).unwrap()).unwrap();
+    let files: Vec<PathBuf> = serde_json::from_str(&dotenvy::var(CHILD_FILES).unwrap()).unwrap();
     let expected: Vec<PathBuf> =
         serde_json::from_str(&dotenvy::var(CHILD_EXPECTED).unwrap()).unwrap();
     let (connector, slug, marker): (Box<dyn Connector>, &'static str, &str) =

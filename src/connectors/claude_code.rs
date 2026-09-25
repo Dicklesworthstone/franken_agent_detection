@@ -400,6 +400,111 @@ impl ClaudeCodeConnector {
             Value::Object(out)
         }
     }
+
+    /// A prompt the user typed while the agent was mid-turn is recorded as
+    /// `{"type":"attachment","attachment":{"type":"queued_command",
+    /// "commandMode":"prompt","prompt":..,"origin":{"kind":"human"}}}` rather
+    /// than as a `type:"user"` entry, so the user/assistant filter would drop
+    /// it and the text would never be searchable (cass GH #500).
+    ///
+    /// Only prompt-mode entries typed by a person are normalized:
+    /// `origin.kind == "human"`, or no `origin` at all (older Claude Code
+    /// builds), which is kept but marked as unknown authorship. Relayed
+    /// (`peer`) and any other explicit origin, meta entries, and
+    /// machine-generated `task-notification` entries are skipped. The sibling
+    /// `queue-operation` records are not indexed either: they repeat the text
+    /// of every queued item, including ones later saved as normal user
+    /// entries, so indexing them would double turns.
+    fn queued_command_message(raw: &Value, compact_extra: bool) -> Option<NormalizedMessage> {
+        let attachment = raw.get("attachment")?;
+        if attachment.get("type").and_then(Value::as_str) != Some("queued_command")
+            || attachment.get("commandMode").and_then(Value::as_str) != Some("prompt")
+        {
+            return None;
+        }
+        let is_meta = |v: &Value| v.get("isMeta").and_then(Value::as_bool) == Some(true);
+        if is_meta(raw) || is_meta(attachment) {
+            return None;
+        }
+        let authorship = match attachment.get("origin") {
+            None | Some(Value::Null) => "unknown",
+            Some(origin) if origin.get("kind").and_then(Value::as_str) == Some("human") => "human",
+            Some(_) => return None,
+        };
+
+        let content = attachment
+            .get("prompt")
+            .map(flatten_content)
+            .unwrap_or_default();
+        if content.trim().is_empty() {
+            return None;
+        }
+
+        let created = raw
+            .get("timestamp")
+            .and_then(parse_timestamp)
+            .or_else(|| attachment.get("timestamp").and_then(parse_timestamp));
+
+        let mut provenance = Map::new();
+        provenance.insert(
+            "command_mode".to_string(),
+            Value::String("prompt".to_string()),
+        );
+        provenance.insert(
+            "authorship".to_string(),
+            Value::String(authorship.to_string()),
+        );
+        if let Some(source_uuid) = attachment
+            .get("source_uuid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            provenance.insert(
+                "source_uuid".to_string(),
+                Value::String(source_uuid.to_string()),
+            );
+        }
+
+        let mut extra = if compact_extra {
+            Self::compact_message_extra(raw)
+        } else {
+            raw.clone()
+        };
+        if let Some(obj) = extra.as_object_mut() {
+            let cass = obj
+                .entry("cass".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !cass.is_object() {
+                *cass = Value::Object(Map::new());
+            }
+            if let Some(cass) = cass.as_object_mut() {
+                cass.insert("queued_command".to_string(), Value::Object(provenance));
+            }
+        }
+
+        Some(NormalizedMessage {
+            idx: 0,
+            role: "user".to_string(),
+            author: None,
+            created_at: created,
+            content,
+            extra,
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        })
+    }
+}
+
+/// Widen a conversation's `[started_at, ended_at]` bounds to cover `created`.
+fn widen_time_bounds(
+    started_at: &mut Option<i64>,
+    ended_at: &mut Option<i64>,
+    created: Option<i64>,
+) {
+    if let Some(ts) = created {
+        *started_at = Some(started_at.map_or(ts, |curr| curr.min(ts)));
+        *ended_at = Some(ended_at.map_or(ts, |curr| curr.max(ts)));
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -575,6 +680,15 @@ fn scan_claude_with_callback_with_exclusions(
                             .filter(|t| !t.is_empty())
                         {
                             json_title = Some(title.to_string());
+                        }
+                        continue;
+                    }
+                    if entry_type == Some("attachment") {
+                        if let Some(message) =
+                            ClaudeCodeConnector::queued_command_message(&val, compact_message_extra)
+                        {
+                            widen_time_bounds(&mut started_at, &mut ended_at, message.created_at);
+                            messages.push(message);
                         }
                         continue;
                     }
@@ -1597,6 +1711,134 @@ mod tests {
         // Only the valid message should be extracted
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].content, "Valid message");
+    }
+
+    /// cass GH #500: prompts typed while the agent is mid-turn are recorded as
+    /// `queued_command` attachments and must be indexed as user messages.
+    #[test]
+    fn scan_indexes_mid_turn_queued_command_prompts() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        let lines = [
+            r#"{"type":"user","uuid":"u1","sessionId":"s","timestamp":"2026-09-24T10:00:00.000Z","message":{"role":"user","content":"please audit the zebratypedphrase module"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s","timestamp":"2026-09-24T10:00:05.000Z","message":{"role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"Starting on the audit now."}]}}"#,
+            // queue-operation records repeat queued text and must stay out.
+            r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-24T10:00:10.000Z","sessionId":"s","content":"also check the walrusqueuedphrase path"}"#,
+            r#"{"type":"queue-operation","operation":"remove","timestamp":"2026-09-24T10:00:12.000Z","sessionId":"s","content":"also check the walrusqueuedphrase path"}"#,
+            // Human-origin, string prompt.
+            r#"{"type":"attachment","uuid":"q1","sessionId":"s","timestamp":"2026-09-24T10:00:12.000Z","attachment":{"type":"queued_command","prompt":"also check the walrusqueuedphrase path","source_uuid":"src1","commandMode":"prompt","origin":{"kind":"human"},"timestamp":"2026-09-24T10:00:12.000Z"}}"#,
+            // Older builds: no origin field -> kept, unknown authorship.
+            r#"{"type":"attachment","uuid":"q2","sessionId":"s","timestamp":"2026-09-24T10:00:13.000Z","attachment":{"type":"queued_command","prompt":"older era narwhallegacyphrase","commandMode":"prompt"}}"#,
+            // List-shaped prompt.
+            r#"{"type":"attachment","uuid":"q3","sessionId":"s","timestamp":"2026-09-24T10:00:14.000Z","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"list shaped ocelotlistphrase prompt"}],"commandMode":"prompt","origin":{"kind":"human"}}}"#,
+            // Skipped: relayed peer message, meta entry, task notification,
+            // unrecognized explicit origin, empty prompt, other attachment.
+            r#"{"type":"attachment","uuid":"x1","sessionId":"s","timestamp":"2026-09-24T10:00:15.000Z","attachment":{"type":"queued_command","prompt":"peer relayed ibexpeerphrase","commandMode":"prompt","isMeta":true,"origin":{"kind":"peer"}}}"#,
+            r#"{"type":"attachment","uuid":"x2","sessionId":"s","timestamp":"2026-09-24T10:00:15.000Z","attachment":{"type":"queued_command","prompt":"meta yakmetaphrase","commandMode":"prompt","isMeta":true}}"#,
+            r#"{"type":"attachment","uuid":"x3","sessionId":"s","timestamp":"2026-09-24T10:00:16.000Z","attachment":{"type":"queued_command","prompt":"<task-notification>lemurtaskphrase</task-notification>","commandMode":"task-notification"}}"#,
+            r#"{"type":"attachment","uuid":"x4","sessionId":"s","timestamp":"2026-09-24T10:00:16.000Z","attachment":{"type":"queued_command","prompt":"odd okapiodd phrase","commandMode":"prompt","origin":{"kind":"something-new"}}}"#,
+            r#"{"type":"attachment","uuid":"x5","sessionId":"s","timestamp":"2026-09-24T10:00:16.000Z","attachment":{"type":"queued_command","prompt":"   ","commandMode":"prompt","origin":{"kind":"human"}}}"#,
+            r#"{"type":"attachment","uuid":"x6","sessionId":"s","timestamp":"2026-09-24T10:00:16.000Z","attachment":{"type":"total_tokens_reminder","prompt":"not a prompt"}}"#,
+            r#"{"type":"assistant","uuid":"a2","sessionId":"s","timestamp":"2026-09-24T10:00:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Noted, I will also check that path."}]}}"#,
+            // A late queued prompt extends the conversation's end bound.
+            r#"{"type":"attachment","uuid":"q4","sessionId":"s","timestamp":"2026-09-24T10:00:30.000Z","attachment":{"type":"queued_command","prompt":"one more kiwilatephrase","commandMode":"prompt","origin":{"kind":"human"}}}"#,
+        ];
+        fs::write(&session_file, lines.join("\n")).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+
+        let summary: Vec<(i64, &str, &str)> = conv
+            .messages
+            .iter()
+            .map(|m| (m.idx, m.role.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, "user", "please audit the zebratypedphrase module"),
+                (1, "assistant", "Starting on the audit now."),
+                (2, "user", "also check the walrusqueuedphrase path"),
+                (3, "user", "older era narwhallegacyphrase"),
+                (4, "user", "list shaped ocelotlistphrase prompt"),
+                (5, "assistant", "Noted, I will also check that path."),
+                (6, "user", "one more kiwilatephrase"),
+            ]
+        );
+
+        let q1 = &conv.messages[2];
+        assert_eq!(
+            q1.created_at,
+            parse_timestamp(&json!("2026-09-24T10:00:12.000Z"))
+        );
+        assert_eq!(q1.extra["cass"]["queued_command"]["authorship"], "human");
+        assert_eq!(q1.extra["cass"]["queued_command"]["source_uuid"], "src1");
+        assert_eq!(q1.extra["cass"]["queued_command"]["command_mode"], "prompt");
+        // The raw record is still carried for non-compacted sessions.
+        assert_eq!(q1.extra["attachment"]["origin"]["kind"], "human");
+
+        let q2 = &conv.messages[3];
+        assert_eq!(q2.extra["cass"]["queued_command"]["authorship"], "unknown");
+        assert!(
+            q2.extra["cass"]["queued_command"]
+                .get("source_uuid")
+                .is_none()
+        );
+
+        // The typed first message still names the conversation.
+        assert_eq!(
+            conv.title.as_deref(),
+            Some("please audit the zebratypedphrase module")
+        );
+        assert_eq!(
+            conv.started_at,
+            parse_timestamp(&json!("2026-09-24T10:00:00.000Z"))
+        );
+        assert_eq!(
+            conv.ended_at,
+            parse_timestamp(&json!("2026-09-24T10:00:30.000Z"))
+        );
+    }
+
+    #[test]
+    fn queued_command_compact_extra_keeps_provenance() {
+        let raw = json!({
+            "type": "attachment",
+            "timestamp": "2026-09-24T10:00:12.000Z",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": "large session queued prompt",
+                "source_uuid": "src9",
+                "commandMode": "prompt",
+                "origin": {"kind": "human"}
+            }
+        });
+        let msg = ClaudeCodeConnector::queued_command_message(&raw, true).unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "large session queued prompt");
+        assert!(msg.extra.get("attachment").is_none());
+        assert_eq!(msg.extra["cass"]["queued_command"]["authorship"], "human");
+        assert_eq!(msg.extra["cass"]["queued_command"]["source_uuid"], "src9");
+
+        // Falls back to the nested timestamp when the outer one is missing.
+        let nested_only = json!({
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": "nested ts",
+                "commandMode": "prompt",
+                "timestamp": "2026-09-24T10:00:12.000Z"
+            }
+        });
+        let msg = ClaudeCodeConnector::queued_command_message(&nested_only, false).unwrap();
+        assert_eq!(
+            msg.created_at,
+            parse_timestamp(&json!("2026-09-24T10:00:12.000Z"))
+        );
     }
 
     #[test]
