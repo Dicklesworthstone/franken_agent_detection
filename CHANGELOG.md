@@ -52,6 +52,30 @@ window is since GitHub Release
 
 No changes yet.
 
+## [0.3.1] -- 2026-09-25
+
+### Fixed
+
+- **Claude Code prompts typed while the agent is mid-turn are indexed**
+  (cass GH #500, [`b2d5705`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/b2d5705)).
+  Claude Code stores them as `attachment` records with
+  `attachment.type:"queued_command"`, which the JSONL parser dropped. Prompt-mode
+  queued commands from a person (`origin.kind:"human"`, or no origin in older
+  builds) are now user messages in transcript order; peer, `isMeta`,
+  task-notification and empty prompts are still skipped.
+- **`CASS_EXCLUDE_PATHS` is honored by the Codex and Pi-family connectors**
+  during discovery and scanning, before any metadata, source hook or parse
+  (cass GH #486, [`7b08fa9`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/7b08fa9),
+  [`7edeb8d`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/7edeb8d)).
+- **Session byte caps are enforced while reading**, not after: a growing or
+  metadata-less source can no longer be read whole before the 100 MiB cap
+  applies ([`6c62692`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/6c62692)).
+- **Codex reads reject incomplete primary sources** (unfinished final records,
+  appends, truncation or replacement during the read) before emitting a
+  conversation ([`8d9eebf`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/8d9eebf)),
+  and **independent repeated user prompts are preserved** instead of being
+  deduplicated session-wide ([`a112e07`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/a112e07)).
+
 ## [0.3.0] -- 2026-09-16
 
 ### Added
