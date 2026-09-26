@@ -52,6 +52,20 @@ window is since GitHub Release
 
 No changes yet.
 
+## [0.3.2] -- 2026-09-26
+
+### Fixed
+
+- **Embedders can raise the Codex rollout admission budget again**
+  ([`7947f9c`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/7947f9c)).
+  0.3.1's primary rollout reader refused every Codex rollout over 100 MiB as
+  invalid data, so cass's `CASS_CODEX_MAX_SOURCE_BYTES` (up to 1 GiB) no longer
+  indexed anything larger. The reader streams through a length-bounded handle,
+  so the cap is an admission budget, not a memory bound: the 100 MiB default
+  stays, and `connectors::codex::set_codex_rollout_byte_budget` /
+  `codex_rollout_byte_budget` let an embedder apply its own policy.
+  `ScanContext` is unchanged.
+
 ## [0.3.1] -- 2026-09-25
 
 ### Fixed
