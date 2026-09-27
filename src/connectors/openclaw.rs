@@ -16,7 +16,14 @@
 //! The `transcript_events(session_id, seq, event_json, created_at)` table holds
 //! one legacy-shaped transcript entry per row (the same "session"/"message"
 //! objects that used to be JSONL lines), so both variants share one event
-//! parser. The SQLite path is behind the `openclaw-sqlite` feature, admits a
+//! parser. Newer stores add `event_zstd` and `event_utf8_bytes`: a large
+//! event is then stored with `event_json` NULL, its UTF-8 JSON compressed into
+//! a Zstandard frame in `event_zstd`, and the decoded byte length recorded in
+//! `event_utf8_bytes`. Such rows are decoded (bounded, length- and
+//! UTF-8-checked) before the shared parser runs, and a row that cannot be
+//! decoded is skipped on its own rather than failing the whole store.
+//!
+//! The SQLite path is behind the `openclaw-sqlite` feature, admits a
 //! database by sniffing the schema (never by version strings), opens it
 //! read-only so a live `OpenClaw` Gateway is undisturbed, and skips legacy
 //! JSONL files whose session id already came out of the SQLite store (the
@@ -689,6 +696,7 @@ mod sqlite_store {
 
     use anyhow::{Context, Result, bail};
     use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
+    use frankensqlite::{Row, SqliteValue};
     use serde_json::Value;
 
     use super::super::parse_timestamp;
@@ -701,7 +709,23 @@ mod sqlite_store {
     /// adds. Version strings are deliberately not consulted.
     const REQUIRED_EVENT_COLS: &[&str] = &["session_id", "seq", "event_json", "created_at"];
 
-    fn admit(db_path: &Path) -> Result<Connection> {
+    /// Columns of the compressed payload encoding. Both must be present for
+    /// compressed rows to be decodable; older stores have neither.
+    const COMPRESSED_EVENT_COLS: &[&str] = &["event_zstd", "event_utf8_bytes"];
+
+    /// `OpenClaw`'s own ceiling for both the stored frame and the decoded
+    /// event (`MAX_COMPRESSED_EVENT_BYTES`). Anything larger is not a frame
+    /// the writer could have produced, so it is rejected before allocating.
+    pub(super) const MAX_COMPRESSED_EVENT_BYTES: usize = 4 * 1024 * 1024;
+
+    /// What [`admit`] learned about a store's schema.
+    struct AdmittedStore {
+        conn: Connection,
+        /// `event_zstd` and `event_utf8_bytes` both exist.
+        has_compressed_payloads: bool,
+    }
+
+    fn admit(db_path: &Path) -> Result<AdmittedStore> {
         let conn = open_with_flags(
             db_path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -745,8 +769,146 @@ mod sqlite_store {
                 bail!("not an OpenClaw agent store: transcript_events lacks column {required}");
             }
         }
+        let has_compressed_payloads = COMPRESSED_EVENT_COLS
+            .iter()
+            .all(|wanted| cols.iter().any(|c| c == wanted));
 
-        Ok(conn)
+        Ok(AdmittedStore {
+            conn,
+            has_compressed_payloads,
+        })
+    }
+
+    fn non_null(row: &Row, index: usize) -> Option<&SqliteValue> {
+        row.get(index)
+            .filter(|value| !matches!(value, SqliteValue::Null))
+    }
+
+    /// Why one transcript row could not be turned into event JSON text.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum PayloadError {
+        /// Neither `event_json` nor a compressed frame is present.
+        Missing,
+        /// `event_json` holds a number, or a blob that is not UTF-8.
+        IdentityNotText,
+        /// The compressed frame or its recorded length is absent, of the
+        /// wrong type, or outside `OpenClaw`'s bounds.
+        InvalidBounds,
+        /// The frame is corrupt or decodes to more than the recorded length.
+        Decompress,
+        /// The frame decoded to a different number of bytes than recorded.
+        LengthMismatch { recorded: usize, decoded: usize },
+        /// The decoded bytes are not UTF-8.
+        NotUtf8,
+    }
+
+    /// Resolve one row's event JSON text the way `OpenClaw` reads it:
+    /// `coalesce(event_json, decode(event_zstd, event_utf8_bytes))`.
+    ///
+    /// The decoder mirrors the writer's checks: the frame must be a non-empty
+    /// blob of at most 4 MiB, the recorded length an integer in
+    /// `1..=4 MiB`, the frame must decode to exactly that many bytes (the
+    /// output buffer is capped at the recorded length, so a frame that would
+    /// expand further fails instead of allocating), and the result must be
+    /// UTF-8.
+    pub(super) fn event_json_text(
+        event_json: Option<&SqliteValue>,
+        event_zstd: Option<&SqliteValue>,
+        event_utf8_bytes: Option<&SqliteValue>,
+    ) -> std::result::Result<String, PayloadError> {
+        match event_json {
+            Some(SqliteValue::Text(text)) => return Ok(text.to_string()),
+            // SQLite's column affinity is advisory; a writer binding bytes
+            // leaves a blob in a TEXT column. Accept it only as UTF-8.
+            Some(SqliteValue::Blob(bytes)) => {
+                return String::from_utf8(bytes.to_vec())
+                    .map_err(|_| PayloadError::IdentityNotText);
+            }
+            Some(_) => return Err(PayloadError::IdentityNotText),
+            None => {}
+        }
+
+        let frame = match event_zstd {
+            None => return Err(PayloadError::Missing),
+            Some(SqliteValue::Blob(frame))
+                if !frame.is_empty() && frame.len() <= MAX_COMPRESSED_EVENT_BYTES =>
+            {
+                frame
+            }
+            Some(_) => return Err(PayloadError::InvalidBounds),
+        };
+        let recorded = match event_utf8_bytes {
+            Some(SqliteValue::Integer(n)) => usize::try_from(*n)
+                .ok()
+                .filter(|n| (1..=MAX_COMPRESSED_EVENT_BYTES).contains(n))
+                .ok_or(PayloadError::InvalidBounds)?,
+            _ => return Err(PayloadError::InvalidBounds),
+        };
+
+        let decoded =
+            zstd::bulk::decompress(frame, recorded).map_err(|_| PayloadError::Decompress)?;
+        if decoded.len() != recorded {
+            return Err(PayloadError::LengthMismatch {
+                recorded,
+                decoded: decoded.len(),
+            });
+        }
+        String::from_utf8(decoded).map_err(|_| PayloadError::NotUtf8)
+    }
+
+    /// Replay one session's rows, in `seq` order, into an accumulator.
+    /// Returns it with the highest `seq` seen (decodable or not).
+    fn read_session_events(
+        conn: &Connection,
+        events_sql: &str,
+        session_id: &str,
+        db_path: &Path,
+    ) -> Result<(SessionEventAccumulator, Option<i64>)> {
+        // Rows are decoded one at a time in Rust so that a single unreadable
+        // payload costs that event only, never the query (and with it every
+        // session in the store).
+        let rows: Vec<(i64, Option<i64>, std::result::Result<String, PayloadError>)> = conn
+            .query_map_collect(events_sql, &[ParamValue::from(session_id)], |row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<Option<i64>>(2).ok().flatten(),
+                    event_json_text(non_null(row, 1), non_null(row, 3), non_null(row, 4)),
+                ))
+            })?;
+
+        let mut acc = SessionEventAccumulator::default();
+        let mut last_seq: Option<i64> = None;
+        let mut undecodable = 0_usize;
+        for (seq, created_at, event_json) in rows {
+            last_seq = Some(seq);
+            let event_json = match event_json {
+                Ok(text) => text,
+                Err(err) => {
+                    undecodable += 1;
+                    tracing::debug!(
+                        "openclaw sqlite: skipping undecodable event {session_id}#{seq} in {}: \
+                         {err:?}",
+                        db_path.display()
+                    );
+                    continue;
+                }
+            };
+            let Ok(val) = serde_json::from_str::<Value>(&event_json) else {
+                continue;
+            };
+            acc.apply_event(
+                val,
+                created_at.and_then(|ms| parse_timestamp(&Value::from(ms))),
+            );
+        }
+        if undecodable > 0 {
+            tracing::warn!(
+                "openclaw sqlite: skipped {undecodable} undecodable transcript event(s) in \
+                 session {session_id} of {}",
+                db_path.display()
+            );
+        }
+        Ok((acc, last_seq))
     }
 
     /// Extract normalized conversations from one per-agent SQLite store.
@@ -755,7 +917,19 @@ mod sqlite_store {
         agent_directory: &str,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = admit(db_path)?;
+        let AdmittedStore {
+            conn,
+            has_compressed_payloads,
+        } = admit(db_path)?;
+        // Legacy stores lack the compressed columns; select NULLs in their
+        // place so both shapes share one row decoder.
+        let events_sql = if has_compressed_payloads {
+            "SELECT seq, event_json, created_at, event_zstd, event_utf8_bytes \
+             FROM transcript_events WHERE session_id = ?1 ORDER BY seq ASC"
+        } else {
+            "SELECT seq, event_json, created_at, NULL, NULL \
+             FROM transcript_events WHERE session_id = ?1 ORDER BY seq ASC"
+        };
         conn.read_transaction(|conn| -> Result<Vec<NormalizedConversation>> {
             // Session-level freshness: include a session when ANY event is at
             // or after the cutoff, then return ALL of its events so the
@@ -777,28 +951,7 @@ mod sqlite_store {
                     }
                 }
 
-                let rows: Vec<(i64, String, i64)> = conn.query_map_collect(
-                    "SELECT seq, event_json, created_at FROM transcript_events \
-                     WHERE session_id = ?1 ORDER BY seq ASC",
-                    &[ParamValue::from(session_id.as_str())],
-                    |row| {
-                        Ok((
-                            row.get_typed::<i64>(0)?,
-                            row.get_typed::<String>(1)?,
-                            row.get_typed::<i64>(2)?,
-                        ))
-                    },
-                )?;
-
-                let mut acc = SessionEventAccumulator::default();
-                let mut last_seq: Option<i64> = None;
-                for (seq, event_json, created_at) in rows {
-                    last_seq = Some(seq);
-                    let Ok(val) = serde_json::from_str::<Value>(&event_json) else {
-                        continue;
-                    };
-                    acc.apply_event(val, parse_timestamp(&Value::from(created_at)));
-                }
+                let (acc, last_seq) = read_session_events(conn, events_sql, &session_id, db_path)?;
 
                 if acc.messages.is_empty() {
                     continue;
@@ -1628,6 +1781,261 @@ mod tests {
             // The whole session is returned, not just the fresh event.
             assert_eq!(convs[0].messages.len(), 3);
             assert_eq!(convs[0].ended_at, Some(1_760_000_000_000));
+        }
+
+        /// Current `OpenClaw` schema: `event_json` is nullable and large
+        /// events live in `event_zstd` with their decoded UTF-8 length.
+        fn create_compressed_agent_db(agent_dir: &Path) -> PathBuf {
+            let db_dir = agent_dir.join("agent");
+            fs::create_dir_all(&db_dir).unwrap();
+            let db_path = db_dir.join("openclaw-agent.sqlite");
+            let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+            conn.execute(
+                "CREATE TABLE transcript_events (
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_json TEXT,
+                    created_at INTEGER NOT NULL,
+                    event_zstd BLOB,
+                    event_utf8_bytes INTEGER,
+                    navigation_json TEXT,
+                    PRIMARY KEY (session_id, seq)
+                )",
+            )
+            .unwrap();
+            drop(conn);
+            db_path
+        }
+
+        fn insert_compressed_event(
+            db_path: &Path,
+            session_id: &str,
+            seq: i64,
+            frame: &[u8],
+            utf8_bytes: i64,
+            created_at: i64,
+        ) {
+            let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+            conn.execute_compat(
+                "INSERT INTO transcript_events \
+                 (session_id, seq, event_json, created_at, event_zstd, event_utf8_bytes) \
+                 VALUES (?, ?, NULL, ?, ?, ?)",
+                params![session_id, seq, created_at, frame.to_vec(), utf8_bytes],
+            )
+            .unwrap();
+        }
+
+        fn compress(json: &str) -> (Vec<u8>, i64) {
+            let frame = zstd::bulk::compress(json.as_bytes(), 1).unwrap();
+            (frame, i64::try_from(json.len()).unwrap())
+        }
+
+        /// The frame from the GH #25 reproduction, produced by an encoder
+        /// other than the `zstd` crate: the 106-byte event whose user text is
+        /// `compressedfixturemessage`.
+        const ISSUE_25_FRAME: &[u8] = &[
+            0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x6a, 0x7d, 0x02, 0x00, 0x62, 0x44, 0x0f, 0x16, 0xa0,
+            0xb5, 0x39, 0x04, 0x9f, 0x23, 0x89, 0xc0, 0xd2, 0xee, 0x1d, 0xcd, 0x12, 0x65, 0xf3,
+            0xff, 0xf2, 0x59, 0xe3, 0xff, 0x1b, 0x02, 0xad, 0x09, 0xcd, 0xa8, 0xbe, 0x8e, 0x82,
+            0x70, 0xa6, 0x31, 0x19, 0x54, 0x7a, 0xa4, 0x5f, 0x7e, 0x70, 0xfd, 0xf1, 0x0f, 0x2a,
+            0x25, 0x45, 0xa7, 0x02, 0x20, 0x2c, 0x3b, 0x52, 0x1b, 0x43, 0xa6, 0x4d, 0xaf, 0x4e,
+            0x81, 0x97, 0x05, 0x05, 0x00, 0x9d, 0x40, 0x82, 0xca, 0x80, 0xb3, 0x2a, 0xf0, 0x33,
+            0x40, 0x2d, 0x8a, 0x1d,
+        ];
+
+        fn user_event(text: &str) -> String {
+            format!(
+                r#"{{"type":"message","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        }
+
+        #[test]
+        fn compressed_event_does_not_hide_the_rest_of_the_store() {
+            // GH #25: one `event_json = NULL` row used to abort the query
+            // with a type mismatch and drop every session in the database.
+            let tmp = TempDir::new().unwrap();
+            let agent_dir = tmp.path().join(".openclaw/agents/main");
+            let db = create_compressed_agent_db(&agent_dir);
+            insert_event(
+                &db,
+                "fixture",
+                1,
+                &user_event("plainfixturemessage"),
+                1_700_000_000_000,
+            );
+            insert_compressed_event(&db, "fixture", 2, ISSUE_25_FRAME, 106, 1_700_000_001_000);
+            let (frame, len) = compress(&user_event("cratecompressedmessage"));
+            insert_compressed_event(&db, "fixture", 3, &frame, len, 1_700_000_002_000);
+            // A second session must survive too.
+            insert_event(
+                &db,
+                "other",
+                1,
+                &user_event("othersession"),
+                1_700_000_003_000,
+            );
+
+            let before = fs::read(&db).unwrap();
+            let connector = OpenClawConnector::new();
+            let ctx = ctx_with_root(tmp.path());
+            let mut convs = connector.scan(&ctx).unwrap();
+            convs.sort_by(|a, b| a.external_id.cmp(&b.external_id));
+            assert_eq!(
+                fs::read(&db).unwrap(),
+                before,
+                "the source store must stay untouched"
+            );
+
+            assert_eq!(convs.len(), 2);
+            let texts: Vec<&str> = convs[0]
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect();
+            assert_eq!(convs[0].external_id.as_deref(), Some("main/fixture"));
+            assert_eq!(
+                texts,
+                [
+                    "plainfixturemessage",
+                    "compressedfixturemessage",
+                    "cratecompressedmessage"
+                ]
+            );
+            assert_eq!(convs[0].messages[1].created_at, Some(1_700_000_001_000));
+            assert_eq!(
+                convs[0]
+                    .metadata
+                    .get("last_event_seq")
+                    .and_then(serde_json::Value::as_i64),
+                Some(3)
+            );
+            assert_eq!(convs[1].messages[0].content, "othersession");
+        }
+
+        #[test]
+        fn undecodable_compressed_rows_are_skipped_individually() {
+            let tmp = TempDir::new().unwrap();
+            let agent_dir = tmp.path().join(".openclaw/agents/main");
+            let db = create_compressed_agent_db(&agent_dir);
+            let (good, good_len) = compress(&user_event("survivor"));
+            let (other, other_len) = compress(&user_event("x"));
+            insert_event(&db, "s", 1, &user_event("first"), 1_700_000_000_000);
+            // Recorded length too short: the capped buffer cannot hold the frame.
+            insert_compressed_event(&db, "s", 2, &other, other_len - 1, 1_700_000_000_001);
+            // Recorded length too long: decodes to fewer bytes than recorded.
+            insert_compressed_event(&db, "s", 3, &other, other_len + 1, 1_700_000_000_002);
+            // Not a Zstandard frame at all.
+            insert_compressed_event(&db, "s", 4, b"not zstd", 8, 1_700_000_000_003);
+            // Recorded length beyond OpenClaw's 4 MiB ceiling.
+            insert_compressed_event(&db, "s", 5, &other, 5 * 1024 * 1024, 1_700_000_000_004);
+            // Well-formed frame whose payload is not UTF-8.
+            let bad_utf8 = zstd::bulk::compress(&[0xff, 0xfe, 0xfd], 1).unwrap();
+            insert_compressed_event(&db, "s", 6, &bad_utf8, 3, 1_700_000_000_005);
+            {
+                let conn = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+                // No payload in any column.
+                conn.execute(
+                    "INSERT INTO transcript_events (session_id, seq, event_json, created_at) \
+                     VALUES ('s', 7, NULL, 1700000000006)",
+                )
+                .unwrap();
+                // Frame present but its recorded length missing.
+                conn.execute_compat(
+                    "INSERT INTO transcript_events \
+                     (session_id, seq, event_json, created_at, event_zstd, event_utf8_bytes) \
+                     VALUES ('s', 8, NULL, 1700000000007, ?, NULL)",
+                    params![good.clone()],
+                )
+                .unwrap();
+            }
+            insert_compressed_event(&db, "s", 9, &good, good_len, 1_700_000_000_008);
+
+            let convs = OpenClawConnector::new()
+                .scan(&ctx_with_root(tmp.path()))
+                .unwrap();
+            assert_eq!(convs.len(), 1);
+            let texts: Vec<&str> = convs[0]
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect();
+            assert_eq!(texts, ["first", "survivor"]);
+            assert_eq!(
+                convs[0]
+                    .metadata
+                    .get("last_event_seq")
+                    .and_then(serde_json::Value::as_i64),
+                Some(9)
+            );
+        }
+
+        #[test]
+        fn payload_decoder_enforces_openclaw_bounds() {
+            use super::super::sqlite_store::{
+                MAX_COMPRESSED_EVENT_BYTES, PayloadError, event_json_text,
+            };
+            use frankensqlite::SqliteValue;
+
+            #[allow(clippy::needless_pass_by_value)] // keeps the call sites terse
+            fn dec(
+                json: Option<SqliteValue>,
+                zstd: Option<SqliteValue>,
+                bytes: Option<SqliteValue>,
+            ) -> Result<String, PayloadError> {
+                event_json_text(json.as_ref(), zstd.as_ref(), bytes.as_ref())
+            }
+
+            let blob = |b: &[u8]| Some(SqliteValue::Blob(b.to_vec().into()));
+            let int = |n: i64| Some(SqliteValue::Integer(n));
+            let json = user_event("bounded");
+            let (frame, len) = compress(&json);
+
+            // Identity text wins even when a frame is also present.
+            assert_eq!(
+                dec(Some(SqliteValue::Text("{}".into())), blob(&frame), int(len)),
+                Ok("{}".to_string())
+            );
+            assert_eq!(dec(None, blob(&frame), int(len)), Ok(json.clone()));
+            assert_eq!(dec(None, None, None), Err(PayloadError::Missing));
+            assert_eq!(
+                dec(Some(SqliteValue::Integer(1)), None, None),
+                Err(PayloadError::IdentityNotText)
+            );
+            assert_eq!(
+                dec(None, blob(&[]), int(len)),
+                Err(PayloadError::InvalidBounds)
+            );
+            assert_eq!(
+                dec(None, blob(&frame), int(0)),
+                Err(PayloadError::InvalidBounds)
+            );
+            assert_eq!(
+                dec(None, blob(&frame), int(-1)),
+                Err(PayloadError::InvalidBounds)
+            );
+            assert_eq!(
+                dec(None, Some(SqliteValue::Text("x".into())), int(len)),
+                Err(PayloadError::InvalidBounds)
+            );
+            let oversized_frame = vec![0_u8; MAX_COMPRESSED_EVENT_BYTES + 1];
+            assert_eq!(
+                dec(None, blob(&oversized_frame), int(len)),
+                Err(PayloadError::InvalidBounds)
+            );
+            // A frame that expands past the recorded length fails inside the
+            // capped buffer instead of allocating its real size.
+            let bomb = zstd::bulk::compress(&vec![b'a'; MAX_COMPRESSED_EVENT_BYTES], 1).unwrap();
+            assert_eq!(
+                dec(None, blob(&bomb), int(16)),
+                Err(PayloadError::Decompress)
+            );
+            assert_eq!(
+                dec(None, blob(&frame), int(len + 5)),
+                Err(PayloadError::LengthMismatch {
+                    recorded: usize::try_from(len + 5).unwrap(),
+                    decoded: usize::try_from(len).unwrap(),
+                })
+            );
         }
 
         #[test]

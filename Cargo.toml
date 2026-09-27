@@ -52,6 +52,10 @@ frankensqlite = { version = "0.4.1", package = "fsqlite", optional = true }
 # fsqlite 0.4 names asupersync 0.5.x types in its public API, so the two
 # must move in lockstep to preserve the bridge's runtime type identity.
 asupersync = { version = "0.5.0", default-features = false, optional = true }
+# OpenClaw 2.0 stores larger transcript events as a Zstandard frame in
+# `transcript_events.event_zstd` (with `event_json` NULL); see the
+# `openclaw-sqlite` feature. Kept on 0.13 to share cass's existing copy.
+zstd = { version = "0.13", default-features = false, optional = true }
 
 [features]
 default = []
@@ -102,7 +106,7 @@ shelley = [
 # agents/<agent>/agent/openclaw-agent.sqlite (transcript_events rows). Legacy
 # JSONL sessions need no SQLite and remain available with the base
 # `connectors` feature.
-openclaw-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync"]
+openclaw-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:zstd"]
 # Copilot legacy generation: pre-March-2025 VS Code chat sessions stored in
 # workspace/global `state.vscdb` (`ItemTable` key `interactive.sessions`).
 # The newer flat-JSON and append-log `chatSessions` generations need no SQLite
