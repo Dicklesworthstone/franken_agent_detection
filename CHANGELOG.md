@@ -52,6 +52,31 @@ window is since GitHub Release
 
 No changes yet.
 
+## [0.3.3] -- 2026-09-28
+
+### Fixed
+
+- **OpenCode 2.x sessions are indexed**
+  ([`7f4c2dd`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/7f4c2dd),
+  cass GH #504). OpenCode 2.0.x keeps sessions in `session_v2` and their
+  transcripts in `session_message`, next to the 1.x `session`/`message`/`part`
+  tables; the connector read only the 1.x tables, so a session created on 2.x
+  was never indexed. It now reads both. A session migrated from 1.x (same id in
+  both schemas) is indexed once, with its 2.x metadata and transcript. 2.x rows
+  are ordered by `seq` and rendered like 1.x parts: user and synthetic text;
+  assistant text, `[Reasoning]` and tool text results as `[Tool Output]`
+  (author = the model id); system, skill, shell and completed compaction rows.
+  `idle` and the `*-switched` events add no message. Later 2.x builds that keep
+  2.x sessions in `session` itself are read the same way. Conversation metadata
+  gains `opencode_schema` (`v1` or `v2`).
+- **OpenClaw: zstd-compressed transcript events no longer drop the store**
+  ([`8dd0b35`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/8dd0b35),
+  GH #25). Rows whose `event_json` is NULL and whose JSON sits in a Zstandard
+  frame in `event_zstd` are decoded within OpenClaw's own bounds; a row that
+  still cannot be decoded is skipped on its own instead of failing the query
+  for every session. New optional dependency `zstd` 0.13 behind
+  `openclaw-sqlite`.
+
 ## [0.3.2] -- 2026-09-26
 
 ### Fixed
