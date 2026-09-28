@@ -1,0 +1,84 @@
+name: Codex read integrity
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/connectors/codex.rs'
+      - 'src/connectors/codex/**'
+      - 'src/connectors/utils.rs'
+      - 'src/connectors/utils/**'
+      - 'tests/codex_read_integrity.rs'
+      - 'tests/codex_exclusions.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/codex-read-integrity.yml'
+  pull_request:
+    paths:
+      - 'src/connectors/codex.rs'
+      - 'src/connectors/codex/**'
+      - 'src/connectors/utils.rs'
+      - 'src/connectors/utils/**'
+      - 'tests/codex_read_integrity.rs'
+      - 'tests/codex_exclusions.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/codex-read-integrity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: Read integrity and CASS consumer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout FAD under test
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test byte limits and record-reader failures
+        run: |
+          cargo test --features connectors --lib connectors::utils::capped::
+          cargo test --features connectors --lib connectors::codex::reader::
+      - name: Test real Codex scan and source-completion contracts
+        run: cargo test --features connectors --test codex_exclusions --test codex_read_integrity
+      - name: Lint the read-integrity contract
+        run: cargo clippy --features connectors --test codex_read_integrity -- -D warnings
+      # Freeze the consumer baseline so FAD changes cannot pass by accidentally
+      # testing different CASS code. The script checks Cargo selected this FAD
+      # checkout, not the consumer's older registry dependency. No source pins
+      # or lockfiles in either repository are modified by this temporary crate.
+      - name: Checkout CASS consumer baseline
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/coding_agent_session_search
+          ref: a897707f287799191798fe4cb1f569d191493870
+          path: consumer/cass
+          persist-credentials: false
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test real CASS wrapper against this FAD source
+        run: python consumer/cass/scripts/test_codex_contract.py --fad-checkout .

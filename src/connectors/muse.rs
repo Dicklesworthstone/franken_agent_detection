@@ -78,7 +78,10 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 use super::flatten_content;
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
@@ -130,7 +133,22 @@ impl MuseConnector {
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots = if ctx.use_default_detection() {
-            vec![ScanRoot::local(Self::base_root())]
+            // Mirror the explicit-root acceptance: a default-detection
+            // data_dir that itself looks like muse storage (the
+            // `~/.local/share/muse` base with a `sessions/` tree, or the
+            // `sessions/` dir itself) scopes the scan to it, so
+            // fixture/mirror scans stay hermetic; otherwise probe the
+            // system base. `CASS_MUSE_DATA_ROOT` keeps precedence so CI
+            // redirection is unaffected.
+            let d = &ctx.data_dir;
+            let env_override = env_path_nonempty("CASS_MUSE_DATA_ROOT").is_some();
+            let looks_like_base =
+                d.join("sessions").is_dir() || d.file_name().is_some_and(|n| n == "sessions");
+            if !env_override && looks_like_base {
+                vec![ScanRoot::local(d.clone())]
+            } else {
+                vec![ScanRoot::local(Self::base_root())]
+            }
         } else {
             ctx.scan_roots.clone()
         };
@@ -222,28 +240,30 @@ fn muse_ts_to_millis(val: &Value) -> Option<i64> {
 /// One decoded `session.jsonl` envelope, holding just what the connector
 /// consumes.
 struct MuseRecord {
-    sequence: i64,
+    /// Sort key: `(0, sequence)` for records carrying the authoritative
+    /// `sequence`; `(1, file position)` for records without one. The band
+    /// keeps the unsequenced tail after every well-formed record while a
+    /// plain `i64::MAX - lineno` fallback would have emitted it in REVERSED
+    /// append order.
+    sort_key: (i64, i64),
     recorded_at_ms: Option<i64>,
     payload_type: String,
     payload: Value,
     stream_id: Option<String>,
 }
-
-/// Decode a single JSONL line into a [`MuseRecord`].
-///
 /// Strict on the envelope basics (`payload_type` string + `payload`
 /// present); tolerant elsewhere. A missing `sequence` sorts the record by
-/// its file position (biased past any well-formed sequence) rather than
-/// dropping it.
+/// its file position (after every sequenced record) rather than dropping
+/// it.
 fn parse_record(line: &str, lineno: usize) -> Option<MuseRecord> {
     let val: Value = serde_json::from_str(line).ok()?;
     let obj = val.as_object()?;
     let payload_type = obj.get("payload_type")?.as_str()?.to_string();
     let payload = obj.get("payload")?.clone();
-    let sequence = obj
-        .get("sequence")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| i64::MAX - i64::try_from(lineno).unwrap_or(0));
+    let sort_key = obj.get("sequence").and_then(Value::as_i64).map_or_else(
+        || (1, i64::try_from(lineno).unwrap_or(i64::MAX)),
+        |seq| (0, seq),
+    );
     let recorded_at_ms = obj.get("recorded_at").and_then(muse_ts_to_millis);
     let stream_id = obj
         .get("stream")
@@ -251,7 +271,7 @@ fn parse_record(line: &str, lineno: usize) -> Option<MuseRecord> {
         .and_then(Value::as_str)
         .map(String::from);
     Some(MuseRecord {
-        sequence,
+        sort_key,
         recorded_at_ms,
         payload_type,
         payload,
@@ -288,9 +308,10 @@ fn read_records(session_file: &Path) -> Vec<MuseRecord> {
             );
         }
     }
-    // `sequence` is the authoritative order per the field report; a stable
-    // sort keeps file order for ties/fallbacks.
-    records.sort_by_key(|r| r.sequence);
+    // `sequence` is the authoritative order per the field report; records
+    // without one sort after all sequenced records, in file order (the
+    // two-band key in `MuseRecord::sort_key`).
+    records.sort_by_key(|r| r.sort_key);
     records
 }
 
@@ -298,9 +319,17 @@ fn read_records(session_file: &Path) -> Vec<MuseRecord> {
 /// `payload.record.workspace_root`, if any. Used both for the session's own
 /// workspace and for subagent inheritance (gotcha 1).
 fn workspace_root_of(session_file: &Path) -> Option<PathBuf> {
-    let file = fs::File::open(session_file).ok()?;
-    for line in BufReader::new(file).lines() {
-        let line = line.ok()?;
+    let Ok(file) = fs::File::open(session_file) else {
+        tracing::debug!(transcript = %session_file.display(), "muse: cannot open transcript for workspace lookup");
+        return None;
+    };
+    for (lineno, line) in BufReader::new(file).lines().enumerate() {
+        // A single unreadable line must not abort workspace extraction for
+        // the whole transcript — skip and keep scanning.
+        let Ok(line) = line else {
+            tracing::debug!(transcript = %session_file.display(), line = lineno + 1, "muse: skipping unreadable line during workspace lookup");
+            continue;
+        };
         let line = line.trim();
         if line.is_empty() || !line.contains("runtime.session.metadata") {
             continue;
@@ -593,9 +622,7 @@ fn parse_session(session_file: &Path) -> Option<NormalizedConversation> {
                             if !call_ids.is_empty() {
                                 extra.insert(
                                     "tool_call_ids".to_string(),
-                                    Value::Array(
-                                        call_ids.into_iter().map(Value::String).collect(),
-                                    ),
+                                    Value::Array(call_ids.into_iter().map(Value::String).collect()),
                                 );
                             }
                             push_message(
@@ -698,6 +725,14 @@ fn scan_muse_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    scan_muse_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
+}
+
+fn scan_muse_with_hooks(
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
     let roots = MuseConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
@@ -712,10 +747,30 @@ fn scan_muse_with_callback(
             if !file_modified_since(&session_file, ctx.since_ts) {
                 continue;
             }
+            // Pre-parse identity, mirrored from discover_sources() (FAD#22).
+            let discovered = DiscoveredSourceFile::new(
+                AGENT_SLUG,
+                &root,
+                session_file.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&discovered) {
+                continue;
+            }
             if let Some(conversation) = parse_session(&session_file) {
                 on_conversation(conversation).with_context(|| {
                     format!("emit muse conversation {}", session_file.display())
                 })?;
+                // Withheld when the file changed while being parsed.
+                if !discovered.fs_metadata_changed() {
+                    hooks.complete(&SourceCompletion {
+                        source: discovered,
+                        required_sidecars: Vec::new(),
+                        conversations_emitted: 1,
+                    })?;
+                }
             }
         }
     }
@@ -783,6 +838,19 @@ impl Connector for MuseConnector {
     ) -> Result<()> {
         scan_muse_with_callback(ctx, on_conversation)
     }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_muse_with_hooks(ctx, hooks, on_conversation)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -822,6 +890,9 @@ mod tests {
         .expect("serialize envelope")
     }
 
+    // Fixture builder: the owned Value reads naturally at call sites and is
+    // only borrowed by the envelope macro.
+    #[allow(clippy::needless_pass_by_value)]
     fn run_event(sequence: i64, event: serde_json::Value) -> String {
         envelope(
             sequence,
@@ -840,8 +911,14 @@ mod tests {
                 &json!({"record": {"workspace_root": workspace, "build": "0.1.0-R708.1"}}),
             ),
             envelope(2, "session.opened.observed", &json!({})),
-            run_event(3, json!({"kind": "started", "prompt": "Fix the failing test"})),
-            run_event(4, json!({"kind": "model_request_configured", "model": "muse-spark-1.2"})),
+            run_event(
+                3,
+                json!({"kind": "started", "prompt": "Fix the failing test"}),
+            ),
+            run_event(
+                4,
+                json!({"kind": "model_request_configured", "model": "muse-spark-1.2"}),
+            ),
             run_event(
                 5,
                 json!({
@@ -917,7 +994,10 @@ mod tests {
         write_lines(
             &sub_log,
             &[
-                run_event(1, json!({"kind": "started", "prompt": "Search the repo for usages"})),
+                run_event(
+                    1,
+                    json!({"kind": "started", "prompt": "Search the repo for usages"}),
+                ),
                 run_event(
                     2,
                     json!({
@@ -941,6 +1021,26 @@ mod tests {
             vec![ScanRoot::local(base.to_path_buf())],
             None,
         )
+    }
+
+    #[test]
+    fn default_detection_scopes_to_muse_base_data_dir() {
+        // build_fixture lays out the real store shape under the temp base;
+        // default detection with this base as data_dir must scan HERE, not
+        // the machine's real ~/.local/share/muse.
+        let temp = TempDir::new().expect("tempdir");
+        let (root_log, sub_log) = build_fixture(temp.path());
+
+        let convs = MuseConnector::new()
+            .scan(&ScanContext::local_default(temp.path().to_path_buf(), None))
+            .expect("scan");
+        let mut paths: Vec<&Path> = convs.iter().map(|c| c.source_path.as_path()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![root_log.as_path(), sub_log.as_path()],
+            "default detection with a muse-base data_dir must scan that base"
+        );
     }
 
     #[test]
@@ -1001,10 +1101,7 @@ mod tests {
 
         // Tool result joined + correlated.
         assert!(conv.messages[2].content.contains("it_works"));
-        assert_eq!(
-            conv.messages[2].extra["tool_call_ids"],
-            json!(["call-1"])
-        );
+        assert_eq!(conv.messages[2].extra["tool_call_ids"], json!(["call-1"]));
 
         // Usage summed once from model_completed only (no
         // goal_usage_attribution double count), reasoning not added on top.
@@ -1050,12 +1147,18 @@ mod tests {
     #[test]
     fn sequence_order_wins_over_file_order() {
         let temp = TempDir::new().expect("tempdir");
-        let log = temp.path().join("sessions/2026/08/05/s1").join(SESSION_FILE);
+        let log = temp
+            .path()
+            .join("sessions/2026/08/05/s1")
+            .join(SESSION_FILE);
         // Assistant line written BEFORE the user line; sequence says otherwise.
         write_lines(
             &log,
             &[
-                run_event(5, json!({"kind": "assistant_message_committed", "text": "answer"})),
+                run_event(
+                    5,
+                    json!({"kind": "assistant_message_committed", "text": "answer"}),
+                ),
                 run_event(2, json!({"kind": "started", "prompt": "question"})),
             ],
         );
@@ -1066,9 +1169,104 @@ mod tests {
     }
 
     #[test]
+    fn unsequenced_records_keep_append_order() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp
+            .path()
+            .join("sessions/2026/08/05/s4")
+            .join(SESSION_FILE);
+        // Envelope without a `sequence` field: must trail every sequenced
+        // record and preserve file order among itself. The old
+        // `i64::MAX - lineno` fallback emitted this band in REVERSE.
+        let unsequenced = |payload_type: &str, payload: serde_json::Value| -> String {
+            serde_json::to_string(&json!({
+                "schema_version": 1,
+                "stream": {"kind": "session", "id": SESSION_ID},
+                "recorded_at": BASE_US,
+                "record_type": "event",
+                "durability": "durable",
+                "payload_type": payload_type,
+                "payload": payload,
+            }))
+            .expect("serialize unsequenced envelope")
+        };
+        write_lines(
+            &log,
+            &[
+                run_event(
+                    7,
+                    json!({"kind": "assistant_message_committed", "text": "answer"}),
+                ),
+                run_event(3, json!({"kind": "started", "prompt": "question"})),
+                unsequenced(
+                    "runtime.session",
+                    json!({"kind": "run", "event": {"kind": "started", "prompt": "late-a"}}),
+                ),
+                unsequenced(
+                    "runtime.session",
+                    json!({
+                        "kind": "run",
+                        "event": {"kind": "assistant_message_committed", "text": "late-b"}
+                    }),
+                ),
+            ],
+        );
+        let conv = parse_session(&log).expect("conversation");
+        let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        // Sequenced records sort by sequence; the unsequenced tail keeps
+        // append order (late-a before late-b).
+        assert_eq!(conv.messages[0].content, "question");
+        assert_eq!(conv.messages[1].content, "answer");
+        assert_eq!(conv.messages[2].content, "late-a");
+        assert_eq!(conv.messages[3].content, "late-b");
+    }
+
+    #[test]
+    fn workspace_lookup_survives_unreadable_line() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_dir = temp.path().join("sessions/2026/08/05").join(SESSION_ID);
+        let root_log = session_dir.join(SESSION_FILE);
+        // Parent transcript: valid event, an invalid-UTF-8 region, THEN the
+        // metadata record. The workspace lookup must skip the bad line and
+        // still find the record (a hard stop would lose the workspace).
+        let mut bytes = run_event(1, json!({"kind": "started", "prompt": "question"})).into_bytes();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"\xff\xfe not valid utf-8\n");
+        bytes.extend_from_slice(
+            envelope(
+                2,
+                "runtime.session.metadata",
+                &json!({"record": {"workspace_root": "/data/projects/demo"}}),
+            )
+            .as_bytes(),
+        );
+        bytes.push(b'\n');
+        fs::create_dir_all(&session_dir).expect("mkdir");
+        fs::write(&root_log, &bytes).expect("write transcript");
+
+        // Subagent transcript with no metadata of its own (gotcha 1): the
+        // workspace must be inherited from the parent despite its bad line.
+        let sub_log = session_dir
+            .join("subagent")
+            .join(SUBAGENT_ID)
+            .join(SESSION_FILE);
+        write_lines(
+            &sub_log,
+            &[run_event(1, json!({"kind": "started", "prompt": "search"}))],
+        );
+
+        let conv = parse_session(&sub_log).expect("subagent conversation");
+        assert_eq!(conv.workspace, Some(PathBuf::from("/data/projects/demo")));
+    }
+
+    #[test]
     fn malformed_lines_are_skipped_not_fatal() {
         let temp = TempDir::new().expect("tempdir");
-        let log = temp.path().join("sessions/2026/08/05/s2").join(SESSION_FILE);
+        let log = temp
+            .path()
+            .join("sessions/2026/08/05/s2")
+            .join(SESSION_FILE);
         write_lines(
             &log,
             &[
@@ -1076,7 +1274,10 @@ mod tests {
                 "{\"payload_type\":42}".to_string(), // wrong type
                 "{\"no_payload_type\":true,\"payload\":{}}".to_string(),
                 run_event(1, json!({"kind": "started", "prompt": "still parses"})),
-                run_event(2, json!({"kind": "assistant_message_committed", "text": "yes"})),
+                run_event(
+                    2,
+                    json!({"kind": "assistant_message_committed", "text": "yes"}),
+                ),
             ],
         );
         let conv = parse_session(&log).expect("conversation despite noise");
@@ -1086,11 +1287,18 @@ mod tests {
     #[test]
     fn telemetry_only_transcript_yields_nothing() {
         let temp = TempDir::new().expect("tempdir");
-        let log = temp.path().join("sessions/2026/08/05/s3").join(SESSION_FILE);
+        let log = temp
+            .path()
+            .join("sessions/2026/08/05/s3")
+            .join(SESSION_FILE);
         write_lines(
             &log,
             &[
-                envelope(1, "runtime.session.metadata", &json!({"record": {"workspace_root": "/w"}})),
+                envelope(
+                    1,
+                    "runtime.session.metadata",
+                    &json!({"record": {"workspace_root": "/w"}}),
+                ),
                 run_event(2, json!({"kind": "resource_usage_sampled", "rss": 1})),
                 envelope(3, "session.end", &json!({"reason": "completed"})),
             ],

@@ -479,7 +479,8 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
             continue;
         }
 
-        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+        // Strip a UTF-8 BOM so the first record is not silently lost.
+        let Ok(val) = serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}')) else {
             continue;
         };
 
@@ -1030,6 +1031,65 @@ fn parse_kimi_code_session(
             // and its context.append_message echo — the pending prompt must
             // survive them or the dedup only works under strict adjacency
             // and the prompt duplicates (fresh-eyes finding, cass#351).
+            "usage.record" => {
+                // Documented event type (module header) with no published
+                // field shape; accept both a flat token record and one
+                // nested under "usage", tolerating the common cache
+                // spellings. Unknown shapes are ignored rather than
+                // guessed. Bookkeeping only: the pending turn.prompt must
+                // survive it (cass#351).
+                let block = val.get("usage").unwrap_or(&val);
+                let field = |key: &str| {
+                    block.get(key).and_then(Value::as_i64).or_else(|| {
+                        block
+                            .pointer(&format!("/tokens/{key}"))
+                            .and_then(Value::as_i64)
+                    })
+                };
+                let input_tokens = field("input_tokens");
+                let output_tokens = field("output_tokens");
+                if input_tokens.is_none() && output_tokens.is_none() {
+                    continue;
+                }
+                let mut usage = serde_json::Map::new();
+                if let Some(input) = input_tokens {
+                    usage.insert("input_tokens".to_string(), Value::from(input));
+                }
+                if let Some(output) = output_tokens {
+                    usage.insert("output_tokens".to_string(), Value::from(output));
+                }
+                // Cache-field semantics are unpublished for Kimi; preserve
+                // alternate spellings VERBATIM rather than remapping onto
+                // `cache_read_tokens`, whose additive-total contract would
+                // be wrong if the source's input_tokens already includes
+                // cached tokens.
+                for cache_key in ["cached_input_tokens", "cache_read_tokens"] {
+                    if let Some(cache) = field(cache_key) {
+                        usage.insert(cache_key.to_string(), Value::from(cache));
+                    }
+                }
+                usage.insert("data_source".to_string(), Value::String("api".to_string()));
+
+                let target = messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == "assistant" && m.invocations.is_empty());
+                if let Some(message) = target {
+                    if let Some(extra_obj) = message.extra.as_object_mut() {
+                        let cass = extra_obj
+                            .entry("cass")
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        if let Some(cass_obj) = cass.as_object_mut() {
+                            cass_obj.insert("token_usage".to_string(), Value::Object(usage));
+                        }
+                    }
+                }
+            }
+            // llm.request and unknown top-level types are bookkeeping and
+            // can legitimately arrive between a turn.prompt and its
+            // context.append_message echo — the pending prompt must survive
+            // them or the dedup only works under strict adjacency and the
+            // prompt duplicates (fresh-eyes finding, cass#351).
             _ => {}
         }
     }
@@ -1653,6 +1713,40 @@ mod tests {
             Some("sess-sub:researcher-1".to_string())
         );
         assert_eq!(convs[0].metadata["agentId"], "researcher-1");
+    }
+
+    #[test]
+    fn modern_usage_record_attaches_token_usage_to_latest_assistant() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_kimi_code_storage(&dir);
+
+        let lines = vec![
+            r#"{"type":"turn.prompt","input":[{"type":"text","text":"Fix the bug"}],"time":"2026-01-01T00:00:00Z"}"#,
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"Fix the bug"}],"toolCalls":[],"origin":"cli"},"time":"2026-01-01T00:00:01Z"}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"Looking now."}},"time":"2026-01-01T00:00:03Z"}"#,
+            r#"{"type":"usage.record","usage":{"input_tokens":100,"output_tokens":30},"time":"2026-01-01T00:00:04Z"}"#,
+            r#"{"type":"context.append_loop_event","event":{"type":"step.begin"},"time":"2026-01-01T00:00:05Z"}"#,
+        ];
+        write_modern_wire_file(&storage, "wdk-u", "sess-tok", "main", &lines);
+        write_modern_state(
+            &storage,
+            "wdk-u",
+            "sess-tok",
+            r#"{"title":"Token session","createdAt":"2025-12-31T23:59:59Z","updatedAt":"2026-01-01T00:01:00Z","workDir":"/home/user/proj","agents":{"main":{"type":"main"}}}"#,
+        );
+
+        let connector = KimiConnector::new();
+        let ctx = ScanContext::local_default(storage, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let usage = convs[0].messages[1]
+            .extra
+            .pointer("/cass/token_usage")
+            .expect("token usage attached to latest assistant turn");
+        assert_eq!(usage["input_tokens"], 100);
+        assert_eq!(usage["output_tokens"], 30);
+        assert_eq!(usage["data_source"], "api");
     }
 
     #[test]

@@ -9,44 +9,552 @@ Repository: <https://github.com/klittle32/franken_agent_detection>
 Upstream: <https://github.com/Dicklesworthstone/franken_agent_detection>
 Crate: <https://crates.io/crates/franken-agent-detection>
 
-> **Release vs. tag:** v0.1.1 and v0.1.3 are the published crates.io releases.
-> v0.1.2 exists as a git tag but was never published to crates.io. No formal
-> GitHub Releases have been created. v0.1.0 was never published
-> (crates.io rejected it due to wildcard dependency versions).
+> **Release vs. tag:** The latest published GitHub Release is
+> [`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0)
+> (2026-09-16).
+> Earlier GitHub Releases exist for
+> [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4),
+> [`v0.1.5`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.5),
+> [`v0.1.6`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.6),
+> [`v0.1.7`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7),
+> [`v0.1.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9),
+> and [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10)
+> (published 2026-08-16). `v0.1.1`, `v0.1.2`, and `v0.1.3` are git tags;
+> they do **not** have GitHub Release pages — do not invent them. `v0.1.2` was
+> never published to crates.io. `v0.1.0` was never published (crates.io
+> rejected wildcard dependency versions). There is no `v0.1.8` tag or Release.
+
+Scope window: 2026-02-15 through HEAD
+[`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
+(2026-08-19) for the historical reconstruction below. The current Unreleased
+window is since GitHub Release
+[`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0).
+
+## Version Timeline
+
+| Version | Kind | Date | Summary |
+|---------|------|------|---------|
+| [`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0) | GitHub Release | 2026-09-16 | Shared Codebuff / Freebuff history, SQLite 0.4.1 and Asupersync 0.5 migration, unwind-safe read transactions, and bounded crate contents. |
+| [`v0.2.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.4) | GitHub Release | 2026-09-10 | Copilot CLI workspace restoration, explicit Cursor workspace attribution, exact Prime watch roots, and Grok Bot desktop replicas. |
+| [`v0.2.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.3) | GitHub Release | 2026-09-07 | Devin CLI connector; Antigravity IDE store, Claude `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` detection, muse/goose/hermes/crush scan scoping, Codex token usage, Claude tool results, Cursor/OpenCode dedupe, 100MB scan cap everywhere. |
+| [`v0.2.2`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.2) | GitHub Release | 2026-08-24 | Cross-connector audit fixes (opencode, muse, clawdbot, chatgpt, amp, aider, copilot-cli, cursor, grok); registry invariant hardening. |
+| [`v0.2.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.1) | GitHub Release | 2026-08-23 | Fresh-eyes fixes: pi-family discovery preserves scan-root provenance; registry invariant tests. |
+| [`v0.2.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.0) | GitHub Release | 2026-08-23 | First-class Oh My Pi (`omp`) connector; shared pi-family wire parser; dep refresh (aes-gcm 0.11, base64 0.23, fsqlite 0.3.8 + asupersync 0.4.9). |
+| [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10) | GitHub Release | 2026-08-16 | Muse Code, Grok Build, Kimi current layout, Oh My Pi, OpenCode scan perf. |
+| [`v0.1.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9) | GitHub Release | 2026-07-02 | Codex `output_text` / `response_item` tool-call capture (#13). |
+| [`v0.1.7`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7) | GitHub Release | 2026-05-17 | See Release page; not reconstructed as a wave in this file. |
+| [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4)–[`v0.1.6`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.6) | GitHub Releases | 2026-05-16 | See Release pages; not reconstructed as waves in this file. |
+| `v0.1.3` / `v0.1.2` / `v0.1.1` | Git tags (not GitHub Releases) | 2026-03-22 / 2026-03-02 / 2026-02-22 | Tag-only; no Release pages. |
+| `v0.1.0` | Unpublished | 2026-02-15 | crates.io rejected wildcard dependency versions. |
 
 ---
 
-## [Unreleased] -- since v0.1.3
+## [Unreleased]
+
+No changes yet.
+
+## [0.3.2] -- 2026-09-26
+
+### Fixed
+
+- **Embedders can raise the Codex rollout admission budget again**
+  ([`7947f9c`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/7947f9c)).
+  0.3.1's primary rollout reader refused every Codex rollout over 100 MiB as
+  invalid data, so cass's `CASS_CODEX_MAX_SOURCE_BYTES` (up to 1 GiB) no longer
+  indexed anything larger. The reader streams through a length-bounded handle,
+  so the cap is an admission budget, not a memory bound: the 100 MiB default
+  stays, and `connectors::codex::set_codex_rollout_byte_budget` /
+  `codex_rollout_byte_budget` let an embedder apply its own policy.
+  `ScanContext` is unchanged.
+
+## [0.3.1] -- 2026-09-25
+
+### Fixed
+
+- **Claude Code prompts typed while the agent is mid-turn are indexed**
+  (cass GH #500, [`b2d5705`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/b2d5705)).
+  Claude Code stores them as `attachment` records with
+  `attachment.type:"queued_command"`, which the JSONL parser dropped. Prompt-mode
+  queued commands from a person (`origin.kind:"human"`, or no origin in older
+  builds) are now user messages in transcript order; peer, `isMeta`,
+  task-notification and empty prompts are still skipped.
+- **`CASS_EXCLUDE_PATHS` is honored by the Codex and Pi-family connectors**
+  during discovery and scanning, before any metadata, source hook or parse
+  (cass GH #486, [`7b08fa9`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/7b08fa9),
+  [`7edeb8d`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/7edeb8d)).
+- **Session byte caps are enforced while reading**, not after: a growing or
+  metadata-less source can no longer be read whole before the 100 MiB cap
+  applies ([`6c62692`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/6c62692)).
+- **Codex reads reject incomplete primary sources** (unfinished final records,
+  appends, truncation or replacement during the read) before emitting a
+  conversation ([`8d9eebf`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/8d9eebf)),
+  and **independent repeated user prompts are preserved** instead of being
+  deduplicated session-wide ([`a112e07`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/a112e07)).
+
+## [0.3.0] -- 2026-09-16
 
 ### Added
 
-- **Prime Agent connector (`PrimeAgentConnector`, fork `0.1.12-letta-prime.1`)** —
-  native parser + factory for Prime Agent JSONL sessions at
-  `$PRIME_AGENT_SESSION_DIR/<session-id>.jsonl` (default
-  `~/.prime/agent/sessions`). Canonical slug `prime_agent` (aliases
-  `prime-agent`, `primeagent`, `prime`). Prime is Pi-derived but remains a
-  distinct connector: `~/.prime` is never a `pi_agent` root, and Prime
-  sessions are never emitted as `pi_agent`. Indexes the complete append-only
-  history, including abandoned branches. Direct API usage is extracted
-  without substituting RLM `aggregateUsage` onto parent assistants.
-  Behavioral reference is `PrimeIntellect-ai/prime-agent`
-  `9bf49d897c22563f3e4483d28149c1aac452a6f9`. Private fork:
-  `klittle32/franken_agent_detection`; do not open an upstream PR.
+- Codebuff / Freebuff CLI transcript scanning through the shared Manicode
+  projects store, behind `codebuff` and included in `all-connectors`. The
+  connector preserves source identity, tool calls, and explicit workspace
+  metadata without guessing which product wrote the shared format.
+- An all-connectors regression exercises real Devin SQLite session discovery
+  and scanning, including source bytes and timestamp preservation.
 
-- **Letta Code connector (`LettaCodeConnector`, fork `0.1.11-letta.1`)** — native
-  parser + factory for Letta Code client transcripts at
-  `$LETTA_TRANSCRIPT_ROOT/<agent>/<conversation>/transcript.jsonl` (default
-  `~/.letta/transcripts`). Canonical slug `letta_code` (alias `letta-code`).
-  Behavioral reference is `letta-ai/trajectory` `59c0db52` (`letta-code`
-  adapter); the trajectory package is **not** a runtime dependency. Does not
-  ingest Letta backend/API histories or reflection payloads. Private fork:
-  `klittle32/franken_agent_detection`; do not open an upstream PR.
+### Changed
+
+- SQLite connectors now use FrankenSQLite `0.4.1` and Asupersync `0.5.0`
+  together. Consumers must align their runtime and engine dependencies with
+  these versions; the synchronous connector API remains available.
+- The crate package explicitly includes source, fixtures, and documentation,
+  preventing remote build caches and temporary artifacts from being shipped.
+
+### Fixed
+
+- Read transactions roll back when a callback or row mapper unwinds, preserving
+  the original panic and leaving the connection usable by the caller.
+- SQLite bridge runtime construction errors propagate as `FrankenError` instead
+  of panicking. Best-effort connection close logs a runtime construction error.
+
+## [0.2.4] -- 2026-09-10
+
+A regression fix plus two connector additions. **Downstream consumers on 0.2.3
+should take this release**: 0.2.3 silently dropped workspace attribution for
+legacy Copilot CLI sessions.
+
+### Fixed
+
+- **Copilot CLI legacy `history.json` sessions lost their workspace** (cass
+  regression, found by cass's `connector_copilot` suite). Splitting the CLI
+  parser out of `copilot.rs` into `copilot_cli.rs` for 0.2.3 carried over the
+  `cwd` / `workingDirectory` / `workspace` aliases but not `workspacePath`,
+  which is the key legacy history-session-state JSON actually uses. Those
+  sessions came back with `workspace: None`, so workspace-scoped filtering and
+  search silently skipped them. The alias is restored at the end of the chain,
+  so existing precedence is unchanged: `cwd`, `workingDirectory` and
+  `workspace` still win when present. Non-string, nested and message-level
+  `workspacePath` values are rejected rather than coerced. Covered by
+  `scan_legacy_history_workspace_path_preserves_identity_and_source` and
+  `scan_legacy_workspace_path_preserves_existing_alias_precedence`, which also
+  pin source bytes, mtime, unicode titles and identity.
+- **Cursor Agent workspaces are attributed from `.workspace-trusted`, not from
+  the hyphenated project-directory slug.** Project directory names collapse
+  separators and literal hyphens, so a workspace named `parent-project/my-app`
+  and one named `parent/project/my/app` encode identically and
+  `decode_agent_workspace` had to guess. The transcript's `.workspace-trusted`
+  sidecar is now read for the explicit `workspacePath`. Unix, drive-letter and
+  UNC absolute paths are accepted (an exported source need not exist on the
+  scanning host); control characters and relative values are rejected.
+  Attribution metadata reports `workspace_trusted` or `unresolved`. The sidecar
+  is discovered as a `MetadataSidecar` and its mtime triggers a rescan even
+  when the JSONL itself is unchanged.
+- **Cursor project-slug collision comparison treats `:` as a path separator.**
+  A Windows drive prefix (`C:`) encodes to the same slug as a POSIX path with
+  extra segments, which made the guessed-vs-explicit workspace test invalid on
+  hosts whose temp path contains a drive letter.
+- **Prime watch roots stay exact and reject foreign stores.** Prime's shared
+  `source_roots` expanded an explicit JSONL file or a configured sessions
+  directory into nothing, so watch-once and live watch of
+  `PRIME_AGENT_SESSION_DIR` discovered zero sessions. `append_explicit_roots`
+  now retains an owned file or subtree when canonical containment proves it
+  lives under a Prime store or the winning environment override, including
+  tilde expansion and remote `ScanRoot` provenance. Ownership is path-based,
+  not wire-format-based: the JSONL header is shared with Pi and OMP, so a
+  parseable session is not sufficient, and both sides are canonicalized so a
+  `..` escape cannot claim another provider's logs. Pi, OMP and generic-log
+  paths stay rejected even when they hold a validly Prime-shaped session.
+
+### Added
+
+- **Grok Bot desktop replica scanning** behind the new opt-in `grok-bot`
+  feature (also included in `all-connectors`). Grok Bot stores lossy FIFO
+  transcript replicas under
+  `~/Library/Application Support/Grok Bot/sand-client-persistence`, distinct
+  from the existing Grok CLI connector, so it is registered as its own
+  `grok_bot` provider (slug aliases `grok_bot` / `grok-bot`). The connector
+  admits lowercase unpadded RFC4648 replica filenames and `schemaVersion` 1
+  `value.entries`, with an explicit message/send-message text allowlist:
+  roster, secret, approval, widget and attachment payloads are never indexed.
+  Identity is account+agent rather than session or workspace; provider entry
+  IDs are retained so hosts can reconcile FIFO rewrites, while `idx` is
+  document order within the current window only. Metadata discloses that this
+  is chat-only, incomplete rolling history. `CASS_GROK_BOT_DATA_ROOT`
+  overrides the macOS default.
+
+### Changed
+
+- `default_database_path` is gated behind the existing `devin` feature.
+
+## [0.2.3] -- 2026-09-07
+
+### Added
+
+- **Devin CLI session scanning** (cass #449) behind the new `devin` feature.
+  The connector reads the CLI's shared read-only store
+  (`~/.local/share/devin/cli/sessions.db`; `CASS_DEVIN_DATA_ROOT` may name the
+  file, its `cli` dir, or the `devin` data root — detection honors the same
+  override). `message_nodes` is a forest of retries/edits, so each session is
+  projected along the `parent_node_id` chain ending at
+  `sessions.main_chain_id` (cycle- and depth-guarded); `hidden` sessions are
+  skipped like `devin list`; `system` nodes are dropped; assistant
+  `tool_calls` become `NormalizedInvocation`s; inline base64 `images` are
+  replaced by `[image]` markers so payloads never reach the index. Without the
+  feature the connector stays detection-only. Devin's cloud sessions are not
+  on disk and are out of scope.
+
+### Fixed
+
+- **Shelley discovery names the same path as scan.** `scan()` reports each
+  conversation's `source_path` as the canonical database path (a store
+  reached through a symlink dedupes to one identity), but
+  `discover_source_files()` emitted the raw candidate path, so on a
+  symlinked root the source-boundary contract could not pair a conversation
+  with its source; the WAL/SHM sidecars followed the raw path too. Discovery
+  now canonicalizes the admitted database before listing it and its
+  sidecars. Surfaced by the `scan_projects_roles_order_and_identity`
+  discovery-covers-scan assertion, which fails on macOS (`/var` →
+  `/private/var` temp dirs) and passes on Linux.
+- **Antigravity detection and scanning cover the IDE store, not just the
+  `agy` CLI** (cass #454). The connector only probed
+  `~/.gemini/antigravity-cli`, so sessions written by the Antigravity IDE to
+  the structurally identical `~/.gemini/antigravity/` tree
+  (`brain/<uuid>/.system_generated/logs/transcript.jsonl` +
+  `conversations/<uuid>.db`) were never indexed unless the user found
+  `CASS_ANTIGRAVITY_DATA_ROOT`. With the override unset, both bases are now
+  probed (detection and scan) and every root that exists is indexed. Store
+  provenance is recorded so the two can never collide in
+  `(agent, external_id)`-keyed consumers: a conversation under the IDE base is
+  emitted with `external_id = "ide/<uuid>"`, the CLI (and any unclassified
+  base such as a fixture or relocated mirror) keeps the bare `<uuid>`, and
+  every conversation carries `metadata.layout` (`"ide"`/`"cli"`) and
+  `metadata.data_root`. `CASS_ANTIGRAVITY_DATA_ROOT` still replaces the pair
+  with one explicit base. `antigravity-ide` joins the slug aliases.
+- **Claude Code detection honors `CLAUDE_CONFIG_DIR` and `XDG_CONFIG_HOME`**
+  (cass #448, follow-up to cass #214). The connector's root resolver already
+  scanned `$CLAUDE_CONFIG_DIR/projects` / `$XDG_CONFIG_HOME/claude-code/projects`,
+  but the registry probe only checked `~/.claude`, `~/.config/claude` and the
+  macOS Desktop dirs, so a redirected profile on a machine with no legacy
+  `~/.claude` reported "not detected" and was never scanned. `env_override_roots`
+  gains a `claude` arm (`CLAUDE_CONFIG_DIR` replaces the defaults, like the
+  resolver) and the default probe adds `$XDG_CONFIG_HOME/claude-code`
+  (additive, so `~/.claude` users with a global `XDG_CONFIG_HOME` stay
+  detected).
+- **Muse default-detection no longer ignores a Cursor-style base `data_dir`.**
+  The muse connector was the last of the three single-surface connectors
+  (with Grok and Antigravity, both fixed in 0.2.2) whose default-detection
+  scan probed the machine's real store unconditionally: a `data_dir` that is
+  itself a muse base (`sessions/` tree) or the `sessions/` dir never scoped
+  the scan, so fixture/mirror scans collected — or missed — sessions from
+  `~/.local/share/muse` depending on the machine. `CASS_MUSE_DATA_ROOT`
+  keeps precedence so CI redirection is unaffected.
+- **Goose, Hermes, and Crush sqlite scans no longer double-probe the
+  machine's real store in default-detection mode.** Their JSONL sides
+  already scoped a `data_dir` that held connector storage, but the sqlite
+  side pushed BOTH the `data_dir` candidate and the system store
+  (`~/.goose/sessions.db`, Hermes `state.db`, crush global + per-project
+  dbs), so scoped fixture/mirror scans collected foreign sessions from the
+  local machine. A `<connector>` db under `data_dir` now scopes the scan;
+  only otherwise does it fall through to the system store. Env overrides
+  (`GOOSE_SQLITE_DB`, `HERMES_SQLITE_DB`, `CRUSH_SQLITE_DB`) keep
+  precedence, and scan/discovery parity holds. Regression tests pin exact
+  source paths for all three.
+- **Codex token usage is captured from real rollouts again.** The
+  `token_count` reader expected flat `payload.{input_tokens,output_tokens}`
+  — a shape that exists only in a repo fixture. Every sampled real rollout
+  (2026-01..2026-08) nests per-turn usage at `payload.info.last_token_usage`,
+  so ALL codex token accounting silently dropped. The nested block is now
+  parsed (`cached_input_tokens` mapped to cache reads; cumulative
+  `info.total_token_usage` deliberately NOT attached per turn), the same
+  stale fallback in `token_extraction::extract_codex_tokens` is fixed, and a
+  regression test uses a real payload shape.
+- **Claude Code tool results are no longer dropped wholesale.** Tool
+  results ride in `type:"user"` entries as `content:[{type:"tool_result"}]`
+  blocks, which `flatten_content` ignores — so every result entry failed the
+  empty-content check and vanished (~30-40% of real entries per measured
+  transcript), leaving invocations with call_ids but zero outputs. They are
+  now emitted as first-class `role:"tool"` messages carrying `tool_use_id`.
+- **Dual-stream Codex rollouts no longer duplicate user prompts.** Files
+  from the Jan–Jun 2026 era record each prompt both as
+  `event_msg/user_message` and as a `response_item` user record (33/61
+  sampled files); the event_msg copy is now suppressed when the same text
+  arrived via response_item, and token counts no longer attach to synthetic
+  `[Tool: …]` placeholder messages.
+- **Cursor conversations are deduped across mirrored databases**, matching
+  the opencode fix: globalStorage/workspaceStorage mirrors or overlapping
+  explicit roots emitted the same composer twice. A failed Cursor bubble
+  range-query is also surfaced at warn instead of silently emptying the
+  conversation, and OpenCode SQLite queries guard NULL/BLOB id, key and
+  data cells on every query variant (one malformed row used to abort an
+  entire store at debug-level silence) with store failures escalated to
+  warn. Codex cache hits are preserved under their own
+  `cached_input_tokens` key rather than remapped onto the additive
+  `cache_read_tokens` contract; Claude tool results carry `is_error`.
+  Cursor and OpenCode row-level `since_ts` filters now apply the same
+  −1s granularity slack as `file_modified_since`, closing an
+  incremental-scan window where a conversation touched right around the
+  watermark was skipped on every subsequent run.
+- **The 100MB scan cap (chatgpt policy) now applies everywhere**: a shared
+  `read_capped` helper (pre-read stat + post-read backstop) covers cursor
+  agent transcripts, copilot-vscode native sessions, amp threads,
+  opencode session/message/part files, codex legacy `.json` rollouts,
+  gemini legacy whole-file sessions, and
+  pi-family transcripts; UTF-8 BOMs are stripped on first-line parses in
+  codex, claude_code, kimi, and opencode message/part files so leading
+  records survive; `file://localhost/path` URIs no longer decode to bogus
+  relative paths, while authority-less drive forms (`file://C:/x`) keep
+  their path intact (cursor + copilot_vscode); Copilot assistant turns keep
+  their request timestamp; amp's cross-root dedupe key is lossless;
+  pi-family homes are canonicalized once per scan so symlinked agent dirs
+  dedupe correctly; and `parse_timestamp` recognizes microsecond epochs
+  instead of reading them as milliseconds ~55 millennia out.
+- **Substring storage predicates replaced with structural checks**
+  (qwen, clawdbot, vibe, factory): default detection no longer
+  mis-scopes onto lookalike directories such as
+  `/home/u/.vibe-backup/logs/session-archive` or
+  `/home/u/factory-reset/sessions-archive`, which previously hijacked
+  the scan away from the real store and silently emitted nothing for
+  this connector.
+- **Claude Code surfaces subagent provenance and its own generated
+  titles.** Transcripts under a session's `subagents/` directory now carry
+  `metadata.sidechain = true` and the parent session id, and Claude's
+  `ai-title` records are preferred over first-line truncation when naming
+  conversations.
+- **Kimi Code token accounting works.** The documented `usage.record`
+  event was parsed nowhere; it is now attached to the latest assistant
+  turn as API-sourced token usage (tolerant of flat and nested field
+  spellings), instead of being silently ignored.
+
+### Changed
+
+- **Amp conversation identity no longer uses bare file stems.** A stem
+  like `thread.json` is shared by every thread in a store and collided
+  downstream. The thread's own `id` field is preferred, falling back to
+  the root-relative path, then the full path. Downstream consumers keying
+  on slug + external_id will see new identities for id-less exports.
+- **Claude Code titles skip harness-injected context** (`# AGENTS.md`
+  instructions, `<environment_context>`, `<session_context>`,
+  `<user_instructions>` headers) via a shared helper also used by codex
+  and gemini title selection.
+
+### Added
+
+- **Default-detection scoping regression tests** for grok, antigravity, and
+  muse: a `local_default` scan over a fixture laid out as each connector's
+  real store must index exactly the fixture's sessions, which fails on
+  pre-fix code on any machine (empty system store yields nothing to leak,
+  and the assertion pins exact source paths).
+- **Schema conformance contract is enforced, not decorative.** The
+  `validate_conversation`/`validate_message` checkers were dead code — the
+  "Schema Conformance" contract gated nothing. A new conformance test
+  scans each checked-in fixture store (antigravity, codex, openhands) and
+  validates every produced conversation and message against it: non-empty
+  slug/source path, sequential message indices, standard roles,
+  well-formed invocation kinds, and consistent time bounds.
+- **Second fresh-eyes sweep across the copilot family and six mid-tier
+  connectors.** The VS Code native chat-store pipeline — advertised by
+  discovery with `required_for_reconstruction` but never called from
+  `scan()` — is now scanned, with cross-surface external-id dedupe;
+  qwen default detection scopes exclusively instead of scanning both the
+  pinned mirror AND live `~/.qwen/tmp`; cline, aider, and qwen enforce
+  the 100MB scan cap on their largest reads; vibe and clawdbot discovery
+  dedupe across overlapping/symlinked roots like their scans do; Claude
+  tool results carry `is_error`; copilot-vscode legacy state-db failures
+  warn instead of vanishing; native-store segment matching is
+  case-insensitive so a case-altered mirrored `data_dir` still pins; BOM
+  first-record loss fixed in factory/clawdbot/vibe; and detection
+  determinism now compares full agent vectors rather than just counts.
+  Copilot CLI dual-ingestion cleanup is tracked separately (bead).
+
+## [0.2.2] -- 2026-08-24
+
+Post-0.2.1 fix wave: connector correctness fixes surfaced by a cross-connector
+audit, plus registry invariant hardening.
+
+### Fixed
+
+- **OpenCode no longer loses or duplicates sessions three ways**.
+  Sessions whose timestamps are all unparseable are kept instead of being
+  pruned forever by every incremental scan (the `since_ts` filter now applies
+  only when a timestamp actually parsed); a `seen_db_session_ids` set spans
+  all db candidates so stale migrated databases (`~/.config/opencode` vs
+  `~/.local/share`) stop double-indexing shared session ids, while
+  conversations with no `external_id` pass through uncollapsed; and a
+  leading UTF-8 BOM is trimmed before JSON parsing instead of skipping the
+  whole file.
+
+- **Muse unsequenced records keep append order, and workspace inheritance
+  survives unreadable lines.** A record without `sequence` used to fall back
+  to `i64::MAX - lineno`, emitting the unsequenced tail in REVERSED order
+  after every sequenced record; the two-band sort key keeps that tail after
+  all sequenced records but in file order. The subagent parent-transcript
+  workspace lookup skips an unreadable line instead of aborting, so one bad
+  region no longer erases workspace inheritance. Regression tests cover both
+  behaviors.
+- **Clawdbot dedupes session files across overlapping scan roots.** The
+  connector walked each root independently and emitted shared files once per
+  covering root; a `HashSet` of shared `dedupe_path_key`s now spans ALL
+  roots, checked before the mtime filter.
+- **ChatGPT enforces the 100MB read cap after the read too**, closing the
+  bypass where a pre-read `fs::metadata` error skipped the size guard
+  entirely.
+- **Amp threads are keyed by path, roles normalized, and workspace URIs
+  percent-decoded**; role-less Factory entries default to `assistant`
+  instead of `"unknown"`.
+- **Aider, copilot-cli, and cursor no longer silently discard sessions.**
+- **Grok detection honors `GROK_HOME`** when resolving override roots.
+- **Cursor default-detection no longer leaks the machine's real
+  `~/.cursor/projects` into scoped scans.** When a scan's `data_dir` is
+  itself a Cursor base (fixture, mirror, or alternate install), Agent
+  transcripts were still collected from the system projects root — the one
+  connector surface that ignored the Composer root policy — duplicating or
+  polluting results on machines with local Cursor data. Agent-transcript
+  discovery now mirrors the Composer policy (`data_dir` base wins;
+  `CASS_CURSOR_PROJECTS_ROOT` still takes precedence for CI). Regression
+  test covers a combined composer + agent-transcript base.
+
+- **Antigravity and Grok default-detection scan roots are scoped the same
+  way as Cursor's** -- a scan whose `data_dir` is itself an agent base no
+  longer leaks the machine's real home-directory roots into fixture or
+  mirror scans
+  ([`5d4996e`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/5d4996e)).
+
+### Added
+
+- **Registry invariant hardening**: factory slugs are canonicalized,
+  duplicate registrations are rejected, and the factory cross-check is
+  feature-aware — the slug-set drift class caught by hand during 0.2.x now
+  fails CI mechanically.
+
+## [0.2.1] -- 2026-08-23
+
+Patch over the 0.2.0 window, from a fresh-eyes audit of everything that
+shipped in it.
+
+### Fixed
+
+- **Pi-family discovery no longer downgrades remote scan roots to local**.
+  The shared `pi_wire::discover_sources` helper took bare paths and
+  re-wrapped every home in `ScanRoot::local`, so `DiscoveredSourceFile`
+  entries for remote roots lost their `Origin` (Ssh) and platform hint —
+  fields downstream consumers key mirroring and path-mapping decisions off.
+  The helper now takes full `ScanRoot`s; the `pi_agent` and `omp` callers
+  pass `source_roots()` through untouched. Regression tests on both
+  connectors prove remote provenance survives discovery end-to-end.
+
+### Added
+
+- **Registry invariant test**: all five registration points
+  (`KNOWN_CONNECTORS`, canonical alias arms, `default_probe_roots`,
+  `default_probe_paths_tilde`, the factory list) must agree exactly with one
+  slug set. Two sibling rows were silently dropped by range edits during the
+  0.2.0 window (caught by hand); this class of mistake now fails CI
+  mechanically.
+
+---
+## [0.2.0] -- 2026-08-23
+
+First-class Oh My Pi (`omp`) support plus dependency refresh.
+
+### Added
+
+- **Oh My Pi (`omp`, <https://omp.sh>) connector** — `OmpConnector` is now a
+  first-class connector slug instead of a piggyback surface on `pi_agent`.
+  omp pins its session store to `~/.omp/agent/` (no relocation env var in
+  the CLI itself), so detection probes `~/.omp/agent/sessions` first and the
+  parent second; `CASS_OMP_DATA_ROOT` overrides detection for tests and CI,
+  and the aliases `oh-my-pi` / `omp` both canonicalize to `omp`. Scanning
+  covers main transcripts
+  (`sessions/<safe-path>/<timestamp>_<uuid>.jsonl`) and sub-agent
+  transcripts (`<timestamp>_<uuid>/<AgentName>.jsonl`), handles omp's
+  standalone `title` entries (preferred over the session-header title) and
+  bare-`model` `model_change` records, and stamps conversations with
+  `agent_slug: "omp"`.
+- **Named-profile provenance for omp homes**
+  (`franken_agent_detection#17`): profile-aware scan entry points tag every
+  conversation with `metadata.profile` so consumers can reconstruct
+  `omp --profile <name> --resume <id>`; `OMP_PROFILE` takes precedence over
+  legacy `PI_PROFILE`, mirroring upstream `resolveProfileEnv`.
+- **Shared pi-family wire parser** (`connectors/pi_wire.rs`): the JSONL v3
+  traversal/parsing primitives moved out of `pi_agent.rs` into one module
+  consumed by both the `pi_agent` and `omp` connectors, so the two
+  distributions can no longer drift apart at the parser level.
+
+### Changed
+
+- **`pi_agent` is scoped back to `~/.pi/agent`** (behavior change): with omp
+  owned by its own connector, `pi_agent` no longer walks `.omp` trees by
+  default. Machines with both distributions now get correctly attributed
+  conversations per slug instead of double-counted sessions; explicit scan
+  roots are unaffected.
+- Dependencies refreshed: `aes-gcm` 0.10 → 0.11 (with the deprecated
+  `Nonce::from_slice` call migrated to `TryFrom` + `&nonce` decrypt),
+  `base64` 0.22 → 0.23, `serial_test` 3 → 4, and the SQLite engine pair
+  moved in lockstep (`fsqlite` 0.3.8 with `asupersync` 0.4.9).
+
+### Fixed
+
+- Restored the `"open-claw"` alias arm in `canonical_connector_slug` that an
+  insertion during this window accidentally dropped.
+- omp root discovery existence-gates its expansion candidates so unrelated
+  explicit scan roots cannot fabricate phantom `.omp/...` probe paths.
+
+---
+
+Current window after the [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10)
+GitHub Release (tag [`f68fc8b`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/f68fc8bb0efe8027a99531b90c555a77bc6fabd7),
+2026-08-14; Release published 2026-08-16) through HEAD
+[`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
+(2026-08-19): 3 non-merge commits.
+
+### Delivered capability
+
+- VS Code native Copilot chat-session store is now a scan surface (#16).
+- `UPGRADE_LOG.md` lives under `docs/planning/`; skill-loop scratch is gitignored.
+
+### Closed workstreams
+
+- [#16](https://github.com/Dicklesworthstone/franken_agent_detection/issues/16) VS Code native Copilot store.
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/franken_agent_detection/blob/main/.beads/issues.jsonl).
+
+### Added
+
+- **VS Code native Copilot chat-session store** ([#16](https://github.com/Dicklesworthstone/franken_agent_detection/issues/16)).
+  Scan now covers VS Code's native Copilot chat-session store in addition to
+  the existing Copilot surfaces.
+
+  [`c8816ff`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/c8816fff484378f362dd517f1f0dd9691c8aeb5a)
+
+### Janitor docs-reorg (2026-08-19)
+
+`UPGRADE_LOG.md` moved to
+[`docs/planning/UPGRADE_LOG.md`](docs/planning/UPGRADE_LOG.md).
+Skill-loop scratch is gitignored. No connector behavior change.
+
+**Representative commits**
+- [`80bd71f`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/80bd71fa90b21c440d43d0569bd0740c7ef08132) — `chore(janitor): untrack skill-loop scratch; move root planning docs into docs/planning/`
+- [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666) — `chore(janitor): relocate remaining root reports and planning docs`
+
+---
+
+## [0.1.10] -- 2026-08-14
+
+GitHub Release [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10)
+published 2026-08-16. Tag points at
+[`f68fc8b`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/f68fc8bb0efe8027a99531b90c555a77bc6fabd7).
+Cargo is `0.1.10`.
+
+### Added
+
+- **Muse Code (Meta) connector** per
+  [#15](https://github.com/Dicklesworthstone/franken_agent_detection/issues/15)
+  field report.
+  [`f68fc8b`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/f68fc8bb0efe8027a99531b90c555a77bc6fabd7)
 
 - **Grok Build connector (`GrokConnector`)** — full parser + factory for
   xAI's official `grok` coding CLI
-  (Dicklesworthstone/coding_agent_session_search#328), building on the
-  detection scaffolding below. Reads `$GROK_HOME/sessions/` (default
-  `~/.grok/sessions/`), whose layout is
+  (Dicklesworthstone/coding_agent_session_search#328). Reads `$GROK_HOME/sessions/`
+  (default `~/.grok/sessions/`), whose layout is
   `sessions/<percent-encoded-cwd>/<session-uuid>/`: `updates.jsonl` (the ACP
   session-update stream the CLI's own docs call the authoritative
   conversation log) is the primary read path, `summary.json` supplies
@@ -68,23 +576,34 @@ Crate: <https://crates.io/crates/franken-agent-detection>
   sidecars) included, with synthetic-fixture tests for chunk coalescing,
   tool-call lifecycle, the chat-history fallback, cwd decoding, and
   scan-root flexibility.
+  [`e90eb77`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/e90eb77744a67c43381bd61a1ef8d95efc4ae10a)
 
-- **Grok (xAI) added to the detection inventory.** xAI's Grok CLI / Grok
-  Build TUI keeps its state under `~/.grok/` (sessions, auth, hooks). Added
-  `grok` to `KNOWN_CONNECTORS`, taught `canonical_connector_slug` the
-  `grok-cli` / `grok-build` / `xai-grok` aliases, and wired up
-  `default_probe_roots` for `~/.grok/sessions`, `~/.grok/auth.json`, and
-  `~/.grok`. Conformance test updated so `default_probe_paths_tilde_covers_expected_roots`
-  asserts the new probe roots.
+- **Kimi Code current layout** alongside legacy `~/.kimi`, including the
+  current event schema (cass#351).
+  [`f685a69`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/f685a69b9ed77f51f05256dd0e35852e16a7817b)
 
-  Note: this lands detection-level support (presence, probe roots) only.
-  A full conversation/normalization connector for Grok session data is
-  deferred — Grok's session format is JSON-on-disk but the schema is still
-  evolving, so adding a connector now would invite churn.
+- **Oh My Pi (`omp`) sessions** on the `pi_agent` connector: probe roots and
+  sub-agent transcripts. `PI_SESSIONS_DIR` is honored; unsupported V2/SQLite
+  stores diagnose instead of silently dropping.
+  [`1a25887`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/1a258873315644914e81d637d651673ac9211e3b)
+
+### Changed
+
+- **OpenCode incremental SQLite scan** skips old sessions' message/part decode
+  (cass#372). Optional `ScanContext` progress-tick for long scans (cass#373).
+  Remote-root scans never pull local canonical DBs (cass#357).
+  [`63b19eb`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/63b19eb846262b8cc15877c2577519f82263fbcd)
+
+- **fsqlite 0.2 async engine** bridged through an asupersync sync wrapper;
+  lockstep bump to fsqlite 0.3.0 + asupersync 0.4.3.
+  [`530d8a9`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/530d8a91081e4c5cd45651789312c6dcbafd4afa)
 
 ---
 
 ## [0.1.9] -- 2026-06-30
+
+GitHub Release [`v0.1.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9)
+(published 2026-07-02).
 
 ### Fixed
 
@@ -264,13 +783,26 @@ Initial public release. No git tag. Not published to crates.io (rejected due to 
 | 0.1.1 | aider, amp, chatgpt, clawdbot, openclaw, pi_agent, vibe | 16 |
 | 0.1.2 | continue, goose | 18 |
 | 0.1.3 | copilot_cli, kimi, qwen | 21 |
+| 0.1.10 | grok, muse, kimi-current-layout, pi_agent omp | (plus VS Code native Copilot store on Unreleased) |
 
 > Note: The `github-copilot` connector (VS Code Copilot Chat) was in the
 > detection registry since v0.1.0; the full session-parsing implementation
 > (`copilot.rs`) was added in v0.1.1, and the separate `copilot_cli` connector
-> for `gh copilot` CLI event logs arrived in v0.1.3.
+> for `gh copilot` CLI event logs arrived in v0.1.3. VS Code's native Copilot
+> chat-session store landed after `v0.1.10` (Unreleased, issue #16).
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.1.3...HEAD
+> `v0.1.4`–`v0.1.7` exist as GitHub Releases (2026-05-16 / 2026-05-17) and are
+> listed above in the Release-vs-tag note. They are not reconstructed as
+> capability-wave sections in this file.
+
+[Unreleased]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0
+[0.1.10]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10
+[0.1.9]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9
+[0.1.7]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7
+[0.1.6]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.6
+[0.1.5]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.5
+[0.1.4]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4
 [0.1.3]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/fa960bcdc294c9f7e16eafc5cbaf43b972c95eab...v0.1.1

@@ -18,7 +18,6 @@
 //! Copilot Chat JSON files) so that CLI-specific event logs are discovered and
 //! indexed independently.
 
-use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +26,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::read_capped;
 use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -256,11 +256,31 @@ impl CopilotCliConnector {
     /// fields) and assemble them into a single conversation per session file.
     #[allow(clippy::too_many_lines)]
     fn parse_event_log(&self, path: &Path) -> Result<Vec<NormalizedConversation>> {
-        let content = fs::read_to_string(path)?;
+        // Event logs accumulate; enforce the project's 100MB scan cap.
+        let content = match read_capped(path) {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "copilot_cli: event log exceeds the scan size cap; skipping"
+                );
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e.into()),
+        };
 
-        // If it looks like a single JSON document, try the legacy session format.
+        // Single-document dispatch is for legacy `.json` session-state files
+        // only. A ONE-LINE `events.jsonl` also starts with `{` and parses as
+        // a bare object, but parse_session_json finds no event arrays in it
+        // and returns empty — silently dropping the session. (.jsonl is
+        // always line-delimited; copilot.rs gates the same dispatch with
+        // !is_jsonl.)
+        let is_jsonl = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
         let trimmed = content.trim_start();
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if !is_jsonl && (trimmed.starts_with('{') || trimmed.starts_with('[')) {
             if let Ok(val) = serde_json::from_str::<Value>(&content) {
                 return Ok(self.parse_session_json(&val, path));
             }
@@ -470,6 +490,7 @@ impl CopilotCliConnector {
             .get("cwd")
             .or_else(|| val.get("workingDirectory"))
             .or_else(|| val.get("workspace"))
+            .or_else(|| val.get("workspacePath"))
             .and_then(|v| v.as_str())
             .map(PathBuf::from);
 
@@ -797,6 +818,7 @@ impl Connector for CopilotCliConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     fn write_file(dir: &Path, filename: &str, content: &str) -> PathBuf {
@@ -920,6 +942,105 @@ mod tests {
         assert_eq!(convs[0].messages.len(), 2);
         assert_eq!(convs[0].messages[0].role, "user");
         assert!(convs[0].messages[0].content.contains("trait"));
+    }
+
+    #[test]
+    fn scan_legacy_history_workspace_path_preserves_identity_and_source() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join(".copilot/history-session-state");
+        let session = serde_json::json!({
+            "history": [
+                {"role": "human", "content": "Summarize unicode Ω handling 🚀", "time": 1_700_003_000_000_i64},
+                {"role": "assistant", "result": "Unicode stays normalized and searchable.", "time": 1_700_003_001_000_i64}
+            ],
+            "workspacePath": "/workspaces/legacy-copilot"
+        });
+        let source = write_file(&root, "legacy-human.json", &session.to_string());
+        let bytes = fs::read(&source).unwrap();
+        let mtime = fs::metadata(&source).unwrap().modified().unwrap();
+        let connector = CopilotCliConnector::new();
+        let ctx = ScanContext::local_default(root, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+        assert_eq!(conv.agent_slug, "copilot_cli");
+        assert_eq!(conv.external_id.as_deref(), Some("legacy-human"));
+        assert_eq!(conv.source_path, source);
+        assert_eq!(
+            conv.title.as_deref(),
+            Some("Summarize unicode Ω handling 🚀")
+        );
+        assert_eq!(
+            conv.workspace.as_deref(),
+            Some(Path::new("/workspaces/legacy-copilot"))
+        );
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[0].role, "user");
+        assert_eq!(conv.messages[1].role, "assistant");
+        assert_eq!(
+            conv.messages[1].content,
+            "Unicode stays normalized and searchable."
+        );
+        assert_eq!(conv.started_at, Some(1_700_003_000_000));
+        assert_eq!(conv.ended_at, Some(1_700_003_001_000));
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn scan_legacy_workspace_path_preserves_existing_alias_precedence() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join(".copilot/history-session-state");
+        let connector = CopilotCliConnector::new();
+        let ctx = ScanContext::local_default(root.clone(), None);
+        for field in ["cwd", "workingDirectory", "workspace"] {
+            let mut session = serde_json::json!({
+                "history": [{"role": "human", "content": "Keep the explicit workspace"}],
+                "workspacePath": "/fallback/workspace"
+            });
+            session[field] = Value::String("/original/workspace".to_string());
+            write_file(&root, "aliases.json", &session.to_string());
+            let convs = connector.scan(&ctx).unwrap();
+            assert_eq!(convs.len(), 1, "{field}");
+            assert_eq!(
+                convs[0].workspace.as_deref(),
+                Some(Path::new("/original/workspace")),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_legacy_workspace_path_does_not_use_non_string_or_nested_values() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join(".copilot/history-session-state");
+        let connector = CopilotCliConnector::new();
+        let ctx = ScanContext::local_default(root.clone(), None);
+        for value in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!(42)),
+            Some(serde_json::json!(["/wrong/array"])),
+            Some(serde_json::json!({"path": "/wrong/object"})),
+        ] {
+            let mut session = serde_json::json!({
+                "history": [{"role": "human", "content": "Keep the message", "workspacePath": "/wrong/message"}],
+                "metadata": {"workspacePath": "/wrong/nested"}
+            });
+            if let Some(value) = value {
+                session["workspacePath"] = value;
+            }
+            let source = write_file(&root, "invalid.json", &session.to_string());
+            let convs = connector.scan(&ctx).unwrap();
+            assert_eq!(convs.len(), 1);
+            assert_eq!(convs[0].workspace, None);
+            assert_eq!(convs[0].external_id.as_deref(), Some("invalid"));
+            assert_eq!(convs[0].source_path, source);
+            assert_eq!(convs[0].messages.len(), 1);
+            assert_eq!(convs[0].messages[0].content, "Keep the message");
+        }
     }
 
     #[test]

@@ -5,7 +5,11 @@
   "llm_message": {
     "role": "assistant",
     "content": [
-      {"cache_prompt": false, "type": "text", "text": "The uuid_service is a small AWS Lambda written in Python. It generates a UUID4 per request and stores it in DynamoDB. Let me look at the directory layout next."}
+      {
+        "cache_prompt": false,
+        "type": "text",
+        "text": "The uuid_service is a small AWS Lambda written in Python. It generates a UUID4 per request and stores it in DynamoDB. Let me look at the directory layout next."
+      }
     ],
     "thinking_blocks": []
   },

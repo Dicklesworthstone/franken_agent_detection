@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -5,9 +6,10 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::read_capped;
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
-    franken_detection_for_connector, parse_timestamp,
+    franken_detection_for_connector, parse_timestamp, utils::dedupe_path_key,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -183,7 +185,16 @@ impl ClineConnector {
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let override_root = Self::normalize_root_path(&ctx.data_dir);
         let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
-            if Self::looks_like_storage(&override_root) {
+            // A data_dir that names an extension dir scopes directly; a
+            // data_dir that is a VS Code base (globalStorage, User,
+            // Code variant, platform root) derives its ext dirs via the
+            // same expansion explicit roots get, so a mirrored base is
+            // not silently ignored in favor of the live machine.
+            let mut derived = Vec::new();
+            Self::append_explicit_roots(&mut derived, &override_root);
+            if !derived.is_empty() {
+                derived.into_iter().map(ScanRoot::local).collect()
+            } else if Self::looks_like_storage(&override_root) {
                 vec![ScanRoot::local(override_root)]
             } else {
                 Self::storage_roots()
@@ -292,6 +303,10 @@ impl Connector for ClineConnector {
         }
 
         let mut convs = Vec::new();
+        // Overlapping roots (Code + Cursor sync, ancestor symlinks) reach
+        // the same task directory twice; dedupe across ALL roots on the
+        // lossless path key so the same task is never parsed twice.
+        let mut seen_task_dirs: HashSet<PathBuf> = HashSet::new();
         for root in roots {
             if !root.exists() {
                 continue;
@@ -308,6 +323,9 @@ impl Connector for ClineConnector {
                 let Ok(entry) = entry else { continue };
                 let path = entry.path();
                 if !path.is_dir() {
+                    continue;
+                }
+                if !seen_task_dirs.insert(dedupe_path_key(&path)) {
                     continue;
                 }
                 let task_id = path
@@ -340,8 +358,14 @@ impl Connector for ClineConnector {
                     continue;
                 }
 
-                let data = match fs::read_to_string(&file) {
-                    Ok(d) => d,
+                // Task logs embed base64 screenshots and routinely reach
+                // tens of MB; enforce the project's 100MB scan cap.
+                let data = match read_capped(&file) {
+                    Ok(Some(d)) => d.trim_start_matches('\u{feff}').to_string(),
+                    Ok(None) => {
+                        tracing::debug!(path = %file.display(), "cline: file exceeds the scan size cap; skipping");
+                        continue;
+                    }
                     Err(e) => {
                         tracing::debug!(path = %file.display(), error = %e, "cline: skipping unreadable file");
                         continue;

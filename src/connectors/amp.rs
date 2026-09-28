@@ -5,6 +5,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::{dedupe_path_key, read_capped};
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
     franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
@@ -261,8 +262,7 @@ impl Connector for AmpConnector {
     #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
-
+        let mut seen_ids = std::collections::HashSet::<PathBuf>::new();
         let roots: Vec<PathBuf> = Self::source_roots(ctx)
             .into_iter()
             .map(|root| root.path)
@@ -285,8 +285,18 @@ impl Connector for AmpConnector {
                 // Amp does not update file mtime when new messages are added to a thread,
                 // so mtime-based incremental indexing would miss new messages.
                 // This means Amp files are always re-read, but correctness is preserved.
-                let Ok(text) = std::fs::read_to_string(path) else {
-                    continue;
+                // Amp never bumps mtimes, so oversized threads are re-read
+                // on EVERY scan — enforce the project's 100MB cap here.
+                let text = match read_capped(path) {
+                    Ok(Some(text)) => text,
+                    Ok(None) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "amp: thread exceeds the scan size cap; skipping"
+                        );
+                        continue;
+                    }
+                    Err(_) => continue,
                 };
                 let val: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -317,20 +327,35 @@ impl Connector for AmpConnector {
                         })
                     });
 
-                    let external_id = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(std::string::ToString::to_string)
+                    // Identity precedence: the thread's own `id` field is
+                    // what amp itself addresses a thread by; a bare file
+                    // stem ("thread.json") is shared by EVERY thread in a
+                    // store and collides downstream. Fall back to the
+                    // root-relative path (stable within a store), then the
+                    // lossless full path.
+                    let external_id = val
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .map(String::from)
                         .or_else(|| {
-                            val.get("id")
-                                .and_then(|v| v.as_str())
+                            path.strip_prefix(&root).ok().and_then(|rel| {
+                                rel.to_str().map(|s| s.trim_start_matches('/').to_string())
+                            })
+                        })
+                        .or_else(|| {
+                            path.file_stem()
+                                .and_then(|s| s.to_str())
                                 .map(std::string::ToString::to_string)
-                        });
+                        })
+                        .or_else(|| Some(path.display().to_string()));
 
-                    let key = external_id.clone().map_or_else(
-                        || format!("amp:{}", path.display()),
-                        |id| format!("amp:{id}"),
-                    );
+                    // Key on the full, losslessly-encoded path: is_amp_log_file
+                    // accepts any *.json under a "threads" directory, so distinct
+                    // files frequently share a stem across roots — a stem-only
+                    // key silently dropped every thread after the first.
+                    // PathBuf (not Display) keeps non-UTF8 OsStr bytes intact.
+                    let key = dedupe_path_key(path);
                     if seen_ids.insert(key) {
                         // Use per-message timestamps when available, falling back
                         // to the top-level "created" field (millisecond epoch) that
@@ -390,13 +415,16 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
 
     let mut out = Vec::new();
     for m in msgs {
-        let role = m
+        // Amp thread JSON uses several raw spellings for turns ("human",
+        // "agent", "userMessage", "assistantMsg", …). Normalize to the
+        // conformance contract's role set — downstream consumers route on
+        // user/assistant, and raw pass-through misfiles user turns.
+        let raw_role = m
             .get("role")
             .or_else(|| m.get("speaker"))
             .or_else(|| m.get("type"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("agent")
-            .to_string();
+            .and_then(|v| v.as_str());
+        let role = normalize_amp_role(raw_role);
 
         // Handle content as either string or array of content blocks
         let content = extract_content_value(m.get("content"))
@@ -431,7 +459,7 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
 
         out.push(NormalizedMessage {
             idx: 0, // Will be re-assigned after filtering
-            role,
+            role: role.to_string(),
             author,
             created_at,
             content,
@@ -451,6 +479,22 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
     crate::types::reindex_messages(&mut out);
 
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// Map an Amp raw role/speaker/type spelling onto the conformance contract's
+/// valid role set (`user`, `assistant`, `system`, `tool`, `function`).
+///
+/// Amp threads label turns "human"/"agent" (and some exports use
+/// "userMessage"/"assistantMsg"); everything model-side — including missing
+/// and unrecognized spellings, which historically defaulted to "agent" —
+/// maps to `assistant`.
+fn normalize_amp_role(raw: Option<&str>) -> &'static str {
+    match raw.map(str::to_ascii_lowercase).as_deref() {
+        Some("human" | "user" | "usermessage") => "user",
+        Some("system") => "system",
+        Some("toolresult" | "tool") => "tool",
+        _ => "assistant",
+    }
 }
 
 /// Extract text content from a value that may be a string or an array of content blocks.
@@ -483,10 +527,12 @@ fn infer_workspace(val: &Value) -> Option<PathBuf> {
         for tree in trees {
             if let Some(uri) = tree.get("uri").and_then(|u| u.as_str()) {
                 let path_str = if let Some(stripped) = uri.strip_prefix("file://") {
-                    stripped
+                    // Decode %XX escapes (e.g. `my%20project`): the URI is
+                    // wire format, the workspace is a filesystem path.
+                    super::percent_decode_utf8(stripped)
                 } else if !uri.contains("://") {
                     // Bare path (no scheme), treat as filesystem path
-                    uri
+                    uri.to_string()
                 } else {
                     // Non-file scheme (ssh://, https://, vscode-remote://…) — skip
                     continue;
@@ -698,6 +744,53 @@ mod tests {
     }
 
     #[test]
+    fn scan_prefers_thread_id_for_external_id_with_relative_path_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("amp-store");
+        let threads = store.join("threads");
+        fs::create_dir_all(&threads).unwrap();
+
+        // A thread carrying amp's own id: that id is the identity.
+        fs::write(
+            threads.join("T-111.json"),
+            json!({
+                "id": "T-111",
+                "title": "With id",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // An export without an id: the root-relative path keeps it unique
+        // (a bare stem would collide with every other thread.json).
+        fs::write(
+            threads.join("thread.json"),
+            json!({
+                "title": "No id",
+                "messages": [{"role": "user", "content": "hello"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let connector = AmpConnector::new();
+        let ctx = ScanContext::local_default(store, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 2);
+        let with_id = convs
+            .iter()
+            .find(|c| c.title.as_deref() == Some("With id"))
+            .expect("thread with id");
+        assert_eq!(with_id.external_id.as_deref(), Some("T-111"));
+        let no_id = convs
+            .iter()
+            .find(|c| c.title.as_deref() == Some("No id"))
+            .expect("thread without id");
+        assert_eq!(no_id.external_id.as_deref(), Some("threads/thread.json"));
+    }
+
+    #[test]
     fn infer_workspace_from_cwd_key() {
         let val = json!({"cwd": "/home/user/cwd-project"});
         assert_eq!(
@@ -798,7 +891,8 @@ mod tests {
             "messages": [{"speaker": "human", "content": "Test"}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].role, "human");
+        // Raw Amp spellings normalize onto the conformance role set.
+        assert_eq!(msgs[0].role, "user");
     }
 
     #[test]
@@ -807,7 +901,7 @@ mod tests {
             "messages": [{"type": "userMessage", "content": "Test"}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].role, "userMessage");
+        assert_eq!(msgs[0].role, "user");
     }
 
     #[test]
@@ -912,12 +1006,12 @@ mod tests {
     }
 
     #[test]
-    fn extract_messages_defaults_role_to_agent() {
+    fn extract_messages_defaults_roleless_entries_to_assistant() {
         let val = json!({
             "messages": [{"content": "No role"}]
         });
         let msgs = extract_messages(&val, None).unwrap();
-        assert_eq!(msgs[0].role, "agent");
+        assert_eq!(msgs[0].role, "assistant");
     }
 
     #[test]
@@ -1100,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_uses_file_stem_as_external_id() {
+    fn scan_uses_relative_path_as_external_id_without_a_thread_id() {
         let dir = TempDir::new().unwrap();
         let amp_dir = create_amp_dir(&dir);
 
@@ -1111,7 +1205,9 @@ mod tests {
         let ctx = ScanContext::local_default(amp_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
 
-        assert_eq!(convs[0].external_id, Some("my-thread-123".to_string()));
+        // No `id` field: the root-relative path is the stable identity (a
+        // bare stem is shared by every thread.json in a store).
+        assert_eq!(convs[0].external_id, Some("my-thread-123.json".to_string()));
     }
 
     #[test]
@@ -1550,8 +1646,8 @@ mod tests {
         let ctx = ScanContext::local_default(amp_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
-        assert_eq!(convs[0].messages[0].role, "human");
-        assert_eq!(convs[0].messages[1].role, "assistantMsg");
+        assert_eq!(convs[0].messages[0].role, "user");
+        assert_eq!(convs[0].messages[1].role, "assistant");
     }
 
     #[test]

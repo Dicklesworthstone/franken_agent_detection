@@ -1,6 +1,6 @@
 [package]
 name = "franken-agent-detection"
-version = "0.1.12-letta-prime.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -10,6 +10,17 @@ documentation = "https://docs.rs/franken-agent-detection"
 readme = "README.md"
 keywords = ["agent", "detection", "filesystem", "codex", "claude"]
 categories = ["development-tools", "command-line-utilities"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/fad_illustration.webp",
+    "/src/**",
+    "/fixtures/**",
+    "/tests/fixtures/**",
+]
 
 [dependencies]
 # --- Always-on (detection + connector shared) ---
@@ -29,16 +40,22 @@ once_cell = { version = "1", optional = true }
 urlencoding = { version = "2", optional = true }
 
 # --- Optional: ChatGPT encrypted conversations ---
-aes-gcm = { version = "0.10", optional = true }
-base64 = { version = "0.22", optional = true }
+aes-gcm = { version = "0.11", optional = true }
+base64 = { version = "0.23", optional = true }
+blake3 = { version = "1", optional = true }
+url = { version = "2", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
-frankensqlite = { version = "0.3.0", package = "fsqlite", optional = true }
+frankensqlite = { version = "0.4.1", package = "fsqlite", optional = true }
 # Drives fsqlite's async (!Send) engine futures to completion behind the
 # connectors' synchronous API surface (see connectors/sqlite_sync.rs).
-# fsqlite 0.3 names asupersync 0.4.x types in its public API, so the two
-# must move in lockstep (asupersync 0.3.x and 0.4.x are non-interchangeable).
-asupersync = { version = "0.4.3", default-features = false, optional = true }
+# fsqlite 0.4 names asupersync 0.5.x types in its public API, so the two
+# must move in lockstep to preserve the bridge's runtime type identity.
+asupersync = { version = "0.5.0", default-features = false, optional = true }
+# OpenClaw 2.0 stores larger transcript events as a Zstandard frame in
+# `transcript_events.event_zstd` (with `event_json` NULL); see the
+# `openclaw-sqlite` feature. Kept on 0.13 to share cass's existing copy.
+zstd = { version = "0.13", default-features = false, optional = true }
 
 [features]
 default = []
@@ -64,6 +81,32 @@ goose = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 hermes = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 # Crush: SQLite database access for Charm's Crush agent
 crush = ["connectors", "dep:frankensqlite", "dep:asupersync"]
+# Devin CLI: read-only access to the shared ~/.local/share/devin/cli/sessions.db
+# (cass #449). Without it the devin connector is detection-only.
+devin = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
+# Grok Bot desktop rolling replicas. Hosts must reconcile provider entry IDs
+# across FIFO rewrites before opting into ingestion (separate from Grok CLI).
+grok-bot = ["connectors"]
+# One shared on-disk CLI lineage; Freebuff and Codebuff cannot be attributed
+# separately from their identical Manicode store.
+codebuff = ["connectors"]
+# Shelley (boldsoftware/shelley): schema-aware read-only access to Shelley's
+# one-database-many-conversations shelley.db (WAL mode; cass gh#415). fts5 is
+# required because Shelley's schema declares an FTS5 messages index.
+shelley = [
+    "connectors",
+    "dep:frankensqlite",
+    "frankensqlite/fts5",
+    "dep:asupersync",
+    "dep:blake3",
+    "dep:base64",
+    "dep:url",
+]
+# OpenClaw 2.0 (v2026.8.1+): per-agent SQLite transcript store at
+# agents/<agent>/agent/openclaw-agent.sqlite (transcript_events rows). Legacy
+# JSONL sessions need no SQLite and remain available with the base
+# `connectors` feature.
+openclaw-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:zstd"]
 # Copilot legacy generation: pre-March-2025 VS Code chat sessions stored in
 # workspace/global `state.vscdb` (`ItemTable` key `interactive.sessions`).
 # The newer flat-JSON and append-log `chatSessions` generations need no SQLite
@@ -73,17 +116,22 @@ copilot-vscdb = ["connectors", "dep:frankensqlite", "dep:asupersync"]
 all-connectors = [
     "connectors",
     "chatgpt",
+    "codebuff",
     "cursor",
+    "devin",
     "opencode",
     "goose",
+    "grok-bot",
     "hermes",
     "crush",
+    "shelley",
+    "openclaw-sqlite",
     "copilot-vscdb",
 ]
 
 [dev-dependencies]
-tempfile = "3"
-serial_test = "3"
+tempfile = "3.27"
+serial_test = "4"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -94,8 +142,13 @@ nursery = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# clippy::assert_is_empty landed in pedantic on the floating nightly
+# (2026-08 toolchain drift) and flags ~35 pre-existing test assertions of
+# the form `assert!(x.is_empty())` across connectors. The lint offers no
+# mechanical rewrite; keep the established assertion style until then.
+assert_is_empty = "allow"
 
-# fsqlite 0.2's async engine builds enormous debug-mode futures; at opt-level 0
+# fsqlite's async engine builds enormous debug-mode futures; at opt-level 0
 # a single statement poll can overflow a 2 MiB test-thread stack. Upstream
 # frankensqlite itself develops at `[profile.dev] opt-level = 1` for the same
 # reason. Applies to dependencies only, never this crate's own test code.

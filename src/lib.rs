@@ -42,16 +42,22 @@ pub use types::{
 // Re-export connector infrastructure at crate root.
 #[cfg(feature = "chatgpt")]
 pub use connectors::chatgpt::ChatGptConnector;
+#[cfg(feature = "codebuff")]
+pub use connectors::codebuff::CodebuffConnector;
 #[cfg(feature = "crush")]
 pub use connectors::crush::CrushConnector;
 #[cfg(feature = "cursor")]
 pub use connectors::cursor::CursorConnector;
 #[cfg(feature = "goose")]
 pub use connectors::goose::GooseConnector;
+#[cfg(feature = "grok-bot")]
+pub use connectors::grok_bot::GrokBotConnector;
 #[cfg(feature = "hermes")]
 pub use connectors::hermes::HermesConnector;
 #[cfg(feature = "opencode")]
 pub use connectors::opencode::OpenCodeConnector;
+#[cfg(feature = "shelley")]
+pub use connectors::shelley::ShelleyConnector;
 #[cfg(feature = "connectors")]
 pub use connectors::token_extraction::{
     ExtractedTokenUsage, ModelInfo, TokenDataSource, extract_pi_family_tokens,
@@ -59,16 +65,17 @@ pub use connectors::token_extraction::{
 #[cfg(feature = "connectors")]
 pub use connectors::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot,
-    WorkspaceCache, aider::AiderConnector, amp::AmpConnector, antigravity::AntigravityConnector,
-    claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
-    codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
+    SourceCompletion, SourceScanHooks, WorkspaceCache, aider::AiderConnector, amp::AmpConnector,
+    antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
+    clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
+    copilot::CopilotConnector, copilot_cli::CopilotCliConnector, devin::DevinConnector,
     estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,
     extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
-    get_connector_factories, grok::GrokConnector, kimi::KimiConnector,
-    letta_code::LettaCodeConnector, normalize_model, openclaw::OpenClawConnector,
-    openhands::OpenHandsConnector, parse_timestamp, pi_agent::PiAgentConnector,
-    prime_agent::PrimeAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,
+    get_connector_factories, grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector,
+    normalize_model, omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
+    parse_timestamp, pi_agent::PiAgentConnector, prime_agent::PrimeAgentConnector,
+    qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -135,26 +142,31 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "claude",
     "clawdbot",
     "cline",
+    "codebuff",
     "codex",
     "continue",
     "copilot_cli",
     "crush",
     "cursor",
+    "devin",
     "factory",
     "gemini",
     "github-copilot",
     "goose",
     "grok",
+    "grok_bot",
     "hermes",
     "kimi",
-    "letta_code",
+    "kiro",
     "muse",
+    "omp",
     "opencode",
     "openclaw",
     "openhands",
     "pi_agent",
     "prime_agent",
     "qwen",
+    "shelley",
     "vibe",
     "windsurf",
 ];
@@ -163,31 +175,36 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
     match slug {
         "aider" | "aider-cli" => Some("aider"),
         "amp" | "amp-cli" => Some("amp"),
-        "antigravity" | "agy" | "antigravity-cli" => Some("antigravity"),
+        "antigravity" | "agy" | "antigravity-cli" | "antigravity-ide" => Some("antigravity"),
         "chatgpt" | "chat-gpt" | "chatgpt-desktop" => Some("chatgpt"),
         "claude" | "claude-code" => Some("claude"),
         "clawdbot" | "clawd-bot" => Some("clawdbot"),
         "cline" => Some("cline"),
+        "codebuff" | "freebuff" | "manicode" | "codebuff-lineage" => Some("codebuff"),
         "codex" | "codex-cli" => Some("codex"),
         "continue" | "continue-dev" => Some("continue"),
         "copilot_cli" | "copilot-cli" | "gh-copilot" => Some("copilot_cli"),
         "crush" | "charm-crush" => Some("crush"),
         "cursor" => Some("cursor"),
+        "devin" | "devin-cli" => Some("devin"),
         "factory" | "factory-droid" => Some("factory"),
         "gemini" | "gemini-cli" => Some("gemini"),
         "github-copilot" | "copilot" => Some("github-copilot"),
         "goose" | "goose-ai" => Some("goose"),
         "grok" | "grok-cli" | "grok-build" | "xai-grok" => Some("grok"),
+        "grok_bot" | "grok-bot" => Some("grok_bot"),
         "hermes" | "hermes-agent" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
-        "letta_code" | "letta-code" => Some("letta_code"),
+        "kiro" | "kiro-cli" | "kirocli" => Some("kiro"),
         "muse" | "muse-code" | "muse_code" | "musecode" | "meta-muse" => Some("muse"),
+        "omp" | "oh-my-pi" => Some("omp"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
         "openhands" | "open-hands" => Some("openhands"),
         "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
-        "prime_agent" | "prime-agent" | "primeagent" | "prime" => Some("prime_agent"),
+        "prime_agent" | "prime-agent" | "primeagent" => Some("prime_agent"),
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
+        "shelley" | "shelley-db" => Some("shelley"),
         "vibe" | "vibe-cli" => Some("vibe"),
         "windsurf" => Some("windsurf"),
         _ => None,
@@ -202,6 +219,29 @@ fn normalize_slug(raw: &str) -> Option<String> {
 fn canonical_or_normalized_slug(raw: &str) -> Option<String> {
     let normalized = normalize_slug(raw)?;
     Some(canonical_connector_slug(&normalized).map_or(normalized, std::string::ToString::to_string))
+}
+
+/// Expand a leading `~` in a configured path value.
+///
+/// Only a bare `~` or a `~/rest` (`~\rest` on Windows) prefix is expanded, the
+/// way agents that document tilde support in their own env overrides do it;
+/// `~user` has no portable meaning here and is preserved verbatim. When the
+/// home directory is unknown the raw value survives rather than being silently
+/// rooted at the process working directory.
+pub(crate) fn expand_leading_tilde(raw: &str, home: Option<&Path>) -> PathBuf {
+    let trimmed = raw.trim();
+    if let Some(home) = home {
+        if trimmed == "~" {
+            return home.to_path_buf();
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("~/")
+            .or_else(|| trimmed.strip_prefix("~\\"))
+        {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
 }
 
 fn home_join(parts: &[&str]) -> Option<PathBuf> {
@@ -327,10 +367,21 @@ fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
     roots
 }
 
+#[allow(clippy::too_many_lines)]
 fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
     let read = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string());
 
     match slug {
+        "codebuff" => {
+            let root = read("CASS_CODEBUFF_DATA_ROOT")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![expand_leading_tilde(
+                &root,
+                dirs::home_dir().as_deref(),
+            )])
+        }
         "aider" => {
             let root = read("CASS_AIDER_DATA_ROOT")?;
             if root.is_empty() {
@@ -344,6 +395,25 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                 return None;
             }
             Some(vec![PathBuf::from(root)])
+        }
+        "claude" => claude_env_override_roots(read("CLAUDE_CONFIG_DIR").as_deref()),
+        "devin" => {
+            // Mirrors DevinConnector's CASS_DEVIN_DATA_ROOT resolution (the
+            // sessions.db file, its `cli` dir, or the `devin` data root) so a
+            // relocated store is detected exactly where it is scanned.
+            let root = read("CASS_DEVIN_DATA_ROOT")?;
+            if root.is_empty() {
+                return None;
+            }
+            let root = PathBuf::from(root);
+            if root.extension().is_some_and(|ext| ext == "db") {
+                return Some(vec![root]);
+            }
+            Some(vec![
+                root.join("sessions.db"),
+                root.join("cli").join("sessions.db"),
+                root,
+            ])
         }
         "codex" => {
             let root = read("CODEX_HOME")?;
@@ -374,21 +444,26 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             Some(vec![PathBuf::from(root).join("sessions")])
         }
         "prime_agent" => {
-            let session = read("PRIME_AGENT_SESSION_DIR");
-            let legacy = read("PRIME_AGENT_CODING_AGENT_SESSION_DIR");
-            let agent = read("PRIME_AGENT_CODING_AGENT_DIR");
-            if nonempty_trimmed(session.as_deref()).is_none()
-                && nonempty_trimmed(legacy.as_deref()).is_none()
-                && nonempty_trimmed(agent.as_deref()).is_none()
+            // Prime's own precedence: PRIME_AGENT_SESSION_DIR (direct
+            // sessions dir) > legacy PRIME_AGENT_CODING_AGENT_SESSION_DIR >
+            // PRIME_AGENT_CODING_AGENT_DIR (agent home; sessions beneath).
+            // Prime expands a leading `~` in all three, so detection must
+            // resolve the same directory the connector will scan.
+            let home = dirs::home_dir();
+            let expand = |raw: &str| expand_leading_tilde(raw, home.as_deref());
+            if let Some(dir) = read("PRIME_AGENT_SESSION_DIR").filter(|v| !v.is_empty()) {
+                return Some(vec![expand(&dir)]);
+            }
+            if let Some(dir) =
+                read("PRIME_AGENT_CODING_AGENT_SESSION_DIR").filter(|v| !v.is_empty())
             {
+                return Some(vec![expand(&dir)]);
+            }
+            let root = read("PRIME_AGENT_CODING_AGENT_DIR")?;
+            if root.is_empty() {
                 return None;
             }
-            Some(vec![prime_agent_session_dir_from_overrides(
-                session.as_deref(),
-                legacy.as_deref(),
-                agent.as_deref(),
-                dirs::home_dir().as_deref(),
-            )])
+            Some(vec![expand(&root).join("sessions")])
         }
         "goose" => {
             let root = read("GOOSE_PATH_ROOT")?;
@@ -408,8 +483,80 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root)])
         }
+        "grok" => {
+            // Mirrors GrokConnector::base_root(): scans honor $GROK_HOME,
+            // so detection must too — otherwise a relocated install reports
+            // not-found while scan finds sessions.
+            let root = read("GROK_HOME")?;
+            if root.is_empty() {
+                return None;
+            }
+            let root = PathBuf::from(root);
+            Some(vec![root.join("sessions"), root])
+        }
+        "grok_bot" => {
+            let root = read("CASS_GROK_BOT_DATA_ROOT")?;
+            if root.trim().is_empty() {
+                return None;
+            }
+            Some(vec![expand_leading_tilde(
+                &root,
+                dirs::home_dir().as_deref(),
+            )])
+        }
+        "omp" => {
+            let root = read("CASS_OMP_DATA_ROOT")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root)])
+        }
         _ => None,
     }
+}
+
+/// Claude Code detection roots when `CLAUDE_CONFIG_DIR` is set (cass #448).
+///
+/// Mirrors `ClaudeCodeConnector::projects_root_resolved`: an explicit
+/// `CLAUDE_CONFIG_DIR` REPLACES the default roots, and the connector scans
+/// `$CLAUDE_CONFIG_DIR/projects`. Both the projects dir and the config dir
+/// itself are probed so a freshly redirected profile with no sessions yet is
+/// still reported as installed (the scan then simply finds nothing).
+fn claude_env_override_roots(claude_config_dir: Option<&str>) -> Option<Vec<PathBuf>> {
+    let root = claude_config_dir?.trim();
+    if root.is_empty() {
+        return None;
+    }
+    let root = PathBuf::from(root);
+    Some(vec![root.join("projects"), root])
+}
+
+/// Claude Code default detection roots (cass #448).
+///
+/// `XDG_CONFIG_HOME` is additive, not a replacement: the connector's resolver
+/// scans `$XDG_CONFIG_HOME/claude-code/projects` when the variable is set, and
+/// `~/.claude` users who export `XDG_CONFIG_HOME` globally (common on Linux)
+/// must stay detected too.
+fn claude_default_probe_roots(
+    xdg_config_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(xdg) = xdg_config_home {
+        out.push(xdg.join("claude-code"));
+    }
+    let Some(home) = home else {
+        return out;
+    };
+    out.push(home.join(".claude"));
+    out.push(home.join(".config").join("claude"));
+    let claude_support = home
+        .join("Library")
+        .join("Application Support")
+        .join("Claude");
+    out.push(claude_support.join("claude-code-sessions"));
+    out.push(claude_support.join("local-agent-mode-sessions"));
+    out
 }
 
 #[allow(clippy::too_many_lines)]
@@ -540,27 +687,17 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
                 &["Library", "Application Support", "com.openai.chat"],
             );
         }
+        "codebuff" => {
+            maybe_push(&mut out, &[".config", "manicode", "projects"]);
+        }
         "claude" => {
-            maybe_push(&mut out, &[".claude"]);
-            maybe_push(&mut out, &[".config", "claude"]);
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "Claude",
-                    "claude-code-sessions",
-                ],
-            );
-            maybe_push(
-                &mut out,
-                &[
-                    "Library",
-                    "Application Support",
-                    "Claude",
-                    "local-agent-mode-sessions",
-                ],
-            );
+            let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty());
+            out.extend(claude_default_probe_roots(
+                xdg_config_home.as_deref(),
+                dirs::home_dir().as_deref(),
+            ));
         }
         "clawdbot" => {
             maybe_push(&mut out, &[".clawdbot"]);
@@ -599,6 +736,11 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             );
             maybe_push(&mut out, &["AppData", "Roaming", "Cursor", "User"]);
         }
+        "devin" => {
+            maybe_push(&mut out, &[".local", "bin", "devin"]);
+            maybe_push(&mut out, &[".local", "share", "devin"]);
+            maybe_push(&mut out, &[".local", "share", "devin", "cli"]);
+        }
         "factory" => {
             maybe_push(&mut out, &[".factory"]);
             maybe_push(&mut out, &[".factory", "sessions"]);
@@ -606,6 +748,12 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".config", "factory-droid"]);
         }
         "antigravity" => {
+            // Two products, two stores (cass #454): the Antigravity IDE
+            // (`~/.gemini/antigravity`) and the `agy` CLI
+            // (`~/.gemini/antigravity-cli`). The connector scans both.
+            maybe_push(&mut out, &[".gemini", "antigravity", "conversations"]);
+            maybe_push(&mut out, &[".gemini", "antigravity", "brain"]);
+            maybe_push(&mut out, &[".gemini", "antigravity"]);
             maybe_push(&mut out, &[".gemini", "antigravity-cli", "conversations"]);
             maybe_push(&mut out, &[".gemini", "antigravity-cli", "brain"]);
             maybe_push(&mut out, &[".gemini", "antigravity-cli"]);
@@ -734,6 +882,17 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".grok", "auth.json"]);
             maybe_push(&mut out, &[".grok"]);
         }
+        "grok_bot" => {
+            maybe_push(
+                &mut out,
+                &[
+                    "Library",
+                    "Application Support",
+                    "Grok Bot",
+                    "sand-client-persistence",
+                ],
+            );
+        }
         "hermes" => {
             maybe_push(&mut out, &[".hermes", "state.db"]);
             maybe_push(&mut out, &[".hermes"]);
@@ -783,15 +942,44 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".openhands", "conversations"]);
             maybe_push(&mut out, &[".openhands"]);
         }
-        "pi_agent" => {
-            maybe_push(&mut out, &[".pi", "agent", "sessions"]);
-            // Oh My Pi (`omp`) is a pi-mono derivative sharing the wire
-            // format; the connector already scans ~/.omp/agent, but detection
-            // is registry-driven, so an omp-only machine reported the
-            // pi_agent connector as not detected without these (cass#351
-            // investigation fallout).
+        "omp" => {
+            // Oh My Pi (`omp`, https://omp.sh) v18 resolves its store via
+            // profiles + XDG (see connectors::omp). Probe the sessions
+            // directory first (highest-signal), then the parent so
+            // detection still fires for fresh installs that haven't
+            // created a session yet, then named-profile and XDG homes.
             maybe_push(&mut out, &[".omp", "agent", "sessions"]);
             maybe_push(&mut out, &[".omp", "agent"]);
+            maybe_push(&mut out, &[".omp", "profiles"]);
+            if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+                let app = PathBuf::from(xdg).join("omp");
+                out.push(app.join("sessions"));
+                out.push(app);
+            } else {
+                maybe_push(&mut out, &[".local", "share", "omp", "sessions"]);
+                maybe_push(&mut out, &[".local", "share", "omp"]);
+            }
+        }
+        "pi_agent" => {
+            maybe_push(&mut out, &[".pi", "agent", "sessions"]);
+        }
+        "prime_agent" => {
+            maybe_push(&mut out, &[".prime", "agent", "sessions"]);
+            maybe_push(&mut out, &[".prime", "agent"]);
+        }
+        "kiro" => {
+            maybe_push(&mut out, &[".kiro", "sessions", "cli"]);
+            maybe_push(&mut out, &[".kiro"]);
+        }
+        "shelley" => {
+            // Display/probe hints only: Shelley detection never trusts bare
+            // path existence — entry_from_detect routes the slug through
+            // schema-aware admission (cass gh#415).
+            maybe_push(&mut out, &[".config", "shelley", "shelley.db"]);
+            if let Some(cwd_db) = cwd_join(&["shelley.db"]) {
+                out.push(cwd_db);
+            }
+            maybe_push(&mut out, &["shelley.db"]);
         }
         "prime_agent" => {
             maybe_push(&mut out, &[".prime", "agent", "sessions"]);
@@ -852,7 +1040,70 @@ fn detect_roots(
     }
 }
 
+/// Schema-aware detection for Shelley: path existence is never sufficient
+/// because any SQLite file could be named `shelley.db` (and a real Shelley
+/// database can have any name). Candidates are opened read-only and admitted
+/// only on the Shelley schema signature (cass gh#415).
+fn shelley_detection_entry(roots: Option<&[PathBuf]>) -> InstalledAgentDetectionEntry {
+    #[cfg(feature = "shelley")]
+    {
+        let mut detected = false;
+        let mut evidence: Vec<String> = Vec::new();
+        let mut root_paths: Vec<String> = Vec::new();
+        let candidates: Vec<(PathBuf, bool)> = roots
+            .map_or_else(connectors::shelley::detection_candidates, |roots| {
+                roots.iter().map(|root| (root.clone(), true)).collect()
+            });
+        if candidates.is_empty() {
+            evidence.push("no Shelley candidate databases available".to_string());
+        }
+        for (path, explicit) in candidates {
+            let file = if path.is_dir() {
+                path.join("shelley.db")
+            } else {
+                path
+            };
+            let file_display = file.display().to_string();
+            if !file.is_file() {
+                evidence.push(format!("candidate missing: {file_display}"));
+                continue;
+            }
+            match connectors::shelley::probe_candidate(&file, explicit) {
+                Ok(()) => {
+                    detected = true;
+                    root_paths.push(file_display.clone());
+                    evidence.push(format!("schema-admitted Shelley database: {file_display}"));
+                }
+                Err(err) => {
+                    evidence.push(format!("candidate rejected ({file_display}): {err:#}"));
+                }
+            }
+        }
+        InstalledAgentDetectionEntry {
+            slug: "shelley".to_string(),
+            detected,
+            evidence,
+            root_paths,
+        }
+    }
+    #[cfg(not(feature = "shelley"))]
+    {
+        let _ = roots;
+        InstalledAgentDetectionEntry {
+            slug: "shelley".to_string(),
+            detected: false,
+            evidence: vec!["compiled without the `shelley` cargo feature".to_string()],
+            root_paths: Vec::new(),
+        }
+    }
+}
+
 fn entry_from_detect(slug: &'static str) -> InstalledAgentDetectionEntry {
+    if slug == "shelley" {
+        // Never path-existence-only for Shelley; CASS_SHELLEY_DB is handled
+        // inside the schema-aware candidate expansion.
+        return shelley_detection_entry(None);
+    }
     if let Some(override_roots) = env_override_roots(slug) {
         return detect_roots(slug, &override_roots, "env");
     }
@@ -861,6 +1112,9 @@ fn entry_from_detect(slug: &'static str) -> InstalledAgentDetectionEntry {
 }
 
 fn entry_from_override(slug: &'static str, roots: &[PathBuf]) -> InstalledAgentDetectionEntry {
+    if slug == "shelley" {
+        return shelley_detection_entry(Some(roots));
+    }
     detect_roots(slug, roots, "override")
 }
 
@@ -930,6 +1184,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
         .iter()
         .map(|&slug| {
             let paths: Vec<String> = match slug {
+                "codebuff" => vec![tilde(&[".config", "manicode", "projects"])],
                 "aider" => vec![tilde(&[".aider.chat.history.md"]), tilde(&[".aider"])],
                 "amp" => vec![
                     tilde(&[".local", "share", "amp"]),
@@ -1131,6 +1386,11 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&["Library", "Application Support", "Cursor", "User"]),
                     tilde(&["AppData", "Roaming", "Cursor", "User"]),
                 ],
+                "devin" => vec![
+                    tilde(&[".local", "bin", "devin"]),
+                    tilde(&[".local", "share", "devin"]),
+                    tilde(&[".local", "share", "devin", "cli"]),
+                ],
                 "factory" => vec![
                     tilde(&[".factory"]),
                     tilde(&[".factory", "sessions"]),
@@ -1138,6 +1398,9 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".config", "factory-droid"]),
                 ],
                 "antigravity" => vec![
+                    tilde(&[".gemini", "antigravity", "conversations"]),
+                    tilde(&[".gemini", "antigravity", "brain"]),
+                    tilde(&[".gemini", "antigravity"]),
                     tilde(&[".gemini", "antigravity-cli", "conversations"]),
                     tilde(&[".gemini", "antigravity-cli", "brain"]),
                     tilde(&[".gemini", "antigravity-cli"]),
@@ -1236,6 +1499,12 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".grok", "auth.json"]),
                     tilde(&[".grok"]),
                 ],
+                "grok_bot" => vec![tilde(&[
+                    "Library",
+                    "Application Support",
+                    "Grok Bot",
+                    "sand-client-persistence",
+                ])],
                 "hermes" => vec![tilde(&[".hermes", "state.db"]), tilde(&[".hermes"])],
                 "kimi" => vec![
                     tilde(&[".kimi-code", "sessions"]),
@@ -1264,15 +1533,30 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".openhands", "conversations"]),
                     tilde(&[".openhands"]),
                 ],
-                "pi_agent" => vec![
-                    tilde(&[".pi", "agent", "sessions"]),
+                "omp" => vec![
+                    // Oh My Pi (`omp`, https://omp.sh) canonical stores; the
+                    // dedicated omp connector owns these roots. Remote
+                    // probes are static paths, so named profiles use the
+                    // profiles parent and XDG uses the conventional
+                    // ~/.local/share location.
                     tilde(&[".omp", "agent", "sessions"]),
                     tilde(&[".omp", "agent"]),
+                    tilde(&[".omp", "profiles"]),
+                    tilde(&[".local", "share", "omp", "sessions"]),
+                    tilde(&[".local", "share", "omp"]),
                 ],
+                "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
                 "prime_agent" => vec![
                     tilde(&[".prime", "agent", "sessions"]),
                     tilde(&[".prime", "agent"]),
                 ],
+                "kiro" => vec![tilde(&[".kiro", "sessions", "cli"]), tilde(&[".kiro"])],
+                // Shelley intentionally has NO remote tilde probes: a live
+                // SQLite database plus WAL cannot be SSH-synced as one
+                // consistent bundle yet (cass gh#415). The explicit arm (vs
+                // the wildcard) documents that this emptiness is deliberate.
+                #[allow(clippy::match_same_arms)]
+                "shelley" => vec![],
                 "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],
                 "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],
                 "windsurf" => vec![tilde(&[".windsurf"]), tilde(&[".config", "windsurf"])],
@@ -1346,6 +1630,133 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gh423_product_aliases_resolve_to_one_shared_lineage() {
+        for alias in ["codebuff", "freebuff", "manicode", "codebuff-lineage"] {
+            assert_eq!(canonical_connector_slug(alias), Some("codebuff"));
+        }
+        assert_eq!(
+            KNOWN_CONNECTORS
+                .iter()
+                .filter(|slug| **slug == "codebuff")
+                .count(),
+            1
+        );
+        assert!(!KNOWN_CONNECTORS.contains(&"freebuff"));
+        let dir = tempfile::tempdir().unwrap();
+        let report = detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec!["freebuff".into(), "codebuff".into()]),
+            include_undetected: true,
+            root_overrides: vec![AgentDetectRootOverride {
+                slug: "freebuff".into(),
+                root: dir.path().into(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(report.installed_agents.len(), 1);
+        assert_eq!(report.installed_agents[0].slug, "codebuff");
+        #[cfg(feature = "codebuff")]
+        assert_eq!(
+            get_connector_factories()
+                .iter()
+                .filter(|(slug, _)| *slug == "codebuff")
+                .count(),
+            1
+        );
+    }
+
+    // cass #448: the Claude Code detection probe must agree with the
+    // connector's root resolver (CLAUDE_CONFIG_DIR, then XDG_CONFIG_HOME,
+    // then ~/.claude), otherwise a redirected install with no legacy
+    // ~/.claude is "not detected" and never scanned.
+    #[test]
+    fn claude_env_override_replaces_defaults_with_the_redirected_profile() {
+        let roots = claude_env_override_roots(Some("/srv/tenant-a")).expect("override");
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/srv/tenant-a/projects"),
+                PathBuf::from("/srv/tenant-a")
+            ]
+        );
+        assert_eq!(
+            claude_env_override_roots(Some("  ~/.claude-work  ")).expect("trimmed"),
+            vec![
+                PathBuf::from("~/.claude-work/projects"),
+                PathBuf::from("~/.claude-work")
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_env_override_ignores_unset_or_blank_config_dir() {
+        assert!(claude_env_override_roots(None).is_none());
+        assert!(claude_env_override_roots(Some("")).is_none());
+        assert!(claude_env_override_roots(Some("   ")).is_none());
+    }
+
+    #[test]
+    fn claude_default_probe_roots_add_xdg_claude_code_before_home_defaults() {
+        let home = PathBuf::from("/home/u");
+        let xdg = PathBuf::from("/home/u/xdg");
+        let roots = claude_default_probe_roots(Some(&xdg), Some(&home));
+        assert_eq!(roots[0], PathBuf::from("/home/u/xdg/claude-code"));
+        assert_eq!(roots[1], PathBuf::from("/home/u/.claude"));
+        assert!(roots.contains(&PathBuf::from("/home/u/.config/claude")));
+        assert!(roots.contains(&PathBuf::from(
+            "/home/u/Library/Application Support/Claude/claude-code-sessions"
+        )));
+        assert!(roots.contains(&PathBuf::from(
+            "/home/u/Library/Application Support/Claude/local-agent-mode-sessions"
+        )));
+        // XDG is additive: the legacy home roots survive a globally exported
+        // XDG_CONFIG_HOME.
+        let without_xdg = claude_default_probe_roots(None, Some(&home));
+        assert_eq!(&roots[1..], &without_xdg[..]);
+        assert_eq!(without_xdg[0], PathBuf::from("/home/u/.claude"));
+    }
+
+    #[test]
+    fn claude_default_probe_roots_without_home_keep_only_xdg() {
+        let xdg = PathBuf::from("/x");
+        assert_eq!(
+            claude_default_probe_roots(Some(&xdg), None),
+            vec![PathBuf::from("/x/claude-code")]
+        );
+        assert!(claude_default_probe_roots(None, None).is_empty());
+    }
+
+    #[test]
+    fn claude_detection_reports_the_redirected_profile_root() {
+        // Exercise the same `detect_roots` path `entry_from_detect` takes for
+        // an env override, against a real directory, without touching the
+        // process environment.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile = tmp.path().join("claude-cfg");
+        std::fs::create_dir_all(profile.join("projects")).expect("projects dir");
+        let roots = claude_env_override_roots(profile.to_str()).expect("override");
+        let entry = detect_roots("claude", &roots, "env");
+        assert!(entry.detected);
+        assert_eq!(
+            entry.root_paths,
+            vec![
+                profile.join("projects").display().to_string(),
+                profile.display().to_string()
+            ]
+        );
+
+        let xdg = tmp.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("claude-code").join("projects")).expect("xdg dir");
+        let missing_home = tmp.path().join("no-such-home");
+        let roots = claude_default_probe_roots(Some(&xdg), Some(&missing_home));
+        let entry = detect_roots("claude", &roots, "default");
+        assert!(entry.detected);
+        assert_eq!(
+            entry.root_paths,
+            vec![xdg.join("claude-code").display().to_string()]
+        );
+    }
+
+    #[test]
     fn detect_installed_agents_can_be_scoped_to_specific_connectors() {
         let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -1403,6 +1814,30 @@ mod tests {
             .expect("gemini entry");
         assert!(gemini.detected);
         assert_eq!(gemini.root_paths, vec![gemini_root.display().to_string()]);
+    }
+
+    #[test]
+    fn omp_connector_detects_via_overrides_and_aliases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join(".omp").join("agent").join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir omp sessions");
+
+        // "oh-my-pi" alias must canonicalize to the omp connector.
+        let report = detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec!["oh-my-pi".to_string()]),
+            include_undetected: true,
+            root_overrides: vec![AgentDetectRootOverride {
+                slug: "omp".to_string(),
+                root: sessions,
+            }],
+        })
+        .expect("detect");
+
+        assert_eq!(report.summary.total_count, 1);
+        assert_eq!(report.summary.detected_count, 1);
+        let entry = &report.installed_agents[0];
+        assert_eq!(entry.slug, "omp");
+        assert!(entry.detected);
     }
 
     #[test]
@@ -1711,6 +2146,10 @@ mod tests {
         assert!(grok.contains(&"~/.grok/sessions".to_string()));
         assert!(grok.contains(&"~/.grok/auth.json".to_string()));
         assert!(grok.contains(&"~/.grok".to_string()));
+        assert_eq!(
+            by_slug.get("grok_bot").expect("Grok Bot paths"),
+            &vec!["~/Library/Application Support/Grok Bot/sand-client-persistence".to_string()]
+        );
 
         let muse = by_slug.get("muse").expect("muse paths");
         assert!(muse.contains(&"~/.local/share/muse/sessions".to_string()));
@@ -1724,24 +2163,15 @@ mod tests {
         assert!(kimi.contains(&"~/.kimi/sessions".to_string()));
         assert!(kimi.contains(&"~/.kimi".to_string()));
 
-        let letta_code = by_slug.get("letta_code").expect("letta_code paths");
-        assert!(letta_code.contains(&"~/.letta/transcripts".to_string()));
-        assert!(!letta_code.contains(&"~/.letta".to_string()));
-
-        // Oh My Pi (`omp`) shares the pi_agent connector; without these
-        // probe entries an omp-only machine reports pi_agent not detected
-        // (cass#351 investigation fallout).
+        // Oh My Pi (`omp`) now has its own first-class connector; pi_agent
+        // is scoped back to the upstream pi-mono home only.
         let pi_agent = by_slug.get("pi_agent").expect("pi_agent paths");
         assert!(pi_agent.contains(&"~/.pi/agent/sessions".to_string()));
-        assert!(pi_agent.contains(&"~/.omp/agent/sessions".to_string()));
-        assert!(pi_agent.contains(&"~/.omp/agent".to_string()));
-        assert!(!pi_agent.contains(&"~/.prime/agent/sessions".to_string()));
+        assert!(!pi_agent.iter().any(|p| p.contains(".omp")));
 
-        let prime_agent = by_slug.get("prime_agent").expect("prime_agent paths");
-        assert!(prime_agent.contains(&"~/.prime/agent/sessions".to_string()));
-        assert!(prime_agent.contains(&"~/.prime/agent".to_string()));
-        assert!(!prime_agent.contains(&"~/.pi/agent/sessions".to_string()));
-        assert!(!prime_agent.contains(&"~/.omp/agent/sessions".to_string()));
+        let omp = by_slug.get("omp").expect("omp paths");
+        assert!(omp.contains(&"~/.omp/agent/sessions".to_string()));
+        assert!(omp.contains(&"~/.omp/agent".to_string()));
 
         let cline = by_slug.get("cline").expect("cline paths");
         assert!(
@@ -1758,5 +2188,128 @@ mod tests {
         assert!(cline.contains(
             &"~/AppData/Roaming/Cursor/User/globalStorage/rooveterinaryinc.roo-cline".to_string()
         ));
+    }
+
+    /// Registry invariants: the five registration points
+    /// (`KNOWN_CONNECTORS`, `canonical_connector_slug`,
+    /// `default_probe_roots`, `default_probe_paths_tilde`, and the factory
+    /// list) must agree exactly. Range-editing one table has twice silently
+    /// dropped a sibling row (kimi/openclaw module arms, "open-claw" alias);
+    /// this pins every table to the slug set mechanically.
+    #[test]
+    fn registry_tables_agree_exactly() {
+        let known: HashSet<&str> = KNOWN_CONNECTORS.iter().copied().collect();
+        assert!(!known.is_empty());
+
+        // 1. Every known connector resolves to itself (canonical self-arm).
+        for slug in KNOWN_CONNECTORS {
+            assert_eq!(
+                canonical_connector_slug(slug),
+                Some(*slug),
+                "connector {slug} must be its own canonical slug"
+            );
+        }
+
+        // 2. Every known connector has default probe roots.
+        for slug in KNOWN_CONNECTORS {
+            assert!(
+                !default_probe_roots(slug).is_empty(),
+                "connector {slug} must have at least one default probe root"
+            );
+        }
+
+        // 3. The tilde table covers exactly the known set — no missing rows,
+        // no orphaned rows for retired slugs.
+        let tilde_slugs: Vec<&str> = default_probe_paths_tilde()
+            .into_iter()
+            .map(|(slug, _)| slug)
+            .collect();
+        let tilde_set: HashSet<&str> = tilde_slugs.iter().copied().collect();
+        assert_eq!(
+            tilde_set,
+            known,
+            "tilde table slugs must equal KNOWN_CONNECTORS; missing={:?} extra={:?}",
+            known.difference(&tilde_set).collect::<Vec<_>>(),
+            tilde_set.difference(&known).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            tilde_slugs.len(),
+            tilde_set.len(),
+            "tilde table must not repeat a connector"
+        );
+        for (slug, paths) in default_probe_paths_tilde() {
+            // Shelley's arm is intentionally empty: no safe remote
+            // export/sync of a live SQLite database exists yet (cass gh#415).
+            assert!(
+                !paths.is_empty() || slug == "shelley",
+                "connector {slug} has empty tilde paths"
+            );
+        }
+
+        // 4. The compiled factory registry covers every scanning connector.
+        // Detection-only slugs (no scan implementation) are enumerated so a
+        // new full connector can't be forgotten: add it to
+        // `get_connector_factories` or to this allowlist. Connectors that
+        // live behind their own cargo feature (SQLite/crypto deps) register
+        // only when compiled in, so they are checked against `cfg!` rather
+        // than assumed present — this leg must hold for `--features
+        // connectors`, `--all-features`, and every mix in between. The
+        // factory list itself only exists with `connectors` (`default = []`),
+        // so the leg is gated; checks 1-3 still run under a plain
+        // `cargo test`.
+        #[cfg(feature = "connectors")]
+        {
+            // Slugs with no scan implementation at all (no module under
+            // `connectors/`). Everything else must register a factory.
+            let detection_only: HashSet<&str> = HashSet::from(["continue", "windsurf"]);
+            let feature_gated: HashMap<&str, bool> = HashMap::from([
+                ("chatgpt", cfg!(feature = "chatgpt")),
+                ("codebuff", cfg!(feature = "codebuff")),
+                ("crush", cfg!(feature = "crush")),
+                ("cursor", cfg!(feature = "cursor")),
+                ("goose", cfg!(feature = "goose")),
+                ("grok_bot", cfg!(feature = "grok-bot")),
+                ("hermes", cfg!(feature = "hermes")),
+                ("opencode", cfg!(feature = "opencode")),
+                ("shelley", cfg!(feature = "shelley")),
+            ]);
+            // Factory slugs are the connector-native names (e.g. `copilot`
+            // for VS Code Copilot chat, which this registry knows as
+            // `github-copilot`), so compare after canonicalising. Every
+            // factory must map into KNOWN_CONNECTORS: a factory registered
+            // under a slug the registry cannot name is unreachable from
+            // `franken_detection_for_connector`, and a slug registered twice
+            // means two factories fight over one connector.
+            let mut factory_slugs: HashSet<&str> = HashSet::new();
+            for (raw, _) in get_connector_factories() {
+                let canonical = canonical_connector_slug(raw).unwrap_or_else(|| {
+                    // ubs:ignore[rust.ownership.panic-macro] — Fail this registry invariant test if a factory has no canonical public connector name.
+                    panic!("factory slug {raw} does not canonicalise into KNOWN_CONNECTORS")
+                });
+                assert!(
+                    factory_slugs.insert(canonical),
+                    "connector {canonical} is registered twice in the factory list (via {raw})"
+                );
+            }
+            for slug in KNOWN_CONNECTORS {
+                if detection_only.contains(slug) {
+                    assert!(
+                        !factory_slugs.contains(slug),
+                        "connector {slug} has a factory and must leave the detection-only allowlist"
+                    );
+                    continue;
+                }
+                match feature_gated.get(slug) {
+                    Some(false) => assert!(
+                        !factory_slugs.contains(slug),
+                        "connector {slug} registered a factory although its cargo feature is off"
+                    ),
+                    Some(true) | None => assert!(
+                        factory_slugs.contains(slug),
+                        "connector {slug} needs a factory registration, a feature gate entry, or a detection-only listing"
+                    ),
+                }
+            }
+        }
     }
 }

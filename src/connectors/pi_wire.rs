@@ -1,274 +1,559 @@
-//! Shared Pi-family wire helpers.
+//! Shared session-store primitives for the pi-mono agent family.
 //!
-//! Prime Agent and Pi share content-block, tool-call, image, and usage shapes.
-//! This module is `pub(super)` so Prime can reuse those primitives without
-//! inheriting Pi identity, roots, titles, or resume semantics.
+//! Oh My Pi (`omp`, <https://omp.sh>) is a pi-mono derivative that kept the
+//! JSONL session-store layout: sessions live under
+//! `<agent-home>/sessions/<safe-path>/<timestamp>_<uuid>.jsonl` and each file
+//! is an append-only log of typed entries (`session` header, `message`,
+//! `model_change`, `thinking_level_change`; omp additionally writes `title`
+//! entries). Because the two distributions share this wire format, the
+//! traversal and parsing primitives live here once and are consumed by both
+//! the [`crate::connectors::pi_agent`] and [`crate::connectors::omp`]
+//! connectors — only root discovery differs between them.
+//!
+//! omp-specific extensions handled tolerantly:
+//! - `title` entries (`{"type":"title","title":...}`) supply the
+//!   conversation title when present; otherwise the `session` header title,
+//!   then the first user message, is used.
+//! - `model_change` entries carry a bare `model` field (pi-mono writes
+//!   `provider` + `modelId`); either spelling updates the tracked model.
 
-use serde_json::{Map, Value};
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
+use crate::types::{NormalizedConversation, NormalizedMessage};
+use anyhow::Result;
+use serde_json::Value;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
-use crate::types::NormalizedInvocation;
-
-/// Flattened Pi-family content used by Prime (and tests).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(super) struct FlattenedPiContent {
-    pub searchable_text: String,
-    pub invocations: Vec<NormalizedInvocation>,
-    pub image_mime_types: Vec<String>,
-    pub had_reasoning: bool,
-}
-
-/// One recognized content block inside a Pi-family message.
-#[derive(Debug, Clone)]
-pub(super) enum PiContentBlock<'a> {
-    Text(&'a str),
-    Thinking(&'a str),
-    ToolCall {
-        name: &'a str,
-        id: Option<&'a str>,
-        arguments: Option<&'a Value>,
-    },
-    Image {
-        mime: Option<&'a str>,
-    },
-    Other,
-}
-
-/// Recursively sort object keys for deterministic searchable JSON.
+/// The sessions directory under a pi-family agent home, or the home itself
+/// when no `sessions/` child exists (older layouts scanned the home directly).
 #[must_use]
-pub(super) fn deterministic_json(value: &Value) -> String {
-    serde_json::to_string(&sort_value(value)).unwrap_or_else(|_| value.to_string())
+pub fn sessions_dir(home: &Path) -> PathBuf {
+    let sessions = home.join("sessions");
+    if sessions.exists() {
+        sessions
+    } else {
+        home.to_path_buf()
+    }
 }
 
-fn sort_value(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let mut out = Map::new();
-            for key in keys {
-                if let Some(child) = map.get(key) {
-                    out.insert(key.clone(), sort_value(child));
+/// Resolve a home path through symlinks so per-file dedupe keys stay stable
+/// regardless of whether a caller reached the store via a symlinked ancestor.
+fn dedupe_home(home: &Path) -> PathBuf {
+    std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf())
+}
+
+/// Find all session JSONL files under the given pi-family root, in
+/// deterministic (sorted) order.
+///
+/// Pi-agent session files are named `<timestamp>_<uuid>.jsonl`. Oh My Pi
+/// additionally writes sub-agent transcripts as `<AgentName>.jsonl` inside a
+/// sibling directory named after the session
+/// (`…/<timestamp>_<uuid>/<AgentName>.jsonl`); each is a complete session
+/// document with its own `session` header, so it parses like any main
+/// transcript. A `.jsonl` is accepted when it is named like a session, or it
+/// lives inside a session directory — recognized by its `_` marker AND the
+/// main transcript `<dir>.jsonl` sitting beside it. The sibling requirement
+/// matters: workspace-slug directories preserve underscores from the original
+/// cwd (path encoding only rewrites `/`, `\`, `:`), so "parent contains `_`"
+/// alone would sweep stray `.jsonl` exports under any project whose path
+/// contains an underscore.
+#[must_use]
+pub fn session_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let sessions = sessions_dir(root);
+    if !sessions.exists() {
+        return out;
+    }
+    for entry in WalkDir::new(sessions).into_iter().flatten() {
+        if entry.file_type().is_file() {
+            let name = entry.file_name().to_str().unwrap_or("");
+            let is_jsonl = Path::new(name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"));
+            if !is_jsonl {
+                continue;
+            }
+            let parent_is_session_dir = entry.path().parent().is_some_and(|parent| {
+                let has_session_marker = parent
+                    .file_name()
+                    .and_then(|dir| dir.to_str())
+                    .is_some_and(|dir| dir.contains('_'));
+                has_session_marker && {
+                    let mut main_transcript = parent.as_os_str().to_owned();
+                    main_transcript.push(".jsonl");
+                    Path::new(&main_transcript).is_file()
+                }
+            });
+            if name.contains('_') || parent_is_session_dir {
+                out.push(entry.path().to_path_buf());
+            }
+        }
+    }
+    // Keep connector traversal deterministic across filesystems/runs.
+    out.sort();
+    out
+}
+
+/// Flatten a pi-family message content value to a searchable string.
+///
+/// Handles the message.content shapes seen across the family:
+/// - A bare string (simple user messages)
+/// - An array of content blocks:
+///   - `TextContent`: `{type: "text", text: "..."}`
+///   - `ThinkingContent`: `{type: "thinking", thinking: "..."}`
+///   - `ToolCall`: `{type: "toolCall", name: "...", arguments: {...}}`
+///   - `ImageContent`: `{type: "image", ...}` (skipped for text extraction)
+#[must_use]
+pub fn flatten_message_content(content: &Value) -> String {
+    // Direct string content (simple user messages)
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+
+    // Array of content blocks
+    if let Some(arr) = content.as_array() {
+        let parts: Vec<String> = arr
+            .iter()
+            .filter_map(|item| {
+                let item_type = item.get("type").and_then(|v| v.as_str());
+
+                match item_type {
+                    Some("text") => item.get("text").and_then(|v| v.as_str()).map(String::from),
+                    Some("thinking") => {
+                        // Include thinking content - valuable for search
+                        item.get("thinking")
+                            .and_then(|v| v.as_str())
+                            .map(|t| format!("[Thinking] {t}"))
+                    }
+                    Some("toolCall") => {
+                        // Include tool calls for searchability
+                        let name = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let args = item
+                            .get("arguments")
+                            .map(|a| {
+                                // Extract key argument values for context
+                                a.as_object().map_or_else(String::new, |obj| {
+                                    obj.iter()
+                                        .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}={s}")))
+                                        .take(3) // Limit to avoid huge strings
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                            })
+                            .unwrap_or_default();
+                        if args.is_empty() {
+                            Some(format!("[Tool: {name}]"))
+                        } else {
+                            Some(format!("[Tool: {name}] {args}"))
+                        }
+                    }
+                    _ => None, // Skip image and unknown content
+                }
+            })
+            .collect();
+        return parts.join("\n");
+    }
+
+    String::new()
+}
+
+/// Parse one pi-family session JSONL file into a normalized conversation.
+///
+/// Returns `None` for unreadable files (logged at debug with `agent_slug`
+/// context) and for files that yield zero usable messages — mirroring the
+/// skip semantics of the original per-connector scan loops.
+///
+/// `sessions_dir` is used to derive the conversation's external id as a path
+/// relative to the sessions directory (falling back to the file stem).
+#[allow(clippy::too_many_lines)]
+pub fn parse_session_file(
+    path: &Path,
+    sessions_dir: &Path,
+    agent_slug: &str,
+) -> Option<NormalizedConversation> {
+    let source_path = path.to_path_buf();
+
+    // Use the parent directory name + filename as external_id
+    // e.g., "--Users-foo-project--/2024-01-15T10-30-00_uuid.jsonl"
+    let external_id = source_path
+        .strip_prefix(sessions_dir)
+        .ok()
+        .and_then(|rel| rel.to_str().map(String::from))
+        .or_else(|| {
+            source_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+        });
+
+    // Session transcripts are append-only logs that grow without bound;
+    // enforce the project's 100MB scan cap (chatgpt policy) instead of
+    // reading an arbitrarily large file into memory.
+    let content = match read_capped(&source_path) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            tracing::debug!(
+                path = %source_path.display(),
+                "{agent_slug}: skipping session over the scan size cap"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::debug!(path = %source_path.display(), error = %e, "{agent_slug}: skipping unreadable session");
+            return None;
+        }
+    };
+
+    let mut messages = Vec::new();
+    let mut started_at: Option<i64> = None;
+    let mut ended_at: Option<i64> = None;
+    let mut session_cwd: Option<PathBuf> = None;
+    let mut session_id: Option<String> = None;
+    let mut provider: Option<String> = None;
+    let mut model_id: Option<String> = None;
+    let mut header_title: Option<String> = None;
+    let mut title_entry: Option<String> = None;
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let val: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match entry_type {
+            "session" => {
+                // Session header - extract metadata
+                session_id = val.get("id").and_then(|v| v.as_str()).map(String::from);
+                session_cwd = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+                provider = val
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                model_id = val
+                    .get("modelId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                header_title = val
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|t| !t.is_empty());
+
+                // Parse timestamp
+                if let Some(ts_val) = val.get("timestamp") {
+                    started_at = super::parse_timestamp(ts_val);
                 }
             }
-            Value::Object(out)
+            "title" => {
+                // omp writes standalone title lines; prefer the most recent
+                // non-empty one over the session-header title.
+                if let Some(title) = val
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|t| !t.is_empty())
+                {
+                    title_entry = Some(title);
+                }
+            }
+            "message" => {
+                // Message entry - extract the nested message object
+                let created = val.get("timestamp").and_then(super::parse_timestamp);
+
+                if let Some(msg) = val.get("message") {
+                    let role = msg
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    // Normalize role names
+                    let normalized_role = match role {
+                        "user" => "user",
+                        "assistant" => "assistant",
+                        "toolResult" => "tool",
+                        _ => role,
+                    };
+
+                    // Extract content
+                    let content_str = msg
+                        .get("content")
+                        .map(flatten_message_content)
+                        .unwrap_or_default();
+
+                    if content_str.trim().is_empty() {
+                        continue;
+                    }
+
+                    // Update timestamps
+                    started_at = match (started_at, created) {
+                        (Some(curr), Some(ts)) => Some(curr.min(ts)),
+                        (None, Some(ts)) => Some(ts),
+                        (other, None) => other,
+                    };
+                    ended_at = match (ended_at, created) {
+                        (Some(curr), Some(ts)) => Some(curr.max(ts)),
+                        (None, Some(ts)) => Some(ts),
+                        (other, None) => other,
+                    };
+
+                    // Extract author (model) for assistant messages
+                    // Check message.model first, fall back to tracked model_id
+                    let author = if normalized_role == "assistant" {
+                        msg.get("model")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .or_else(|| model_id.clone())
+                    } else {
+                        None
+                    };
+
+                    let invocations = msg
+                        .get("content")
+                        .and_then(|c| c.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter(|item| {
+                                    item.get("type").and_then(|t| t.as_str()) == Some("toolCall")
+                                })
+                                .map(|item| {
+                                    let name = item
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    crate::types::NormalizedInvocation {
+                                        kind: "tool".to_string(),
+                                        name,
+                                        raw_name: None,
+                                        call_id: item
+                                            .get("id")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from),
+                                        arguments: item.get("arguments").cloned(),
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+
+                    messages.push(NormalizedMessage {
+                        idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
+                        role: normalized_role.to_string(),
+                        author,
+                        created_at: created,
+                        content: content_str,
+                        extra: val.clone(),
+                        invocations,
+                        snippets: Vec::new(),
+                    });
+                }
+            }
+            "model_change" => {
+                // Track model changes (useful metadata). pi-mono writes
+                // `provider` + `modelId`; omp writes a bare `model`. A
+                // record lacking one field must not erase the previously
+                // tracked value.
+                if let Some(p) = val.get("provider").and_then(|v| v.as_str()) {
+                    provider = Some(p.to_string());
+                }
+                if let Some(m) = val
+                    .get("modelId")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| val.get("model").and_then(|v| v.as_str()))
+                {
+                    model_id = Some(m.to_string());
+                }
+            }
+            _ => {
+                // Skip thinking_level_change and unknown types
+            }
         }
-        Value::Array(items) => Value::Array(items.iter().map(sort_value).collect()),
-        other => other.clone(),
     }
-}
 
-/// MIME-only image placeholder. Never includes base64 data.
-#[must_use]
-pub(super) fn image_placeholder(mime: &str) -> String {
-    format!("[image: {mime}]")
-}
-
-#[must_use]
-pub(super) fn mime_from_image_block(block: &Value) -> Option<&str> {
-    block
-        .get("mimeType")
-        .or_else(|| block.get("mime_type"))
-        .and_then(Value::as_str)
-        .or_else(|| block.get("media_type").and_then(Value::as_str))
-}
-
-/// Visit Pi-family content blocks in source order.
-pub(super) fn visit_pi_content_blocks(
-    content: &Value,
-    mut on_block: impl FnMut(PiContentBlock<'_>),
-) {
-    if let Some(text) = content.as_str() {
-        on_block(PiContentBlock::Text(text));
-        return;
+    if messages.is_empty() {
+        return None;
     }
-    let Some(items) = content.as_array() else {
-        return;
-    };
-    for item in items {
-        let block_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-        let block = match block_type {
-            "text" => item
-                .get("text")
-                .and_then(Value::as_str)
-                .map_or(PiContentBlock::Other, PiContentBlock::Text),
-            "thinking" => item
-                .get("thinking")
-                .and_then(Value::as_str)
-                .map_or(PiContentBlock::Other, PiContentBlock::Thinking),
-            "toolCall" => PiContentBlock::ToolCall {
-                name: item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-                id: item.get("id").and_then(Value::as_str),
-                arguments: item.get("arguments"),
-            },
-            "image" => PiContentBlock::Image {
-                mime: mime_from_image_block(item),
-            },
-            _ => PiContentBlock::Other,
-        };
-        on_block(block);
-    }
-}
 
-/// Extract every toolCall block as a structured invocation, in block order.
-#[must_use]
-pub(super) fn extract_tool_invocations(content: &Value) -> Vec<NormalizedInvocation> {
-    let mut invocations = Vec::new();
-    visit_pi_content_blocks(content, |block| {
-        if let PiContentBlock::ToolCall {
-            name,
-            id,
-            arguments,
-        } = block
-        {
-            invocations.push(NormalizedInvocation {
-                kind: "tool".to_string(),
-                name: name.to_string(),
-                raw_name: None,
-                call_id: id.map(str::to_string),
-                arguments: arguments.cloned(),
-            });
-        }
+    // Title precedence: explicit omp `title` entry, then session-header
+    // title, then the first user message, then the first message at all.
+    let title = title_entry.or(header_title).or_else(|| {
+        messages
+            .iter()
+            .find(|m| m.role == "user")
+            .map(|m| first_line_truncated(&m.content))
     });
-    invocations
-}
-
-/// Prime-style searchable flatten: keep block order, all tool args, MIME
-/// placeholders, and no image bodies.
-#[must_use]
-pub(super) fn flatten_pi_family_content(content: &Value) -> FlattenedPiContent {
-    if let Some(text) = content.as_str() {
-        return FlattenedPiContent {
-            searchable_text: text.to_string(),
-            ..FlattenedPiContent::default()
-        };
-    }
-
-    let mut parts = Vec::new();
-    let mut invocations = Vec::new();
-    let mut image_mime_types = Vec::new();
-    let mut had_reasoning = false;
-
-    visit_pi_content_blocks(content, |block| match block {
-        PiContentBlock::Text(text) => parts.push(text.to_string()),
-        PiContentBlock::Thinking(text) => {
-            had_reasoning = true;
-            parts.push(format!("[reasoning]\n{text}"));
-        }
-        PiContentBlock::ToolCall {
-            name,
-            id,
-            arguments,
-        } => {
-            let args = arguments.cloned().unwrap_or(Value::Null);
-            parts.push(format!(
-                "[tool call: {name}]\n{}",
-                deterministic_json(&args)
-            ));
-            invocations.push(NormalizedInvocation {
-                kind: "tool".to_string(),
-                name: name.to_string(),
-                raw_name: None,
-                call_id: id.map(str::to_string),
-                arguments: arguments.cloned(),
-            });
-        }
-        PiContentBlock::Image { mime } => {
-            let mime = mime.unwrap_or("image");
-            image_mime_types.push(mime.to_string());
-            parts.push(image_placeholder(mime));
-        }
-        PiContentBlock::Other => {}
+    let title = title.or_else(|| messages.first().map(|m| first_line_truncated(&m.content)));
+    // Build metadata
+    let metadata = serde_json::json!({
+        "source": agent_slug,
+        "session_id": session_id,
+        "provider": provider,
+        "model_id": model_id,
     });
 
-    FlattenedPiContent {
-        searchable_text: parts.join("\n"),
-        invocations,
-        image_mime_types,
-        had_reasoning,
-    }
+    Some(NormalizedConversation {
+        agent_slug: agent_slug.to_string(),
+        external_id,
+        title,
+        workspace: session_cwd,
+        source_path,
+        started_at,
+        ended_at,
+        metadata,
+        messages,
+    })
 }
 
-pub(super) fn i64_usage_field(usage: &Value, names: &[&str]) -> Option<i64> {
-    names
-        .iter()
-        .find_map(|name| usage.get(*name))
-        .and_then(Value::as_i64)
+fn first_line_truncated(content: &str) -> String {
+    content
+        .lines()
+        .next()
+        .unwrap_or(content)
+        .chars()
+        .take(100)
+        .collect()
 }
 
-/// Compact selected usage fields for Prime/Pi assistant extras.
+/// Discover deduplicated session files across `roots`, filtered by
+/// `since_ts`, wrapped as primary session-log sources attributed to
+/// `agent_slug`.
+///
+/// Takes full [`super::ScanRoot`]s rather than bare paths so each discovered
+/// source keeps its scan-root provenance (`origin`, `platform`) — remote
+/// roots must not be downgraded to local during discovery.
 #[must_use]
-pub(super) fn compact_pi_family_usage(message: &Value, service_tier: Option<&str>) -> Value {
-    let usage = message.get("usage");
-    let mut out = Map::new();
-    if let Some(usage) = usage {
-        if let Some(input) = i64_usage_field(usage, &["input", "input_tokens"]) {
-            out.insert("input".to_string(), Value::from(input));
-            out.insert("input_tokens".to_string(), Value::from(input));
-        }
-        if let Some(output) = i64_usage_field(usage, &["output", "output_tokens"]) {
-            out.insert("output".to_string(), Value::from(output));
-            out.insert("output_tokens".to_string(), Value::from(output));
-        }
-        if let Some(cache_read) = i64_usage_field(usage, &["cacheRead", "cache_read_tokens"]) {
-            out.insert("cacheRead".to_string(), Value::from(cache_read));
-            out.insert("cache_read_tokens".to_string(), Value::from(cache_read));
-        }
-        if let Some(cache_write) = i64_usage_field(usage, &["cacheWrite", "cache_creation_tokens"])
-        {
-            out.insert("cacheWrite".to_string(), Value::from(cache_write));
-            out.insert(
-                "cache_creation_tokens".to_string(),
-                Value::from(cache_write),
+pub fn discover_sources(
+    roots: &[super::ScanRoot],
+    ctx: &super::ScanContext,
+    agent_slug: &'static str,
+) -> Vec<super::DiscoveredSourceFile> {
+    use super::{DiscoveredSourceFile, DiscoveredSourceRole};
+    use crate::connectors::file_modified_since;
+
+    let excluded_paths = excluded_scan_paths_from_env();
+    let mut out = Vec::new();
+    let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
+    for root in roots {
+        for file in session_files(&root.path) {
+            // Match before deduplication and per-source metadata or pre-mirroring.
+            if path_is_excluded(&file, &excluded_paths) {
+                continue;
+            }
+            if !seen_session_paths.insert(dedupe_path_key(&file)) {
+                continue;
+            }
+            if !file_modified_since(&file, ctx.since_ts) {
+                continue;
+            }
+            out.push(
+                DiscoveredSourceFile::new(
+                    agent_slug,
+                    root,
+                    file,
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata(),
             );
         }
     }
-    if let Some(tier) = service_tier.filter(|text| !text.is_empty()) {
-        out.insert("service_tier".to_string(), Value::String(tier.to_string()));
-    }
-    Value::Object(out)
+    out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
+/// Scan every deduplicated, time-filtered session file across `homes` into
+/// normalized conversations attributed to `agent_slug`.
+///
+/// Files that fail to parse or yield no messages are skipped silently
+/// (debug-logged), matching the established connector behavior.
+pub fn scan_homes(
+    homes: &[PathBuf],
+    ctx: &super::ScanContext,
+    agent_slug: &'static str,
+) -> Result<Vec<NormalizedConversation>> {
+    let tagged: Vec<(PathBuf, Option<String>)> =
+        homes.iter().map(|home| (home.clone(), None)).collect();
+    scan_homes_tagged(&tagged, ctx, agent_slug)
+}
 
-    #[test]
-    fn deterministic_json_sorts_nested_keys() {
-        let value = json!({"z": 1, "a": {"c": 2, "b": 3}});
-        assert_eq!(deterministic_json(&value), r#"{"a":{"b":3,"c":2},"z":1}"#);
+/// Like [`scan_homes`], but each home carries optional profile provenance.
+///
+/// Provenance covers Oh My Pi named profiles: when a home is tagged, every
+/// conversation parsed from it gets `metadata.profile = "<name>"` so
+/// downstream consumers can reconstruct `omp --profile <name> --resume <id>`
+/// instead of losing the profile after normalization
+/// (`franken_agent_detection#17`).
+///
+/// Dedup is first-wins across the whole list: a session file reachable
+/// through two homes (symlinks, overlapping roots) keeps the provenance of
+/// the first home that reached it, so callers should order roots
+/// most-specific first.
+pub fn scan_homes_tagged(
+    homes: &[(PathBuf, Option<String>)],
+    ctx: &super::ScanContext,
+    agent_slug: &'static str,
+) -> Result<Vec<NormalizedConversation>> {
+    use crate::connectors::file_modified_since;
+
+    let excluded_paths = excluded_scan_paths_from_env();
+    let mut convs = Vec::new();
+    // Symlink-aliased homes (e.g. `~/.omp/agent` -> `~/Library/...`) reach
+    // the same session files twice. Canonicalizing every FILE would be far
+    // too expensive for hot scans, so resolve each home ONCE and skip a
+    // home whose canonical path was already processed; emitted paths keep
+    // the raw (first-seen) form.
+    let mut seen_homes: HashSet<PathBuf> = HashSet::new();
+    let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
+
+    for (home, profile) in homes {
+        let canonical_home = dedupe_home(home);
+        if !seen_homes.insert(dedupe_path_key(&canonical_home)) {
+            continue;
+        }
+
+        let files = session_files(home);
+        if files.is_empty() {
+            continue;
+        }
+        let sessions = sessions_dir(home);
+
+        for file in files {
+            // Use the same policy as discovery before the source is opened.
+            if path_is_excluded(&file, &excluded_paths) {
+                continue;
+            }
+            // Guard against equivalent-but-differently-spelled file paths.
+            let dedupe_key = dedupe_path_key(&file);
+            if !seen_session_paths.insert(dedupe_key) {
+                continue;
+            }
+            // Skip files not modified since last scan
+            if !file_modified_since(&file, ctx.since_ts) {
+                continue;
+            }
+
+            if let Some(mut conversation) = parse_session_file(&file, &sessions, agent_slug) {
+                if let Some(profile) = profile {
+                    if let Some(meta) = conversation.metadata.as_object_mut() {
+                        meta.insert(
+                            "profile".to_string(),
+                            serde_json::Value::String(profile.clone()),
+                        );
+                    }
+                }
+                convs.push(conversation);
+            }
+        }
     }
 
-    #[test]
-    fn flatten_keeps_all_tool_args_and_image_placeholder() {
-        let content = json!([
-            {"type": "text", "text": "hello"},
-            {"type": "thinking", "thinking": "reason"},
-            {
-                "type": "toolCall",
-                "id": "call-1",
-                "name": "read",
-                "arguments": {"z": "last", "a": "first", "nested": {"b": 1, "a": 2}}
-            },
-            {"type": "image", "mimeType": "image/png", "data": "PRIME_BASE64_MUST_NOT_SURVIVE"}
-        ]);
-        let flat = flatten_pi_family_content(&content);
-        assert!(flat.searchable_text.contains("hello"));
-        assert!(flat.searchable_text.contains("[reasoning]\nreason"));
-        assert!(flat.searchable_text.contains("[tool call: read]"));
-        assert!(flat.searchable_text.contains(r#""a":"first""#));
-        assert!(flat.searchable_text.contains(r#""z":"last""#));
-        assert!(flat.searchable_text.contains("[image: image/png]"));
-        assert!(
-            !flat
-                .searchable_text
-                .contains("PRIME_BASE64_MUST_NOT_SURVIVE")
-        );
-        assert_eq!(flat.invocations.len(), 1);
-        assert_eq!(flat.invocations[0].call_id.as_deref(), Some("call-1"));
-        assert!(flat.had_reasoning);
-    }
+    Ok(convs)
 }

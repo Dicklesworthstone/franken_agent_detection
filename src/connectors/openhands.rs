@@ -83,7 +83,21 @@ impl OpenHandsConnector {
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots = if ctx.use_default_detection() {
-            vec![ScanRoot::local(Self::conversations_root())]
+            // Mirror the explicit-root acceptance: a default-detection
+            // data_dir that itself looks like OpenHands storage (a base
+            // with a conversations/ tree, or the conversations/ dir itself)
+            // scopes the scan to it, so fixture/mirror scans stay hermetic;
+            // otherwise probe the system root. CASS_OPENHANDS_DATA_ROOT
+            // keeps precedence.
+            let d = &ctx.data_dir;
+            let env_override = env_path_nonempty("CASS_OPENHANDS_DATA_ROOT").is_some();
+            let looks_like_base = d.join("conversations").is_dir()
+                || d.file_name().is_some_and(|n| n == "conversations");
+            if !env_override && looks_like_base {
+                vec![ScanRoot::local(d.clone())]
+            } else {
+                vec![ScanRoot::local(Self::conversations_root())]
+            }
         } else {
             ctx.scan_roots.clone()
         };
@@ -722,6 +736,28 @@ mod tests {
     fn new_creates_connector() {
         let _ = OpenHandsConnector::new();
         let _ = OpenHandsConnector;
+    }
+
+    #[test]
+    fn default_detection_scopes_to_openhands_base_data_dir() {
+        // The checked-in fixture base holds conversations/<uuid>/events;
+        // default detection with THIS base as data_dir must scan here, not
+        // the machine's real ~/.openhands/conversations.
+        let base = fixture_conversation_dir()
+            .parent()
+            .and_then(Path::parent)
+            .expect("fixture base")
+            .to_path_buf();
+        assert!(base.join("conversations").is_dir());
+
+        let convs = OpenHandsConnector::new()
+            .scan(&ScanContext::local_default(base, None))
+            .unwrap();
+        assert_eq!(
+            convs.len(),
+            1,
+            "default detection with an openhands-base data_dir must scan that base"
+        );
     }
 
     #[test]

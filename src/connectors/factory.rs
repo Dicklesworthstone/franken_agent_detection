@@ -48,6 +48,12 @@ impl FactoryConnector {
 
     /// Decode a workspace path slug back to a path.
     /// e.g., `-Users-alice-Dev-myproject` -> `/Users/alice/Dev/myproject`
+    ///
+    /// The dash-to-slash mapping is lossy for hyphenated directory names;
+    /// the raw slug is always available in the session file name. This
+    /// matches Factory's own encoding convention and cannot be verified
+    /// against the filesystem on mirror scans where the workspace may be
+    /// on a different machine.
     fn decode_workspace_slug(slug: &str) -> Option<PathBuf> {
         if slug.starts_with('-') {
             // Replace leading dash and internal dashes with path separators
@@ -225,8 +231,26 @@ impl Connector for FactoryConnector {
 
 /// Check if a directory looks like Factory storage
 fn looks_like_factory_storage(path: &Path) -> bool {
-    let path_str = path.to_string_lossy().to_lowercase();
-    path_str.contains("factory") && path_str.contains("sessions")
+    // Structural, not substring-based: a `.factory` dir with `sessions/`,
+    // the `sessions/` dir whose parent is `.factory`, or a dir containing
+    // session JSONLs directly (explicit single-dir scans). A substring
+    // test hijacked default detection onto lookalikes such as
+    // `/home/u/factory-reset/sessions-archive`, silently missing real
+    // `~/.factory/sessions`.
+    let is_factory_sessions = path.file_name().is_some_and(|n| n == "sessions")
+        && path
+            .parent()
+            .is_some_and(|p| p.file_name().is_some_and(|n| n == ".factory"));
+    if is_factory_sessions || path.file_name().is_some_and(|n| n == ".factory") {
+        return true;
+    }
+    // A directory that directly holds session JSONLs also counts, so an
+    // explicit single-store scan keeps working regardless of its name.
+    std::fs::read_dir(path).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+    })
 }
 
 fn update_time_bounds(started_at: &mut Option<i64>, ended_at: &mut Option<i64>, ts: Option<i64>) {
@@ -266,7 +290,8 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
             continue;
         }
 
-        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+        // Strip a UTF-8 BOM so the first record is not silently lost.
+        let Ok(val) = serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}')) else {
             continue;
         };
 
@@ -294,12 +319,14 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
                 // Track session bounds robustly even if events are out of order.
                 update_time_bounds(&mut started_at, &mut ended_at, created);
 
-                // Extract role from message.role
+                // Extract role from message.role. Role-less entries default
+                // to assistant (model-side), matching qwen's normalization;
+                // "unknown" is outside the conformance contract's role set.
                 let role = val
                     .get("message")
                     .and_then(|m| m.get("role"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                    .unwrap_or("assistant");
 
                 // Extract content from message.content
                 let content_val = val.get("message").and_then(|m| m.get("content"));

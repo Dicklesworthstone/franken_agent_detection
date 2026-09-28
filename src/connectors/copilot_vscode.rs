@@ -36,8 +36,8 @@
 //!    - `{"kind":1,"k":[…],"v":…}` — set value at key path
 //!    - `{"kind":2,"k":[…],"v":[…]?,"i":n?}` — array push; `i` truncates first
 //!    - `{"kind":3,"k":[…]}` — delete at key path
-//!    A truncated final line is a normal artifact of an interrupted append and
-//!    is tolerated; malformed interior lines are skipped-and-logged.
+//!      A truncated final line is a normal artifact of an interrupted append
+//!      and is tolerated; malformed interior lines are skipped-and-logged.
 //!
 //! ## Provider filtering
 //!
@@ -58,6 +58,13 @@
 //! order — append-log, then flat JSON, then SQLite — and the first successful
 //! parse of a session id wins.
 
+// The full native-store parsing pipeline (`scan_native` and its helpers:
+// append-log replay, state.vscdb decode, session projection) is staged for
+// the copilot.rs scan-path wiring tracked by issue #16. Until that lands,
+// rustc sees the not-yet-referenced half as dead code; keep it compiled and
+// lint-clean so wiring is a one-call change.
+#![allow(dead_code)]
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -65,10 +72,11 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanRoot};
-use super::utils::dedupe_path_key;
+use super::utils::{dedupe_path_key, read_capped};
 use super::{file_modified_since, parse_timestamp};
-use crate::types::{NormalizedConversation, NormalizedInvocation, NormalizedMessage,
-    reindex_messages};
+use crate::types::{
+    NormalizedConversation, NormalizedInvocation, NormalizedMessage, reindex_messages,
+};
 
 /// VS Code product directories that host a `User` tree.
 const PRODUCT_DIRS: &[&str] = &["Code", "Code - Insiders", "VSCodium"];
@@ -81,7 +89,7 @@ const STORE_STATE_DB: &str = "vscode-state-db";
 
 /// Native storage generation, ordered by parse priority (newest first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum NativeFormat {
+pub enum NativeFormat {
     /// `<session-id>.jsonl` append log (VS Code 1.109+).
     AppendLog,
     /// `<session-id>.json` flat serialized session (March 2025 – 1.108).
@@ -93,7 +101,7 @@ pub(crate) enum NativeFormat {
 /// One native chat-session source file, plus enough context to resolve the
 /// owning workspace.
 #[derive(Debug, Clone)]
-pub(crate) struct NativeSource {
+pub struct NativeSource {
     pub format: NativeFormat,
     pub path: PathBuf,
     /// Which store family the file came from (metadata label).
@@ -101,6 +109,9 @@ pub(crate) struct NativeSource {
     /// `workspaceStorage/<id>` directory, when workspace-scoped; used to read
     /// the sibling `workspace.json` for workspace resolution.
     pub workspace_dir: Option<PathBuf>,
+    /// File mtime in milliseconds since Unix epoch, for generation-priority
+    /// tiebreaking. Populated by `collect_sources`, not at construction.
+    pub modified_at_ms: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +119,7 @@ pub(crate) struct NativeSource {
 // ---------------------------------------------------------------------------
 
 /// Default VS Code `User` roots probed when no explicit scan roots are given.
-pub(crate) fn default_user_roots() -> Vec<PathBuf> {
+pub fn default_user_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(home) = dirs::home_dir() {
         for product in PRODUCT_DIRS {
@@ -133,10 +144,10 @@ pub(crate) fn default_user_roots() -> Vec<PathBuf> {
 
 /// Whether a path clearly points into VS Code's native chat storage (used to
 /// honor a `data_dir` that targets the native store directly).
-pub(crate) fn looks_like_native_store(path: &Path) -> bool {
+pub fn looks_like_native_store(path: &Path) -> bool {
     let named = |name: &str| {
         path.components().any(|component| {
-            let segment = component.as_os_str().to_string_lossy();
+            let segment = component.as_os_str().to_string_lossy().to_lowercase();
             segment == name
         })
     };
@@ -213,21 +224,19 @@ fn collect_session_container(
             path,
             store,
             workspace_dir: workspace_dir.map(Path::to_path_buf),
+            modified_at_ms: None,
         });
     }
 }
 
-fn push_state_db(
-    out: &mut Vec<NativeSource>,
-    db: PathBuf,
-    workspace_dir: Option<&Path>,
-) {
+fn push_state_db(out: &mut Vec<NativeSource>, db: PathBuf, workspace_dir: Option<&Path>) {
     if cfg!(feature = "copilot-vscdb") && db.is_file() {
         out.push(NativeSource {
             format: NativeFormat::StateDb,
             path: db,
             store: STORE_STATE_DB,
             workspace_dir: workspace_dir.map(Path::to_path_buf),
+            modified_at_ms: None,
         });
     }
 }
@@ -274,8 +283,7 @@ fn push_source_for_file(out: &mut Vec<NativeSource>, file: &Path) {
     if dir_name(file) == Some("state.vscdb") {
         let workspace_dir = file.parent().and_then(|storage_dir| {
             storage_dir.parent().and_then(|root| {
-                (dir_name(root) == Some("workspaceStorage"))
-                    .then(|| storage_dir.to_path_buf())
+                (dir_name(root) == Some("workspaceStorage")).then(|| storage_dir.to_path_buf())
             })
         });
         push_state_db(out, file.to_path_buf(), workspace_dir.as_deref());
@@ -295,6 +303,7 @@ fn push_source_for_file(out: &mut Vec<NativeSource>, file: &Path) {
         path: file.to_path_buf(),
         store,
         workspace_dir,
+        modified_at_ms: None,
     });
 }
 
@@ -303,7 +312,7 @@ fn push_source_for_file(out: &mut Vec<NativeSource>, file: &Path) {
 /// Accepts a session file, a session container, a `workspaceStorage` /
 /// `globalStorage` / `User` / product directory, a platform config directory
 /// (`.config`, `Application Support`, `AppData/Roaming`), or a home-like root.
-pub(crate) fn native_sources_under(base: &Path) -> Vec<NativeSource> {
+pub fn native_sources_under(base: &Path) -> Vec<NativeSource> {
     let mut out = Vec::new();
     if base.is_file() {
         push_source_for_file(&mut out, base);
@@ -401,14 +410,16 @@ fn apply_set(state: &mut Value, path: &[Value], value: Value) -> bool {
     let Some(arr) = parent.as_array_mut() else {
         return false;
     };
-    if idx < arr.len() {
-        arr[idx] = value;
-        true
-    } else if idx == arr.len() {
-        arr.push(value);
-        true
-    } else {
-        false
+    match idx.cmp(&arr.len()) {
+        std::cmp::Ordering::Less => {
+            arr[idx] = value;
+            true
+        }
+        std::cmp::Ordering::Equal => {
+            arr.push(value);
+            true
+        }
+        std::cmp::Ordering::Greater => false,
     }
 }
 
@@ -490,7 +501,7 @@ fn apply_push(
 /// malformed *final* line is tolerated silently as a truncated append (the
 /// normal crash/power-loss artifact for this format); malformed or
 /// inapplicable interior entries are skipped-and-logged.
-pub(crate) fn replay_append_log(content: &str, path: &Path) -> Option<Value> {
+pub fn replay_append_log(content: &str, path: &Path) -> Option<Value> {
     let lines: Vec<&str> = content
         .lines()
         .map(str::trim)
@@ -577,10 +588,7 @@ pub(crate) fn replay_append_log(content: &str, path: &Path) -> Option<Value> {
 // ---------------------------------------------------------------------------
 
 fn agent_is_copilot(agent: &Value) -> bool {
-    if let Some(ext) = agent
-        .pointer("/extensionId/value")
-        .and_then(Value::as_str)
-    {
+    if let Some(ext) = agent.pointer("/extensionId/value").and_then(Value::as_str) {
         if ext.to_ascii_lowercase().starts_with("github.copilot") {
             return true;
         }
@@ -593,7 +601,7 @@ fn agent_is_copilot(agent: &Value) -> bool {
 
 /// Admit only sessions whose serialized metadata identifies GitHub Copilot.
 /// The native store is shared by all chat providers (issue #16).
-pub(crate) fn session_is_copilot(session: &Value) -> bool {
+pub fn session_is_copilot(session: &Value) -> bool {
     if session
         .get("responderUsername")
         .and_then(Value::as_str)
@@ -617,7 +625,7 @@ pub(crate) fn session_is_copilot(session: &Value) -> bool {
 
 /// Minimal percent-decoding for `file://` URIs (no external dependency).
 fn percent_decode(input: &str) -> String {
-    fn hex_val(byte: u8) -> Option<u8> {
+    const fn hex_val(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -647,6 +655,21 @@ fn parse_file_uri(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let decoded = percent_decode(rest);
     let mut path = decoded.as_str();
+    // An RFC 3986 authority (`file://localhost/path`) is not path text:
+    // drop it when the remainder stays separator-led, so the result is a
+    // real absolute path instead of a bogus relative one.
+    if !path.starts_with('/')
+        && !path.starts_with('\\')
+        && let Some(slash) = path.find(['/', '\\'])
+    {
+        // `file://C:/x` (no authority) carries a DRIVE LETTER where an
+        // authority would be; stripping it would amputate the path.
+        let authority = &path[..slash];
+        let looks_like_drive = authority.len() == 2 && authority.as_bytes()[1] == b':';
+        if !looks_like_drive {
+            path = &path[slash..];
+        }
+    }
     // Windows: `file:///C:/…` decodes to `/C:/…`.
     if cfg!(windows) && path.len() > 2 {
         let chars: Vec<char> = path.chars().take(3).collect();
@@ -663,15 +686,42 @@ fn parse_file_uri(uri: &str) -> Option<PathBuf> {
 
 /// Resolve the workspace folder for a `workspaceStorage/<id>` directory from
 /// its `workspace.json` sidecar.
-pub(crate) fn workspace_for_storage_dir(storage_dir: &Path) -> Option<PathBuf> {
-    let raw = fs::read_to_string(storage_dir.join("workspace.json")).ok()?;
-    let val: Value = serde_json::from_str(&raw).ok()?;
+pub fn workspace_for_storage_dir(storage_dir: &Path) -> Option<PathBuf> {
+    let raw = match fs::read_to_string(storage_dir.join("workspace.json")) {
+        Ok(raw) => raw,
+        Err(err) => {
+            tracing::debug!(
+                dir = %storage_dir.display(),
+                %err,
+                "copilot: unreadable workspace.json sidecar"
+            );
+            return None;
+        }
+    };
+    let val: Value = match serde_json::from_str(&raw) {
+        Ok(val) => val,
+        Err(err) => {
+            tracing::debug!(
+                dir = %storage_dir.display(),
+                %err,
+                "copilot: malformed workspace.json sidecar"
+            );
+            return None;
+        }
+    };
     let uri = val
         .get("folder")
         .or_else(|| val.get("workspace"))
         .or_else(|| val.get("configuration"))
-        .and_then(Value::as_str)?;
-    parse_file_uri(uri)
+        // Multi-root workspaces store a `folders` array; take the first.
+        .or_else(|| {
+            val.get("folders")
+                .and_then(Value::as_array)
+                .and_then(|folders| folders.first())
+        })
+        .and_then(|entry| entry.get("uri").and_then(Value::as_str).or(entry.as_str()))
+        .map(String::from)?;
+    parse_file_uri(&uri)
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +814,10 @@ fn response_content(response: &Value) -> (String, Vec<NormalizedInvocation>) {
 ///
 /// Returns `None` for sessions that are not Copilot's (shared store) or that
 /// carry no conversation content.
-pub(crate) fn session_to_conversation(
+// Staged for issue #16 wiring; refactoring an unwired parser into smaller
+// functions now would churn call sites that may still move.
+#[allow(clippy::too_many_lines)]
+pub fn session_to_conversation(
     session: &Value,
     source_path: &Path,
     store: &'static str,
@@ -785,15 +838,22 @@ pub(crate) fn session_to_conversation(
         return None;
     }
 
+    // Identity precedence: the session's own `sessionId` field; otherwise
+    // the file stem qualified by its container directory. A bare stem is
+    // shared by every session across `chatSessions/`,
+    // `emptyWindowChatSessions/`, and `transferredChatSessions/` — two
+    // id-less sessions in different containers would silently collapse.
     let external_id = session
         .get("sessionId")
         .and_then(Value::as_str)
         .map(String::from)
         .or_else(|| {
-            source_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(String::from)
+            let stem = source_path.file_stem()?.to_str()?;
+            let container = source_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())?;
+            Some(format!("{container}/{stem}"))
         });
 
     let explicit_title = session
@@ -838,7 +898,9 @@ pub(crate) fn session_to_conversation(
             messages.push(NormalizedMessage {
                 idx: 0,
                 role: "user".to_string(),
-                author: requester.map(String::from).or_else(|| Some("user".to_string())),
+                author: requester
+                    .map(String::from)
+                    .or_else(|| Some("user".to_string())),
                 created_at: ts,
                 content: user_text,
                 extra: Value::Object(extra),
@@ -861,7 +923,11 @@ pub(crate) fn session_to_conversation(
                 idx: 0,
                 role: "assistant".to_string(),
                 author: Some("copilot".to_string()),
-                created_at: None,
+                // The store only offers request-level granularity; the
+                // sibling user message already carries `ts`, and dropping
+                // it here misorders assistant turns against every other
+                // connector's output.
+                created_at: ts,
                 content: assistant_text,
                 extra: Value::Object(extra),
                 invocations,
@@ -960,8 +1026,11 @@ fn sessions_from_state_db(db_path: &Path) -> Vec<Value> {
     // Avoid lock errors when VS Code is running.
     let _ = conn.execute("PRAGMA busy_timeout = 5000;");
 
+    // CAST(value AS TEXT): a BLOB-typed value would fail get_typed::<String>
+    // and abort the whole collect; the legacy generation would then vanish
+    // indistinguishably from "no legacy sessions".
     let rows = conn.query_map_collect(
-        "SELECT value FROM ItemTable WHERE key = 'interactive.sessions' AND value IS NOT NULL",
+        "SELECT CAST(value AS TEXT) FROM ItemTable WHERE key = 'interactive.sessions' AND value IS NOT NULL",
         params![],
         |row| {
             let value: String = row.get_typed(0)?;
@@ -969,6 +1038,9 @@ fn sessions_from_state_db(db_path: &Path) -> Vec<Value> {
         },
     );
     let Ok(rows) = rows else {
+        tracing::warn!(
+            "copilot: legacy state-db sessions query failed; legacy sessions may be missing"
+        );
         return Vec::new();
     };
 
@@ -996,7 +1068,7 @@ fn sessions_from_state_db(db_path: &Path) -> Vec<Value> {
 }
 
 #[cfg(not(feature = "copilot-vscdb"))]
-fn sessions_from_state_db(_db_path: &Path) -> Vec<Value> {
+const fn sessions_from_state_db(_db_path: &Path) -> Vec<Value> {
     Vec::new()
 }
 
@@ -1009,16 +1081,34 @@ fn sessions_from_state_db(_db_path: &Path) -> Vec<Value> {
 fn collect_sources(bases: &[ScanRoot]) -> Vec<(ScanRoot, NativeSource)> {
     let mut out: Vec<(ScanRoot, NativeSource)> = Vec::new();
     for base in bases {
-        for source in native_sources_under(&base.path) {
+        for mut source in native_sources_under(&base.path) {
+            // Capture mtime for the generation tiebreak below.
+            source.modified_at_ms = std::fs::metadata(&source.path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| i64::try_from(duration.as_millis()).ok());
             out.push((base.clone(), source));
         }
     }
-    // Newest generation first so migration copies dedupe toward it.
-    out.sort_by(|(_, a), (_, b)| a.format.cmp(&b.format).then_with(|| a.path.cmp(&b.path)));
+    // Newest generation first so migration copies dedupe toward it. The
+    // mtime tiebreak (newer wins) prevents ASCII path order from handing
+    // ties to the wrong tree — e.g. `Code - Insiders/…` sorting before
+    // `Code/…` because space < slash, shadowing the stable install's
+    // copy of the same session with a stale Insiders one.
+    out.sort_by(|(_, a), (_, b)| {
+        a.format
+            .cmp(&b.format)
+            .then_with(|| b.modified_at_ms.cmp(&a.modified_at_ms))
+            .then_with(|| a.path.cmp(&b.path))
+    });
     out
 }
 
-fn parse_source(source: &NativeSource, seen_sessions: &mut HashSet<String>) -> Vec<NormalizedConversation> {
+fn parse_source(
+    source: &NativeSource,
+    seen_sessions: &mut HashSet<String>,
+) -> Vec<NormalizedConversation> {
     let workspace = source
         .workspace_dir
         .as_deref()
@@ -1026,7 +1116,20 @@ fn parse_source(source: &NativeSource, seen_sessions: &mut HashSet<String>) -> V
 
     let sessions: Vec<Value> = match source.format {
         NativeFormat::FlatJson => {
-            let Ok(raw) = fs::read_to_string(&source.path) else {
+            // Append-log sessions grow monotonically (base64 screenshots
+            // embed per turn); enforce the project's 100MB scan cap.
+            let Some(raw) = read_capped(&source.path).unwrap_or_else(|err| {
+                tracing::warn!(
+                    source = %source.path.display(),
+                    error = %err,
+                    "copilot: unreadable native chat session file"
+                );
+                None
+            }) else {
+                tracing::warn!(
+                    source = %source.path.display(),
+                    "copilot: native chat session exceeds the scan size cap; skipping"
+                );
                 return Vec::new();
             };
             match serde_json::from_str::<Value>(&raw) {
@@ -1042,7 +1145,18 @@ fn parse_source(source: &NativeSource, seen_sessions: &mut HashSet<String>) -> V
             }
         }
         NativeFormat::AppendLog => {
-            let Ok(raw) = fs::read_to_string(&source.path) else {
+            let Some(raw) = read_capped(&source.path).unwrap_or_else(|err| {
+                tracing::warn!(
+                    source = %source.path.display(),
+                    error = %err,
+                    "copilot: unreadable native chat session file"
+                );
+                None
+            }) else {
+                tracing::warn!(
+                    source = %source.path.display(),
+                    "copilot: append-log session exceeds the scan size cap; skipping"
+                );
                 return Vec::new();
             };
             match replay_append_log(&raw, &source.path) {
@@ -1083,7 +1197,7 @@ fn parse_source(source: &NativeSource, seen_sessions: &mut HashSet<String>) -> V
 
 /// Scan every native source reachable from `bases`, deduplicating session ids
 /// across storage generations and duplicated trees.
-pub(crate) fn scan_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<NormalizedConversation> {
+pub fn scan_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<NormalizedConversation> {
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut seen_sessions: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
@@ -1101,10 +1215,7 @@ pub(crate) fn scan_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<Norm
 
 /// Discover the native source files `scan_native` would consume, plus the
 /// `workspace.json` sidecars consulted for workspace resolution.
-pub(crate) fn discover_native(
-    bases: &[ScanRoot],
-    since_ts: Option<i64>,
-) -> Vec<DiscoveredSourceFile> {
+pub fn discover_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<DiscoveredSourceFile> {
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut seen_sidecars: HashSet<PathBuf> = HashSet::new();
     let mut out = Vec::new();
@@ -1243,9 +1354,15 @@ mod tests {
             r#"{"folder": "file:///home/octocat/proj%20x"}"#,
         );
         write_file(
-            &storage_dir.join("chatSessions").join(format!("{WS_SESSION_ID}.json")),
-            &copilot_session(WS_SESSION_ID, "Explain this borrow error", "Clone before the loop.")
-                .to_string(),
+            &storage_dir
+                .join("chatSessions")
+                .join(format!("{WS_SESSION_ID}.json")),
+            &copilot_session(
+                WS_SESSION_ID,
+                "Explain this borrow error",
+                "Clone before the loop.",
+            )
+            .to_string(),
         );
         // Harness noise that must never be parsed as a session.
         write_file(&storage_dir.join("chatSessions/.DS_Store"), "junk");
@@ -1558,7 +1675,9 @@ mod tests {
         });
         assert!(session_is_copilot(&by_agent));
         // No evidence at all — never attribute.
-        assert!(!session_is_copilot(&json!({"sessionId": "d", "requests": []})));
+        assert!(!session_is_copilot(
+            &json!({"sessionId": "d", "requests": []})
+        ));
     }
 
     #[test]
@@ -1575,13 +1694,9 @@ mod tests {
                 "response": [{"value": "Use .sort()."}]
             }]
         });
-        let conv = session_to_conversation(
-            &session,
-            Path::new("/db/state.vscdb"),
-            STORE_STATE_DB,
-            None,
-        )
-        .expect("legacy session parses");
+        let conv =
+            session_to_conversation(&session, Path::new("/db/state.vscdb"), STORE_STATE_DB, None)
+                .expect("legacy session parses");
         assert_eq!(conv.messages.len(), 2);
         assert_eq!(conv.messages[0].content, "How do I sort a vec?");
         assert_eq!(conv.messages[1].content, "Use .sort().");
@@ -1675,7 +1790,10 @@ mod tests {
             // Index metadata key that must never be treated as a transcript.
             conn.execute_compat(
                 "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
-                params!["chat.ChatSessionStore.index", "{\"version\":1,\"entries\":{}}"],
+                params![
+                    "chat.ChatSessionStore.index",
+                    "{\"version\":1,\"entries\":{}}"
+                ],
             )
             .expect("insert index");
         }

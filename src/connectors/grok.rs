@@ -51,7 +51,10 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 use super::flatten_content;
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 use super::utils::{dedupe_path_key, env_path_nonempty};
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
@@ -99,7 +102,19 @@ impl GrokConnector {
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots = if ctx.use_default_detection() {
-            vec![ScanRoot::local(Self::base_root())]
+            // Mirror the explicit-root acceptance: a default-detection
+            // data_dir that itself resolves as Grok storage (a `$GROK_HOME`
+            // base with `sessions/`, the `sessions/` tree, or one session
+            // dir) scopes the scan to it, so fixture/mirror scans stay
+            // hermetic; otherwise probe the system base. `GROK_HOME` keeps
+            // precedence so CI redirection is unaffected.
+            let d = &ctx.data_dir;
+            let env_override = env_path_nonempty("GROK_HOME").is_some();
+            if !env_override && (d.join("sessions").is_dir() || Self::is_session_dir(d)) {
+                vec![ScanRoot::local(d.clone())]
+            } else {
+                vec![ScanRoot::local(Self::base_root())]
+            }
         } else {
             ctx.scan_roots.clone()
         };
@@ -771,6 +786,14 @@ fn scan_grok_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    scan_grok_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
+}
+
+fn scan_grok_with_hooks(
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
     let roots = GrokConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
@@ -785,9 +808,86 @@ fn scan_grok_with_callback(
             if !GrokConnector::session_modified_since(&session_dir, ctx.since_ts) {
                 continue;
             }
+            // Pre-parse identity for the session's file set, mirrored from
+            // discover_sources() (FAD#22). The authoritative updates.jsonl is
+            // the completion's primary; chat_history.jsonl (fallback read
+            // path) and summary.json ride as sidecar fingerprints because
+            // parse_session() consults them. A session dir with NEITHER
+            // stream present has no trustworthy boundary and never completes.
+            let updates = session_dir.join("updates.jsonl");
+            let chat_history = session_dir.join("chat_history.jsonl");
+            let summary = session_dir.join("summary.json");
+            let primary = if updates.is_file() {
+                Some(
+                    DiscoveredSourceFile::new(
+                        AGENT_SLUG,
+                        &root,
+                        updates,
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                )
+            } else if chat_history.is_file() {
+                Some(
+                    DiscoveredSourceFile::new(
+                        AGENT_SLUG,
+                        &root,
+                        chat_history.clone(),
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        false,
+                    )
+                    .with_fs_metadata(),
+                )
+            } else {
+                None
+            };
+            let mut sidecars: Vec<DiscoveredSourceFile> = Vec::new();
+            if let Some(primary) = primary.as_ref() {
+                if chat_history.is_file() && primary.source_path != chat_history {
+                    sidecars.push(
+                        DiscoveredSourceFile::new(
+                            AGENT_SLUG,
+                            &root,
+                            chat_history.clone(),
+                            DiscoveredSourceRole::PrimarySessionLog,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+                if summary.is_file() {
+                    sidecars.push(
+                        DiscoveredSourceFile::new(
+                            AGENT_SLUG,
+                            &root,
+                            summary,
+                            DiscoveredSourceRole::MetadataSidecar,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+                if !hooks.should_scan(primary) {
+                    continue;
+                }
+            }
             if let Some(conversation) = parse_session(&session_dir) {
                 on_conversation(conversation)
                     .with_context(|| format!("emit grok conversation {}", session_dir.display()))?;
+                if let Some(primary) = primary {
+                    let changed = primary.fs_metadata_changed()
+                        || sidecars
+                            .iter()
+                            .any(DiscoveredSourceFile::fs_metadata_changed);
+                    if !changed {
+                        hooks.complete(&SourceCompletion {
+                            source: primary,
+                            required_sidecars: sidecars,
+                            conversations_emitted: 1,
+                        })?;
+                    }
+                }
             }
         }
     }
@@ -888,6 +988,19 @@ impl Connector for GrokConnector {
     ) -> Result<()> {
         scan_grok_with_callback(ctx, on_conversation)
     }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_grok_with_hooks(ctx, hooks, on_conversation)
+    }
 }
 
 #[cfg(test)]
@@ -962,6 +1075,30 @@ mod tests {
     }
 
     #[test]
+    fn default_detection_scopes_to_grok_base_data_dir() {
+        let tmp = TempDir::new().expect("tempdir");
+        write_session(
+            tmp.path(),
+            &[
+                envelope(&text_chunk("user_message_chunk", "hello"), 1_784_388_056),
+                envelope(
+                    &text_chunk("agent_message_chunk", "hi there"),
+                    1_784_388_057,
+                ),
+            ],
+        );
+        let convs = GrokConnector
+            .scan(&ScanContext::local_default(tmp.path().to_path_buf(), None))
+            .expect("scan");
+        assert_eq!(
+            convs.len(),
+            1,
+            "default detection with a Grok-base data_dir must scan that base, not ~/.grok"
+        );
+        assert_eq!(convs[0].external_id.as_deref(), Some(SESSION_ID));
+    }
+    #[test]
+
     fn parses_chunked_conversation_with_tool_calls() {
         let tmp = TempDir::new().expect("tempdir");
         let lines = vec![

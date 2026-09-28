@@ -25,3 +25,15 @@ fad_illustration.png
 
 # NTM session state
 .ntm/
+
+# Skill-loop / repo-janitor scratch
+.skill-loop-progress.md
+.skill-loop-progress-*.md
+
+# br doctor per-run artifacts
+.doctor/
+
+# Local release/format/scan receipts (clippy logs, crate tarballs, sha256s)
+.gate-results/
+# RCH per-release cargo target trees dropped in the workspace
+.rch-*-target/

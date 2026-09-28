@@ -36,6 +36,7 @@ use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
 use frankensqlite::{Row, SqliteValue, params};
 
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::utils::read_capped;
 
 /// Max ids bound into a single `... IN (?, ?, …)` chunk. Kept well under
 /// SQLite's default 999-parameter ceiling. (#372: incremental opencode scans
@@ -490,7 +491,10 @@ impl OpenCodeConnector {
         // We normalize in Rust rather than using strftime() which breaks on integer columns.
         let sessions: Vec<SqliteSession> = conn
             .query_map_collect(
-                "SELECT id, title, directory, project_id, time_created, time_updated FROM session",
+                // `id IS NOT NULL`: SQLite PRIMARY KEYs do not imply
+                // NOT NULL, and one NULL/BLOB id aborts the whole row
+                // collect — dropping every conversation in the store.
+                "SELECT id, title, directory, project_id, time_created, time_updated FROM session WHERE id IS NOT NULL",
                 params![],
                 |row| {
                     Ok(SqliteSession {
@@ -522,7 +526,11 @@ impl OpenCodeConnector {
                         .time_updated_raw
                         .as_ref()
                         .and_then(normalize_sqlite_ts_value)
-                        .is_none_or(|updated| updated >= since)
+                        // Same −1s mtime-granularity slack as
+                        // file_modified_since, so a session touched within
+                        // the slack window is not skipped on every
+                        // subsequent incremental scan.
+                        .is_none_or(|updated| updated >= since.saturating_sub(1_000))
                 })
                 .map(|session| session.id.clone())
                 .collect()
@@ -560,12 +568,16 @@ impl OpenCodeConnector {
             let ended_at = session_updated_ms.or(msg_ended_at).or(started_at);
 
             // Filter by since_ts in Rust (can't reliably filter in SQL when
-            // timestamp column format is unknown).
-            if let Some(since) = since_ts {
-                let latest = ended_at.or(started_at).unwrap_or(0);
-                if latest < since {
-                    continue;
-                }
+            // timestamp column format is unknown). Sessions whose timestamps
+            // are ALL unparseable must stay: pruning them on latest=0 would
+            // drop them from every incremental scan forever (the flat-file
+            // path guards this blind spot with mtimes; SQLite rows have no
+            // such fallback). Only KNOWN-old sessions are pruned.
+            if let Some(since) = since_ts
+                && let Some(latest) = ended_at.or(started_at)
+                && latest < since.saturating_sub(1_000)
+            {
+                continue;
             }
 
             let workspace = session.directory.map(PathBuf::from);
@@ -606,7 +618,9 @@ impl OpenCodeConnector {
         // scan so old sessions' messages are never read or decoded (#372).
         let rows: Vec<SqliteMessageRow> = match keep_session_ids {
             None => conn.query_map_collect(
-                "SELECT session_id, id, data, time_created FROM message",
+                // `data IS NOT NULL`: internal marker rows carry no payload
+                // and would abort the whole collect (see the session query).
+                "SELECT session_id, id, data, time_created FROM message WHERE data IS NOT NULL AND session_id IS NOT NULL AND id IS NOT NULL",
                 params![],
                 |row| {
                     Ok(SqliteMessageRow {
@@ -623,7 +637,7 @@ impl OpenCodeConnector {
                 for chunk in id_list.chunks(OPENCODE_SQL_IN_CHUNK) {
                     let placeholders = vec!["?"; chunk.len()].join(",");
                     let sql = format!(
-                        "SELECT session_id, id, data, time_created FROM message WHERE session_id IN ({placeholders})"
+                        "SELECT session_id, id, data, time_created FROM message WHERE data IS NOT NULL AND session_id IS NOT NULL AND id IS NOT NULL AND session_id IN ({placeholders})"
                     );
                     let bind: Vec<ParamValue> = chunk
                         .iter()
@@ -739,18 +753,18 @@ impl OpenCodeConnector {
         // scan only the kept messages' parts are read/decoded (#372: the `part`
         // table is the largest, so this is the dominant saving).
         let rows: Vec<(String, String)> = match message_ids {
-            None => {
-                conn.query_map_collect("SELECT message_id, data FROM part", params![], |row| {
-                    Ok((row.get_typed(0)?, row.get_typed(1)?))
-                })?
-            }
+            None => conn.query_map_collect(
+                    "SELECT message_id, data FROM part WHERE data IS NOT NULL AND message_id IS NOT NULL",
+                params![],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?,
             Some(ids) => {
                 let id_list: Vec<&String> = ids.iter().collect();
                 let mut rows: Vec<(String, String)> = Vec::new();
                 for chunk in id_list.chunks(OPENCODE_SQL_IN_CHUNK) {
                     let placeholders = vec!["?"; chunk.len()].join(",");
                     let sql = format!(
-                        "SELECT message_id, data FROM part WHERE message_id IN ({placeholders})"
+                        "SELECT message_id, data FROM part WHERE data IS NOT NULL AND message_id IS NOT NULL AND message_id IN ({placeholders})"
                     );
                     let bind: Vec<ParamValue> = chunk
                         .iter()
@@ -969,6 +983,13 @@ impl Connector for OpenCodeConnector {
             db_candidates.retain(|p| seen.insert(p.clone()));
         }
 
+        // Session ids seen across ALL db candidates: stale migrated copies
+        // (e.g. ~/.config/opencode/opencode.db left behind after a move to
+        // ~/.local/share) share session ids with the live store, and
+        // emitting both double-indexes every conversation. First-wins by
+        // candidate priority order (explicit/data_dir before defaults).
+        let mut seen_db_session_ids: HashSet<String> = HashSet::new();
+
         for db in db_candidates {
             if !db.is_file() {
                 continue;
@@ -981,15 +1002,23 @@ impl Connector for OpenCodeConnector {
             }
             match Self::extract_from_sqlite(&db, ctx.since_ts, ctx.progress_tick.as_deref()) {
                 Ok(sqlite_convs) => {
+                    let fresh_count = sqlite_convs.len();
+                    convs.extend(sqlite_convs.into_iter().filter(|conv| {
+                        conv.external_id
+                            .as_ref()
+                            .is_none_or(|id| seen_db_session_ids.insert(id.clone()))
+                    }));
                     tracing::debug!(
-                        "opencode sqlite: found {} sessions in {}",
-                        sqlite_convs.len(),
+                        "opencode sqlite: found {fresh_count} sessions in {}",
                         db.display()
                     );
-                    convs.extend(sqlite_convs);
                 }
                 Err(e) => {
-                    tracing::debug!("opencode sqlite: failed to read {}: {e}", db.display());
+                    tracing::warn!(
+                        db = %db.display(),
+                        error = %e,
+                        "opencode sqlite: failed to read store; conversations from it may be missing"
+                    );
                 }
             }
         }
@@ -1278,9 +1307,25 @@ fn session_has_updates(
 
 /// Parse a session JSON file
 fn parse_session_file(path: &Path) -> Result<SessionInfo> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("read session file {}", path.display()))?;
-    let session: SessionInfo = serde_json::from_str(&content)
+    let content = match read_capped(path) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return Err(anyhow::Error::msg(format!(
+                "session file {} exceeds the scan size cap",
+                path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(
+                anyhow::Error::new(e).context(format!("read session file {}", path.display()))
+            );
+        }
+    };
+    // Editors/tools sometimes leave a UTF-8 BOM on flat-file sessions;
+    // serde_json rejects a leading U+FEFF and the whole session would be
+    // silently skipped (gemini's replay strips it for the same reason).
+    let content = content.trim_start_matches('\u{feff}');
+    let session: SessionInfo = serde_json::from_str(content)
         .with_context(|| format!("parse session JSON {}", path.display()))?;
     Ok(session)
 }
@@ -1305,8 +1350,17 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
         .collect();
 
     for msg_file in msg_files {
-        let content = match fs::read_to_string(&msg_file) {
-            Ok(c) => c,
+        // Cap the read (message JSONs embed full tool outputs) and strip a
+        // leading UTF-8 BOM, which serde_json rejects (same as session files).
+        let content = match read_capped(&msg_file) {
+            Ok(Some(c)) => c.trim_start_matches('\u{feff}').to_string(),
+            Ok(None) => {
+                tracing::debug!(
+                    file = %msg_file.display(),
+                    "opencode: message file exceeds the scan size cap; skipping"
+                );
+                continue;
+            }
             Err(_) => continue,
         };
 
@@ -1330,7 +1384,10 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
                 }
                 let path = entry.path();
                 if path.extension().map(|e| e == "json").unwrap_or(false)
-                    && let Ok(content) = fs::read_to_string(path)
+                    && let Some(content) = read_capped(path)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.trim_start_matches('\u{feff}').to_string())
                     && let Ok(part) = serde_json::from_str::<PartInfo>(&content)
                 {
                     parts.push(part);

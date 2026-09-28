@@ -1,0 +1,68 @@
+name: Codex prompt integrity
+
+# Permanent, read-only regression checks for the landed production code.
+# The historical patches under .github/patches are not applied by this job.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/codex_prompt_integrity.rs'
+      - 'tests/codex_exclusions.rs'
+      - 'tests/codex_read_integrity.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/validate-codex-prompt-patch.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/codex_prompt_integrity.rs'
+      - 'tests/codex_exclusions.rs'
+      - 'tests/codex_read_integrity.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/validate-codex-prompt-patch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Prompt integrity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Complete connector library tests (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test --features connectors --lib
+      - name: Prompt and reader unit regressions (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # This focused gate is not a claim that the full Windows library passes.
+          # Its unrelated path/root fixture failures remain visible in full runs.
+          cargo test --features connectors --lib user_prompts
+          cargo test --features connectors --lib connectors::codex::reader
+      - name: Public prompt, exclusion and read-integrity regressions
+        run: cargo test --features connectors --test codex_prompt_integrity --test codex_exclusions --test codex_read_integrity
+      - name: Strict connector lint checks
+        run: cargo clippy --all-targets --features connectors -- -D warnings
+      - name: Verify formatting
+        run: cargo fmt --all --check

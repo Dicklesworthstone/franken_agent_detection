@@ -1,0 +1,36 @@
+diff --git a/tests/codex_prompt_integrity.rs b/tests/codex_prompt_integrity.rs
+--- a/tests/codex_prompt_integrity.rs
++++ b/tests/codex_prompt_integrity.rs
+@@ -72,7 +72,7 @@
+         for since in [None, Some(0)] {
+             let ctx = ScanContext::with_roots(
+                 temp.path().join("cass"),
+-                vec![ScanRoot::local(root.to_path_buf())],
++                vec![ScanRoot::local(root.clone())],
+                 since,
+             );
+             let collected = connector.scan(&ctx).unwrap();
+@@ -174,16 +174,16 @@
+ 
+ #[test]
+ fn opposite_streams_with_incompatible_identity_are_retained() {
+-    for (left, right) in [
+-        (
++    for records in [
++        [
+             event("continue", Some(1_700_000_000_000), None),
+             response("continue", Some(1_700_000_060_000), None),
+-        ),
+-        (event("continue", None, Some("one")), response("continue", None, Some("two"))),
+-        (event("continue", None, Some("one")), response("continue", None, None)),
+-        (event("continue", Some(1_700_000_000_000), None), response("continue", None, None)),
++        ],
++        [event("continue", None, Some("one")), response("continue", None, Some("two"))],
++        [event("continue", None, Some("one")), response("continue", None, None)],
++        [event("continue", Some(1_700_000_000_000), None), response("continue", None, None)],
+     ] {
+-        assert_all_routes(&[left, right], &["continue", "continue"]);
++        assert_all_routes(&records, &["continue", "continue"]);
+     }
+ }
+ 

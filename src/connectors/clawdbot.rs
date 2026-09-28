@@ -6,6 +6,7 @@
 //! Each line is a message object:
 //! {"role":"user|assistant|system","content":"...","timestamp":"2025-01-27T03:30:00.000Z", ...}
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::dedupe_path_key;
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -43,8 +45,18 @@ impl ClawdbotConnector {
     }
 
     fn looks_like_clawdbot_storage(path: &Path) -> bool {
-        let path_str = path.to_string_lossy().to_lowercase();
-        path_str.contains("clawdbot") && path_str.contains("sessions")
+        // Structural, not substring-based: a `.clawdbot` dir with
+        // `sessions/`, the `sessions/` dir whose parent is `.clawdbot`, or
+        // the sessions dir itself. A substring test hijacked default
+        // detection onto lookalikes such as `/backup/clawdbot-sessions-old`,
+        // silently missing real `~/.clawdbot/sessions`.
+        if path.file_name().is_some_and(|n| n == ".clawdbot") && path.join("sessions").is_dir() {
+            return true;
+        }
+        path.file_name().is_some_and(|n| n == "sessions")
+            && path
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".clawdbot"))
     }
 
     pub(crate) fn session_files(root: &Path) -> Vec<PathBuf> {
@@ -108,6 +120,10 @@ impl ClawdbotConnector {
     }
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        // Same cross-root dedupe scan() applies: overlapping or
+        // symlink-aliased roots must not produce duplicate discovered
+        // sources (double mirroring downstream).
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
         let mut out = Vec::new();
         for mut root in Self::source_roots(ctx) {
             if root.path.is_file() {
@@ -115,6 +131,9 @@ impl ClawdbotConnector {
                 root = root.with_path(parent);
             }
             for file in Self::session_files(&root.path) {
+                if !seen_files.insert(dedupe_path_key(&file)) {
+                    continue;
+                }
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }
@@ -151,6 +170,10 @@ impl Connector for ClawdbotConnector {
         }
 
         let mut convs = Vec::new();
+        // Cross-root guard: overlapping explicit roots (two machine mirrors,
+        // nested roots) would otherwise parse and emit the same session
+        // file once per covering root.
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
         for mut root in roots {
             if root.is_file() {
@@ -159,6 +182,9 @@ impl Connector for ClawdbotConnector {
 
             let files = Self::session_files(&root);
             for file in files {
+                if !seen_files.insert(dedupe_path_key(&file)) {
+                    continue;
+                }
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }
@@ -200,7 +226,8 @@ impl Connector for ClawdbotConnector {
                         continue;
                     }
 
-                    let val: Value = match serde_json::from_str(&line) {
+                    let line = line.trim_start_matches('\u{feff}');
+                    let val: Value = match serde_json::from_str(line) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };

@@ -132,17 +132,24 @@ impl CrushConnector {
         if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             db_paths.push(ScanRoot::local(ctx.data_dir.clone()));
         } else if ctx.use_default_detection() {
-            if let Some(global) = Self::global_db_path() {
-                db_paths.push(ScanRoot::local(global));
-            }
-            db_paths.extend(
-                Self::discover_project_dbs()
-                    .into_iter()
-                    .map(ScanRoot::local),
-            );
+            // A crush.db under data_dir scopes the scan to it; only
+            // otherwise probe the global + per-project stores. Probing both
+            // polluted scoped fixture/mirror scans with the machine's real
+            // sessions (deduped by id, but still foreign content).
+            // CRUSH_SQLITE_DB keeps precedence.
             let candidate = ctx.data_dir.join("crush.db");
-            if candidate.exists() {
+            let env_override = env_path_nonempty("CRUSH_SQLITE_DB").is_some();
+            if !env_override && !ctx.data_dir.as_os_str().is_empty() && candidate.exists() {
                 db_paths.push(ScanRoot::local(candidate));
+            } else {
+                if let Some(global) = Self::global_db_path() {
+                    db_paths.push(ScanRoot::local(global));
+                }
+                db_paths.extend(
+                    Self::discover_project_dbs()
+                        .into_iter()
+                        .map(ScanRoot::local),
+                );
             }
         } else {
             let candidate = ctx.data_dir.join("crush.db");
@@ -483,5 +490,66 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].source_path, db_path);
         crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
+    }
+
+    #[test]
+    fn default_detection_scopes_sqlite_to_data_dir() {
+        // A crush.db under data_dir must scope the default-detection scan
+        // to THIS store; the machine's real global/per-project stores must
+        // not leak additional conversations into the result.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("crush.db");
+        let conn =
+            crate::connectors::sqlite_sync::Connection::open(db_path.to_string_lossy().as_ref())
+                .unwrap();
+        conn.execute(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                cost REAL
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE messages (
+                session_id TEXT,
+                role TEXT,
+                parts TEXT,
+                created_at INTEGER,
+                model TEXT,
+                provider TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO sessions (id, title, prompt_tokens, completion_tokens, cost)
+             VALUES (?, ?, ?, ?, ?)",
+            params!["sess-scope", "Scoped Crush", 1_i64, 2_i64, 0.01_f64],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO messages (session_id, role, parts, created_at, model, provider)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                "sess-scope",
+                "user",
+                r#"[{"type":"text","text":"Hello Crush"}]"#,
+                1_733_000_000_000_i64,
+                "crush-model",
+                "crush"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let connector = CrushConnector::new();
+        let ctx = ScanContext::local_default(tmp.path().to_path_buf(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sess-scope"));
+        assert_eq!(convs[0].source_path, db_path);
     }
 }

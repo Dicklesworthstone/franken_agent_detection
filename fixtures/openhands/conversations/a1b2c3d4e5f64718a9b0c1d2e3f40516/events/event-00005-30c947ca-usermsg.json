@@ -5,13 +5,21 @@
   "llm_message": {
     "role": "user",
     "content": [
-      {"cache_prompt": false, "type": "text", "text": "Now containerize it with docker and show me the resulting tree."}
+      {
+        "cache_prompt": false,
+        "type": "text",
+        "text": "Now containerize it with docker and show me the resulting tree."
+      }
     ],
     "thinking_blocks": []
   },
   "activated_skills": ["docker"],
   "extended_content": [
-    {"cache_prompt": false, "type": "text", "text": "Skill 'docker' activated: prefer rootless docker and multi-stage builds."}
+    {
+      "cache_prompt": false,
+      "type": "text",
+      "text": "Skill 'docker' activated: prefer rootless docker and multi-stage builds."
+    }
   ],
   "kind": "MessageEvent"
 }

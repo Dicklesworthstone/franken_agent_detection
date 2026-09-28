@@ -1,12 +1,18 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -394,6 +400,111 @@ impl ClaudeCodeConnector {
             Value::Object(out)
         }
     }
+
+    /// A prompt the user typed while the agent was mid-turn is recorded as
+    /// `{"type":"attachment","attachment":{"type":"queued_command",
+    /// "commandMode":"prompt","prompt":..,"origin":{"kind":"human"}}}` rather
+    /// than as a `type:"user"` entry, so the user/assistant filter would drop
+    /// it and the text would never be searchable (cass GH #500).
+    ///
+    /// Only prompt-mode entries typed by a person are normalized:
+    /// `origin.kind == "human"`, or no `origin` at all (older Claude Code
+    /// builds), which is kept but marked as unknown authorship. Relayed
+    /// (`peer`) and any other explicit origin, meta entries, and
+    /// machine-generated `task-notification` entries are skipped. The sibling
+    /// `queue-operation` records are not indexed either: they repeat the text
+    /// of every queued item, including ones later saved as normal user
+    /// entries, so indexing them would double turns.
+    fn queued_command_message(raw: &Value, compact_extra: bool) -> Option<NormalizedMessage> {
+        let attachment = raw.get("attachment")?;
+        if attachment.get("type").and_then(Value::as_str) != Some("queued_command")
+            || attachment.get("commandMode").and_then(Value::as_str) != Some("prompt")
+        {
+            return None;
+        }
+        let is_meta = |v: &Value| v.get("isMeta").and_then(Value::as_bool) == Some(true);
+        if is_meta(raw) || is_meta(attachment) {
+            return None;
+        }
+        let authorship = match attachment.get("origin") {
+            None | Some(Value::Null) => "unknown",
+            Some(origin) if origin.get("kind").and_then(Value::as_str) == Some("human") => "human",
+            Some(_) => return None,
+        };
+
+        let content = attachment
+            .get("prompt")
+            .map(flatten_content)
+            .unwrap_or_default();
+        if content.trim().is_empty() {
+            return None;
+        }
+
+        let created = raw
+            .get("timestamp")
+            .and_then(parse_timestamp)
+            .or_else(|| attachment.get("timestamp").and_then(parse_timestamp));
+
+        let mut provenance = Map::new();
+        provenance.insert(
+            "command_mode".to_string(),
+            Value::String("prompt".to_string()),
+        );
+        provenance.insert(
+            "authorship".to_string(),
+            Value::String(authorship.to_string()),
+        );
+        if let Some(source_uuid) = attachment
+            .get("source_uuid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            provenance.insert(
+                "source_uuid".to_string(),
+                Value::String(source_uuid.to_string()),
+            );
+        }
+
+        let mut extra = if compact_extra {
+            Self::compact_message_extra(raw)
+        } else {
+            raw.clone()
+        };
+        if let Some(obj) = extra.as_object_mut() {
+            let cass = obj
+                .entry("cass".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !cass.is_object() {
+                *cass = Value::Object(Map::new());
+            }
+            if let Some(cass) = cass.as_object_mut() {
+                cass.insert("queued_command".to_string(), Value::Object(provenance));
+            }
+        }
+
+        Some(NormalizedMessage {
+            idx: 0,
+            role: "user".to_string(),
+            author: None,
+            created_at: created,
+            content,
+            extra,
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        })
+    }
+}
+
+/// Widen a conversation's `[started_at, ended_at]` bounds to cover `created`.
+fn widen_time_bounds(
+    started_at: &mut Option<i64>,
+    ended_at: &mut Option<i64>,
+    created: Option<i64>,
+) {
+    if let Some(ts) = created {
+        *started_at = Some(started_at.map_or(ts, |curr| curr.min(ts)));
+        *ended_at = Some(ended_at.map_or(ts, |curr| curr.max(ts)));
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -401,7 +512,12 @@ fn scan_claude_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    scan_claude_with_callback_with_exclusions(ctx, on_conversation, &excluded_scan_paths_from_env())
+    scan_claude_with_callback_with_exclusions(
+        ctx,
+        on_conversation,
+        &excluded_scan_paths_from_env(),
+        &mut SourceScanHooks::default(),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -409,20 +525,22 @@ fn scan_claude_with_callback_with_exclusions(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     excluded_paths: &[PathBuf],
+    hooks: &mut SourceScanHooks<'_>,
 ) -> Result<()> {
-    let roots: Vec<PathBuf> = ClaudeCodeConnector::source_roots(ctx)
-        .into_iter()
-        .map(|root| root.path)
-        .collect();
+    let roots: Vec<ScanRoot> = ClaudeCodeConnector::source_roots(ctx);
+    // Overlapping explicit roots (or a symlinked CLAUDE_CONFIG_DIR aliasing
+    // another root) reach the same transcript twice; dedupe on the
+    // lossless path key across ALL roots, first occurrence wins.
+    let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
     let mut file_count = 0;
 
     for root in roots {
-        let explicit_file_root = root.is_file();
-        let scan_target = root.clone();
+        let explicit_file_root = root.path.is_file();
+        let scan_target = root.path.clone();
         let external_id_root = if explicit_file_root {
-            ClaudeCodeConnector::projects_root_for_explicit_file(&root)
-                .or_else(|| root.parent().map(Path::to_path_buf))
+            ClaudeCodeConnector::projects_root_for_explicit_file(&root.path)
+                .or_else(|| root.path.parent().map(Path::to_path_buf))
         } else {
             Some(scan_target.clone())
         };
@@ -445,8 +563,29 @@ fn scan_claude_with_callback_with_exclusions(
                 );
                 continue;
             }
+            if !seen_files.insert(dedupe_path_key(&path)) {
+                continue;
+            }
             let ext = path.extension().and_then(|s| s.to_str());
             if !file_modified_since(&path, ctx.since_ts) {
+                continue;
+            }
+            // Pre-parse source identity: constructed exactly like
+            // discover_sources_with_exclusions(), with size/mtime observed
+            // BEFORE the file is opened (FAD#22).
+            let discovered = DiscoveredSourceFile::new(
+                "claude_code",
+                &root,
+                path.clone(),
+                ClaudeCodeConnector::discovered_source_role(&path),
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&discovered) {
+                tracing::debug!(
+                    path = %path.display(),
+                    "claude_code host ledger skipped unchanged source"
+                );
                 continue;
             }
             let file_size_bytes = fs::metadata(&path).ok().map(|metadata| metadata.len());
@@ -475,6 +614,25 @@ fn scan_claude_with_callback_with_exclusions(
             let mut permission_mode: Option<String> = None;
             let mut source_kind = "claude_code";
 
+            // Subagent transcripts live at
+            // `<session>/subagents/agent-*.jsonl` and are separate
+            // conversations; surface the relationship instead of leaving the
+            // parent link implicit in the path.
+            let is_subagent_transcript = path
+                .components()
+                .any(|c| c.as_os_str().to_str() == Some("subagents"));
+            let mut parent_session_id: Option<String> = None;
+            if is_subagent_transcript {
+                let components: Vec<_> = path.components().collect();
+                if let Some(pos) = components
+                    .iter()
+                    .position(|c| c.as_os_str().to_str() == Some("subagents"))
+                    && pos > 0
+                {
+                    parent_session_id = components[pos - 1].as_os_str().to_str().map(String::from);
+                }
+            }
+
             if ext == Some("jsonl") {
                 let file = std::fs::File::open(&path)
                     .with_context(|| format!("open {}", path.display()))?;
@@ -487,7 +645,10 @@ fn scan_claude_with_callback_with_exclusions(
                     if line.trim().is_empty() {
                         continue;
                     }
-                    let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                    // Strip a UTF-8 BOM so the first record (often
+                    // session_meta or the first prompt) is not silently lost.
+                    let line = line.trim_start_matches('\u{feff}');
+                    let Ok(val) = serde_json::from_str::<Value>(line) else {
                         continue;
                     };
 
@@ -508,6 +669,29 @@ fn scan_claude_with_callback_with_exclusions(
                     }
 
                     let entry_type = val.get("type").and_then(|v| v.as_str());
+                    // Claude's own generated title beats first-line
+                    // truncation; the entry is otherwise skipped as a
+                    // non-conversation sidecar type.
+                    if entry_type == Some("ai-title") {
+                        if let Some(title) = val
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                        {
+                            json_title = Some(title.to_string());
+                        }
+                        continue;
+                    }
+                    if entry_type == Some("attachment") {
+                        if let Some(message) =
+                            ClaudeCodeConnector::queued_command_message(&val, compact_message_extra)
+                        {
+                            widen_time_bounds(&mut started_at, &mut ended_at, message.created_at);
+                            messages.push(message);
+                        }
+                        continue;
+                    }
                     let role_hint = val
                         .get("message")
                         .and_then(|m| m.get("role"))
@@ -540,6 +724,59 @@ fn scan_claude_with_callback_with_exclusions(
                         .and_then(|m| m.get("content"))
                         .or_else(|| val.get("content"));
                     let content_str = content_val.map(flatten_content).unwrap_or_default();
+
+                    // Tool results ride in user entries as
+                    // content:[{type:"tool_result", tool_use_id, content}].
+                    // flatten_content ignores those blocks, so without this
+                    // pass every result entry is dropped wholesale
+                    // (~30-40% of real entries per transcript), leaving
+                    // invocations with call_ids but no outputs anywhere.
+                    if let Some(blocks) = content_val.and_then(Value::as_array) {
+                        for block in blocks {
+                            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                                continue;
+                            }
+                            let result_text = match block.get("content") {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Array(parts)) => parts
+                                    .iter()
+                                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                _ => continue,
+                            };
+                            if result_text.trim().is_empty() {
+                                continue;
+                            }
+                            let mut tool_extra = Map::new();
+                            tool_extra.insert(
+                                "source".to_string(),
+                                Value::String("tool_result".to_string()),
+                            );
+                            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                                tool_extra.insert(
+                                    "tool_use_id".to_string(),
+                                    Value::String(id.to_string()),
+                                );
+                            }
+                            // Failed tool calls are common and downstream
+                            // analytics split on them; pass the flag through
+                            // when Claude recorded one.
+                            if let Some(is_error) = block.get("is_error").and_then(Value::as_bool) {
+                                tool_extra.insert("is_error".to_string(), Value::from(is_error));
+                            }
+                            messages.push(NormalizedMessage {
+                                idx: 0,
+                                role: "tool".to_string(),
+                                author: None,
+                                created_at: created,
+                                content: result_text,
+                                extra: Value::Object(tool_extra),
+                                invocations: Vec::new(),
+                                snippets: Vec::new(),
+                            });
+                        }
+                    }
 
                     if content_str.trim().is_empty() {
                         continue;
@@ -730,10 +967,28 @@ fn scan_claude_with_callback_with_exclusions(
                     "cliSessionId": cli_session_id,
                     "gitBranch": git_branch,
                     "permissionMode": permission_mode,
-                    "bodyAvailable": source_kind != "claude_code_desktop_sidecar"
+                    "bodyAvailable": source_kind != "claude_code_desktop_sidecar",
+                    "sidechain": is_subagent_transcript,
+                    "parentSessionId": parent_session_id
                 }),
                 messages,
             })?;
+
+            // Source complete: the (single) conversation derived from this
+            // transcript was delivered. Suppressed when the file changed
+            // while it was being parsed — the host must re-observe it.
+            if discovered.fs_metadata_changed() {
+                tracing::debug!(
+                    path = %path.display(),
+                    "claude_code source changed during parse; completion withheld"
+                );
+            } else {
+                hooks.complete(&SourceCompletion {
+                    source: discovered,
+                    required_sidecars: Vec::new(),
+                    conversations_emitted: 1,
+                })?;
+            }
         }
     }
 
@@ -769,6 +1024,24 @@ impl Connector for ClaudeCodeConnector {
     ) -> Result<()> {
         scan_claude_with_callback(ctx, on_conversation)
     }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_claude_with_callback_with_exclusions(
+            ctx,
+            on_conversation,
+            &excluded_scan_paths_from_env(),
+            hooks,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -795,6 +1068,67 @@ mod tests {
     fn new_creates_connector() {
         let connector = ClaudeCodeConnector::new();
         let _ = connector;
+    }
+
+    #[test]
+    fn scan_marks_subagent_transcripts_with_parent_link() {
+        let base = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(base.path());
+        let session_dir = claude_dir
+            .join("projects")
+            .join("-data-projects-demo")
+            .join("11111111-2222-3333-4444-555555555555");
+        let subagents = session_dir
+            .join("subagents")
+            .join("66666666-7777-8888-9999-000000000000");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            subagents.join("agent-abc123.jsonl"),
+            concat!(
+                r#"{"type":"assistant","sessionId":"66666666-7777-8888-9999-000000000000","message":{"role":"assistant","model":"claude-x","content":[{"type":"text","text":"subagent work"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].metadata["sidechain"], true);
+        assert_eq!(
+            convs[0].metadata["parentSessionId"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+    }
+
+    #[test]
+    fn scan_prefers_ai_title_over_first_line_truncation() {
+        let base = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(base.path());
+        let session_dir = claude_dir
+            .join("projects")
+            .join("-data-projects-demo")
+            .join("aaaa-bbbb");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("cccc-dddd.jsonl"),
+            concat!(
+                r#"{"type":"ai-title","title":"Fix the flaky auth test"}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"cccc-dddd","message":{"role":"user","content":[{"type":"text","text":"please look at the auth module and fix the flaky test"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Fix the flaky auth test"));
     }
 
     #[test]
@@ -1014,6 +1348,88 @@ mod tests {
     }
 
     #[test]
+    fn source_boundaries_complete_per_file_and_skip_on_resume() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        for name in ["a.jsonl", "b.jsonl"] {
+            fs::write(
+                claude_dir.join(name),
+                concat!(
+                    r#"{"type":"user","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Hello"}}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+        }
+
+        let connector = ClaudeCodeConnector::new();
+        assert!(connector.supports_source_boundaries());
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+
+        let mut completions: Vec<SourceCompletion> = Vec::new();
+        let mut emitted = 0usize;
+        {
+            let mut on_complete = |completion: &SourceCompletion| {
+                completions.push(completion.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    emitted += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(emitted, 2);
+        assert_eq!(completions.len(), 2, "one completion per session file");
+        for completion in &completions {
+            assert_eq!(completion.conversations_emitted, 1);
+            assert_eq!(completion.source.provider_slug, "claude_code");
+            assert!(completion.source.size_bytes.is_some());
+            assert!(completion.required_sidecars.is_empty());
+        }
+
+        // Identity matches discovery for every completed source.
+        let discovered = connector.discover_source_files(&ctx).unwrap();
+        for completion in &completions {
+            let matching = discovered
+                .iter()
+                .find(|source| source.source_path == completion.source.source_path)
+                .expect("completed source must be discoverable");
+            assert_eq!(completion.source.size_bytes, matching.size_bytes);
+            assert_eq!(completion.source.modified_at_ms, matching.modified_at_ms);
+        }
+
+        // Resume with a ledger built from the completions: nothing re-parsed.
+        let ledger: Vec<SourceCompletion> = completions;
+        let mut resumed = 0usize;
+        {
+            let mut should_scan = |source: &DiscoveredSourceFile| {
+                !ledger.iter().any(|entry| {
+                    entry.source.source_path == source.source_path
+                        && entry.source.size_bytes == source.size_bytes
+                        && entry.source.modified_at_ms == source.modified_at_ms
+                })
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: Some(&mut should_scan),
+                on_source_complete: None,
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    resumed += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(resumed, 0, "unchanged files must be skipped on resume");
+    }
+
+    #[test]
     fn scan_skips_explicitly_excluded_session_path_without_skipping_siblings() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
@@ -1040,6 +1456,7 @@ mod tests {
                 Ok(())
             },
             std::slice::from_ref(&active_session),
+            &mut SourceScanHooks::default(),
         )
         .unwrap();
 
@@ -1294,6 +1711,134 @@ mod tests {
         // Only the valid message should be extracted
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].content, "Valid message");
+    }
+
+    /// cass GH #500: prompts typed while the agent is mid-turn are recorded as
+    /// `queued_command` attachments and must be indexed as user messages.
+    #[test]
+    fn scan_indexes_mid_turn_queued_command_prompts() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        let lines = [
+            r#"{"type":"user","uuid":"u1","sessionId":"s","timestamp":"2026-09-24T10:00:00.000Z","message":{"role":"user","content":"please audit the zebratypedphrase module"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s","timestamp":"2026-09-24T10:00:05.000Z","message":{"role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"Starting on the audit now."}]}}"#,
+            // queue-operation records repeat queued text and must stay out.
+            r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-24T10:00:10.000Z","sessionId":"s","content":"also check the walrusqueuedphrase path"}"#,
+            r#"{"type":"queue-operation","operation":"remove","timestamp":"2026-09-24T10:00:12.000Z","sessionId":"s","content":"also check the walrusqueuedphrase path"}"#,
+            // Human-origin, string prompt.
+            r#"{"type":"attachment","uuid":"q1","sessionId":"s","timestamp":"2026-09-24T10:00:12.000Z","attachment":{"type":"queued_command","prompt":"also check the walrusqueuedphrase path","source_uuid":"src1","commandMode":"prompt","origin":{"kind":"human"},"timestamp":"2026-09-24T10:00:12.000Z"}}"#,
+            // Older builds: no origin field -> kept, unknown authorship.
+            r#"{"type":"attachment","uuid":"q2","sessionId":"s","timestamp":"2026-09-24T10:00:13.000Z","attachment":{"type":"queued_command","prompt":"older era narwhallegacyphrase","commandMode":"prompt"}}"#,
+            // List-shaped prompt.
+            r#"{"type":"attachment","uuid":"q3","sessionId":"s","timestamp":"2026-09-24T10:00:14.000Z","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"list shaped ocelotlistphrase prompt"}],"commandMode":"prompt","origin":{"kind":"human"}}}"#,
+            // Skipped: relayed peer message, meta entry, task notification,
+            // unrecognized explicit origin, empty prompt, other attachment.
+            r#"{"type":"attachment","uuid":"x1","sessionId":"s","timestamp":"2026-09-24T10:00:15.000Z","attachment":{"type":"queued_command","prompt":"peer relayed ibexpeerphrase","commandMode":"prompt","isMeta":true,"origin":{"kind":"peer"}}}"#,
+            r#"{"type":"attachment","uuid":"x2","sessionId":"s","timestamp":"2026-09-24T10:00:15.000Z","attachment":{"type":"queued_command","prompt":"meta yakmetaphrase","commandMode":"prompt","isMeta":true}}"#,
+            r#"{"type":"attachment","uuid":"x3","sessionId":"s","timestamp":"2026-09-24T10:00:16.000Z","attachment":{"type":"queued_command","prompt":"<task-notification>lemurtaskphrase</task-notification>","commandMode":"task-notification"}}"#,
+            r#"{"type":"attachment","uuid":"x4","sessionId":"s","timestamp":"2026-09-24T10:00:16.000Z","attachment":{"type":"queued_command","prompt":"odd okapiodd phrase","commandMode":"prompt","origin":{"kind":"something-new"}}}"#,
+            r#"{"type":"attachment","uuid":"x5","sessionId":"s","timestamp":"2026-09-24T10:00:16.000Z","attachment":{"type":"queued_command","prompt":"   ","commandMode":"prompt","origin":{"kind":"human"}}}"#,
+            r#"{"type":"attachment","uuid":"x6","sessionId":"s","timestamp":"2026-09-24T10:00:16.000Z","attachment":{"type":"total_tokens_reminder","prompt":"not a prompt"}}"#,
+            r#"{"type":"assistant","uuid":"a2","sessionId":"s","timestamp":"2026-09-24T10:00:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Noted, I will also check that path."}]}}"#,
+            // A late queued prompt extends the conversation's end bound.
+            r#"{"type":"attachment","uuid":"q4","sessionId":"s","timestamp":"2026-09-24T10:00:30.000Z","attachment":{"type":"queued_command","prompt":"one more kiwilatephrase","commandMode":"prompt","origin":{"kind":"human"}}}"#,
+        ];
+        fs::write(&session_file, lines.join("\n")).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+
+        let summary: Vec<(i64, &str, &str)> = conv
+            .messages
+            .iter()
+            .map(|m| (m.idx, m.role.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, "user", "please audit the zebratypedphrase module"),
+                (1, "assistant", "Starting on the audit now."),
+                (2, "user", "also check the walrusqueuedphrase path"),
+                (3, "user", "older era narwhallegacyphrase"),
+                (4, "user", "list shaped ocelotlistphrase prompt"),
+                (5, "assistant", "Noted, I will also check that path."),
+                (6, "user", "one more kiwilatephrase"),
+            ]
+        );
+
+        let q1 = &conv.messages[2];
+        assert_eq!(
+            q1.created_at,
+            parse_timestamp(&json!("2026-09-24T10:00:12.000Z"))
+        );
+        assert_eq!(q1.extra["cass"]["queued_command"]["authorship"], "human");
+        assert_eq!(q1.extra["cass"]["queued_command"]["source_uuid"], "src1");
+        assert_eq!(q1.extra["cass"]["queued_command"]["command_mode"], "prompt");
+        // The raw record is still carried for non-compacted sessions.
+        assert_eq!(q1.extra["attachment"]["origin"]["kind"], "human");
+
+        let q2 = &conv.messages[3];
+        assert_eq!(q2.extra["cass"]["queued_command"]["authorship"], "unknown");
+        assert!(
+            q2.extra["cass"]["queued_command"]
+                .get("source_uuid")
+                .is_none()
+        );
+
+        // The typed first message still names the conversation.
+        assert_eq!(
+            conv.title.as_deref(),
+            Some("please audit the zebratypedphrase module")
+        );
+        assert_eq!(
+            conv.started_at,
+            parse_timestamp(&json!("2026-09-24T10:00:00.000Z"))
+        );
+        assert_eq!(
+            conv.ended_at,
+            parse_timestamp(&json!("2026-09-24T10:00:30.000Z"))
+        );
+    }
+
+    #[test]
+    fn queued_command_compact_extra_keeps_provenance() {
+        let raw = json!({
+            "type": "attachment",
+            "timestamp": "2026-09-24T10:00:12.000Z",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": "large session queued prompt",
+                "source_uuid": "src9",
+                "commandMode": "prompt",
+                "origin": {"kind": "human"}
+            }
+        });
+        let msg = ClaudeCodeConnector::queued_command_message(&raw, true).unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "large session queued prompt");
+        assert!(msg.extra.get("attachment").is_none());
+        assert_eq!(msg.extra["cass"]["queued_command"]["authorship"], "human");
+        assert_eq!(msg.extra["cass"]["queued_command"]["source_uuid"], "src9");
+
+        // Falls back to the nested timestamp when the outer one is missing.
+        let nested_only = json!({
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": "nested ts",
+                "commandMode": "prompt",
+                "timestamp": "2026-09-24T10:00:12.000Z"
+            }
+        });
+        let msg = ClaudeCodeConnector::queued_command_message(&nested_only, false).unwrap();
+        assert_eq!(
+            msg.created_at,
+            parse_timestamp(&json!("2026-09-24T10:00:12.000Z"))
+        );
     }
 
     #[test]

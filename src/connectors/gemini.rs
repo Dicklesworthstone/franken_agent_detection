@@ -6,8 +6,11 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::env_path_nonempty;
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{MAX_SCAN_FILE_BYTES, env_path_nonempty, is_injected_context_message};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -433,6 +436,17 @@ impl GeminiConnector {
     }
 
     fn parse_session_file(file: &Path) -> Option<Value> {
+        // Legacy whole-file sessions load into a full JSON DOM (~4-10x the
+        // file size in RAM); enforce the project's 100MB scan cap.
+        if let Ok(metadata) = fs::metadata(file)
+            && metadata.len() > MAX_SCAN_FILE_BYTES
+        {
+            tracing::warn!(
+                path = %file.display(),
+                "gemini: session exceeds the scan size cap; skipping"
+            );
+            return None;
+        }
         let file_handle = match fs::File::open(file) {
             Ok(handle) => handle,
             Err(error) => {
@@ -473,21 +487,39 @@ fn scan_gemini_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    let roots: Vec<PathBuf> = GeminiConnector::source_roots(ctx)
-        .into_iter()
-        .map(|root| root.path)
-        .collect();
+    scan_gemini_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_gemini_with_hooks(
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
+    let roots: Vec<ScanRoot> = GeminiConnector::source_roots(ctx);
 
     for root in roots {
-        if !root.exists() {
+        if !root.path.exists() {
             continue;
         }
 
-        let files = GeminiConnector::session_files(&root);
+        let files = GeminiConnector::session_files(&root.path);
 
         for file in files {
             // Skip files not modified since last scan (incremental indexing)
             if !file_modified_since(&file, ctx.since_ts) {
+                continue;
+            }
+            // Pre-parse identity, mirrored from discover_sources() (FAD#22).
+            let discovered = DiscoveredSourceFile::new(
+                "gemini",
+                &root,
+                file.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&discovered) {
                 continue;
             }
             let file_size_bytes = fs::metadata(&file).ok().map(|metadata| metadata.len());
@@ -593,7 +625,7 @@ fn scan_gemini_with_callback(
             // Extract title from first user message
             let title = messages
                 .iter()
-                .find(|m| m.role == "user")
+                .find(|m| m.role == "user" && !is_injected_context_message(&m.content))
                 .map(|m| {
                     m.content
                         .lines()
@@ -635,6 +667,16 @@ fn scan_gemini_with_callback(
                 }),
                 messages,
             })?;
+
+            // Source complete: the session's conversation was delivered.
+            // Withheld when the file changed while being parsed.
+            if !discovered.fs_metadata_changed() {
+                hooks.complete(&SourceCompletion {
+                    source: discovered,
+                    required_sidecars: Vec::new(),
+                    conversations_emitted: 1,
+                })?;
+            }
         }
     }
 
@@ -669,6 +711,19 @@ impl Connector for GeminiConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         scan_gemini_with_callback(ctx, on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_gemini_with_hooks(ctx, hooks, on_conversation)
     }
 }
 
@@ -1294,6 +1349,30 @@ mod tests {
             ]
         }"#;
         fs::write(chats_dir.join("session-1.json"), session_json).unwrap();
+
+        let connector = GeminiConnector::new();
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs[0].title.as_deref(), Some("Help me with Rust"));
+    }
+
+    #[test]
+    fn scan_title_skips_injected_context_user_records() {
+        let dir = TempDir::new().unwrap();
+        let hash_dir = dir.path().join("gemini_hash");
+        let chats_dir = hash_dir.join("chats");
+        fs::create_dir_all(&chats_dir).unwrap();
+
+        let session_json = r##"{
+            "sessionId": "session-ctx",
+            "messages": [
+                {"type": "user", "content": "# AGENTS.md instructions for /data/projects/demo\nBe helpful."},
+                {"type": "user", "content": "Help me with Rust"},
+                {"type": "model", "content": "Sure!"}
+            ]
+        }"##;
+        fs::write(chats_dir.join("session-ctx.json"), session_json).unwrap();
 
         let connector = GeminiConnector::new();
         let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);

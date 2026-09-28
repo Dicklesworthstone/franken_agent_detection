@@ -204,9 +204,15 @@ impl Origin {
     }
 
     /// Check if this origin is local.
+    ///
+    /// Like [`Origin::is_remote`], this is kind-based: any origin whose
+    /// `kind` is [`SourceKind::Local`] is local, including named local
+    /// sources whose `source_id` differs from [`LOCAL_SOURCE_ID`]. Callers
+    /// that specifically need the default local source should compare
+    /// `source_id == LOCAL_SOURCE_ID` explicitly.
     #[must_use]
-    pub fn is_local(&self) -> bool {
-        self.source_id == LOCAL_SOURCE_ID && self.kind == SourceKind::Local
+    pub const fn is_local(&self) -> bool {
+        matches!(self.kind, SourceKind::Local)
     }
 
     /// Get a display label for this origin.
@@ -363,5 +369,39 @@ impl std::fmt::Display for Platform {
             Self::Linux => write!(f, "linux"),
             Self::Windows => write!(f, "windows"),
         }
+    }
+}
+
+#[cfg(all(test, feature = "connectors"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_local_origin_is_local_not_remote() {
+        let origin = Origin::local();
+        assert!(origin.is_local());
+        assert!(!origin.is_remote());
+        assert_eq!(origin.source_id, LOCAL_SOURCE_ID);
+    }
+
+    #[test]
+    fn named_local_kind_origin_is_local_not_remote() {
+        // Regression for issue #23: a named local source (source_id !=
+        // LOCAL_SOURCE_ID but kind == Local) must classify as local, matching
+        // the kind-based semantics of `is_remote`.
+        let origin = Origin {
+            source_id: "backup-local".to_string(),
+            kind: SourceKind::Local,
+            host: None,
+        };
+        assert!(origin.is_local());
+        assert!(!origin.is_remote());
+    }
+
+    #[test]
+    fn remote_origin_is_remote_not_local() {
+        let origin = Origin::remote("workstation");
+        assert!(origin.is_remote());
+        assert!(!origin.is_local());
     }
 }

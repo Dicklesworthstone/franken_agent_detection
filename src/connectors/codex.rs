@@ -1,13 +1,24 @@
+mod reader;
+mod user_prompts;
+
+pub use reader::{codex_rollout_byte_budget, set_codex_rollout_byte_budget};
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, is_injected_context_message,
+    path_is_excluded, read_capped,
+};
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -127,16 +138,31 @@ impl CodexConnector {
 
     fn is_token_usage_target_message(message: &NormalizedMessage) -> bool {
         // Attribute token_count usage to concrete assistant turns only.
-        // This avoids attaching usage to synthetic reasoning helper messages.
-        message.role == "assistant" && message.author.is_none()
+        // This avoids attaching usage to synthetic reasoning helper
+        // messages AND to the synthetic "[Tool: name]" placeholders pushed
+        // for function_call items — a token_count following a tool call
+        // belongs to the surrounding turn, not the placeholder.
+        message.role == "assistant" && message.author.is_none() && message.invocations.is_empty()
     }
 
     fn token_usage_from_payload(payload: &Value) -> Option<Value> {
-        let input_tokens = payload.get("input_tokens").and_then(Value::as_i64);
-        let output_tokens = payload
+        // Modern rollouts (verified against live 2026-01..2026-08 history)
+        // nest per-turn usage at `info.last_token_usage`;
+        // `info.total_token_usage` is CUMULATIVE across the session and
+        // must never be attached per turn (downstream sums would double
+        // count). Legacy shapes carried the fields directly on the payload.
+        let usage_block = payload
+            .pointer("/info/last_token_usage")
+            .filter(|block| {
+                block.get("input_tokens").is_some() || block.get("output_tokens").is_some()
+            })
+            .unwrap_or(payload);
+
+        let input_tokens = usage_block.get("input_tokens").and_then(Value::as_i64);
+        let output_tokens = usage_block
             .get("output_tokens")
             .and_then(Value::as_i64)
-            .or_else(|| payload.get("tokens").and_then(Value::as_i64));
+            .or_else(|| usage_block.get("tokens").and_then(Value::as_i64));
 
         if input_tokens.is_none() && output_tokens.is_none() {
             return None;
@@ -148,6 +174,18 @@ impl CodexConnector {
         }
         if let Some(output) = output_tokens {
             usage.insert("output_tokens".to_string(), Value::from(output));
+        }
+        // Codex reports prompt-cache hits as `cached_input_tokens`, a
+        // SUBSET of input_tokens — NOT additive like Anthropic's
+        // cache_read/cache_creation split. Remapping it onto
+        // `cache_read_tokens` would make downstream totals double-count
+        // the cached portion, so the field is preserved verbatim instead
+        // (unknown keys are ignored by total computation).
+        if let Some(cache) = usage_block
+            .get("cached_input_tokens")
+            .and_then(Value::as_i64)
+        {
+            usage.insert("cached_input_tokens".to_string(), Value::from(cache));
         }
         usage.insert("data_source".to_string(), Value::String("api".to_string()));
 
@@ -219,6 +257,7 @@ impl CodexConnector {
     }
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let excluded_paths = excluded_scan_paths_from_env();
         let roots = Self::source_roots(ctx);
         let mut out = Vec::new();
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
@@ -242,6 +281,10 @@ impl CodexConnector {
                 .map_or_else(|| Self::rollout_files(&home), |path| vec![path]);
 
             for file in files {
+                // Explicit-file roots bypass rollout_files(), so filter here.
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&file)) {
                     continue;
                 }
@@ -380,15 +423,21 @@ fn tool_output_text(payload: &Value) -> String {
     flatten_content(output)
 }
 
-#[allow(clippy::too_many_lines)]
 fn scan_codex_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    let roots: Vec<PathBuf> = CodexConnector::source_roots(ctx)
-        .into_iter()
-        .map(|root| root.path)
-        .collect();
+    scan_codex_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_codex_with_hooks(
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
+    let excluded_paths = excluded_scan_paths_from_env();
+    let roots: Vec<ScanRoot> = CodexConnector::source_roots(ctx);
 
     if roots.is_empty() {
         return Ok(());
@@ -398,13 +447,14 @@ fn scan_codex_with_callback(
 
     for root in roots {
         let explicit_file = root
+            .path
             .is_file()
-            .then_some(root.clone())
+            .then_some(root.path.clone())
             .filter(|path| CodexConnector::is_rollout_file(path));
         let home = explicit_file
             .as_ref()
             .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| root.clone());
+            .unwrap_or_else(|| root.path.clone());
         if !home.exists() {
             continue;
         }
@@ -418,6 +468,10 @@ fn scan_codex_with_callback(
             .unwrap_or_else(|| CodexConnector::sessions_dir(&home));
 
         for file in files {
+            // Excluded sources must not reach pre-parse hooks or completions.
+            if path_is_excluded(&file, &excluded_paths) {
+                continue;
+            }
             if !seen_files.insert(dedupe_path_key(&file)) {
                 continue;
             }
@@ -427,6 +481,18 @@ fn scan_codex_with_callback(
                 FileScanMetadata::Process(metadata) => metadata,
                 FileScanMetadata::Skip => continue,
             };
+            // Pre-parse identity, mirrored from discover_sources() (FAD#22).
+            let discovered = DiscoveredSourceFile::new(
+                "codex",
+                &root,
+                file.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&discovered) {
+                continue;
+            }
             let file_size_bytes = file_metadata.as_ref().map(std::fs::Metadata::len);
             let compact_message_extra =
                 CodexConnector::should_compact_large_message_extra(file_size_bytes);
@@ -456,23 +522,15 @@ fn scan_codex_with_callback(
             let mut started_at = None;
             let mut ended_at = None;
             let mut session_cwd: Option<PathBuf> = None;
+            // Pair individual records, not all occurrences of prompt text.
+            // Capture stream/turn identity before large-message extra compaction.
+            let mut user_prompts = user_prompts::UserPrompts::default();
 
             if ext == Some("jsonl") {
-                let f = std::fs::File::open(&file)
-                    .with_context(|| format!("open rollout {}", file.display()))?;
-                let reader = std::io::BufReader::new(f);
+                let mut reader = reader::RolloutReader::open(&file, ctx.progress_tick.as_deref())?;
 
-                for (line_idx, line_res) in std::io::BufRead::lines(reader).enumerate() {
-                    let Ok(line) = line_res else {
-                        continue;
-                    };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let Ok(val) = serde_json::from_str::<Value>(&line) else {
-                        continue;
-                    };
-
+                // Accumulate privately until the complete opened snapshot is validated.
+                while let Some((line_idx, val)) = reader.next_record()? {
                     let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let created = val.get("timestamp").and_then(parse_timestamp);
 
@@ -582,6 +640,16 @@ fn scan_codex_with_callback(
                                         }
 
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        if role == "user" {
+                                            user_prompts.observe(
+                                                user_prompts::Stream::Response,
+                                                line_idx,
+                                                messages.len(),
+                                                &content_str,
+                                                created,
+                                                payload.get("turn_id").and_then(Value::as_str),
+                                            );
+                                        }
                                         let invocations = payload.get("content").map_or_else(
                                             Vec::new,
                                             extract_invocations_from_content_blocks,
@@ -620,6 +688,14 @@ fn scan_codex_with_callback(
                                                 &mut started_at,
                                                 &mut ended_at,
                                                 created,
+                                            );
+                                            user_prompts.observe(
+                                                user_prompts::Stream::Event,
+                                                line_idx,
+                                                messages.len(),
+                                                text,
+                                                created,
+                                                payload.get("turn_id").and_then(Value::as_str),
                                             );
                                             messages.push(NormalizedMessage {
                                                 idx: 0,
@@ -730,11 +806,27 @@ fn scan_codex_with_callback(
                         _ => {}
                     }
                 }
+                user_prompts.finish(&mut messages);
                 crate::types::reindex_messages(&mut messages);
             } else if ext == Some("json") {
-                let content = fs::read_to_string(&file)
-                    .with_context(|| format!("read rollout {}", file.display()))?;
-                let val: Value = match serde_json::from_str(&content) {
+                // Legacy single-file rollouts can be huge; enforce the
+                // project's 100MB scan cap (chatgpt policy).
+                let content = match read_capped(&file) {
+                    Ok(Some(content)) => content,
+                    Ok(None) => {
+                        tracing::warn!(
+                            file = %file.display(),
+                            "codex: legacy rollout exceeds the scan size cap; skipping"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(file = %file.display(), error = %e, "codex: unreadable legacy rollout");
+                        continue;
+                    }
+                };
+                let content = content.trim_start_matches('\u{feff}');
+                let val: Value = match serde_json::from_str(content) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -785,7 +877,7 @@ fn scan_codex_with_callback(
 
             let title = messages
                 .iter()
-                .find(|m| m.role == "user")
+                .find(|m| m.role == "user" && !is_injected_context_message(&m.content))
                 .map(|m| {
                     m.content
                         .lines()
@@ -813,6 +905,16 @@ fn scan_codex_with_callback(
                 metadata: serde_json::json!({"source": if ext == Some("json") { "rollout_json" } else { "rollout" }}),
                 messages,
             })?;
+
+            // Source complete: the rollout's conversation was delivered.
+            // Withheld when the file changed while being parsed.
+            if !discovered.fs_metadata_changed() {
+                hooks.complete(&SourceCompletion {
+                    source: discovered,
+                    required_sidecars: Vec::new(),
+                    conversations_emitted: 1,
+                })?;
+            }
         }
     }
 
@@ -847,6 +949,19 @@ impl Connector for CodexConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         scan_codex_with_callback(ctx, on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_codex_with_hooks(ctx, hooks, on_conversation)
     }
 }
 
@@ -970,6 +1085,103 @@ mod tests {
         assert_eq!(convs[0].messages.len(), 2);
         assert_eq!(convs[0].messages[0].content, "Hello Codex");
         assert_eq!(convs[0].messages[1].content, "Hi there!");
+    }
+
+    #[test]
+    fn title_skips_injected_context_user_records() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let sessions = home.join(".codex").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r##"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"# AGENTS.md instructions for /data/projects/demo\nBe helpful."}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"user","content":"Fix the flaky test"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:02Z","payload":{"role":"assistant","content":"On it."}}
+"##;
+        fs::write(sessions.join("rollout-title.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx =
+            ScanContext::with_roots(dir.path().join("cass"), vec![ScanRoot::local(home)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn dual_stream_user_prompts_are_deduplicated() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let sessions = home.join(".codex").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // Dual-stream era: the same prompt arrives via BOTH streams.
+        let content = r#"{"type":"event_msg","timestamp":"2025-12-01T10:00:00Z","payload":{"type":"user_message","message":"First read ALL of the AGENTS.md file"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"user","content":"First read ALL of the AGENTS.md file"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:02Z","payload":{"role":"assistant","content":"Reading it now."}}
+"#;
+        fs::write(sessions.join("rollout-dual.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx =
+            ScanContext::with_roots(dir.path().join("cass"), vec![ScanRoot::local(home)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let user_texts: Vec<&str> = convs[0]
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["First read ALL of the AGENTS.md file"],
+            "the event_msg copy of a response_item user prompt must be suppressed"
+        );
+    }
+
+    #[test]
+    fn token_count_reads_nested_last_token_usage() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let sessions = home.join(".codex").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // Real payload shape (sampled live 2026-06): usage nested under
+        // info.last_token_usage, NOT flat on the payload.
+        let usage_line = r#"{"timestamp":"2026-06-14T02:46:39.992Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":42187,"cached_input_tokens":5504,"output_tokens":733,"reasoning_output_tokens":516,"total_tokens":42920},"last_token_usage":{"input_tokens":42187,"cached_input_tokens":5504,"output_tokens":733,"reasoning_output_tokens":516,"total_tokens":42920}}}}"#;
+        let content = format!(
+            "{}\n{}\n{}\n{}\n",
+            r#"{"type":"response_item","timestamp":"2026-06-14T02:45:00.000Z","payload":{"role":"assistant","content":"Working on it."}}"#,
+            usage_line,
+            r#"{"type":"response_item","timestamp":"2026-06-14T02:47:00.000Z","payload":{"role":"assistant","content":"Done."}}"#,
+            usage_line.replace("\"input_tokens\":42187", "\"input_tokens\":500")
+        );
+        fs::write(sessions.join("rollout-tokens.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx =
+            ScanContext::with_roots(dir.path().join("cass"), vec![ScanRoot::local(home)], None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        let with_usage: Vec<&Value> = convs[0]
+            .messages
+            .iter()
+            .filter(|m| m.extra.pointer("/cass/token_usage/input_tokens").is_some())
+            .map(|m| &m.extra)
+            .collect();
+        assert_eq!(with_usage.len(), 2, "each turn carries its own usage");
+        let first = with_usage[0]
+            .pointer("/cass/token_usage/input_tokens")
+            .and_then(Value::as_i64);
+        let second = with_usage[1]
+            .pointer("/cass/token_usage/input_tokens")
+            .and_then(Value::as_i64);
+        assert_eq!(first, Some(42_187));
+        assert_eq!(second, Some(500));
     }
 
     #[test]
@@ -2129,7 +2341,7 @@ not valid json at all
     // =====================================================
 
     #[test]
-    fn truncated_jsonl_mid_json_returns_partial_results() {
+    fn truncated_jsonl_mid_json_requires_retry() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex");
         let sessions = codex_dir.join("sessions");
@@ -2143,19 +2355,17 @@ not valid json at all
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let result = connector.scan(&ctx);
 
-        assert!(result.is_ok(), "truncated file should not cause an error");
-        let convs = result.unwrap();
-        assert_eq!(convs.len(), 1);
+        let error = result.expect_err("unfinished input requires retry");
         assert_eq!(
-            convs[0].messages.len(),
-            1,
-            "should yield only the 1 valid message from truncated file"
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::UnexpectedEof)
         );
-        assert_eq!(convs[0].messages[0].content, "Valid");
     }
 
     #[test]
-    fn truncated_mid_utf8_does_not_panic() {
+    fn truncated_mid_utf8_requires_retry_without_panicking() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex");
         let sessions = codex_dir.join("sessions");
@@ -2174,14 +2384,17 @@ not valid json at all
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let result = connector.scan(&ctx);
 
-        assert!(result.is_ok(), "truncated mid-UTF8 should not panic");
-        let convs = result.unwrap();
-        assert_eq!(convs.len(), 1);
-        assert_eq!(convs[0].messages[0].content, "OK");
+        let error = result.expect_err("incomplete UTF-8 requires retry");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
     }
 
     #[test]
-    fn invalid_utf8_skips_corrupted_lines() {
+    fn invalid_utf8_requires_retry_instead_of_partial_success() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex");
         let sessions = codex_dir.join("sessions");
@@ -2202,16 +2415,13 @@ not valid json at all
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let result = connector.scan(&ctx);
 
-        assert!(result.is_ok(), "invalid UTF-8 should not cause a panic");
-        let convs = result.unwrap();
-        assert_eq!(convs.len(), 1);
+        let error = result.expect_err("invalid UTF-8 must not certify partial history");
         assert_eq!(
-            convs[0].messages.len(),
-            2,
-            "should extract valid messages around invalid UTF-8"
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
         );
-        assert_eq!(convs[0].messages[0].content, "Before");
-        assert_eq!(convs[0].messages[1].content, "After");
     }
 
     #[test]

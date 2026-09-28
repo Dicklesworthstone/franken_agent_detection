@@ -28,8 +28,10 @@ mod conformance {
     // =========================================================================
     //
     // The parse_timestamp function must handle:
-    // - i64 milliseconds (>= 100_000_000_000)
+    // - i64 milliseconds (>= 100_000_000_000, < 100_000_000_000_000)
     // - i64 seconds (< 100_000_000_000, converted to ms)
+    // - i64 microseconds (100_000_000_000_000..=100_000_000_000_000_000,
+    //   converted to ms)
     // - f64 milliseconds and seconds
     // - ISO-8601 / RFC-3339 strings
     // - Numeric strings
@@ -258,6 +260,97 @@ mod conformance {
             }
         }
 
+        // Run with --no-default-features --features all-connectors. Using
+        // --all-features would hide a missing edge in the aggregate feature.
+        #[cfg(feature = "all-connectors")]
+        #[test]
+        fn all_connectors_scans_devin_sqlite_sessions() {
+            use crate::connectors::sqlite_sync::Connection;
+
+            let retained = tempfile::Builder::new()
+                .prefix("fad-all-connectors-devin-")
+                .tempdir()
+                .expect("create Devin fixture directory")
+                .keep();
+            eprintln!("retained Devin SQLite fixture: {}", retained.display());
+            let database = retained.join("sessions.db");
+            let connection = Connection::open(database.to_string_lossy().as_ref())
+                .expect("open Devin fixture database");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE sessions (
+                        id TEXT PRIMARY KEY, title TEXT, working_directory TEXT,
+                        model TEXT, agent_mode TEXT, created_at INTEGER,
+                        last_activity_at INTEGER, main_chain_id INTEGER, hidden INTEGER
+                    );
+                    CREATE TABLE message_nodes (
+                        node_id INTEGER PRIMARY KEY, session_id TEXT,
+                        parent_node_id INTEGER, chat_message TEXT, created_at INTEGER
+                    );
+                    INSERT INTO sessions VALUES
+                        ('visible', 'Feature coverage', '/workspace/devin', 'test-model',
+                         'test', 1700000000, 1700000001, 1, 0),
+                        ('hidden', 'Retired session', '/workspace/devin', 'test-model',
+                         'test', 1700000000, 1700000001, 3, 1);
+                    INSERT INTO message_nodes VALUES
+                        (1, 'visible', NULL,
+                         '{"role":"user","content":"visible main-chain message"}', 1700000000),
+                        (2, 'visible', NULL,
+                         '{"role":"user","content":"abandoned branch"}', 1700000000),
+                        (3, 'hidden', NULL,
+                         '{"role":"user","content":"hidden session message"}', 1700000000);
+                    "#,
+                )
+                .expect("populate Devin fixture");
+            drop(connection);
+            let original_bytes = fs::read(&database).expect("read closed fixture database");
+
+            let (_, factory) = get_connector_factories()
+                .into_iter()
+                .find(|(slug, _)| *slug == "devin")
+                .expect("Devin factory must be registered");
+            let connector = factory();
+            let context =
+                ScanContext::with_roots(retained, vec![ScanRoot::local(database.clone())], None);
+            let conversations = connector.scan(&context).expect("scan Devin fixture");
+            assert_eq!(
+                conversations.len(),
+                1,
+                "all-connectors must enable scanning, with hidden sessions excluded"
+            );
+            let conversation = &conversations[0];
+            assert_eq!(conversation.agent_slug, "devin");
+            assert_eq!(conversation.external_id.as_deref(), Some("visible"));
+            assert_eq!(conversation.source_path, database.join("visible"));
+            assert_eq!(
+                conversation.workspace,
+                Some(PathBuf::from("/workspace/devin"))
+            );
+            assert_eq!(
+                conversation.messages.len(),
+                1,
+                "off-chain nodes stay excluded"
+            );
+            assert_eq!(conversation.messages[0].role, "user");
+            assert_eq!(
+                conversation.messages[0].content,
+                "visible main-chain message"
+            );
+
+            let sources = connector
+                .discover_source_files(&context)
+                .expect("discover Devin SQLite source");
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].provider_slug, "devin");
+            assert_eq!(sources[0].source_path, database);
+            assert_eq!(
+                fs::read(&database).expect("read fixture after scan and discovery"),
+                original_bytes,
+                "read-only scanning must preserve the database"
+            );
+        }
+
         #[test]
         fn all_factories_support_source_discovery_contract() {
             let temp = TempDir::new().expect("create temp dir");
@@ -273,13 +366,22 @@ mod conformance {
                 );
                 let sources = connector
                     .discover_source_files(&ctx)
-                    .unwrap_or_else(|err| panic!("connector {slug} discovery failed: {err}"));
+                    .unwrap_or_else(|err| panic!("connector {slug} discovery failed: {err}")); // ubs:ignore[rust.ownership.panic-macro] — Fail conformance with the connector identity on discovery error.
 
                 for source in sources {
+                    // Known divergence: the claude connector's own emitted
+                    // identity is "claude_code" while its registry slug is
+                    // "claude" (public API; alignment is a tracked decision).
+                    // The mapping must stay EXPLICIT so any future drift
+                    // between factory slugs and provider slugs fails here.
+                    let expected_provider: &str = if *slug == *"claude" {
+                        "claude_code"
+                    } else {
+                        slug
+                    };
                     assert_eq!(
-                        source.provider_slug,
-                        slug.replace("claude", "claude_code"),
-                        "connector {slug} should report its own provider slug"
+                        source.provider_slug, expected_provider,
+                        "connector {slug} should report its documented provider slug"
                     );
                     assert!(
                         !source.source_path.as_os_str().is_empty(),
@@ -310,7 +412,6 @@ mod conformance {
     mod schema_conformance {
         use super::*;
 
-        #[allow(dead_code)]
         fn validate_conversation(conv: &NormalizedConversation, connector_slug: &str) {
             // agent_slug must not be empty
             assert!(
@@ -357,7 +458,6 @@ mod conformance {
             }
         }
 
-        #[allow(dead_code)]
         fn validate_message(msg: &NormalizedMessage, connector_slug: &str) {
             // Role must be one of the standard roles
             let valid_roles = ["user", "assistant", "system", "tool", "function"];
@@ -442,6 +542,53 @@ mod conformance {
                 "NormalizedConversation should deserialize from JSON"
             );
         }
+        #[test]
+        fn checked_in_fixture_stores_produce_schema_conformant_conversations() {
+            // Contract 3 made real: every conversation produced from a
+            // checked-in fixture store must satisfy the schema validators
+            // below. Without this, `validate_conversation`/`validate_message`
+            // were dead code and the schema contract gated nothing.
+            let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let fixtures: &[(&str, &str)] = &[
+                ("antigravity", "fixtures/antigravity"),
+                ("codex", "fixtures/codex"),
+                ("openhands", "fixtures/openhands"),
+            ];
+
+            for (slug, rel) in fixtures {
+                let root = manifest.join(rel);
+                assert!(
+                    root.exists(),
+                    "checked-in fixture store missing: {}",
+                    root.display()
+                );
+                let ctx = ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root)], None);
+
+                let matched = get_connector_factories()
+                    .into_iter()
+                    .find(|(factory_slug, _)| factory_slug == slug);
+                let Some((_, factory)) = matched else {
+                    // ubs:ignore[rust.ownership.panic-macro] — Missing registered fixture connector is a test failure, not a production fallback.
+                    panic!("no registered factory for fixture connector {slug}");
+                };
+
+                let convs = factory().scan(&ctx).unwrap_or_else(|err| {
+                    // ubs:ignore[rust.ownership.panic-macro] — Preserve the fixture scan error and connector slug in the failing test.
+                    panic!("{slug}: scan of checked-in fixture failed: {err}")
+                });
+                assert!(
+                    !convs.is_empty(),
+                    "{slug}: checked-in fixture store yielded no conversations"
+                );
+
+                for conv in &convs {
+                    validate_conversation(conv, slug);
+                    for msg in &conv.messages {
+                        validate_message(msg, slug);
+                    }
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -484,18 +631,19 @@ mod conformance {
                 .map(|_| detect_installed_agents(&opts).expect("detection"))
                 .collect();
 
-            // All results should be identical
+            // All results should be identical. `generated_at` is wall-clock
+            // and excluded; entries and summary are compared IN FULL, so any
+            // drift in detection verdicts, evidence, or root ordering fails.
             let first = &results[0];
             for (i, result) in results.iter().enumerate() {
                 assert_eq!(
-                    result.summary.detected_count, first.summary.detected_count,
-                    "run {} has different detected_count",
+                    result.installed_agents, first.installed_agents,
+                    "run {} has different installed_agents",
                     i
                 );
                 assert_eq!(
-                    result.installed_agents.len(),
-                    first.installed_agents.len(),
-                    "run {} has different number of agents",
+                    result.summary, first.summary,
+                    "run {} has different summary",
                     i
                 );
             }
@@ -690,6 +838,7 @@ mod conformance {
                         // Windows path; look for a doubled backslash anywhere
                         // after position 0.
                         if let Some(pos) = output[1..].find("\\\\") {
+                            // ubs:ignore[rust.ownership.panic-macro] — This property assertion reports an unexpected doubled separator with its input and offset.
                             panic!(
                                 "PathMapping({:?} -> {:?}).apply({:?}) = {:?} contains doubled `\\\\` at offset {}",
                                 from,

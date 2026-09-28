@@ -18,12 +18,12 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::read_capped;
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp, utils::dedupe_path_key,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
-
 pub struct QwenConnector;
 
 impl Default for QwenConnector {
@@ -47,8 +47,19 @@ impl QwenConnector {
     }
 
     fn looks_like_qwen_storage(path: &Path) -> bool {
-        let path_str = path.to_string_lossy().to_lowercase();
-        path_str.contains(".qwen") && path_str.contains("tmp")
+        // Structural, not substring-based: a `.qwen` directory containing
+        // `tmp/`, or a `tmp/` directory whose parent is `.qwen`.
+        // (`~/.qwen/tmp` is the session root.) A substring test
+        // mis-scoped default detection onto lookalike directories such as
+        // `/data/tmp-mirror/.qwen-tools`, silently finding nothing.
+        if path.file_name().is_some_and(|n| n == "tmp")
+            && path
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".qwen"))
+        {
+            return true;
+        }
+        path.file_name().is_some_and(|n| n == ".qwen") && path.join("tmp").is_dir()
     }
 
     fn append_qwen_roots(roots: &mut Vec<PathBuf>, base: &Path) {
@@ -102,12 +113,17 @@ impl QwenConnector {
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots: Vec<ScanRoot> = Vec::new();
         if ctx.use_default_detection() {
+            // Exclusive scoping (house pattern): a data_dir that IS qwen
+            // storage scopes the scan to it; only otherwise probe the
+            // default tmp root. Scanning both leaked live-machine sessions
+            // into scoped mirror ingests.
             if Self::looks_like_qwen_storage(&ctx.data_dir) && ctx.data_dir.exists() {
                 roots.push(ScanRoot::local(ctx.data_dir.clone()));
-            }
-            let root = Self::tmp_root();
-            if root.exists() {
-                roots.push(ScanRoot::local(root));
+            } else {
+                let root = Self::tmp_root();
+                if root.exists() {
+                    roots.push(ScanRoot::local(root));
+                }
             }
         } else {
             for scan_root in &ctx.scan_roots {
@@ -232,8 +248,23 @@ impl Connector for QwenConnector {
 
 /// Parse a Qwen session JSON file into a `NormalizedConversation`.
 fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("read qwen session {}", path.display()))?;
+    // Whole-session JSON loads into a full DOM; enforce the project's
+    // 100MB scan cap (chatgpt policy).
+    let content = match read_capped(path) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            tracing::warn!(
+                path = %path.display(),
+                "qwen: session exceeds the scan size cap; skipping"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(
+                anyhow::Error::new(e).context(format!("read qwen session {}", path.display()))
+            );
+        }
+    };
 
     let val: Value = serde_json::from_str(&content)
         .with_context(|| format!("parse qwen session JSON {}", path.display()))?;

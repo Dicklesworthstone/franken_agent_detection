@@ -14,6 +14,7 @@ use serde_json::json;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::utils::read_capped;
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -41,6 +42,18 @@ impl AiderConnector {
             for entry in WalkDir::new(root)
                 .max_depth(5)
                 .into_iter()
+                .filter_entry(|e| {
+                    // Warn when the depth cutoff silently prunes a subtree
+                    // (the entry itself would have been visited but its
+                    // children won't be).
+                    if e.depth() == 5 && e.file_type().is_dir() {
+                        tracing::debug!(
+                            path = %e.path().display(),
+                            "aider: depth cutoff at level 5 may skip deeper history files"
+                        );
+                    }
+                    true
+                })
                 .flatten()
                 .filter(|e| e.file_type().is_file())
             {
@@ -54,13 +67,31 @@ impl AiderConnector {
             }
         }
         // Keep connector traversal deterministic across filesystems/runs.
+        // Dedup is mandatory: default mode adds both cwd and $HOME as roots,
+        // which overlap by construction, and explicit nested scan_roots can
+        // overlap too — without dedup every history under the shared prefix
+        // would be parsed (and emitted) once per covering root.
         files.sort();
+        files.dedup();
         files
     }
 
     #[allow(clippy::unused_self)]
     fn parse_chat_history(&self, path: &Path) -> Result<NormalizedConversation> {
-        let content = fs::read_to_string(path)?;
+        // History files accumulate for years; enforce the project's 100MB
+        // scan cap. The BOM strip keeps the first prompt from being
+        // misread into the system preamble (U+FEFF is not whitespace).
+        let content = match read_capped(path) {
+            Ok(Some(content)) => content.trim_start_matches('\u{feff}').to_string(),
+            Ok(None) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "aider: history exceeds the scan size cap; skipping"
+                );
+                return Err(anyhow::anyhow!("history exceeds scan size cap"));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let mut messages = Vec::new();
         let mut current_role = "system";
         let mut current_content = String::new();
@@ -179,7 +210,13 @@ impl AiderConnector {
                 ctx.data_dir.clone()
             };
 
-            let is_cass_db_dir = data_root.join("agent_search.db").exists();
+            // Guard against ingesting archived/copied aider histories that
+            // live inside the cass state dir as phantom live conversations.
+            // The agent_search.db marker alone misses fresh/partly-
+            // initialised state dirs; also exclude when the data_dir IS
+            // (or is under) a directory explicitly named for cass state.
+            let is_cass_db_dir = data_root.join("agent_search.db").exists()
+                || data_root.to_string_lossy().to_lowercase().contains("cass");
 
             if let Ok(override_root) = dotenvy::var("CASS_AIDER_DATA_ROOT")
                 && !override_root.trim().is_empty()

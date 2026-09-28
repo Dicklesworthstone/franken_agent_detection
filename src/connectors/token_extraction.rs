@@ -10,6 +10,10 @@ pub enum TokenDataSource {
     /// Estimated from content character count (~4 chars per token).
     #[default]
     Estimated,
+    /// Deliberately no usage and no estimate (e.g. Shelley fork-copied rows
+    /// whose original usage is already counted once). Consumers must exclude
+    /// these from both API totals and estimated totals.
+    Suppressed,
 }
 
 impl TokenDataSource {
@@ -18,6 +22,7 @@ impl TokenDataSource {
         match self {
             Self::Api => "api",
             Self::Estimated => "estimated",
+            Self::Suppressed => "suppressed",
         }
     }
 }
@@ -260,12 +265,17 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
         && let Some(payload) = extra.get("payload")
         && payload.get("type").and_then(|v| v.as_str()) == Some("token_count")
     {
-        input_tokens = payload.get("input_tokens").and_then(Value::as_i64);
-        output_tokens = payload
+        // Real rollouts nest per-turn usage at info.last_token_usage
+        // (info.total_token_usage is cumulative — never attach it).
+        let usage_block = payload.pointer("/info/last_token_usage").unwrap_or(payload);
+        input_tokens = usage_block.get("input_tokens").and_then(Value::as_i64);
+        output_tokens = usage_block
             .get("output_tokens")
             .and_then(Value::as_i64)
-            .or_else(|| payload.get("tokens").and_then(Value::as_i64));
-        data_source = TokenDataSource::Api;
+            .or_else(|| usage_block.get("tokens").and_then(Value::as_i64));
+        if input_tokens.is_some() || output_tokens.is_some() {
+            data_source = TokenDataSource::Api;
+        }
     }
 
     let model_name = extra
@@ -404,6 +414,7 @@ pub fn extract_pi_family_tokens(extra: &Value) -> ExtractedTokenUsage {
 
 /// Extract token usage from a message, dispatching by agent type.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn extract_tokens_for_agent(
     agent_slug: &str,
     extra: &Value,
@@ -413,8 +424,111 @@ pub fn extract_tokens_for_agent(
     let extracted = match agent_slug {
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
-        "pi_agent" | "prime_agent" => extract_pi_family_tokens(extra),
-        "cursor" | "factory" | "opencode" | "gemini" | "antigravity" => {
+        // Prime Agent assistant messages carry a full usage block
+        // (`input`/`output`/`cacheRead`/`cacheWrite`), which the connector
+        // preserves under `extra.usage`. Child-usage attribution entries are
+        // deliberately NOT summed here: Prime folds them into the parent
+        // assistant aggregate on reload, so counting them again would double
+        // count.
+        "prime_agent" => {
+            let model_name = extra
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let provider = extra
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    model_name
+                        .as_deref()
+                        .map(|name| normalize_model(name).provider)
+                });
+            let usage = extra.get("usage");
+            let read = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
+            let input_tokens = read("input");
+            let output_tokens = read("output");
+            let cache_read_tokens = read("cacheRead");
+            let cache_creation_tokens = read("cacheWrite");
+            let has_api_data = input_tokens.is_some() || output_tokens.is_some();
+            ExtractedTokenUsage {
+                model_name,
+                provider,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                data_source: if has_api_data {
+                    TokenDataSource::Api
+                } else {
+                    TokenDataSource::Estimated
+                },
+                ..Default::default()
+            }
+        }
+        // Shelley: the connector preserves direct llm.Usage under
+        // `extra.usage` (snake_case fields) and marks fork-copied rows with
+        // `extra.fork_copied` so their already-counted usage is neither
+        // re-counted nor re-estimated. Indirect `other_usage` entries are
+        // deliberately NOT summed here: they are heterogeneous purposed calls
+        // preserved as metadata only.
+        "shelley" => {
+            if extra
+                .get("fork_copied")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                ExtractedTokenUsage {
+                    data_source: TokenDataSource::Suppressed,
+                    ..Default::default()
+                }
+            } else {
+                let usage = extra.get("usage");
+                let read = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
+                let model_name = extra
+                    .get("model_name")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .or_else(|| {
+                        usage
+                            .and_then(|u| u.get("model"))
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    });
+                let provider = model_name
+                    .as_deref()
+                    .map(|name| normalize_model(name).provider);
+                let input_tokens = read("input_tokens");
+                let output_tokens = read("output_tokens");
+                let cache_read_tokens = read("cache_read_input_tokens");
+                let cache_creation_tokens = read("cache_creation_input_tokens");
+                let tool_call_count = u32::try_from(
+                    extra
+                        .pointer("/cass/tool_call_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                )
+                .unwrap_or(u32::MAX);
+                let has_api = input_tokens.is_some() || output_tokens.is_some();
+                ExtractedTokenUsage {
+                    model_name,
+                    provider,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                    has_tool_calls: tool_call_count > 0,
+                    tool_call_count,
+                    data_source: if has_api {
+                        TokenDataSource::Api
+                    } else {
+                        TokenDataSource::Estimated
+                    },
+                    ..Default::default()
+                }
+            }
+        }
+        "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" | "antigravity" => {
             let model_name = extra
                 .get("model")
                 .or_else(|| extra.pointer("/cass/model"))
@@ -435,6 +549,12 @@ pub fn extract_tokens_for_agent(
         }
         _ => ExtractedTokenUsage::default(),
     };
+
+    if matches!(extracted.data_source, TokenDataSource::Suppressed) {
+        // Explicit suppressed state: no API data AND no content-based
+        // estimation fallback.
+        return extracted;
+    }
 
     if !extracted.has_token_data() && !content.is_empty() {
         let mut estimated = estimate_tokens_from_content(content, role);

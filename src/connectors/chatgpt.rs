@@ -88,6 +88,20 @@ impl ChatGptConnector {
         Self { encryption_key }
     }
 
+    /// Construct with an explicitly supplied AES-256 key, bypassing the
+    /// `CHATGPT_ENCRYPTION_KEY` / key-file discovery entirely.
+    ///
+    /// This is the env-free injection seam (cass qu81y): hosts and tests
+    /// that already hold key material pass it directly instead of mutating
+    /// process-global environment, which is unsound under parallel test
+    /// scheduling and leaks state on panic.
+    #[must_use]
+    pub fn with_encryption_key(key: [u8; KEY_SIZE]) -> Self {
+        Self {
+            encryption_key: Some(key),
+        }
+    }
+
     /// Load encryption key from environment variable or key file
     fn load_encryption_key() -> Option<[u8; KEY_SIZE]> {
         // Try environment variable first (base64-encoded)
@@ -392,8 +406,11 @@ impl ChatGptConnector {
             anyhow::bail!("Encrypted data too short: {} bytes", data.len());
         }
 
-        // Extract nonce from the beginning
-        let nonce = Nonce::from_slice(&data[..NONCE_SIZE]);
+        // Extract nonce from the beginning. (`Nonce::from_slice` is
+        // deprecated in aes-gcm 0.11; TryFrom keeps the length check
+        // explicit.)
+        let nonce = Nonce::try_from(&data[..NONCE_SIZE])
+            .map_err(|_| anyhow::anyhow!("invalid nonce length in encrypted file"))?;
 
         // The rest is ciphertext + tag
         let ciphertext = &data[NONCE_SIZE..];
@@ -403,7 +420,7 @@ impl ChatGptConnector {
             .map_err(|e| anyhow::anyhow!("Failed to create cipher: {}", e))?;
 
         let plaintext = cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
 
         Ok(plaintext)
@@ -417,8 +434,9 @@ impl ChatGptConnector {
         is_encrypted: bool,
     ) -> Result<Option<NormalizedConversation>> {
         // Safety check: Don't read files larger than 100MB to avoid OOM
+        const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
         if let Ok(metadata) = fs::metadata(path)
-            && metadata.len() > 100 * 1024 * 1024
+            && metadata.len() > MAX_FILE_BYTES
         {
             tracing::warn!(
                 path = %path.display(),
@@ -429,6 +447,18 @@ impl ChatGptConnector {
         }
 
         let content_bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        // Post-read backstop: when fs::metadata errored above (ancestor
+        // perms, TOCTOU unlink), the pre-read guard was skipped — enforce
+        // the cap on the buffer we actually hold so a metadata failure can
+        // never turn into an unbounded read + decrypt double-buffer.
+        if content_bytes.len() as u64 > MAX_FILE_BYTES {
+            tracing::warn!(
+                path = %path.display(),
+                size_bytes = content_bytes.len(),
+                "skipping large file (>100MB, post-read check)"
+            );
+            return Ok(None);
+        }
 
         // Decrypt if necessary
         let content = if is_encrypted {

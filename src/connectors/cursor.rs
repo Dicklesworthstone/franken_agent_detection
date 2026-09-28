@@ -37,7 +37,7 @@ use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::utils::{dedupe_path_key, env_path_nonempty, read_capped};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -354,8 +354,13 @@ impl CursorConnector {
 
         let prefix_len = prefix.len();
 
-        if let Ok(rows) = conn.query_map_collect(
-            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?",
+        // Filter out NULL-value rows (same rationale as the composerData
+        // query in extract_from_db): Cursor inserts internal markers with
+        // no chat payload, and `row.get_typed(1)?` on NULL aborts the whole
+        // query_map_collect — silently emptying this conversation's bubble
+        // map so the entire chat is dropped as message-less.
+        match conn.query_map_collect(
+            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
             params![prefix.as_str(), limit.as_str()],
             |row| {
                 let key: String = row.get_typed(0)?;
@@ -363,15 +368,28 @@ impl CursorConnector {
                 Ok((key, value))
             },
         ) {
-            for (key, value) in rows {
-                // Key format: bubbleId:{composerId}:{bubbleId}
-                // Extract just the bubbleId part
-                if key.len() > prefix_len {
-                    let bubble_id = &key[prefix_len..];
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&value) {
-                        bubble_map.insert(bubble_id.to_string(), parsed);
+            Ok(rows) => {
+                for (key, value) in rows {
+                    // Key format: bubbleId:{composerId}:{bubbleId}
+                    // Extract just the bubbleId part
+                    if key.len() > prefix_len {
+                        let bubble_id = &key[prefix_len..];
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&value) {
+                            bubble_map.insert(bubble_id.to_string(), parsed);
+                        }
                     }
                 }
+            }
+            Err(e) => {
+                // A failed bubble range-query must not be silently
+                // indistinguishable from a composer with no bubbles:
+                // parse_composer_data would drop the whole chat as
+                // message-less (same class as the composerData query fix).
+                tracing::warn!(
+                    composer = %composer_id,
+                    error = %e,
+                    "cursor: bubbleData query failed; messages from this conversation may be missing"
+                );
             }
         }
 
@@ -411,6 +429,24 @@ impl CursorConnector {
             // URL decode
             let decoded = urlencoding::decode(path).ok()?;
             let mut path_str = decoded.as_ref();
+
+            // An RFC 3986 authority (`file://localhost/path`,
+            // `file://server/share`) is not part of the path: drop it when
+            // the remainder starts with a separator, so the result stays
+            // absolute instead of becoming a bogus relative path.
+            if !path_str.starts_with('/')
+                && !path_str.starts_with('\\')
+                && let Some(slash) = path_str.find(['/', '\\'])
+            {
+                // `file://C:/x` (no authority, malformed but seen in the
+                // wild) carries a DRIVE LETTER where an authority would be;
+                // stripping it would amputate the path.
+                let authority = &path_str[..slash];
+                let looks_like_drive = authority.len() == 2 && authority.as_bytes()[1] == b':';
+                if !looks_like_drive {
+                    path_str = &path_str[slash..];
+                }
+            }
 
             // On Windows, file:///C:/... becomes /C:/...
             // We need to strip the leading slash if it looks like a drive letter
@@ -459,7 +495,9 @@ impl CursorConnector {
         // Try cursorDiskKV table for composerData entries
         let composer_prefix = "composerData:";
         let composer_limit = Self::prefix_upper_bound(composer_prefix);
-        if let Ok(rows) = conn.query_map_collect(
+        // Surface query errors at warn level: a corrupted page or missing
+        // table must not be indistinguishable from a legitimately empty DB.
+        match conn.query_map_collect(
             // Filter out NULL-value rows: Cursor inserts internal markers with no
             // chat payload, and `row.get_typed(1)?` on NULL aborts the whole
             // query_map_collect — silently turning every row into zero conversations.
@@ -471,22 +509,27 @@ impl CursorConnector {
                 Ok((key, value))
             },
         ) {
-            for (key, value) in rows {
-                if let Some(conv) = Self::parse_composer_data(
-                    &key,
-                    &value,
-                    db_path,
-                    since_ts,
-                    &mut seen_ids,
-                    Some(&conn),
-                ) {
-                    convs.push(conv);
+            Ok(rows) => {
+                for (key, value) in rows {
+                    if let Some(conv) = Self::parse_composer_data(
+                        &key,
+                        &value,
+                        db_path,
+                        since_ts,
+                        &mut seen_ids,
+                        Some(&conn),
+                    ) {
+                        convs.push(conv);
+                    }
                 }
+            }
+            Err(e) => {
+                tracing::warn!(db = %db_path.display(), error = %e, "cursor: composerData query failed; conversations from this store may be missing");
             }
         }
 
         // Also try ItemTable for legacy aichat data
-        if let Ok(rows) = conn.query_map_collect(
+        match conn.query_map_collect(
             "SELECT key, value FROM ItemTable WHERE (key LIKE '%aichat%chatdata%' OR key LIKE '%composer%') AND value IS NOT NULL",
             params![],
             |row| {
@@ -495,12 +538,17 @@ impl CursorConnector {
                 Ok((key, value))
             },
         ) {
-            for (key, value) in rows {
-                if let Some(conv) =
-                    Self::parse_aichat_data(&key, &value, db_path, since_ts, &mut seen_ids)
-                {
-                    convs.push(conv);
+            Ok(rows) => {
+                for (key, value) in rows {
+                    if let Some(conv) =
+                        Self::parse_aichat_data(&key, &value, db_path, since_ts, &mut seen_ids)
+                    {
+                        convs.push(conv);
+                    }
                 }
+            }
+            Err(e) => {
+                tracing::warn!(db = %db_path.display(), error = %e, "cursor: ItemTable query failed; legacy conversations from this store may be missing");
             }
         }
 
@@ -659,10 +707,12 @@ impl CursorConnector {
         let ended_at = last_updated_at
             .or_else(|| messages.iter().filter_map(|m| m.created_at).max())
             .or(created_at);
-
-        // Optimization: Skip conversations not modified since last scan
-        if let (Some(threshold), Some(ts)) = (since_ts, ended_at)
-            && ts < threshold
+        // Optimization: Skip conversations not modified since last scan.
+        // The −1s slack mirrors file_modified_since (mtime granularity):
+        // without it a conversation updated inside the slack window is
+        // skipped on every subsequent incremental scan.
+        if let (Some(since), Some(ts)) = (since_ts, ended_at)
+            && ts < since.saturating_sub(1_000)
         {
             return None;
         }
@@ -901,14 +951,24 @@ impl CursorConnector {
     }
 
     /// Roots under which to look for Agent transcripts. Mirrors the Composer
-    /// root policy: default detection uses `~/.cursor/projects`; explicit scan
-    /// roots (e.g. remote mirrors) are walked as-is.
+    /// root policy: a default-detection `data_dir` that itself looks like a
+    /// Cursor base scopes the whole scan to that base (so fixture/mirror
+    /// scans stay hermetic); otherwise default detection uses
+    /// `~/.cursor/projects`, with `CASS_CURSOR_PROJECTS_ROOT` still taking
+    /// precedence for CI; explicit scan roots (e.g. remote mirrors) are
+    /// walked as-is.
     fn agent_scan_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
-            Self::agent_projects_root()
-                .into_iter()
-                .map(ScanRoot::local)
-                .collect()
+            if Self::looks_like_base(&ctx.data_dir)
+                && env_path_nonempty("CASS_CURSOR_PROJECTS_ROOT").is_none()
+            {
+                vec![ScanRoot::local(ctx.data_dir.clone())]
+            } else {
+                Self::agent_projects_root()
+                    .into_iter()
+                    .map(ScanRoot::local)
+                    .collect()
+            }
         } else {
             ctx.scan_roots.clone()
         };
@@ -978,7 +1038,9 @@ impl CursorConnector {
                 continue;
             }
             for transcript in Self::agent_transcript_files(&root.path) {
-                if !file_modified_since(&transcript, ctx.since_ts) {
+                let workspace_metadata_changed = Self::agent_workspace_metadata_path(&transcript)
+                    .is_some_and(|path| path.is_file() && file_modified_since(&path, ctx.since_ts));
+                if !file_modified_since(&transcript, ctx.since_ts) && !workspace_metadata_changed {
                     continue;
                 }
                 if !seen.insert(dedupe_path_key(&transcript)) {
@@ -1002,41 +1064,63 @@ impl CursorConnector {
             .map(String::from)
     }
 
-    /// Best-effort decode of Cursor's encoded project directory name into a
-    /// workspace path. Cursor encodes the absolute project path by replacing
-    /// path separators with `-` (gh #306: `Users-ibrahim-workspace-foo` ->
-    /// `/Users/ibrahim/workspace/foo`). The raw encoded name is always preserved
-    /// in metadata, so this lossy reconstruction is non-load-bearing; returns
-    /// `None` rather than guessing when it cannot produce a path.
-    fn decode_agent_workspace(encoded: &str) -> Option<PathBuf> {
-        let decoded = urlencoding::decode(encoded)
-            .map(std::borrow::Cow::into_owned)
-            .unwrap_or_else(|_| encoded.to_string());
-        let trimmed = decoded.trim();
-        if trimmed.is_empty() {
+    fn agent_workspace_metadata_path(transcript: &Path) -> Option<PathBuf> {
+        Some(
+            transcript
+                .parent()?
+                .parent()?
+                .parent()?
+                .join(".workspace-trusted"),
+        )
+    }
+
+    /// Project slugs lose the distinction between separators and literal
+    /// hyphens. Only the explicit workspacePath can establish attribution.
+    /// Accept foreign absolute paths too: exported sources need not exist on
+    /// the scanning host, and ScanRoot applies source mappings afterward.
+    fn agent_workspace_from_metadata(transcript: &Path) -> Option<PathBuf> {
+        let path = Self::agent_workspace_metadata_path(transcript)?;
+        let text = read_capped(&path).ok()??;
+        let metadata: Value = serde_json::from_str(&text).ok()?;
+        let workspace = metadata.get("workspacePath")?.as_str()?;
+        let bytes = workspace.as_bytes();
+        let drive_absolute = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\');
+        let unc_absolute = workspace.strip_prefix("\\\\").is_some_and(|rest| {
+            let mut components = rest.split('\\');
+            components.next().is_some_and(|part| !part.is_empty())
+                && components.next().is_some_and(|part| !part.is_empty())
+        });
+        if workspace.chars().any(char::is_control)
+            || !(workspace.starts_with('/') || drive_absolute || unc_absolute)
+        {
             return None;
         }
-        // Some encodings keep real separators; treat an already-pathlike value
-        // as-is rather than shredding it on `-`.
-        if trimmed.contains('/') {
-            return Some(PathBuf::from(trimmed));
-        }
-        let joined = trimmed
-            .split('-')
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("/");
-        if joined.is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(format!("/{joined}")))
+        Some(PathBuf::from(workspace))
     }
 
     /// Read a JSONL transcript into per-line records, skipping blank and
     /// individually-malformed lines (warned, never fatal).
     fn read_agent_transcript_records(transcript: &Path) -> Vec<Value> {
-        let Ok(text) = std::fs::read_to_string(transcript) else {
-            return Vec::new();
+        let text = match read_capped(transcript) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                tracing::warn!(
+                    transcript = %transcript.display(),
+                    "cursor: agent transcript exceeds the scan size cap; skipping"
+                );
+                return Vec::new();
+            }
+            Err(err) => {
+                tracing::warn!(
+                    transcript = %transcript.display(),
+                    error = %err,
+                    "cursor: unreadable agent transcript"
+                );
+                return Vec::new();
+            }
         };
         let mut records = Vec::new();
         for (lineno, line) in text.lines().enumerate() {
@@ -1160,14 +1244,16 @@ impl CursorConnector {
             .and_then(|s| s.to_str())
             .map(String::from);
         let project = Self::agent_project_dir_name(transcript);
-        let workspace = project
-            .as_deref()
-            .and_then(Self::decode_agent_workspace)
-            .map(|w| {
-                let rewritten =
-                    root.rewrite_workspace(&w.to_string_lossy(), Some(CURSOR_AGENT_SLUG));
-                PathBuf::from(rewritten)
-            });
+        let explicit_workspace = Self::agent_workspace_from_metadata(transcript);
+        let attribution = if explicit_workspace.is_some() {
+            "workspace_trusted"
+        } else {
+            "unresolved"
+        };
+        let workspace = explicit_workspace.map(|w| {
+            let rewritten = root.rewrite_workspace(&w.to_string_lossy(), Some(CURSOR_AGENT_SLUG));
+            PathBuf::from(rewritten)
+        });
 
         let title = messages
             .iter()
@@ -1184,6 +1270,10 @@ impl CursorConnector {
         metadata.insert(
             "cursor_format".to_string(),
             Value::String("agent".to_string()),
+        );
+        metadata.insert(
+            "cursor_workspace_attribution".to_string(),
+            Value::String(attribution.to_string()),
         );
         if let Some(p) = &project {
             metadata.insert("cursor_project_dir".to_string(), Value::String(p.clone()));
@@ -1213,7 +1303,23 @@ impl CursorConnector {
 
     /// Agent-transcript files as discovered sources (mirrors `scan_agent_transcripts`).
     fn discover_agent_sources(ctx: &ScanContext, out: &mut Vec<DiscoveredSourceFile>) {
+        let mut seen_metadata = HashSet::new();
         for (root, transcript) in Self::agent_transcript_sources(ctx) {
+            if let Some(path) = Self::agent_workspace_metadata_path(&transcript)
+                && path.is_file()
+                && seen_metadata.insert(dedupe_path_key(&path))
+            {
+                out.push(
+                    DiscoveredSourceFile::new(
+                        CURSOR_AGENT_SLUG,
+                        &root,
+                        path,
+                        DiscoveredSourceRole::MetadataSidecar,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
             out.push(
                 DiscoveredSourceFile::new(
                     CURSOR_AGENT_SLUG,
@@ -1235,6 +1341,14 @@ impl Connector for CursorConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut all_convs = Vec::new();
+        // The same composer id can be mirrored across DBs (globalStorage vs
+        // workspaceStorage, explicit overlapping roots, backups). extract_from_db
+        // only dedupes within one store, so span a session-id set across ALL
+        // stores here — first occurrence wins (candidate order is
+        // explicit/data_dir before defaults). Conversations with no
+        // external_id pass through: dropping them would trade a duplicate bug
+        // for a loss bug. Mirrors the opencode connector's spanning dedupe.
+        let mut seen_db_session_ids: HashSet<String> = HashSet::new();
 
         // Composer (`state.vscdb` -> `composerData:*`) — unchanged behavior.
         let roots: Vec<PathBuf> = Self::source_roots(ctx)
@@ -1257,12 +1371,22 @@ impl Connector for CursorConnector {
 
                 match Self::extract_from_db(&db_path, ctx.since_ts) {
                     Ok(convs) => {
+                        let mut kept = 0;
+                        for conv in convs {
+                            match conv.external_id.as_ref() {
+                                Some(id) if !seen_db_session_ids.insert(id.clone()) => {
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                            kept += 1;
+                            all_convs.push(conv);
+                        }
                         tracing::debug!(
                             path = %db_path.display(),
-                            count = convs.len(),
+                            count = kept,
                             "cursor extracted conversations"
                         );
-                        all_convs.extend(convs);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -2173,6 +2297,59 @@ mod tests {
         assert_eq!(result.unwrap().len(), 1);
     }
 
+    #[test]
+    fn default_detection_scopes_agent_transcripts_to_cursor_base() {
+        let dir = TempDir::new().unwrap();
+
+        // A data_dir that IS a Cursor base: one Composer conversation…
+        let cursor_dir = dir.path().join("Cursor");
+        let global_dir = cursor_dir.join("globalStorage");
+        fs::create_dir_all(&global_dir).unwrap();
+        let db_path = global_dir.join("state.vscdb");
+        let conn = create_test_db(&db_path);
+        let value = json!({ "text": "Both sources" }).to_string();
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            params!["composerData:both-123", value.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        // …plus one Agent transcript under the SAME base. Default detection
+        // must scan it from HERE, not from the machine's real
+        // ~/.cursor/projects (which leaks foreign sessions into the scan and
+        // made these tests fail on machines with local Cursor data).
+        let sid = "sess-both";
+        let transcript_dir = cursor_dir
+            .join("proj-x")
+            .join(AGENT_TRANSCRIPTS_DIR)
+            .join(sid);
+        fs::create_dir_all(&transcript_dir).unwrap();
+        fs::write(
+            transcript_dir.join(format!("{sid}.jsonl")),
+            format!(
+                "{}\n",
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"from agent transcripts"}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let connector = CursorConnector::new();
+        let ctx = ScanContext::local_default(cursor_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(
+            convs.len(),
+            2,
+            "exactly the one composer conversation and the one agent transcript from this base"
+        );
+        let ids: HashSet<String> = convs.iter().filter_map(|c| c.external_id.clone()).collect();
+        assert!(
+            ids.contains(sid),
+            "agent transcript under a Cursor-base data_dir must be indexed from that dir, ids={ids:?}"
+        );
+    }
+
     // =========================================================================
     // Edge case tests
     // =========================================================================
@@ -2701,15 +2878,26 @@ mod agent_transcript_tests {
         )
     }
 
+    fn write_workspace(transcript: &Path, workspace: &str) -> PathBuf {
+        let path = CursorConnector::agent_workspace_metadata_path(transcript).unwrap();
+        fs::write(
+            &path,
+            serde_json::json!({"workspacePath": workspace}).to_string(),
+        )
+        .unwrap();
+        path
+    }
+
     #[test]
     fn scan_parses_documented_agent_shape() {
         let tmp = TempDir::new().unwrap();
-        write_transcript(
+        let transcript = write_transcript(
             tmp.path(),
             "Users-ibrahim-workspace-foo",
             "sess-1",
             &[USER_LINE, ASSISTANT_LINE],
         );
+        write_workspace(&transcript, "/Users/ibrahim/workspace/foo");
         let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
         assert_eq!(convs.len(), 1);
         let c = &convs[0];
@@ -2717,6 +2905,10 @@ mod agent_transcript_tests {
         assert_eq!(c.external_id.as_deref(), Some("sess-1"));
         assert_eq!(c.metadata["cursor_format"], "agent");
         assert_eq!(c.metadata["source"], "cursor");
+        assert_eq!(
+            c.metadata["cursor_workspace_attribution"],
+            "workspace_trusted"
+        );
         assert_eq!(
             c.metadata["cursor_project_dir"],
             "Users-ibrahim-workspace-foo"
@@ -2842,14 +3034,216 @@ mod agent_transcript_tests {
     }
 
     #[test]
-    fn decode_agent_workspace_matches_documented_example() {
+    fn explicit_workspace_preserves_parent_and_leaf_hyphens_with_both_candidates_present() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("project-parent/my-app");
+        let guessed = tmp.path().join("project/parent/my/app");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&guessed).unwrap();
+        let project = workspace.to_str().unwrap().replace(['/', '\\', ':'], "-");
         assert_eq!(
-            CursorConnector::decode_agent_workspace("Users-ibrahim-workspace-foo"),
-            Some(PathBuf::from("/Users/ibrahim/workspace/foo"))
+            project,
+            guessed.to_str().unwrap().replace(['/', '\\', ':'], "-")
         );
-        // Empty / junk degrade to None, never panic.
-        assert_eq!(CursorConnector::decode_agent_workspace(""), None);
-        assert_eq!(CursorConnector::decode_agent_workspace("-"), None);
+        let projects = tmp.path().join("cursor-projects");
+        let transcript = write_transcript(&projects, &project, "stable-id", &[USER_LINE]);
+        write_workspace(&transcript, workspace.to_str().unwrap());
+        let convs = CursorConnector::new().scan(&ctx_for(&projects)).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].workspace.as_ref(), Some(&workspace));
+        assert_ne!(convs[0].workspace.as_ref(), Some(&guessed));
+        assert_eq!(convs[0].external_id.as_deref(), Some("stable-id"));
+        assert_eq!(convs[0].source_path, transcript);
+        assert_eq!(convs[0].metadata["cursor_project_dir"], project);
+    }
+
+    #[test]
+    fn absent_malformed_and_invalid_workspace_metadata_never_guess() {
+        let tmp = TempDir::new().unwrap();
+        let transcript = write_transcript(
+            tmp.path(),
+            "home-example-projects-my-app",
+            "s",
+            &[USER_LINE],
+        );
+        let sidecar = CursorConnector::agent_workspace_metadata_path(&transcript).unwrap();
+        let invalid = [
+            None,
+            Some("not json"),
+            Some("{}"),
+            Some(r#"{"workspacePath":null}"#),
+            Some(r#"{"workspacePath":42}"#),
+            Some(r#"{"workspacePath":[]}"#),
+            Some(r#"{"workspacePath":""}"#),
+            Some(r#"{"workspacePath":"relative/my-app"}"#),
+            Some(r#"{"workspacePath":"file:///home/example/my-app"}"#),
+            Some(r#"{"workspacePath":"C:relative"}"#),
+            Some(r#"{"workspacePath":"/home/example/\u0000my-app"}"#),
+        ];
+        for input in invalid {
+            if let Some(input) = input {
+                fs::write(&sidecar, input).unwrap();
+            }
+            let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
+            assert_eq!(convs.len(), 1, "{input:?}");
+            let c = &convs[0];
+            assert_eq!(c.workspace, None, "{input:?}");
+            assert_eq!(c.metadata["cursor_workspace_attribution"], "unresolved");
+            assert_eq!(
+                c.metadata["cursor_project_dir"],
+                "home-example-projects-my-app"
+            );
+            assert_eq!(c.external_id.as_deref(), Some("s"));
+            assert_eq!(c.source_path, transcript);
+            assert_eq!(c.messages.len(), 1);
+            assert_eq!(c.messages[0].content, "find the bug");
+        }
+    }
+
+    #[test]
+    fn exported_workspace_metadata_preserves_attribution_and_source_bytes() {
+        let source = TempDir::new().unwrap();
+        let exported = TempDir::new().unwrap();
+        let first = write_transcript(
+            source.path(),
+            "home-example-projects-my-app",
+            "first",
+            &[USER_LINE, ASSISTANT_LINE],
+        );
+        write_transcript(
+            source.path(),
+            "home-example-projects-my-app",
+            "second",
+            &[USER_LINE],
+        );
+        let sidecar = write_workspace(&first, "/home/example/projects/my-app");
+        let connector = CursorConnector::new();
+        let discovered = connector
+            .discover_source_files(&ctx_for(source.path()))
+            .unwrap();
+        assert_eq!(discovered.len(), 3);
+        let metadata: Vec<_> = discovered
+            .iter()
+            .filter(|s| s.role == DiscoveredSourceRole::MetadataSidecar)
+            .collect();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].source_path, sidecar);
+        assert!(metadata[0].required_for_reconstruction);
+        let before: Vec<_> = discovered
+            .iter()
+            .map(|s| {
+                (
+                    s.source_path.clone(),
+                    fs::read(&s.source_path).unwrap(),
+                    fs::metadata(&s.source_path).unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        for source_file in &discovered {
+            let destination = exported
+                .path()
+                .join(source_file.source_path.strip_prefix(source.path()).unwrap());
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(&source_file.source_path, destination).unwrap();
+        }
+        let original = connector.scan(&ctx_for(source.path())).unwrap();
+        let copied = connector.scan(&ctx_for(exported.path())).unwrap();
+        assert_eq!(original.len(), 2);
+        assert_eq!(copied.len(), original.len());
+        for (a, b) in original.iter().zip(&copied) {
+            assert_eq!(a.external_id, b.external_id);
+            assert_eq!(a.workspace, b.workspace);
+            assert_eq!(
+                a.workspace.as_deref(),
+                Some(Path::new("/home/example/projects/my-app"))
+            );
+            assert_eq!(a.metadata, b.metadata);
+            assert_eq!(a.messages.len(), b.messages.len());
+            for (a, b) in a.messages.iter().zip(&b.messages) {
+                assert_eq!(a.content, b.content);
+                assert_eq!(a.role, b.role);
+            }
+        }
+        for (path, bytes, mtime) in before {
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), mtime);
+        }
+        let mapped = ScanContext::with_roots(
+            exported.path().to_path_buf(),
+            vec![
+                ScanRoot::local(exported.path().to_path_buf())
+                    .with_rewrite("/home/example/projects", "/mapped/projects"),
+            ],
+            None,
+        );
+        let mapped = connector.scan(&mapped).unwrap();
+        assert_eq!(mapped.len(), 2);
+        assert!(
+            mapped
+                .iter()
+                .all(|c| c.workspace.as_deref() == Some(Path::new("/mapped/projects/my-app")))
+        );
+    }
+
+    #[test]
+    fn absolute_foreign_workspace_paths_do_not_require_local_existence() {
+        let tmp = TempDir::new().unwrap();
+        let transcript = write_transcript(tmp.path(), "foreign-project", "s", &[USER_LINE]);
+        for workspace in [
+            "/remote/parent-name/my-app",
+            r"C:\Users\example\my-app",
+            r"\\server\share\my-app",
+        ] {
+            write_workspace(&transcript, workspace);
+            let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
+            assert_eq!(convs.len(), 1);
+            assert_eq!(convs[0].workspace.as_deref(), Some(Path::new(workspace)));
+            assert_eq!(
+                convs[0].metadata["cursor_workspace_attribution"],
+                "workspace_trusted"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_change_selects_an_unchanged_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let transcript = write_transcript(tmp.path(), "parent-my-app", "s", &[USER_LINE]);
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        let original_mtime = fs::metadata(&transcript).unwrap().modified().unwrap();
+        let original_bytes = fs::read(&transcript).unwrap();
+        let since = i64::try_from(
+            (std::time::SystemTime::now() - std::time::Duration::from_secs(5))
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            Some(since),
+        );
+        assert!(CursorConnector::new().scan(&ctx).unwrap().is_empty());
+        write_workspace(&transcript, "/parent/my-app");
+        let convs = CursorConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].workspace.as_deref(),
+            Some(Path::new("/parent/my-app"))
+        );
+        assert_discovery_covers_scan_sources(&CursorConnector::new(), &ctx);
+        assert_eq!(fs::read(&transcript).unwrap(), original_bytes);
+        assert_eq!(
+            fs::metadata(&transcript).unwrap().modified().unwrap(),
+            original_mtime
+        );
     }
 
     #[test]
