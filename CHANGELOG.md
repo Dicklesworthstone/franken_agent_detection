@@ -51,7 +51,18 @@ window is since GitHub Release
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- **Letta Code client transcripts** stay on this fork (`LettaCodeConnector`,
+  `0.3.3-letta.1`). Canonical slug `letta_code` (alias `letta-code`). Default
+  root `~/.letta/transcripts`, override `LETTA_TRANSCRIPT_ROOT`. The parser
+  follows `letta-ai/trajectory` `59c0db52` and does not call Node.
+
+### Changed
+
+- **Upstream `main` through 0.3.2** is merged. Prime Agent is upstream's
+  connector. It indexes the active branch and records omitted sibling
+  branches in metadata. The alias `prime` still resolves to `prime_agent`.
 
 ## [0.3.2] -- 2026-09-26
 

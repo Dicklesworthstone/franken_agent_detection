@@ -469,22 +469,6 @@ mod tests {
     }
 
     #[test]
-    fn flatten_message_content_regression_snapshot_unchanged() {
-        let content = json!([
-            {"type": "text", "text": "Let me help:"},
-            {"type": "thinking", "thinking": "Analyzing..."},
-            {"type": "toolCall", "name": "bash", "arguments": {"command": "ls", "a": "1", "b": "2", "c": "3", "d": "4"}},
-            {"type": "image", "url": "data:image/png;base64,AAA"},
-            {"type": "text", "text": "Done!"}
-        ]);
-        let result = PiAgentConnector::flatten_message_content(&content);
-        assert_eq!(
-            result,
-            "Let me help:\n[Thinking] Analyzing...\n[Tool: bash] command=ls, a=1, b=2\nDone!"
-        );
-    }
-
-    #[test]
     fn flatten_message_content_limits_tool_args_to_three() {
         let content = json!([
             {"type": "toolCall", "name": "multi_arg", "arguments": {

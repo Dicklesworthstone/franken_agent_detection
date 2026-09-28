@@ -59,9 +59,7 @@ pub use connectors::opencode::OpenCodeConnector;
 #[cfg(feature = "shelley")]
 pub use connectors::shelley::ShelleyConnector;
 #[cfg(feature = "connectors")]
-pub use connectors::token_extraction::{
-    ExtractedTokenUsage, ModelInfo, TokenDataSource, extract_pi_family_tokens,
-};
+pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenDataSource};
 #[cfg(feature = "connectors")]
 pub use connectors::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot,
@@ -73,9 +71,10 @@ pub use connectors::{
     extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
     get_connector_factories, grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector,
-    normalize_model, omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
-    parse_timestamp, pi_agent::PiAgentConnector, prime_agent::PrimeAgentConnector,
-    qwen::QwenConnector, token_extraction, vibe::VibeConnector,
+    letta_code::LettaCodeConnector, normalize_model, omp::OmpConnector,
+    openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
+    pi_agent::PiAgentConnector, prime_agent::PrimeAgentConnector, qwen::QwenConnector,
+    token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -158,6 +157,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "hermes",
     "kimi",
     "kiro",
+    "letta_code",
     "muse",
     "omp",
     "opencode",
@@ -196,13 +196,14 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "hermes" | "hermes-agent" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
         "kiro" | "kiro-cli" | "kirocli" => Some("kiro"),
+        "letta_code" | "letta-code" => Some("letta_code"),
         "muse" | "muse-code" | "muse_code" | "musecode" | "meta-muse" => Some("muse"),
         "omp" | "oh-my-pi" => Some("omp"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
         "openhands" | "open-hands" => Some("openhands"),
         "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
-        "prime_agent" | "prime-agent" | "primeagent" => Some("prime_agent"),
+        "prime_agent" | "prime-agent" | "primeagent" | "prime" => Some("prime_agent"),
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
         "shelley" | "shelley-db" => Some("shelley"),
         "vibe" | "vibe-cli" => Some("vibe"),
@@ -281,44 +282,6 @@ fn letta_transcript_root_from_env_value(value: &str) -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(trimmed))
     }
-}
-
-pub(crate) fn nonempty_trimmed(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|text| !text.is_empty())
-}
-
-/// Expand `~` and `~/` the same way Prime Agent's `expandTildePath` does.
-pub(crate) fn expand_tilde_like_prime(path: &str, home: Option<&std::path::Path>) -> PathBuf {
-    let trimmed = path.trim();
-    if trimmed == "~" {
-        return home.map_or_else(PathBuf::new, Path::to_path_buf);
-    }
-    if let Some(rest) = trimmed.strip_prefix("~/") {
-        return home.map_or_else(|| PathBuf::from(rest), |home| home.join(rest));
-    }
-    PathBuf::from(trimmed)
-}
-
-/// Resolve the Prime sessions directory from documented environment overrides.
-pub(crate) fn prime_agent_session_dir_from_overrides(
-    session_dir: Option<&str>,
-    legacy_session_dir: Option<&str>,
-    agent_dir: Option<&str>,
-    home: Option<&std::path::Path>,
-) -> PathBuf {
-    if let Some(dir) = nonempty_trimmed(session_dir) {
-        return expand_tilde_like_prime(dir, home);
-    }
-    if let Some(dir) = nonempty_trimmed(legacy_session_dir) {
-        return expand_tilde_like_prime(dir, home);
-    }
-    if let Some(dir) = nonempty_trimmed(agent_dir) {
-        return expand_tilde_like_prime(dir, home).join("sessions");
-    }
-    home.map_or_else(
-        || PathBuf::from(".prime/agent/sessions"),
-        |home| home.join(".prime").join("agent").join("sessions"),
-    )
 }
 
 fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
@@ -980,10 +943,6 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
                 out.push(cwd_db);
             }
             maybe_push(&mut out, &["shelley.db"]);
-        }
-        "prime_agent" => {
-            maybe_push(&mut out, &[".prime", "agent", "sessions"]);
-            maybe_push(&mut out, &[".prime", "agent"]);
         }
         "qwen" => {
             maybe_push(&mut out, &[".qwen", "tmp"]);
@@ -2150,6 +2109,10 @@ mod tests {
             by_slug.get("grok_bot").expect("Grok Bot paths"),
             &vec!["~/Library/Application Support/Grok Bot/sand-client-persistence".to_string()]
         );
+
+        let letta_code = by_slug.get("letta_code").expect("letta_code paths");
+        assert!(letta_code.contains(&"~/.letta/transcripts".to_string()));
+        assert!(!letta_code.iter().any(|path| path == "~/.letta"));
 
         let muse = by_slug.get("muse").expect("muse paths");
         assert!(muse.contains(&"~/.local/share/muse/sessions".to_string()));

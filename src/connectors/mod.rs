@@ -32,6 +32,7 @@ pub mod grok_bot;
 pub mod hermes;
 pub mod kimi;
 pub mod kiro;
+pub mod letta_code;
 pub mod muse;
 pub mod omp;
 pub mod openclaw;
@@ -73,8 +74,7 @@ pub use scan::{
 };
 pub use token_extraction::{
     ExtractedTokenUsage, ModelInfo, TokenDataSource, estimate_tokens_from_content,
-    extract_claude_code_tokens, extract_codex_tokens, extract_pi_family_tokens,
-    extract_tokens_for_agent, normalize_model,
+    extract_claude_code_tokens, extract_codex_tokens, extract_tokens_for_agent, normalize_model,
 };
 pub use utils::{
     extract_invocations_from_content_blocks, file_modified_since, flatten_content, parse_timestamp,
@@ -294,6 +294,9 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("factory", || Box::new(factory::FactoryConnector::new())),
         ("kimi", || Box::new(kimi::KimiConnector::new())),
         ("kiro", || Box::new(kiro::KiroConnector::new())),
+        ("letta_code", || {
+            Box::new(letta_code::LettaCodeConnector::new())
+        }),
         ("muse", || Box::new(muse::MuseConnector::new())),
         ("openclaw", || Box::new(openclaw::OpenClawConnector::new())),
         ("openhands", || {
