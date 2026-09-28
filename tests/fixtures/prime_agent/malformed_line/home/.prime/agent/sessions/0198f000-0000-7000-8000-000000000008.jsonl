@@ -1,4 +1,0 @@
-{"type":"session","version":3,"id":"0198f000-0000-7000-8000-000000000008","timestamp":"2026-08-13T18:00:00.000Z","cwd":"/fabricated/prime/malformed"}
-{"type":"message","id":"muser001","parentId":null,"timestamp":"2026-08-13T18:00:01.000Z","message":{"role":"user","content":"before bad line"}}
-{this is not json
-{"type":"message","id":"muser002","parentId":"muser001","timestamp":"2026-08-13T18:00:03.000Z","message":{"role":"user","content":"after bad line"}}

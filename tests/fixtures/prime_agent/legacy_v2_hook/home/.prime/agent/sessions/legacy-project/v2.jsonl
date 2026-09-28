@@ -1,3 +1,0 @@
-{"type":"session","version":2,"id":"legacy-v2-session","timestamp":"2026-02-01T00:00:00.000Z","cwd":"/fabricated/prime/legacy-v2"}
-{"type":"message","id":"hook0001","parentId":null,"timestamp":"2026-02-01T00:00:01.000Z","message":{"role":"hookMessage","customType":"legacy-hook","content":"legacy hook context","display":true}}
-{"type":"message","id":"v2user01","parentId":"hook0001","timestamp":"2026-02-01T00:00:02.000Z","message":{"role":"user","content":"v2 user after hook"}}

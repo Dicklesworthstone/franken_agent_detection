@@ -1,3 +1,0 @@
-{"type":"session","id":"legacy-v1-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/fabricated/prime/legacy-v1"}
-{"type":"message","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"legacy v1 user"}}
-{"type":"message","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"legacy v1 assistant"}]}}

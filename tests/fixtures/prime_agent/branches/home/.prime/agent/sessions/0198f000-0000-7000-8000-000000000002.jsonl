@@ -1,6 +1,0 @@
-{"type":"session","version":3,"id":"0198f000-0000-7000-8000-000000000002","timestamp":"2026-08-13T13:00:00.000Z","cwd":"/fabricated/prime/branches"}
-{"type":"message","id":"root0001","parentId":null,"timestamp":"2026-08-13T13:00:01.000Z","message":{"role":"user","content":"start branch tree"}}
-{"type":"message","id":"asstb001","parentId":"root0001","timestamp":"2026-08-13T13:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"choose a path"}],"provider":"anthropic","model":"claude-opus-4-6","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0},"stopReason":"stop"}}
-{"type":"message","id":"aband001","parentId":"asstb001","timestamp":"2026-08-13T13:00:03.000Z","message":{"role":"user","content":"prime-abandoned-branch-magenta-path"}}
-{"type":"branch_summary","id":"summ0001","parentId":"asstb001","timestamp":"2026-08-13T13:00:04.000Z","fromId":"aband001","summary":"prime-branch-summary-blue-fork"}
-{"type":"message","id":"kept0001","parentId":"summ0001","timestamp":"2026-08-13T13:00:05.000Z","message":{"role":"user","content":"prime-append-white-quill"}}

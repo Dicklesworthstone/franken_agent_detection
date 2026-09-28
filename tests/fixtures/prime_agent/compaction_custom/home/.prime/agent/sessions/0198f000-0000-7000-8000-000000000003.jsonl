@@ -1,7 +1,0 @@
-{"type":"session","version":3,"id":"0198f000-0000-7000-8000-000000000003","timestamp":"2026-08-13T14:00:00.000Z","cwd":"/fabricated/prime/custom"}
-{"type":"message","id":"cuser001","parentId":null,"timestamp":"2026-08-13T14:00:01.000Z","message":{"role":"user","content":"please compact later"}}
-{"type":"compaction","id":"comp0001","parentId":"cuser001","timestamp":"2026-08-13T14:00:02.000Z","summary":"prime-compaction-gold-archive","firstKeptEntryId":"cuser001","tokensBefore":50000,"fromHook":false,"customInstructions":"keep the orchard"}
-{"type":"custom_message","id":"cmsg0001","parentId":"comp0001","timestamp":"2026-08-13T14:00:03.000Z","customType":"prime-extension","content":"prime-custom-context-teal-signal","display":true}
-{"type":"custom_message","id":"cmsg0002","parentId":"cmsg0001","timestamp":"2026-08-13T14:00:04.000Z","customType":"hidden-note","content":"hidden custom context","display":false}
-{"type":"message","id":"cmsg0003","parentId":"cmsg0002","timestamp":"2026-08-13T14:00:05.000Z","message":{"role":"custom","customType":"nested-custom","content":[{"type":"text","text":"nested custom context"}],"display":true}}
-{"type":"custom","id":"cste0001","parentId":"cmsg0003","timestamp":"2026-08-13T14:00:06.000Z","customType":"prime-extension","data":{"secret":"do-not-copy-this-blob"}}

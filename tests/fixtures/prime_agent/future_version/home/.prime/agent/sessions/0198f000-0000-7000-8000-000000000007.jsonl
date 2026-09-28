@@ -1,4 +1,0 @@
-{"type":"session","version":4,"id":"0198f000-0000-7000-8000-000000000007","timestamp":"2026-08-13T17:00:00.000Z","cwd":"/fabricated/prime/future"}
-{"type":"message","id":"fuser001","parentId":null,"timestamp":"2026-08-13T17:00:01.000Z","message":{"role":"user","content":"future known user"}}
-{"type":"unknown_future_entry","id":"unkn0001","parentId":"fuser001","timestamp":"2026-08-13T17:00:02.000Z","payload":{"x":1}}
-{"type":"message","id":"fasst001","parentId":"unkn0001","timestamp":"2026-08-13T17:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"future known assistant"}]}}
