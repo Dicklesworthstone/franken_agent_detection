@@ -408,17 +408,40 @@ impl Connector for CodebuffConnector {
         ctx: &ScanContext,
         emit: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
+        // One transcript that does not parse (upstream's /history lists chats
+        // truncated by a crash mid-write as unreadable) must not hide every
+        // other chat (cass GH #511): emit each chat that parses, then fail the
+        // scan with the first bad transcript's path and cause. Hosts often
+        // show only the top message, so it carries both; the original error
+        // stays in the chain, so an I/O cause is still an I/O cause.
+        let mut first_failure: Option<(PathBuf, anyhow::Error)> = None;
+        let mut failures = 0_usize;
         for source in Self::discover(ctx)? {
             if source.role == DiscoveredSourceRole::PrimarySessionLog {
-                if let Some(conversation) = parse_session(&source)? {
-                    emit(conversation)?;
+                match parse_session(&source) {
+                    Ok(Some(conversation)) => emit(conversation)?,
+                    Ok(None) => {}
+                    Err(error) => {
+                        failures += 1;
+                        first_failure.get_or_insert_with(|| (source.source_path.clone(), error));
+                    }
                 }
                 if let Some(tick) = &ctx.progress_tick {
                     tick();
                 }
             }
         }
-        Ok(())
+        match first_failure {
+            None => Ok(()),
+            Some((path, error)) => {
+                let others = match failures - 1 {
+                    0 => String::new(),
+                    more => format!(" (and {more} more unparseable transcripts)"),
+                };
+                let summary = format!("{}: {error:#}{others}", path.display());
+                Err(error.context(summary))
+            }
+        }
     }
 }
 
@@ -730,6 +753,55 @@ mod tests {
         assert_eq!(undated[0].messages[0].created_at, None);
         assert_eq!(undated[0].started_at, Some(1_788_264_000_000));
         assert_eq!(undated[0].ended_at, None);
+    }
+
+    /// cass GH #511: one transcript that does not parse (here truncated
+    /// mid-write) aborted the scan before the store's other chats. Every chat
+    /// that parses is now emitted, and the scan then fails naming the first
+    /// bad transcript and its cause.
+    #[test]
+    fn gh511_one_unparseable_transcript_does_not_hide_the_other_chats() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path(), "good", &records());
+        let truncated = fixture(dir.path(), "truncated", &records());
+        fs::write(&truncated, br#"[{"id":"user-1774113351457""#).unwrap();
+        let wrong_shape = fixture(dir.path(), "wrong-shape", &records());
+        fs::write(&wrong_shape, b"{}").unwrap();
+        let connector = CodebuffConnector::new();
+        let mut emitted = Vec::new();
+        let error = connector
+            .scan_with_callback(&context(dir.path()), &mut |conversation| {
+                emitted.push(conversation);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].messages.len(), 4);
+        assert!(
+            emitted[0]
+                .source_path
+                .ends_with("good/chats/2026-09-01T12-00-00.000Z/chat-messages.json")
+        );
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!("{}: ", truncated.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains("invalid Codebuff / Freebuff transcript JSON"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("(and 1 more unparseable transcripts)"),
+            "{message}"
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+        );
+        // The collecting scan still refuses to report a partial store as whole.
+        assert!(connector.scan(&context(dir.path())).is_err());
     }
 
     #[test]
