@@ -142,6 +142,50 @@ fn session_key(path: &Path) -> Option<String> {
     serde_json::to_string(&(store, project, id)).ok()
 }
 
+// Upstream writes `timestamp` with `formatTimestamp()` (cli/src/utils/helpers.ts):
+// a locale time of day ("01:15 PM", "13:15", "13.15") with no date or zone
+// (cass GH #511). The instant lives in the message ID, which embeds
+// `Date.now()`: `user-<ms>`, `ai-<ms>-<hex>`, `error-<ms>`, `divider-<ms>`,
+// `sys-<ms>`; `bash-result-<uuid>` has none. An ISO-8601 timestamp (schema
+// fixtures, exports) is used as written, and a corrupt one is an error. A time
+// of day is never joined to a guessed date or zone: with no ID instant the
+// message time is unknown. The second value names the source of the instant.
+fn message_created_at(id: &str, timestamp: &str) -> Result<(Option<i64>, &'static str)> {
+    let bytes = timestamp.as_bytes();
+    let iso_shaped =
+        bytes.len() >= 10 && bytes[..4].iter().all(u8::is_ascii_digit) && bytes[4] == b'-';
+    if iso_shaped {
+        let ms = parse_timestamp(&Value::String(timestamp.into()))
+            .context("unparseable ISO-8601 timestamp")?;
+        return Ok((Some(ms), "timestamp"));
+    }
+    Ok(id_epoch_ms(id).map_or((None, "unavailable"), |ms| {
+        (Some(ms), "message_id_epoch_ms")
+    }))
+}
+
+/// The `Date.now()` segment after an ID's first dash: 13 decimal digits
+/// between 2020-01-01 and 2100-01-01.
+fn id_epoch_ms(id: &str) -> Option<i64> {
+    let digits = id.split_once('-')?.1.split('-').next()?;
+    if digits.len() != 13 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let ms = digits.parse::<i64>().ok()?;
+    (1_577_836_800_000..4_102_444_800_000)
+        .contains(&ms)
+        .then_some(ms)
+}
+
+/// The chat directory is `new Date().toISOString()` with `:` replaced by `-`
+/// (cli/src/project-files.ts), so it records when the chat started.
+fn chat_started_at(path: &Path) -> Option<i64> {
+    let id = path.parent()?.file_name()?.to_str()?;
+    chrono::NaiveDateTime::parse_from_str(id, "%Y-%m-%dT%H-%M-%S%.fZ")
+        .ok()
+        .map(|time| time.and_utc().timestamp_millis())
+}
+
 fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value
         .get(key)
@@ -229,7 +273,7 @@ fn parse_session(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
         };
         let base = required_string(record, "content")?;
         let timestamp = required_string(record, "timestamp")?;
-        let created_at = parse_timestamp(&Value::String(timestamp.into()))
+        let (created_at, created_at_source) = message_created_at(id, timestamp)
             .with_context(|| format!("invalid shared CLI timestamp at record {idx}"))?;
         let mut invocations = Vec::new();
         let block_text = record
@@ -259,6 +303,7 @@ fn parse_session(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
             metadata.remove("runState");
         }
         extra["codebuff_message_id"] = json!(id);
+        extra["codebuff_created_at_source"] = json!(created_at_source);
         messages.push(NormalizedMessage {
             idx: i64::try_from(idx).context("too many shared CLI messages")?,
             role: role.into(),
@@ -266,7 +311,7 @@ fn parse_session(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
                 .pointer("/agent/agentName")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            created_at: Some(created_at),
+            created_at,
             content,
             extra,
             snippets: Vec::new(),
@@ -286,7 +331,11 @@ fn parse_session(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
             .map(|m| m.content.chars().take(120).collect()),
         workspace,
         source_path: source.source_path.clone(),
-        started_at: messages.iter().filter_map(|m| m.created_at).min(),
+        started_at: messages
+            .iter()
+            .filter_map(|m| m.created_at)
+            .min()
+            .or_else(|| chat_started_at(&source.source_path)),
         ended_at: messages.iter().filter_map(|m| m.created_at).max(),
         metadata,
         messages,
@@ -582,7 +631,10 @@ mod tests {
         }
         for (field, bad) in [
             ("variant", json!("future-role")),
-            ("timestamp", json!("bad")),
+            // A time of day is native display text (GH #511), but an ISO
+            // timestamp that does not parse is corrupt.
+            ("timestamp", json!("2026-13-45T99:00:00Z")),
+            ("timestamp", json!(17)),
             ("id", json!("")),
             ("blocks", json!([{"type":"future-block"}])),
         ] {
@@ -610,6 +662,74 @@ mod tests {
             recovered[0].metadata["run_state_status"],
             "unreadable_or_oversized"
         );
+    }
+
+    /// cass GH #511: native CLIs write `formatTimestamp()`, a locale time of
+    /// day, so every native transcript failed with "invalid shared CLI
+    /// timestamp". The instant comes from the `Date.now()` in the message ID
+    /// and is never synthesized from the time of day.
+    #[test]
+    fn gh511_native_time_of_day_takes_the_instant_from_the_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = json!([
+            {"id":"user-1774113351457", "variant":"user", "content":"Synthetic probe question",
+             "timestamp":"01:15 PM"},
+            // Current AI IDs append a random suffix; "13.16" is a time of day
+            // that a numeric parse would read as 13 seconds after 1970.
+            {"id":"ai-1774113411457-3f9a2c", "variant":"ai", "content":"Synthetic probe answer",
+             "timestamp":"13.16"},
+            {"id":"bash-result-6f1c3a52-9e0b-4f7d-8a21-0c5d4e3b2a19", "variant":"ai",
+             "content":"ls output", "timestamp":"01:17 PM"},
+            {"id":"user-123", "variant":"user", "content":"short id", "timestamp":"1:18 pm"},
+            {"id":"sys-9999999999999", "variant":"user", "content":"year 2286",
+             "timestamp":"01:19 PM"},
+            {"id":"error-1774113351457", "variant":"error", "content":"absolute wins",
+             "timestamp":"2026-09-01T12:00:00.000Z"}
+        ]);
+        let path = fixture(dir.path(), "probe", &native);
+        let connector = CodebuffConnector::new();
+        let conversations = connector.scan(&context(dir.path())).unwrap();
+        assert_eq!(conversations.len(), 1);
+        let conv = &conversations[0];
+        let times: Vec<_> = conv
+            .messages
+            .iter()
+            .map(|m| {
+                (
+                    m.created_at,
+                    m.extra["codebuff_created_at_source"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            times,
+            [
+                (Some(1_774_113_351_457), "message_id_epoch_ms"),
+                (Some(1_774_113_411_457), "message_id_epoch_ms"),
+                (None, "unavailable"),
+                (None, "unavailable"),
+                (None, "unavailable"),
+                (Some(1_788_264_000_000), "timestamp"),
+            ]
+        );
+        assert_eq!(conv.messages[0].extra["timestamp"], "01:15 PM");
+        assert_eq!(conv.started_at, Some(1_774_113_351_457));
+        assert_eq!(conv.ended_at, Some(1_788_264_000_000));
+
+        // No message instant: the chat directory still dates the session.
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([
+                {"id":"bash-result-1", "variant":"ai", "content":"only output",
+                 "timestamp":"01:17 PM"}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let undated = connector.scan(&context(dir.path())).unwrap();
+        assert_eq!(undated[0].messages[0].created_at, None);
+        assert_eq!(undated[0].started_at, Some(1_788_264_000_000));
+        assert_eq!(undated[0].ended_at, None);
     }
 
     #[test]
