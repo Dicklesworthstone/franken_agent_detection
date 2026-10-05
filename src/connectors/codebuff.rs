@@ -762,7 +762,9 @@ mod tests {
     #[test]
     fn gh511_one_unparseable_transcript_does_not_hide_the_other_chats() {
         let dir = tempfile::tempdir().unwrap();
-        fixture(dir.path(), "good", &records());
+        // Discovery is path-ordered: the good chat sorts after both bad ones,
+        // so the old early return emitted nothing.
+        fixture(dir.path(), "z-good", &records());
         let truncated = fixture(dir.path(), "truncated", &records());
         fs::write(&truncated, br#"[{"id":"user-1774113351457""#).unwrap();
         let wrong_shape = fixture(dir.path(), "wrong-shape", &records());
@@ -780,7 +782,7 @@ mod tests {
         assert!(
             emitted[0]
                 .source_path
-                .ends_with("good/chats/2026-09-01T12-00-00.000Z/chat-messages.json")
+                .ends_with("z-good/chats/2026-09-01T12-00-00.000Z/chat-messages.json")
         );
         let message = error.to_string();
         assert!(
