@@ -52,6 +52,21 @@ window is since GitHub Release
 
 No changes yet.
 
+## [0.3.5] -- 2026-10-05
+
+### Fixed
+
+- **Codebuff / Freebuff: one unparseable transcript no longer hides the
+  store's other chats**
+  ([`a7b0dc9`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/a7b0dc9),
+  cass GH #511). The scan stopped at the first transcript that failed to
+  parse, for example one truncated by a crash mid-write, so every other chat
+  in the store went unindexed. Each chat that parses is now emitted, and the
+  scan then fails with the first bad transcript's path and cause in its top
+  message, plus how many more failed. The original error stays in the
+  chain, so an I/O cause is still classified as I/O. The collecting
+  `scan()` still returns the error rather than a partial store.
+
 ## [0.3.4] -- 2026-10-05
 
 ### Fixed
