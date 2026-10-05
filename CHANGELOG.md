@@ -52,6 +52,26 @@ window is since GitHub Release
 
 No changes yet.
 
+## [0.3.4] -- 2026-10-05
+
+### Fixed
+
+- **Codebuff / Freebuff: native transcripts index**
+  ([`8fb564b`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/8fb564b),
+  cass GH #511). The CLI writes `ChatMessage.timestamp` with
+  `formatTimestamp()`: a locale time of day such as `"01:15 PM"`, with no date
+  or zone. The connector required a full timestamp, so every native transcript
+  failed with "invalid shared CLI timestamp" (the GH #423 fixtures used ISO
+  timestamps the CLI never writes). The instant now comes, in order, from an
+  ISO-8601 `timestamp` (a corrupt one is still an error), then from the
+  `Date.now()` milliseconds in the message ID (`user-<ms>`, `ai-<ms>-<hex>`,
+  `error-<ms>`, …). Otherwise it is unknown. A time of day is never combined
+  with a guessed date or zone. Each message records the rule in
+  `extra.codebuff_created_at_source` (`timestamp`, `message_id_epoch_ms`,
+  `unavailable`) and keeps the native display string. A conversation with no
+  message instant takes `started_at` from its chat directory, which the CLI
+  names with the chat's ISO creation time.
+
 ## [0.3.3] -- 2026-09-28
 
 ### Fixed
