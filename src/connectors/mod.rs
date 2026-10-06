@@ -56,7 +56,9 @@ pub mod shelley;
     feature = "devin",
     feature = "shelley",
     feature = "openclaw-sqlite",
-    feature = "copilot-vscdb"
+    feature = "copilot-vscdb",
+    feature = "pi-sqlite",
+    feature = "pi-durable"
 ))]
 pub mod sqlite_sync;
 pub mod token_extraction;

@@ -858,10 +858,13 @@ fn visible_entries<'a>(
                     .filter(|e| as_i64(e.get("id")).is_some_and(|eid| eid <= cap)),
             );
         }
+        // A nested fork sees an ancestor only up to the EARLIEST cap on the
+        // way: C forked from B at an entry B inherited from A must not see
+        // A's entries after that point.
         cursor = store.conversations.get(&id).and_then(|record| {
             Some((
                 as_i64(record.pointer("/parent/conversationId"))?,
-                as_i64(record.pointer("/parent/at"))?,
+                as_i64(record.pointer("/parent/at"))?.min(cap),
             ))
         });
     }
@@ -1275,9 +1278,13 @@ fn normalize_store(store: &DurableStore, identity: &StoreIdentity) -> Vec<Normal
 }
 
 fn store_modified_since(candidate: &StoreCandidate, since_ts: Option<i64>) -> bool {
+    // A missing WAL (checkpointed on close) is not a change, but
+    // `file_modified_since` treats a missing path as modified.
+    let wal = sidecar_path(&candidate.path, "-wal");
     file_modified_since(&candidate.path, since_ts)
         || (candidate.backend == DurableBackend::Sqlite
-            && file_modified_since(&sidecar_path(&candidate.path, "-wal"), since_ts))
+            && wal.is_file()
+            && file_modified_since(&wal, since_ts))
 }
 
 fn scan_candidate(candidate: &StoreCandidate) -> Result<Vec<NormalizedConversation>> {
@@ -1996,6 +2003,47 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn nested_forks_see_ancestors_only_up_to_the_earliest_cap() {
+        // A: 10 user, 11 answer, 12 user, 13 reset(head 13), 14 answer.
+        // B forks A at 14 (sees the reset). C forks B at 12, an entry B
+        // inherited from A: C must not see A's reset at 13.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("s");
+        fs::create_dir_all(&dir).unwrap();
+        let user_entry = |id: i64, conv: i64, text: &str| json!({"type": "entry", "value": {"id": id, "conversationId": conv, "kind": "pi.user", "model": [{"role": "user", "content": text}]}});
+        let commits = [
+            vec![json!({"type": "conversation", "value": {"id": 1}})],
+            vec![
+                user_entry(10, 1, "a10"),
+                user_entry(11, 1, "a11"),
+                user_entry(12, 1, "a12"),
+                json!({"type": "entry", "value": {"id": 13, "conversationId": 1, "kind": "pi.reset", "head": 13}}),
+                user_entry(14, 1, "a14"),
+            ],
+            vec![
+                json!({"type": "conversation", "value": {"id": 2, "parent": {"conversationId": 1, "at": 14}}}),
+            ],
+            vec![user_entry(20, 2, "b20")],
+            vec![
+                json!({"type": "conversation", "value": {"id": 3, "parent": {"conversationId": 2, "at": 12}}}),
+            ],
+            vec![user_entry(30, 3, "c30")],
+        ];
+        let mut main = String::new();
+        for (i, writes) in commits.iter().enumerate() {
+            main.push_str(
+                &json!({"format": 1, "type": "commit", "seq": i + 1, "writes": writes}).to_string(),
+            );
+            main.push('\n');
+        }
+        fs::write(dir.join(MAIN_FILE), main).unwrap();
+
+        let convs = scan(&dir);
+        assert_eq!(by_id(&convs, 2).metadata["context"]["head_entry_id"], 13);
+        assert!(by_id(&convs, 3).metadata["context"]["head_entry_id"].is_null());
+    }
+
     #[cfg(feature = "pi-durable")]
     mod sqlite {
         use super::*;
@@ -2201,6 +2249,27 @@ mod tests {
                 .collect();
             codes.sort_unstable();
             assert_eq!(codes, vec!["not_a_durable_store", "unsupported_version"]);
+        }
+
+        #[test]
+        fn incremental_scans_skip_closed_stores_without_a_wal() {
+            let tmp = TempDir::new().unwrap();
+            let db = host_layout_db(tmp.path());
+            write_sqlite_store(&db, SUPPORTED_SQLITE_SCHEMA);
+            // Simulate a store whose WAL was checkpointed away on close; the
+            // filter must decide from the database alone, without opening it.
+            for suffix in ["-wal", "-shm"] {
+                let _ = fs::remove_file(sidecar_path(&db, suffix));
+            }
+            let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+            let ctx = ScanContext::with_roots(
+                PathBuf::from("/nonexistent"),
+                vec![ScanRoot::local(tmp.path().join(".pi/agent"))],
+                Some(future),
+            );
+            let connector = PiDurableConnector::new();
+            assert!(connector.scan(&ctx).unwrap().is_empty());
+            assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
         }
 
         #[test]

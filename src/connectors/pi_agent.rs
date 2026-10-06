@@ -261,7 +261,16 @@ impl PiAgentConnector {
     ///   session files carry a `_` (mirroring `<timestamp>_<uuid>` naming); the
     ///   always-present `session-index.sqlite` metadata index sidecar has no
     ///   `_`, so default JSONL installs never trip this diagnostic.
+    #[cfg(test)]
     fn detect_unsupported_stores(root: &Path) -> Vec<UnsupportedPiStore> {
+        Self::detect_unsupported_stores_at(root, false)
+    }
+
+    /// As [`Self::detect_unsupported_stores`]; SQLite sessions under a
+    /// `remote` root are always reported, because they are never read there
+    /// (a synced database plus WAL is not a consistent snapshot).
+    fn detect_unsupported_stores_at(root: &Path, remote: bool) -> Vec<UnsupportedPiStore> {
+        let report_sqlite = remote || !cfg!(feature = "pi-sqlite");
         let mut out = Vec::new();
         let sessions = Self::sessions_dir(root);
         if !sessions.exists() {
@@ -282,7 +291,7 @@ impl PiAgentConnector {
                         entry.path().to_path_buf(),
                     ));
                 }
-            } else if !cfg!(feature = "pi-sqlite")
+            } else if report_sqlite
                 && entry.file_type().is_file()
                 && Path::new(name)
                     .extension()
@@ -301,11 +310,11 @@ impl PiAgentConnector {
     }
 
     /// Collect deduplicated unsupported-store diagnostics across `homes`.
-    fn collect_unsupported_stores(homes: &[PathBuf]) -> Vec<UnsupportedPiStore> {
+    fn collect_unsupported_stores(roots: &[ScanRoot]) -> Vec<UnsupportedPiStore> {
         let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut out = Vec::new();
-        for home in homes {
-            for store in Self::detect_unsupported_stores(home) {
+        for root in roots {
+            for store in Self::detect_unsupported_stores_at(&root.path, root.origin.is_remote()) {
                 if seen.insert(dedupe_path_key(&store.path)) {
                     out.push(store);
                 }
@@ -323,11 +332,7 @@ impl PiAgentConnector {
     /// `scan()` additionally logs each of these via `tracing::warn!`.
     #[must_use]
     pub fn unsupported_store_diagnostics(&self, ctx: &ScanContext) -> Vec<UnsupportedPiStore> {
-        let homes: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
-        Self::collect_unsupported_stores(&homes)
+        Self::collect_unsupported_stores(&Self::source_roots(ctx))
     }
 }
 
@@ -368,13 +373,13 @@ impl Connector for PiAgentConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         let roots = Self::source_roots(ctx);
-        let homes: Vec<PathBuf> = roots.iter().map(|root| root.path.clone()).collect();
 
         // Surface Pi storage formats this connector does not index (Session
-        // Store V2 sidecars; SQLite sessions without the `pi-sqlite` feature)
-        // as explicit, machine-readable diagnostics so users on non-default
-        // storage are not silently left with zero/partial coverage.
-        for store in Self::collect_unsupported_stores(&homes) {
+        // Store V2 sidecars; SQLite sessions without the `pi-sqlite` feature
+        // or under a remote root) as explicit, machine-readable diagnostics so
+        // users on non-default storage are not silently left with zero or
+        // partial coverage.
+        for store in Self::collect_unsupported_stores(&roots) {
             store.warn();
         }
 
@@ -2180,6 +2185,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn excluded_shell_runs_and_failed_answers_never_reach_the_model_context() {
+        let lines: Vec<String> = vec![
+            json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"ask"}}),
+            json!({"type":"message","id":"b1","parentId":"u1","timestamp":"2026-01-05T10:00:02Z","message":{"role":"bashExecution","command":"echo private","output":"PRIVATE_SHELL","excludeFromContext":true}}),
+            json!({"type":"message","id":"a1","parentId":"b1","timestamp":"2026-01-05T10:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"ABORTED_REPLY"}],"stopReason":"aborted"}}),
+            json!({"type":"message","id":"a2","parentId":"a1","timestamp":"2026-01-05T10:00:04Z","message":{"role":"assistant","content":[{"type":"text","text":"GOOD_REPLY"}],"stopReason":"stop"}}),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect();
+        let conv = scan_single(&lines);
+        // Archived and on the active branch, but never sent to the model.
+        for marker in ["PRIVATE_SHELL", "ABORTED_REPLY"] {
+            let msg = message_with(&conv, marker);
+            assert_eq!(cass(msg, "on_active_branch"), true, "{marker}");
+            assert_eq!(cass(msg, "in_active_context"), false, "{marker}");
+        }
+        assert_eq!(
+            cass(message_with(&conv, "GOOD_REPLY"), "in_active_context"),
+            true
+        );
+    }
+
     // =========================================================================
     // pi_agent_rust SQLite sessions (`pi-sqlite` feature)
     // =========================================================================
@@ -2287,6 +2316,30 @@ mod tests {
         }
 
         #[test]
+        fn incremental_scans_skip_closed_sqlite_sessions_without_a_wal() {
+            let dir = TempDir::new().unwrap();
+            let storage = create_pi_agent_storage(&dir);
+            let (header, entries) = rust_session();
+            let db = storage
+                .join("sessions")
+                .join("--w--")
+                .join("2026-02-01T10-00-00_closed.sqlite");
+            write_sqlite_session(&db, &header, &entries);
+            // Simulate a session whose WAL was checkpointed away on close; the
+            // filter must decide from the database alone, without opening it.
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = db.as_os_str().to_owned();
+                sidecar.push(suffix);
+                let _ = fs::remove_file(sidecar);
+            }
+            let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+            let ctx = ScanContext::local_default(storage, Some(future));
+            let connector = PiAgentConnector::new();
+            assert!(connector.scan(&ctx).unwrap().is_empty());
+            assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
+        }
+
+        #[test]
         fn remote_sqlite_sessions_are_not_read() {
             let dir = TempDir::new().unwrap();
             let storage = create_pi_agent_storage(&dir);
@@ -2311,6 +2364,10 @@ mod tests {
             let connector = PiAgentConnector::new();
             assert!(connector.scan(&ctx).unwrap().is_empty());
             assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
+            // Not read, so reported rather than silently missing.
+            let diagnostics = connector.unsupported_store_diagnostics(&ctx);
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert_eq!(diagnostics[0].store_format, "sqlite_sessions");
         }
 
         #[test]

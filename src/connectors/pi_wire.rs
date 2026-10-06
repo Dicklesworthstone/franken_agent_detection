@@ -994,8 +994,23 @@ fn parse_session_records<'a>(
             off_branch_message_count += 1;
         }
         // An older compaction retained inside the newest kept range is raw
-        // history only; just the newest one contributes its summary.
+        // history only. Shell runs marked `excludeFromContext` and failed or
+        // aborted answers never reach a model request either (pi's
+        // `convertToLlm` / pi-ai message transform drop them).
+        let message = entry.value.get("message");
+        let excluded_from_requests = message
+            .and_then(|m| m.get("excludeFromContext"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || (emitted.role == "assistant"
+                && matches!(
+                    message
+                        .and_then(|m| m.get("stopReason"))
+                        .and_then(Value::as_str),
+                    Some("aborted" | "error" | "deferred")
+                ));
         let in_active_context = tree.in_active_context[idx]
+            && !excluded_from_requests
             && (entry.entry_type() != "compaction" || tree.context_compaction == Some(idx));
 
         let mut cass = serde_json::Map::new();
@@ -1318,7 +1333,11 @@ fn home_sources(
                 continue;
             }
             let wal = sqlite_wal(&db);
-            if !file_modified_since(&db, ctx.since_ts) && !file_modified_since(&wal, ctx.since_ts) {
+            // A missing WAL (checkpointed on close, or a rollback-journal
+            // database) is not a change: `file_modified_since` treats a
+            // missing path as modified.
+            let wal_changed = wal.is_file() && file_modified_since(&wal, ctx.since_ts);
+            if !wal_changed && !file_modified_since(&db, ctx.since_ts) {
                 continue;
             }
             let wal_source = wal.is_file().then(|| {
