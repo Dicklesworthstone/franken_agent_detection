@@ -27,9 +27,10 @@ use crate::types::{DetectionResult, NormalizedConversation};
 /// `pi_agent_rust` supports three on-disk session formats: the default JSONL
 /// (`jsonl_v3`) tree store, an optional SQLite-backed store (`sqlite_v1`, built
 /// via the default `sqlite-sessions` feature), and the segmented Session Store
-/// V2 (`native_v2`) sidecar. This connector only parses the JSONL store, so a
-/// user on a non-default store would otherwise get silent zero or partial
-/// coverage. Each detected unsupported store is surfaced as a machine-readable
+/// V2 (`native_v2`) sidecar. This connector parses the JSONL store, and the
+/// SQLite store when built with the `pi-sqlite` feature (without it, SQLite
+/// sessions are reported here), so a user on a non-default store would not
+/// otherwise get silent zero or partial coverage. Each detected unsupported store is surfaced as a machine-readable
 /// diagnostic — matching the connector framework's existing `tracing`
 /// diagnostic shape (structured key/value fields) — so the compatibility
 /// boundary is explicit rather than invisible.
@@ -281,7 +282,8 @@ impl PiAgentConnector {
                         entry.path().to_path_buf(),
                     ));
                 }
-            } else if entry.file_type().is_file()
+            } else if !cfg!(feature = "pi-sqlite")
+                && entry.file_type().is_file()
                 && Path::new(name)
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -1735,8 +1737,13 @@ mod tests {
         .unwrap();
 
         let stores = PiAgentConnector::detect_unsupported_stores(dir.path());
-        assert_eq!(stores.len(), 1);
-        assert_eq!(stores[0].store_format, "sqlite_sessions");
+        if cfg!(feature = "pi-sqlite") {
+            // Indexed, so not a coverage gap.
+            assert!(stores.is_empty(), "{stores:?}");
+        } else {
+            assert_eq!(stores.len(), 1);
+            assert_eq!(stores[0].store_format, "sqlite_sessions");
+        }
     }
 
     /// The always-present `session-index.sqlite` metadata index sidecar (and
@@ -1820,9 +1827,10 @@ mod tests {
             formats.contains("session_store_v2"),
             "expected V2 diagnostic, got {diags:?}"
         );
-        assert!(
+        assert_eq!(
             formats.contains("sqlite_sessions"),
-            "expected SQLite diagnostic, got {diags:?}"
+            !cfg!(feature = "pi-sqlite"),
+            "SQLite sessions are a gap only without the pi-sqlite feature, got {diags:?}"
         );
     }
     /// Regression: discovery must preserve scan-root provenance. Remote
@@ -2140,5 +2148,146 @@ mod tests {
                 .iter()
                 .all(|m| cass(m, "on_active_branch") == true)
         );
+    }
+
+    // =========================================================================
+    // pi_agent_rust SQLite sessions (`pi-sqlite` feature)
+    // =========================================================================
+
+    #[cfg(feature = "pi-sqlite")]
+    mod sqlite_sessions {
+        use super::*;
+        use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
+        use frankensqlite::compat::ParamValue;
+
+        /// `pi_agent_rust`'s `session_sqlite.rs` schema, with the same wire
+        /// records a JSONL session would hold.
+        fn write_sqlite_session(
+            path: &Path,
+            header: &serde_json::Value,
+            entries: &[serde_json::Value],
+        ) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let conn = Connection::open(path.to_str().unwrap()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pi_session_header (id TEXT PRIMARY KEY, json TEXT NOT NULL);
+                 CREATE TABLE pi_session_entries (seq INTEGER PRIMARY KEY, json TEXT NOT NULL);
+                 CREATE TABLE pi_session_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute_compat(
+                "INSERT INTO pi_session_header (id, json) VALUES (?1, ?2)",
+                &[
+                    ParamValue::from(header["id"].as_str().unwrap()),
+                    ParamValue::from(header.to_string().as_str()),
+                ],
+            )
+            .unwrap();
+            // Insert out of order: storage order is `seq`, not insertion.
+            let mut order: Vec<usize> = (0..entries.len()).collect();
+            order.reverse();
+            for index in order {
+                conn.execute_compat(
+                    "INSERT INTO pi_session_entries (seq, json) VALUES (?1, ?2)",
+                    &[
+                        ParamValue::from(i64::try_from(index).unwrap() + 1),
+                        ParamValue::from(entries[index].to_string().as_str()),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        fn rust_session() -> (serde_json::Value, Vec<serde_json::Value>) {
+            let header = json!({"type":"session","version":3,"id":"rust-sess","timestamp":"2026-02-01T10:00:00.000Z","cwd":"/w/rust","provider":"anthropic","modelId":"claude-a","leafId":"a1","branchedFrom":"/s/--w-rust--/2026-01-31T09-00-00_parent.jsonl"});
+            let entries = vec![
+                json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-02-01T10:00:01.000Z","message":{"role":"user","content":"SQLITE_PROMPT"}}),
+                json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-02-01T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ACTIVE_ANSWER"}],"model":"claude-a","usage":{"input":7,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":10}}}),
+                // Written later but abandoned: the header's leafId selects a1.
+                json!({"type":"message","id":"a2","parentId":"u1","timestamp":"2026-02-01T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"LATER_SIBLING"}],"model":"claude-b"}}),
+            ];
+            (header, entries)
+        }
+
+        #[test]
+        fn sqlite_sessions_parse_like_jsonl_and_honor_the_header_leaf() {
+            let dir = TempDir::new().unwrap();
+            let storage = create_pi_agent_storage(&dir);
+            let db = storage
+                .join("sessions")
+                .join("--w-rust--")
+                .join("2026-02-01T10-00-00_rust.sqlite");
+            let (header, entries) = rust_session();
+            write_sqlite_session(&db, &header, &entries);
+            let before = fs::read(&db).unwrap();
+
+            let ctx = ScanContext::local_default(storage.clone(), None);
+            let convs = PiAgentConnector::new().scan(&ctx).unwrap();
+            assert_eq!(convs.len(), 1);
+            let conv = &convs[0];
+            assert_eq!(conv.metadata["storage"], "sqlite");
+            assert_eq!(conv.source_path, db);
+            assert_eq!(
+                conv.external_id.as_deref(),
+                Some("--w-rust--/2026-02-01T10-00-00_rust.sqlite")
+            );
+            assert_eq!(conv.workspace.as_deref(), Some(Path::new("/w/rust")));
+            assert_eq!(
+                conv.metadata["parent_session"],
+                "2026-01-31T09-00-00_parent.jsonl"
+            );
+            let text: Vec<&str> = conv.messages.iter().map(|m| m.content.as_str()).collect();
+            assert_eq!(
+                text,
+                vec!["SQLITE_PROMPT", "ACTIVE_ANSWER", "LATER_SIBLING"]
+            );
+            assert_eq!(conv.metadata["tree"]["active_leaf_id"], "a1");
+            assert_eq!(
+                conv.metadata["tree"]["active_leaf_source"],
+                "header_leaf_id"
+            );
+            assert_eq!(conv.messages[1].extra["cass"]["on_active_branch"], true);
+            assert_eq!(conv.messages[2].extra["cass"]["on_active_branch"], false);
+            assert_eq!(fs::read(&db).unwrap(), before, "scan mutated the database");
+
+            let sources = PiAgentConnector::new().discover_source_files(&ctx).unwrap();
+            assert!(sources.iter().any(|s| s.source_path == db
+                && s.role == crate::connectors::DiscoveredSourceRole::SqliteDatabase));
+            crate::connectors::assert_discovery_covers_scan_sources(&PiAgentConnector::new(), &ctx);
+        }
+
+        #[test]
+        fn jsonl_twins_win_and_foreign_sqlite_files_are_skipped() {
+            let dir = TempDir::new().unwrap();
+            let storage = create_pi_agent_storage(&dir);
+            let project = storage.join("sessions").join("--w--");
+            let (header, entries) = rust_session();
+            write_sqlite_session(
+                &project.join("2026-02-01T10-00-00_twin.sqlite"),
+                &header,
+                &entries,
+            );
+            fs::write(
+                project.join("2026-02-01T10-00-00_twin.jsonl"),
+                format!("{header}\n{}\n", entries[0]),
+            )
+            .unwrap();
+            let foreign = project.join("2026-02-01T11-00-00_foreign.sqlite");
+            Connection::open(foreign.to_str().unwrap())
+                .unwrap()
+                .execute("CREATE TABLE notes (body TEXT)")
+                .unwrap();
+
+            let convs = PiAgentConnector::new()
+                .scan(&ScanContext::local_default(storage, None))
+                .unwrap();
+            assert_eq!(convs.len(), 1, "twin read once, foreign file skipped");
+            assert!(
+                convs[0]
+                    .source_path
+                    .extension()
+                    .is_some_and(|e| e == "jsonl")
+            );
+        }
     }
 }

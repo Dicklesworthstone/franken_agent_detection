@@ -84,6 +84,18 @@ window is since GitHub Release
   metadata gains `tree` (integrity, leaf/branch counts, active leaf),
   `session_version`, `parent_session`, and compaction/system-message counts.
   Session names (`session_info`) and labels are used.
+- **`pi_agent_rust` SQLite sessions (`pi-sqlite` feature, part of
+  `all-connectors`):** `<timestamp>_<uuid>.sqlite` sessions (the
+  `session_store = "sqlite"` backend), previously only reported as
+  unsupported, are now indexed. Their `pi_session_header` /
+  `pi_session_entries` rows are the JSONL wire records and go through the
+  same branch-aware parser (`metadata.storage = "sqlite"`), read-only in one
+  snapshot including a live WAL. A same-stem JSONL twin wins. Discovery lists
+  the database and its WAL. Without the feature they are still reported by
+  `unsupported_store_diagnostics`.
+- **Pi-family headers:** an explicit `leafId` (pi_agent_rust) selects the
+  active branch (`tree.active_leaf_source = "header_leaf_id"`), and
+  `branchedFrom` is read as fork ancestry like `parentSession`.
 - **Pi / Oh My Pi token usage:** token extraction reads pi's exact assistant
   `usage` block (and compaction/branch-summary generation usage) instead of
   estimating from content; `omp` is now covered too.

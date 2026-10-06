@@ -272,6 +272,9 @@ struct WireTree {
     model_state: Vec<(Option<String>, Option<String>)>,
     branch_leaf_count: usize,
     active_branch_len: usize,
+    /// The active leaf entry, and whether the header named it explicitly.
+    active_leaf: Option<usize>,
+    leaf_from_header: bool,
     integrity: TreeIntegrity,
 }
 
@@ -281,6 +284,7 @@ impl WireTree {
         entries: &mut [WireEntry],
         header_provider: Option<&String>,
         header_model: Option<&String>,
+        header_leaf: Option<&str>,
     ) -> Self {
         let n = entries.len();
         // v1 logs carry no ids: every entry is a tree node, linked in file
@@ -337,11 +341,16 @@ impl WireTree {
             }
         }
 
-        // Active branch: pi's leaf on load is the last tree entry in the
-        // file, walked to its root.
+        // Active branch: the header's explicit `leafId` (pi_agent_rust) when
+        // it names an entry of an intact tree, else pi's leaf on load — the
+        // last tree entry in the file — walked to its root.
         let mut on_active_branch = vec![false; n];
         let mut path = Vec::new();
-        let mut cursor = entries.iter().rposition(is_node);
+        let explicit_leaf = header_leaf
+            .filter(|_| integrity == TreeIntegrity::Ok)
+            .and_then(|leaf| by_id.get(leaf).copied());
+        let leaf = explicit_leaf.or_else(|| entries.iter().rposition(is_node));
+        let mut cursor = leaf;
         while let Some(idx) = cursor {
             if on_active_branch[idx] {
                 break;
@@ -453,6 +462,8 @@ impl WireTree {
             model_state,
             branch_leaf_count,
             active_branch_len: path.len(),
+            active_leaf: leaf,
+            leaf_from_header: explicit_leaf.is_some(),
             integrity,
         }
     }
@@ -784,7 +795,6 @@ fn emit_entry(
 ///
 /// System messages (prompt sections and tool declarations) and compaction
 /// system checkpoints are never indexed as conversation text.
-#[allow(clippy::too_many_lines)]
 pub fn parse_session_file(
     path: &Path,
     sessions_dir: &Path,
@@ -823,6 +833,20 @@ pub fn parse_session_file(
         }
     };
 
+    parse_session_records(content.lines(), source_path, external_id, agent_slug)
+}
+
+/// Parse pi-family session records — one JSON document per item, in storage
+/// order (a JSONL file's lines, or a SQLite session's header row followed by
+/// its entry rows by `seq`). `extra.cass.source_line` is the 1-based position
+/// of the record in that sequence.
+#[allow(clippy::too_many_lines)]
+fn parse_session_records<'a>(
+    records: impl IntoIterator<Item = &'a str>,
+    source_path: PathBuf,
+    external_id: Option<String>,
+    agent_slug: &str,
+) -> Option<NormalizedConversation> {
     let mut entries: Vec<WireEntry> = Vec::new();
     let mut file_index = 0_usize;
     let mut session_id: Option<String> = None;
@@ -836,8 +860,9 @@ pub fn parse_session_file(
     let mut title_entry: Option<String> = None;
     let mut session_name: Option<String> = None;
     let mut labels: HashMap<String, String> = HashMap::new();
+    let mut header_leaf: Option<String> = None;
 
-    for (line_idx, line) in content.lines().enumerate() {
+    for (line_idx, line) in records.into_iter().enumerate() {
         let line = line.trim_start_matches('\u{feff}');
         if line.trim().is_empty() {
             continue;
@@ -866,8 +891,11 @@ pub fn parse_session_file(
                 session_version = val.get("version").cloned();
                 // Fork/clone ancestry. Keep the parent's file name (pi file
                 // names embed the session UUID) rather than its absolute path.
+                // pi_agent_rust names the active leaf explicitly.
+                header_leaf = val.get("leafId").and_then(Value::as_str).map(String::from);
                 parent_session = val
                     .get("parentSession")
+                    .or_else(|| val.get("branchedFrom"))
                     .and_then(Value::as_str)
                     .filter(|p| !p.is_empty())
                     .map(|parent| {
@@ -932,7 +960,12 @@ pub fn parse_session_file(
         });
     }
 
-    let tree = WireTree::build(&mut entries, provider.as_ref(), model_id.as_ref());
+    let tree = WireTree::build(
+        &mut entries,
+        provider.as_ref(),
+        model_id.as_ref(),
+        header_leaf.as_deref(),
+    );
 
     let mut messages = Vec::new();
     let mut started_at = header_ts;
@@ -1043,9 +1076,8 @@ pub fn parse_session_file(
     // The conversation-level selection is the ACTIVE branch's, i.e. the
     // state at pi's current leaf.
     let (active_provider, active_model) = tree
-        .model_state
-        .last()
-        .cloned()
+        .active_leaf
+        .and_then(|leaf| tree.model_state.get(leaf).cloned())
         .unwrap_or((provider, model_id));
 
     let mut metadata = serde_json::json!({
@@ -1059,7 +1091,8 @@ pub fn parse_session_file(
             "active_branch_entry_count": tree.active_branch_len,
             "branch_leaf_count": tree.branch_leaf_count,
             "off_branch_message_count": off_branch_message_count,
-            "active_leaf_id": entries.last().and_then(|e| e.id.clone()),
+            "active_leaf_id": tree.active_leaf.and_then(|leaf| entries[leaf].id.clone()),
+            "active_leaf_source": if tree.leaf_from_header { "header_leaf_id" } else { "last_entry" },
             "active_context": "compaction_and_context_edit_aware",
         },
     });
@@ -1092,6 +1125,145 @@ pub fn parse_session_file(
         metadata,
         messages,
     })
+}
+
+/// `pi_agent_rust` SQLite session files (`<timestamp>_<uuid>.sqlite`) under a
+/// pi-family root, sorted. The always-present `session-index.sqlite`
+/// metadata index has no `_` and is never returned.
+#[must_use]
+pub fn sqlite_session_files(root: &Path) -> Vec<PathBuf> {
+    let sessions = sessions_dir(root);
+    if !sessions.exists() {
+        return Vec::new();
+    }
+    let mut out: Vec<PathBuf> = WalkDir::new(sessions)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| {
+            let name = entry.file_name().to_str().unwrap_or("");
+            name.contains('_')
+                && Path::new(name)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sqlite"))
+        })
+        .map(walkdir::DirEntry::into_path)
+        .collect();
+    out.sort();
+    out
+}
+
+/// A SQLite session that also has a same-stem JSONL file is read from the
+/// JSONL (the established source) so the session is never indexed twice.
+fn has_jsonl_twin(sqlite: &Path) -> bool {
+    sqlite.with_extension("jsonl").is_file()
+}
+
+fn sqlite_wal(db: &Path) -> PathBuf {
+    let mut raw = db.as_os_str().to_owned();
+    raw.push("-wal");
+    PathBuf::from(raw)
+}
+
+/// Read a `pi_agent_rust` SQLite session's records in storage order: the
+/// single `pi_session_header` row, then every `pi_session_entries` row by
+/// `seq`. The rows hold exactly the JSONL wire records (only image/media
+/// blocks may be externalized to `pi_session_blobs`, and those carry no
+/// searchable text), so they parse through the same branch-aware path.
+///
+/// The database is opened read-only inside one read transaction: a coherent
+/// snapshot that includes a live WAL, with nothing recovered or written.
+#[cfg(feature = "pi-sqlite")]
+fn read_sqlite_records(path: &Path) -> Result<Vec<String>> {
+    use super::sqlite_sync::{ConnectionExt, open_with_flags};
+    use anyhow::{Context as _, bail};
+    use frankensqlite::compat::{OpenFlags, RowExt};
+
+    let conn = open_with_flags(
+        path.to_string_lossy().as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .with_context(|| format!("failed to open read-only: {}", path.display()))?;
+    conn.execute("PRAGMA busy_timeout = 2000;")
+        .with_context(|| "failed to set busy_timeout")?;
+    for pragma in ["PRAGMA query_only = ON;", "PRAGMA trusted_schema = OFF;"] {
+        if let Err(err) = conn.execute(pragma) {
+            tracing::debug!("pi sqlite session: best-effort {pragma} failed: {err}");
+        }
+    }
+    let objects: Vec<(String, String)> = conn.query_map_collect(
+        "SELECT name, type FROM sqlite_master \
+         WHERE name IN ('pi_session_header','pi_session_entries')",
+        &[],
+        |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+    )?;
+    for required in ["pi_session_header", "pi_session_entries"] {
+        if !objects
+            .iter()
+            .any(|(name, kind)| name == required && kind == "table")
+        {
+            bail!("not a pi SQLite session: missing table {required}");
+        }
+    }
+    conn.read_transaction(|conn| -> Result<Vec<String>> {
+        let headers: Vec<String> = conn.query_map_collect(
+            "SELECT json FROM pi_session_header ORDER BY id LIMIT 2",
+            &[],
+            |row| row.get_typed::<String>(0),
+        )?;
+        if headers.len() != 1 {
+            bail!(
+                "pi SQLite session must have exactly one header row, found {}",
+                headers.len()
+            );
+        }
+        let mut records = headers;
+        records.extend(conn.query_map_collect(
+            "SELECT json FROM pi_session_entries ORDER BY seq",
+            &[],
+            |row| row.get_typed::<String>(0),
+        )?);
+        Ok(records)
+    })
+}
+
+/// Parse one `pi_agent_rust` SQLite session into a normalized conversation.
+///
+/// Archive semantics match [`parse_session_file`]. The external id is the
+/// sessions-relative path (`….sqlite`), and `metadata.storage = "sqlite"`.
+#[cfg(feature = "pi-sqlite")]
+pub fn parse_sqlite_session(
+    path: &Path,
+    sessions_dir: &Path,
+    agent_slug: &str,
+) -> Option<NormalizedConversation> {
+    let records = match read_sqlite_records(path) {
+        Ok(records) => records,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %format!("{err:#}"),
+                "{agent_slug}: skipping unreadable pi SQLite session"
+            );
+            return None;
+        }
+    };
+    let external_id = path
+        .strip_prefix(sessions_dir)
+        .ok()
+        .and_then(|rel| rel.to_str().map(String::from))
+        .or_else(|| path.file_name().and_then(|s| s.to_str()).map(String::from));
+    let mut conversation = parse_session_records(
+        records.iter().map(String::as_str),
+        path.to_path_buf(),
+        external_id,
+        agent_slug,
+    )?;
+    if let Some(meta) = conversation.metadata.as_object_mut() {
+        meta.insert("storage".into(), Value::from("sqlite"));
+    }
+    Some(conversation)
 }
 
 fn first_line_truncated(content: &str) -> String {
@@ -1145,6 +1317,43 @@ pub fn discover_sources(
                 )
                 .with_fs_metadata(),
             );
+        }
+        if !cfg!(feature = "pi-sqlite") {
+            continue;
+        }
+        for db in sqlite_session_files(&root.path) {
+            if path_is_excluded(&db, &excluded_paths)
+                || has_jsonl_twin(&db)
+                || !seen_session_paths.insert(dedupe_path_key(&db))
+            {
+                continue;
+            }
+            let wal = sqlite_wal(&db);
+            if !file_modified_since(&db, ctx.since_ts) && !file_modified_since(&wal, ctx.since_ts) {
+                continue;
+            }
+            out.push(
+                DiscoveredSourceFile::new(
+                    agent_slug,
+                    root,
+                    db,
+                    DiscoveredSourceRole::SqliteDatabase,
+                    true,
+                )
+                .with_fs_metadata(),
+            );
+            if wal.is_file() {
+                out.push(
+                    DiscoveredSourceFile::new(
+                        agent_slug,
+                        root,
+                        wal,
+                        DiscoveredSourceRole::MetadataSidecar,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
         }
     }
     out
@@ -1200,13 +1409,38 @@ pub fn scan_homes_tagged(
             continue;
         }
 
-        let files = session_files(home);
-        if files.is_empty() {
-            continue;
-        }
         let sessions = sessions_dir(home);
+        let tag = |mut conversation: NormalizedConversation| {
+            if let Some(profile) = profile {
+                if let Some(meta) = conversation.metadata.as_object_mut() {
+                    meta.insert(
+                        "profile".to_string(),
+                        serde_json::Value::String(profile.clone()),
+                    );
+                }
+            }
+            conversation
+        };
 
-        for file in files {
+        #[cfg(feature = "pi-sqlite")]
+        for db in sqlite_session_files(home) {
+            if path_is_excluded(&db, &excluded_paths)
+                || has_jsonl_twin(&db)
+                || !seen_session_paths.insert(dedupe_path_key(&db))
+            {
+                continue;
+            }
+            if !file_modified_since(&db, ctx.since_ts)
+                && !file_modified_since(&sqlite_wal(&db), ctx.since_ts)
+            {
+                continue;
+            }
+            if let Some(conversation) = parse_sqlite_session(&db, &sessions, agent_slug) {
+                convs.push(tag(conversation));
+            }
+        }
+
+        for file in session_files(home) {
             // Use the same policy as discovery before the source is opened.
             if path_is_excluded(&file, &excluded_paths) {
                 continue;
@@ -1221,16 +1455,8 @@ pub fn scan_homes_tagged(
                 continue;
             }
 
-            if let Some(mut conversation) = parse_session_file(&file, &sessions, agent_slug) {
-                if let Some(profile) = profile {
-                    if let Some(meta) = conversation.metadata.as_object_mut() {
-                        meta.insert(
-                            "profile".to_string(),
-                            serde_json::Value::String(profile.clone()),
-                        );
-                    }
-                }
-                convs.push(conversation);
+            if let Some(conversation) = parse_session_file(&file, &sessions, agent_slug) {
+                convs.push(tag(conversation));
             }
         }
     }
