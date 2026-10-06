@@ -373,6 +373,74 @@ pub fn extract_tokens_for_agent(
                 ..Default::default()
             }
         }
+        // Pi-family (pi-mono and Oh My Pi) assistant messages carry pi's
+        // exact `usage` block (`input`/`output`/`cacheRead`/`cacheWrite`,
+        // with `reasoning` already folded into `output`) inside the raw
+        // entry at `extra.message.usage`. Compaction and branch-summary
+        // entries carry the usage of generating the summary at `extra.usage`;
+        // pi counts both in session totals. Tool-result usage (nested model
+        // work) is deliberately NOT read: pi keeps it out of the main
+        // model-call accounting.
+        "pi_agent" | "omp" => {
+            let entry_type = extra.get("type").and_then(Value::as_str);
+            let usage = match entry_type {
+                Some("message")
+                    if extra.pointer("/message/role").and_then(Value::as_str)
+                        == Some("assistant") =>
+                {
+                    extra.pointer("/message/usage")
+                }
+                Some("compaction" | "branch_summary") => extra.get("usage"),
+                _ => None,
+            };
+            let model_name = extra
+                .pointer("/message/model")
+                .or_else(|| extra.pointer("/cass/model"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            let provider = extra
+                .pointer("/message/provider")
+                .or_else(|| extra.pointer("/cass/provider"))
+                .and_then(Value::as_str)
+                .map(String::from)
+                .or_else(|| {
+                    model_name
+                        .as_deref()
+                        .map(|name| normalize_model(name).provider)
+                });
+            let read = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
+            let input_tokens = read("input");
+            let output_tokens = read("output");
+            let tool_call_count = u32::try_from(
+                extra
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .map_or(0, |blocks| {
+                        blocks
+                            .iter()
+                            .filter(|b| b.get("type").and_then(Value::as_str) == Some("toolCall"))
+                            .count()
+                    }),
+            )
+            .unwrap_or(u32::MAX);
+            let has_api_data = input_tokens.is_some() || output_tokens.is_some();
+            ExtractedTokenUsage {
+                model_name,
+                provider,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens: read("cacheRead"),
+                cache_creation_tokens: read("cacheWrite"),
+                has_tool_calls: tool_call_count > 0,
+                tool_call_count,
+                data_source: if has_api_data {
+                    TokenDataSource::Api
+                } else {
+                    TokenDataSource::Estimated
+                },
+                ..Default::default()
+            }
+        }
         // Shelley: the connector preserves direct llm.Usage under
         // `extra.usage` (snake_case fields) and marks fork-copied rows with
         // `extra.fork_copied` so their already-counted usage is neither
@@ -435,7 +503,7 @@ pub fn extract_tokens_for_agent(
                 }
             }
         }
-        "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" | "antigravity" => {
+        "cursor" | "factory" | "opencode" | "gemini" | "antigravity" => {
             let model_name = extra
                 .get("model")
                 .or_else(|| extra.pointer("/cass/model"))

@@ -10,6 +10,15 @@
 //! the [`crate::connectors::pi_agent`] and [`crate::connectors::omp`]
 //! connectors — only root discovery differs between them.
 //!
+//! Entry kinds beyond plain turns are preserved with identifiable provenance
+//! (`extra.cass.entry_kind` / `source_role`): `compaction` and
+//! `branch_summary` summaries (role `system`, prefixed `[compaction]` /
+//! `[branch summary]`), extension `custom_message`s and in-message `custom`
+//! roles, and `bashExecution` shell runs. System messages and compaction
+//! system checkpoints (prompt sections, tool declarations) are never indexed.
+//! Every branch in the file is kept (archive semantics) and annotated with
+//! `on_active_branch` / `in_active_context`; see [`parse_session_file`].
+//!
 //! omp-specific extensions handled tolerantly:
 //! - `title` entries (`{"type":"title","title":...}`) supply the
 //!   conversation title when present; otherwise the `session` header title,
@@ -21,7 +30,7 @@ use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_exclud
 use crate::types::{NormalizedConversation, NormalizedMessage};
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -162,6 +171,589 @@ pub fn flatten_message_content(content: &Value) -> String {
     String::new()
 }
 
+/// Roles a pi-family `message` entry can carry that map to a fixed
+/// normalized role. Anything else keeps its raw role (pi's `AgentMessage`
+/// union is open: extensions may add roles via declaration merging).
+const fn normalized_role(role: &str) -> Option<&'static str> {
+    match role.as_bytes() {
+        // Besides plain user turns: direct shell commands (`bashExecution`:
+        // `!cmd` in the TUI, the RPC `bash` command) and extension-injected
+        // context (`custom`; `hookMessage` before v3). Pi converts both to
+        // user-role text before the next model request, which is also how
+        // the Prime connector normalizes them.
+        b"user" | b"bashExecution" | b"custom" | b"hookMessage" => Some("user"),
+        b"assistant" => Some("assistant"),
+        b"toolResult" => Some("tool"),
+        // Context messages synthesized from summary entries.
+        b"branchSummary" | b"compactionSummary" => Some("system"),
+        _ => None,
+    }
+}
+
+/// One tree entry of a pi-family session file (everything except the
+/// `session` header, which is metadata only and not part of the tree).
+struct WireEntry {
+    value: Value,
+    /// 1-based physical line in the source file: a stable source locator.
+    line: usize,
+    /// Position among all parsed records including the header; v1 compaction
+    /// entries address their first kept entry by this index.
+    file_index: usize,
+    /// The entry's own id, when the file carries one (v2+).
+    id: Option<String>,
+    /// Resolved parent entry. v1 entries without ids are linked in file
+    /// order, exactly as pi's v1→v2 migration links them.
+    parent: Option<usize>,
+}
+
+impl WireEntry {
+    fn entry_type(&self) -> &str {
+        self.value.get("type").and_then(Value::as_str).unwrap_or("")
+    }
+
+    fn message_role(&self) -> Option<&str> {
+        self.value
+            .get("message")
+            .and_then(|m| m.get("role"))
+            .and_then(Value::as_str)
+    }
+
+    fn is_system_message(&self) -> bool {
+        self.entry_type() == "message" && self.message_role() == Some("system")
+    }
+}
+
+/// Integrity of the reconstructed `id`/`parentId` tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeIntegrity {
+    /// v2+ tree with every parent present.
+    Ok,
+    /// v1 linear log (no entry ids); file order is the only branch.
+    Linear,
+    /// At least one `parentId` names an entry absent from the file. Branches
+    /// cannot be told apart, so the file falls back to file order.
+    MissingParent,
+    /// The `parentId` links loop; the file falls back to file order.
+    Cycle,
+}
+
+impl TreeIntegrity {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Linear => "linear",
+            Self::MissingParent => "missing_parent",
+            Self::Cycle => "cycle",
+        }
+    }
+}
+
+/// Branch- and context-aware view over the entries of one session file.
+///
+/// Pi stores every branch of a conversation in one append-only file. This
+/// crate indexes the whole archive (abandoned branches included, so archive
+/// search never silently loses them), and annotates each emitted message with
+/// whether it lies on the ACTIVE branch (pi's current leaf, which on load is
+/// the last entry in the file, walked to its root) and whether it is part of
+/// the ACTIVE MODEL CONTEXT (that branch after the latest compaction and the
+/// latest `context_edit` for each target are applied — mirroring pi's
+/// `buildContextEntries` / `buildSessionProjection`).
+struct WireTree {
+    on_active_branch: Vec<bool>,
+    in_active_context: Vec<bool>,
+    /// The newest compaction on the active branch: the only one whose
+    /// summary is part of the model context.
+    context_compaction: Option<usize>,
+    /// `context_edit` effects on in-context targets: `"omitted"` or
+    /// `"replaced"`.
+    context_edits: HashMap<usize, &'static str>,
+    /// Effective `(provider, model)` selection after each entry, inherited
+    /// along its OWN ancestor chain only.
+    model_state: Vec<(Option<String>, Option<String>)>,
+    branch_leaf_count: usize,
+    active_branch_len: usize,
+    integrity: TreeIntegrity,
+}
+
+impl WireTree {
+    #[allow(clippy::too_many_lines)]
+    fn build(
+        entries: &mut [WireEntry],
+        header_provider: Option<&String>,
+        header_model: Option<&String>,
+    ) -> Self {
+        let n = entries.len();
+        // v1 logs carry no ids: every entry is a tree node, linked in file
+        // order (pi's v1→v2 migration). In v2+ files, id-less lines (e.g.
+        // omp's standalone `title` records) are metadata, not tree nodes.
+        let has_ids = entries.iter().any(|e| e.id.is_some());
+        let is_node = |e: &WireEntry| !has_ids || e.id.is_some();
+        let mut integrity = if has_ids {
+            TreeIntegrity::Ok
+        } else {
+            TreeIntegrity::Linear
+        };
+
+        // Resolve parents. Last write wins for duplicated ids, matching pi's
+        // `Map.set` index.
+        let mut by_id: HashMap<String, usize> = HashMap::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            if let Some(id) = &entry.id {
+                by_id.insert(id.clone(), idx);
+            }
+        }
+        if has_ids {
+            for (idx, entry) in entries.iter_mut().enumerate() {
+                if entry.id.is_none() {
+                    continue;
+                }
+                let parent_id = entry.value.get("parentId").and_then(Value::as_str);
+                entry.parent = parent_id.and_then(|parent_id| match by_id.get(parent_id) {
+                    Some(&parent_idx) if parent_idx != idx => Some(parent_idx),
+                    _ => {
+                        integrity = TreeIntegrity::MissingParent;
+                        None
+                    }
+                });
+            }
+            if integrity == TreeIntegrity::Ok && has_parent_cycle(entries) {
+                integrity = TreeIntegrity::Cycle;
+            }
+        }
+        if integrity != TreeIntegrity::Ok {
+            // Linear log, or a broken tree whose branches cannot be told
+            // apart: file order is the only defensible branch (the same
+            // fallback the Prime connector uses). A broken tree is reported
+            // through `tree.integrity` instead of emitting an apparently
+            // complete orphan suffix.
+            let mut previous = None;
+            for (idx, entry) in entries.iter_mut().enumerate() {
+                if is_node(entry) {
+                    entry.parent = previous;
+                    previous = Some(idx);
+                } else {
+                    entry.parent = None;
+                }
+            }
+        }
+
+        // Active branch: pi's leaf on load is the last tree entry in the
+        // file, walked to its root.
+        let mut on_active_branch = vec![false; n];
+        let mut path = Vec::new();
+        let mut cursor = entries.iter().rposition(is_node);
+        while let Some(idx) = cursor {
+            if on_active_branch[idx] {
+                break;
+            }
+            on_active_branch[idx] = true;
+            path.push(idx);
+            cursor = entries[idx].parent;
+        }
+        path.reverse();
+
+        let mut has_child = vec![false; n];
+        for entry in entries.iter() {
+            if let Some(parent) = entry.parent {
+                has_child[parent] = true;
+            }
+        }
+        let branch_leaf_count = entries
+            .iter()
+            .zip(&has_child)
+            .filter(|(entry, has_child)| is_node(entry) && !**has_child)
+            .count();
+
+        // Active context: the latest compaction on the path replaces the
+        // entries before its first kept entry (system messages in the kept
+        // range fold into the compaction checkpoint).
+        let mut in_active_context = vec![false; n];
+        let context_compaction = path
+            .iter()
+            .rposition(|&idx| entries[idx].entry_type() == "compaction");
+        match context_compaction {
+            None => {
+                for &idx in &path {
+                    in_active_context[idx] = true;
+                }
+            }
+            Some(pos) => {
+                let compaction = &entries[path[pos]];
+                let first_kept_id = compaction
+                    .value
+                    .get("firstKeptEntryId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                // v1 compactions address the first kept record by its index
+                // among all file records (header included).
+                let first_kept_index = compaction
+                    .value
+                    .get("firstKeptEntryIndex")
+                    .and_then(Value::as_u64)
+                    .and_then(|i| usize::try_from(i).ok());
+                in_active_context[path[pos]] = true;
+                let mut found = false;
+                for &idx in &path[..pos] {
+                    let entry = &entries[idx];
+                    if (first_kept_id.is_some() && entry.id == first_kept_id)
+                        || (first_kept_id.is_none() && Some(entry.file_index) == first_kept_index)
+                    {
+                        found = true;
+                    }
+                    if found && !entry.is_system_message() {
+                        in_active_context[idx] = true;
+                    }
+                }
+                for &idx in &path[pos + 1..] {
+                    in_active_context[idx] = true;
+                }
+            }
+        }
+        let context_compaction = context_compaction.map(|pos| path[pos]);
+
+        // Context edits among the context entries; the latest edit per
+        // target wins. Edits change model context only, never raw history.
+        let mut latest_edit: HashMap<usize, bool> = HashMap::new();
+        for &idx in &path {
+            let entry = &entries[idx];
+            if !in_active_context[idx] || entry.entry_type() != "context_edit" {
+                continue;
+            }
+            let Some(target) = entry
+                .value
+                .get("targetId")
+                .and_then(Value::as_str)
+                .and_then(|t| by_id.get(t).copied())
+            else {
+                continue;
+            };
+            let omitted = entry.value.get("replacement").is_none_or(Value::is_null);
+            latest_edit.insert(target, omitted);
+        }
+        let mut context_edits = HashMap::new();
+        for (target, omitted) in latest_edit {
+            if !in_active_context[target] {
+                continue;
+            }
+            if omitted {
+                in_active_context[target] = false;
+                context_edits.insert(target, "omitted");
+            } else {
+                context_edits.insert(target, "replaced");
+            }
+        }
+
+        let model_state = resolve_model_states(entries, header_provider, header_model);
+
+        Self {
+            on_active_branch,
+            in_active_context,
+            context_compaction,
+            context_edits,
+            model_state,
+            branch_leaf_count,
+            active_branch_len: path.len(),
+            integrity,
+        }
+    }
+}
+
+/// Whether following `parent` links from any entry loops.
+fn has_parent_cycle(entries: &[WireEntry]) -> bool {
+    // 0 = unvisited, 1 = on the current walk, 2 = known to reach a root.
+    let mut state = vec![0_u8; entries.len()];
+    for start in 0..entries.len() {
+        let mut walk = Vec::new();
+        let mut cursor = Some(start);
+        while let Some(idx) = cursor {
+            match state[idx] {
+                1 => return true,
+                2 => break,
+                _ => {}
+            }
+            state[idx] = 1;
+            walk.push(idx);
+            cursor = entries[idx].parent;
+        }
+        for idx in walk {
+            state[idx] = 2;
+        }
+    }
+    false
+}
+
+/// Effective `(provider, model)` selection after each entry.
+///
+/// Each entry inherits the selection of its PARENT, never of whatever entry
+/// happens to precede it in the file: a sibling branch's `model_change` must
+/// not leak into another branch's attribution. `model_change` updates each
+/// field it carries (pi-mono writes `provider` + `modelId`; omp writes a bare
+/// `model`) and leaves the other one inherited.
+fn resolve_model_states(
+    entries: &[WireEntry],
+    header_provider: Option<&String>,
+    header_model: Option<&String>,
+) -> Vec<(Option<String>, Option<String>)> {
+    let root_state = (header_provider.cloned(), header_model.cloned());
+    let mut states: Vec<Option<(Option<String>, Option<String>)>> = vec![None; entries.len()];
+    for start in 0..entries.len() {
+        if states[start].is_some() {
+            continue;
+        }
+        // Collect the unresolved ancestor chain, stopping at a resolved
+        // ancestor, a root, or a cycle.
+        let mut chain = Vec::new();
+        let mut on_chain = HashSet::new();
+        let mut cursor = Some(start);
+        let mut base = root_state.clone();
+        while let Some(idx) = cursor {
+            if let Some(state) = &states[idx] {
+                base = state.clone();
+                break;
+            }
+            if !on_chain.insert(idx) {
+                break;
+            }
+            chain.push(idx);
+            cursor = entries[idx].parent;
+        }
+        for &idx in chain.iter().rev() {
+            let value = &entries[idx].value;
+            if entries[idx].entry_type() == "model_change" {
+                if let Some(provider) = value.get("provider").and_then(Value::as_str) {
+                    base.0 = Some(provider.to_string());
+                }
+                if let Some(model) = value
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("model").and_then(Value::as_str))
+                {
+                    base.1 = Some(model.to_string());
+                }
+            }
+            states[idx] = Some(base.clone());
+        }
+    }
+    states
+        .into_iter()
+        .map(|state| state.unwrap_or_else(|| root_state.clone()))
+        .collect()
+}
+
+/// Extract structured tool invocations from an assistant content array.
+fn tool_invocations(content: Option<&Value>) -> Vec<crate::types::NormalizedInvocation> {
+    content
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("toolCall"))
+                .map(|item| crate::types::NormalizedInvocation {
+                    kind: "tool".to_string(),
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    raw_name: None,
+                    call_id: item.get("id").and_then(Value::as_str).map(String::from),
+                    arguments: item.get("arguments").cloned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What one tree entry contributes as a normalized message, before
+/// provenance is attached.
+struct EmittedEntry {
+    role: String,
+    /// The pi role (or entry kind) it was derived from.
+    source_role: String,
+    content: String,
+    author: Option<String>,
+    invocations: Vec<crate::types::NormalizedInvocation>,
+    created_at: Option<i64>,
+    /// Raw entry to keep as `extra` (prompt/tool checkpoints stripped).
+    raw: Value,
+    /// Kind-specific provenance merged into `extra.cass`.
+    provenance: serde_json::Map<String, Value>,
+}
+
+/// Map one tree entry to its normalized message, if it carries searchable
+/// text. `model_state` is the entry's branch-local `(provider, model)`.
+#[allow(clippy::too_many_lines)]
+fn emit_entry(
+    entry: &WireEntry,
+    model_state: &(Option<String>, Option<String>),
+) -> Option<EmittedEntry> {
+    let value = &entry.value;
+    let entry_ts = value.get("timestamp").and_then(super::parse_timestamp);
+    let mut provenance = serde_json::Map::new();
+    match entry.entry_type() {
+        "message" => {
+            let msg = value.get("message")?;
+            let raw_role = msg.get("role").and_then(Value::as_str).unwrap_or("unknown");
+            if raw_role == "system" {
+                // Prompt sections and tool declarations, not conversation.
+                return None;
+            }
+            let created_at =
+                entry_ts.or_else(|| msg.get("timestamp").and_then(super::parse_timestamp));
+            let role = normalized_role(raw_role).unwrap_or(raw_role).to_string();
+            let content = match raw_role {
+                "bashExecution" => {
+                    let command = msg.get("command").and_then(Value::as_str).unwrap_or("");
+                    let output = msg.get("output").and_then(Value::as_str).unwrap_or("");
+                    for key in ["exitCode", "cancelled", "truncated", "excludeFromContext"] {
+                        if let Some(v) = msg.get(key) {
+                            provenance.insert(key.to_string(), v.clone());
+                        }
+                    }
+                    if command.trim().is_empty() && output.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("$ {command}\n{output}")
+                    }
+                }
+                "branchSummary" | "compactionSummary" => {
+                    let summary = msg.get("summary").and_then(Value::as_str).unwrap_or("");
+                    let label = if raw_role == "branchSummary" {
+                        "branch summary"
+                    } else {
+                        "compaction"
+                    };
+                    if summary.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("[{label}] {summary}")
+                    }
+                }
+                "custom" | "hookMessage" => {
+                    for (key, out) in [("customType", "custom_type"), ("display", "display")] {
+                        if let Some(v) = msg.get(key) {
+                            provenance.insert(out.to_string(), v.clone());
+                        }
+                    }
+                    msg.get("content")
+                        .map(flatten_message_content)
+                        .unwrap_or_default()
+                }
+                _ => msg
+                    .get("content")
+                    .map(flatten_message_content)
+                    .unwrap_or_default(),
+            };
+            if content.trim().is_empty() {
+                return None;
+            }
+            // Assistant attribution: the message's own model first, then the
+            // selection inherited along this entry's own branch.
+            let author = (role == "assistant").then(|| {
+                msg.get("model")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .or_else(|| model_state.1.clone())
+            });
+            let invocations = if role == "assistant" {
+                tool_invocations(msg.get("content"))
+            } else {
+                Vec::new()
+            };
+            Some(EmittedEntry {
+                role,
+                source_role: raw_role.to_string(),
+                content,
+                author: author.flatten(),
+                invocations,
+                created_at,
+                raw: value.clone(),
+                provenance,
+            })
+        }
+        "custom_message" => {
+            let content = value
+                .get("content")
+                .map(flatten_message_content)
+                .unwrap_or_default();
+            if content.trim().is_empty() {
+                return None;
+            }
+            for (key, out) in [("customType", "custom_type"), ("display", "display")] {
+                if let Some(v) = value.get(key) {
+                    provenance.insert(out.to_string(), v.clone());
+                }
+            }
+            Some(EmittedEntry {
+                role: "user".to_string(),
+                source_role: "custom".to_string(),
+                content,
+                author: None,
+                invocations: Vec::new(),
+                created_at: entry_ts,
+                raw: value.clone(),
+                provenance,
+            })
+        }
+        "compaction" => {
+            let summary = value.get("summary").and_then(Value::as_str).unwrap_or("");
+            if summary.trim().is_empty() {
+                return None;
+            }
+            for (key, out) in [
+                ("firstKeptEntryId", "first_kept_entry_id"),
+                ("tokensBefore", "tokens_before"),
+                ("fromHook", "from_hook"),
+            ] {
+                if let Some(v) = value.get(key) {
+                    provenance.insert(out.to_string(), v.clone());
+                }
+            }
+            // The checkpoint replays the full system prompt and tool
+            // declarations at the compaction boundary: context-boundary
+            // metadata, never conversation text. Keep only the fact that it
+            // exists so the raw extra cannot smuggle it into an index.
+            let mut raw = value.clone();
+            if let Some(obj) = raw.as_object_mut() {
+                if obj.remove("systemMessage").is_some() {
+                    provenance.insert("system_checkpoint".to_string(), Value::Bool(true));
+                }
+            }
+            Some(EmittedEntry {
+                role: "system".to_string(),
+                source_role: "compaction".to_string(),
+                content: format!("[compaction] {summary}"),
+                author: None,
+                invocations: Vec::new(),
+                created_at: entry_ts,
+                raw,
+                provenance,
+            })
+        }
+        "branch_summary" => {
+            let summary = value.get("summary").and_then(Value::as_str).unwrap_or("");
+            if summary.trim().is_empty() {
+                return None;
+            }
+            for (key, out) in [("fromId", "from_id"), ("fromHook", "from_hook")] {
+                if let Some(v) = value.get(key) {
+                    provenance.insert(out.to_string(), v.clone());
+                }
+            }
+            Some(EmittedEntry {
+                role: "system".to_string(),
+                source_role: "branch_summary".to_string(),
+                content: format!("[branch summary] {summary}"),
+                author: None,
+                invocations: Vec::new(),
+                created_at: entry_ts,
+                raw: value.clone(),
+                provenance,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Parse one pi-family session JSONL file into a normalized conversation.
 ///
 /// Returns `None` for unreadable files (logged at debug with `agent_slug`
@@ -170,6 +762,28 @@ pub fn flatten_message_content(content: &Value) -> String {
 ///
 /// `sessions_dir` is used to derive the conversation's external id as a path
 /// relative to the sessions directory (falling back to the file stem).
+///
+/// # Archive semantics
+///
+/// Every branch stored in the file is emitted, in file order, so abandoned
+/// branches stay searchable. Each message's `extra.cass` records where it
+/// came from and how it relates to the live conversation:
+///
+/// - `entry_kind` (`message`, `compaction`, `branch_summary`,
+///   `custom_message`) and `source_role` (the pi role, e.g. `bashExecution`,
+///   `custom`, `toolResult`), so summaries and injected context are never
+///   mistaken for original turns;
+/// - `entry_id` / `parent_id` / `source_line`: the tree link and a source
+///   locator;
+/// - `on_active_branch`: on the path from pi's current leaf to its root;
+/// - `in_active_context`: part of the model context pi would rebuild (latest
+///   compaction and `context_edit`s applied); `context_edit` says whether an
+///   edit `omitted` or `replaced` the message for the model;
+/// - `model` / `provider`: the selection inherited along the entry's own
+///   branch.
+///
+/// System messages (prompt sections and tool declarations) and compaction
+/// system checkpoints are never indexed as conversation text.
 #[allow(clippy::too_many_lines)]
 pub fn parse_session_file(
     path: &Path,
@@ -209,197 +823,263 @@ pub fn parse_session_file(
         }
     };
 
-    let mut messages = Vec::new();
-    let mut started_at: Option<i64> = None;
-    let mut ended_at: Option<i64> = None;
-    let mut session_cwd: Option<PathBuf> = None;
+    let mut entries: Vec<WireEntry> = Vec::new();
+    let mut file_index = 0_usize;
     let mut session_id: Option<String> = None;
+    let mut session_cwd: Option<PathBuf> = None;
+    let mut session_version: Option<Value> = None;
+    let mut parent_session: Option<String> = None;
+    let mut header_ts: Option<i64> = None;
     let mut provider: Option<String> = None;
     let mut model_id: Option<String> = None;
     let mut header_title: Option<String> = None;
     let mut title_entry: Option<String> = None;
+    let mut session_name: Option<String> = None;
+    let mut labels: HashMap<String, String> = HashMap::new();
 
-    for line in content.lines() {
+    for (line_idx, line) in content.lines().enumerate() {
+        let line = line.trim_start_matches('\u{feff}');
         if line.trim().is_empty() {
             continue;
         }
-        let val: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(val) = serde_json::from_str::<Value>(line) else {
+            continue;
         };
+        let this_index = file_index;
+        file_index += 1;
 
-        let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-        match entry_type {
+        match val.get("type").and_then(Value::as_str).unwrap_or("") {
             "session" => {
-                // Session header - extract metadata
-                session_id = val.get("id").and_then(|v| v.as_str()).map(String::from);
-                session_cwd = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+                // Session header: metadata only, not part of the tree.
+                session_id = val.get("id").and_then(Value::as_str).map(String::from);
+                session_cwd = val.get("cwd").and_then(Value::as_str).map(PathBuf::from);
                 provider = val
                     .get("provider")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .map(String::from);
-                model_id = val
-                    .get("modelId")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+                model_id = val.get("modelId").and_then(Value::as_str).map(String::from);
                 header_title = val
                     .get("title")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .map(str::to_string)
                     .filter(|t| !t.is_empty());
-
-                // Parse timestamp
+                session_version = val.get("version").cloned();
+                // Fork/clone ancestry. Keep the parent's file name (pi file
+                // names embed the session UUID) rather than its absolute path.
+                parent_session = val
+                    .get("parentSession")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty())
+                    .map(|parent| {
+                        Path::new(parent)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or(parent)
+                            .to_string()
+                    });
                 if let Some(ts_val) = val.get("timestamp") {
-                    started_at = super::parse_timestamp(ts_val);
+                    header_ts = super::parse_timestamp(ts_val);
                 }
+                continue;
             }
             "title" => {
                 // omp writes standalone title lines; prefer the most recent
                 // non-empty one over the session-header title.
                 if let Some(title) = val
                     .get("title")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .map(str::to_string)
                     .filter(|t| !t.is_empty())
                 {
                     title_entry = Some(title);
                 }
             }
-            "message" => {
-                // Message entry - extract the nested message object
-                let created = val.get("timestamp").and_then(super::parse_timestamp);
-
-                if let Some(msg) = val.get("message") {
-                    let role = msg
-                        .get("role")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-
-                    // Normalize role names
-                    let normalized_role = match role {
-                        "user" => "user",
-                        "assistant" => "assistant",
-                        "toolResult" => "tool",
-                        _ => role,
-                    };
-
-                    // Extract content
-                    let content_str = msg
-                        .get("content")
-                        .map(flatten_message_content)
-                        .unwrap_or_default();
-
-                    if content_str.trim().is_empty() {
-                        continue;
+            "session_info" => {
+                // User-defined display name (`/name`, `--name`); the latest
+                // entry wins, as in pi's session selector.
+                session_name = val
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string);
+            }
+            "label" => {
+                if let Some(target) = val.get("targetId").and_then(Value::as_str) {
+                    match val
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .filter(|l| !l.is_empty())
+                    {
+                        Some(label) => {
+                            labels.insert(target.to_string(), label.to_string());
+                        }
+                        None => {
+                            labels.remove(target);
+                        }
                     }
-
-                    // Update timestamps
-                    started_at = match (started_at, created) {
-                        (Some(curr), Some(ts)) => Some(curr.min(ts)),
-                        (None, Some(ts)) => Some(ts),
-                        (other, None) => other,
-                    };
-                    ended_at = match (ended_at, created) {
-                        (Some(curr), Some(ts)) => Some(curr.max(ts)),
-                        (None, Some(ts)) => Some(ts),
-                        (other, None) => other,
-                    };
-
-                    // Extract author (model) for assistant messages
-                    // Check message.model first, fall back to tracked model_id
-                    let author = if normalized_role == "assistant" {
-                        msg.get("model")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                            .or_else(|| model_id.clone())
-                    } else {
-                        None
-                    };
-
-                    let invocations = msg
-                        .get("content")
-                        .and_then(|c| c.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter(|item| {
-                                    item.get("type").and_then(|t| t.as_str()) == Some("toolCall")
-                                })
-                                .map(|item| {
-                                    let name = item
-                                        .get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("unknown")
-                                        .to_string();
-                                    crate::types::NormalizedInvocation {
-                                        kind: "tool".to_string(),
-                                        name,
-                                        raw_name: None,
-                                        call_id: item
-                                            .get("id")
-                                            .and_then(|v| v.as_str())
-                                            .map(String::from),
-                                        arguments: item.get("arguments").cloned(),
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-
-                    messages.push(NormalizedMessage {
-                        idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
-                        role: normalized_role.to_string(),
-                        author,
-                        created_at: created,
-                        content: content_str,
-                        extra: val.clone(),
-                        invocations,
-                        snippets: Vec::new(),
-                    });
                 }
             }
-            "model_change" => {
-                // Track model changes (useful metadata). pi-mono writes
-                // `provider` + `modelId`; omp writes a bare `model`. A
-                // record lacking one field must not erase the previously
-                // tracked value.
-                if let Some(p) = val.get("provider").and_then(|v| v.as_str()) {
-                    provider = Some(p.to_string());
-                }
-                if let Some(m) = val
-                    .get("modelId")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| val.get("model").and_then(|v| v.as_str()))
-                {
-                    model_id = Some(m.to_string());
-                }
+            _ => {}
+        }
+
+        entries.push(WireEntry {
+            id: val.get("id").and_then(Value::as_str).map(String::from),
+            value: val,
+            line: line_idx + 1,
+            file_index: this_index,
+            parent: None,
+        });
+    }
+
+    let tree = WireTree::build(&mut entries, provider.as_ref(), model_id.as_ref());
+
+    let mut messages = Vec::new();
+    let mut started_at = header_ts;
+    let mut ended_at: Option<i64> = None;
+    let mut system_message_count = 0_usize;
+    let mut compaction_count = 0_usize;
+    let mut off_branch_message_count = 0_usize;
+
+    for (idx, entry) in entries.iter().enumerate() {
+        match entry.entry_type() {
+            "compaction" => compaction_count += 1,
+            "message" if entry.is_system_message() => system_message_count += 1,
+            _ => {}
+        }
+        let Some(emitted) = emit_entry(entry, &tree.model_state[idx]) else {
+            continue;
+        };
+
+        if let Some(ts) = emitted.created_at {
+            started_at = Some(started_at.map_or(ts, |curr| curr.min(ts)));
+            ended_at = Some(ended_at.map_or(ts, |curr| curr.max(ts)));
+        }
+
+        let on_active_branch = tree.on_active_branch[idx];
+        if !on_active_branch {
+            off_branch_message_count += 1;
+        }
+        // An older compaction retained inside the newest kept range is raw
+        // history only; just the newest one contributes its summary.
+        let in_active_context = tree.in_active_context[idx]
+            && (entry.entry_type() != "compaction" || tree.context_compaction == Some(idx));
+
+        let mut cass = serde_json::Map::new();
+        cass.insert("entry_kind".into(), Value::from(entry.entry_type()));
+        cass.insert("source_role".into(), Value::from(emitted.source_role));
+        if let Some(id) = &entry.id {
+            cass.insert("entry_id".into(), Value::from(id.as_str()));
+        }
+        if let Some(parent_id) = entry.value.get("parentId").and_then(Value::as_str) {
+            cass.insert("parent_id".into(), Value::from(parent_id));
+        }
+        cass.insert("source_line".into(), Value::from(entry.line));
+        cass.insert("on_active_branch".into(), Value::Bool(on_active_branch));
+        cass.insert("in_active_context".into(), Value::Bool(in_active_context));
+        if let Some(edit) = tree.context_edits.get(&idx) {
+            cass.insert("context_edit".into(), Value::from(*edit));
+        }
+        if let Some(label) = entry.id.as_ref().and_then(|id| labels.get(id)) {
+            cass.insert("label".into(), Value::from(label.as_str()));
+        }
+        if emitted.role == "assistant" {
+            if let Some(model) = &emitted.author {
+                cass.insert("model".into(), Value::from(model.as_str()));
             }
-            _ => {
-                // Skip thinking_level_change and unknown types
+            let provider = entry
+                .value
+                .pointer("/message/provider")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .or_else(|| tree.model_state[idx].0.clone());
+            if let Some(provider) = provider {
+                cass.insert("provider".into(), Value::from(provider));
             }
         }
+        cass.extend(emitted.provenance);
+
+        let mut extra = emitted.raw;
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert("cass".to_string(), Value::Object(cass));
+        }
+
+        messages.push(NormalizedMessage {
+            idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
+            role: emitted.role,
+            author: emitted.author,
+            created_at: emitted.created_at,
+            content: emitted.content,
+            extra,
+            invocations: emitted.invocations,
+            snippets: Vec::new(),
+        });
     }
 
     if messages.is_empty() {
         return None;
     }
 
-    // Title precedence: explicit omp `title` entry, then session-header
-    // title, then the first user message, then the first message at all.
-    let title = title_entry.or(header_title).or_else(|| {
-        messages
-            .iter()
-            .find(|m| m.role == "user")
-            .map(|m| first_line_truncated(&m.content))
-    });
-    let title = title.or_else(|| messages.first().map(|m| first_line_truncated(&m.content)));
-    // Build metadata
-    let metadata = serde_json::json!({
+    // Title precedence: the user-defined session name, then an explicit omp
+    // `title` entry, then the session-header title, then the first ORIGINAL
+    // user message (never injected context or a shell command), then any
+    // message at all.
+    let is_original_user = |m: &&NormalizedMessage| {
+        m.role == "user"
+            && m.extra.pointer("/cass/source_role").and_then(Value::as_str) == Some("user")
+    };
+    let title = session_name
+        .or(title_entry)
+        .or(header_title)
+        .or_else(|| {
+            messages
+                .iter()
+                .find(is_original_user)
+                .or_else(|| messages.iter().find(|m| m.role == "user"))
+                .map(|m| first_line_truncated(&m.content))
+        })
+        .or_else(|| messages.first().map(|m| first_line_truncated(&m.content)));
+
+    // The conversation-level selection is the ACTIVE branch's, i.e. the
+    // state at pi's current leaf.
+    let (active_provider, active_model) = tree
+        .model_state
+        .last()
+        .cloned()
+        .unwrap_or((provider, model_id));
+
+    let mut metadata = serde_json::json!({
         "source": agent_slug,
         "session_id": session_id,
-        "provider": provider,
-        "model_id": model_id,
+        "provider": active_provider,
+        "model_id": active_model,
+        "tree": {
+            "integrity": tree.integrity.as_str(),
+            "total_entry_count": entries.len(),
+            "active_branch_entry_count": tree.active_branch_len,
+            "branch_leaf_count": tree.branch_leaf_count,
+            "off_branch_message_count": off_branch_message_count,
+            "active_leaf_id": entries.last().and_then(|e| e.id.clone()),
+            "active_context": "compaction_and_context_edit_aware",
+        },
     });
+    if let Some(meta) = metadata.as_object_mut() {
+        if let Some(version) = session_version {
+            meta.insert("session_version".into(), version);
+        }
+        if let Some(parent) = parent_session {
+            meta.insert("parent_session".into(), Value::from(parent));
+        }
+        if compaction_count > 0 {
+            meta.insert("compaction_count".into(), Value::from(compaction_count));
+        }
+        if system_message_count > 0 {
+            meta.insert(
+                "system_message_count".into(),
+                Value::from(system_message_count),
+            );
+        }
+    }
 
     Some(NormalizedConversation {
         agent_slug: agent_slug.to_string(),

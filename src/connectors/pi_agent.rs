@@ -361,6 +361,7 @@ mod tests {
     use super::*;
     use crate::connectors::pi_wire::{flatten_message_content, session_files};
     use crate::connectors::scan::ScanRoot;
+    use crate::types::NormalizedMessage;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -1858,5 +1859,286 @@ mod tests {
             sources[0].origin
         );
         assert_eq!(sources[0].platform, Some(crate::types::Platform::Linux));
+    }
+
+    // =========================================================================
+    // Archive fidelity: checkpoints, extended messages, branch provenance
+    // (franken_agent_detection#27)
+    // =========================================================================
+
+    /// One pi v3 session exercising every entry kind #27 names. File order is
+    /// deliberately hostile to file-order model tracking: branch A's
+    /// `model_change` is written AFTER branch B's, and branch B then continues
+    /// (after a `branch_summary`) with an assistant message lacking
+    /// `message.model`.
+    fn branchy_session_lines() -> Vec<String> {
+        vec![
+            json!({"type":"session","version":3,"id":"sess-br","timestamp":"2026-01-05T10:00:00.000Z","cwd":"/w/proj","provider":"anthropic","modelId":"claude-sonnet-4-5","parentSession":"/home/u/.pi/agent/sessions/--w-proj--/2026-01-04T09-00-00_parent-uuid.jsonl"}),
+            json!({"type":"message","id":"s0","parentId":null,"timestamp":"2026-01-05T10:00:01.000Z","message":{"role":"system","content":"SYSTEM_PROMPT_MARKER","sections":{"preamble":"SYSTEM_SECTION_MARKER"},"toolsAdded":[{"name":"read","description":"TOOL_DECL_MARKER"}],"timestamp":1_767_607_201_000_i64}}),
+            json!({"type":"message","id":"u1","parentId":"s0","timestamp":"2026-01-05T10:00:02.000Z","message":{"role":"user","content":"USER_QUESTION_MARKER","timestamp":1_767_607_202_000_i64}}),
+            json!({"type":"model_change","id":"mB","parentId":"u1","timestamp":"2026-01-05T10:00:03.000Z","provider":"google","modelId":"gemini-branch-b"}),
+            json!({"type":"message","id":"aB","parentId":"mB","timestamp":"2026-01-05T10:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"SIBLING_B_MARKER"}],"provider":"anthropic","model":"claude-explicit","usage":{"input":11,"output":7,"cacheRead":3,"cacheWrite":2,"totalTokens":23}}}),
+            json!({"type":"model_change","id":"mA","parentId":"u1","timestamp":"2026-01-05T10:00:05.000Z","provider":"openai","modelId":"gpt-branch-a"}),
+            json!({"type":"message","id":"aA","parentId":"mA","timestamp":"2026-01-05T10:00:06.000Z","message":{"role":"assistant","content":[{"type":"text","text":"SIBLING_A_MARKER"}]}}),
+            json!({"type":"branch_summary","id":"bs","parentId":"aB","timestamp":"2026-01-05T10:00:07.000Z","fromId":"aA","summary":"BRANCH_SUMMARY_MARKER"}),
+            json!({"type":"message","id":"aB2","parentId":"bs","timestamp":"2026-01-05T10:00:08.000Z","message":{"role":"assistant","content":[{"type":"text","text":"COMPAT_B_MARKER"}]}}),
+            json!({"type":"compaction","id":"c1","parentId":"aB2","timestamp":"2026-01-05T10:00:09.000Z","summary":"COMPACTION_SUMMARY_MARKER","firstKeptEntryId":"aB","tokensBefore":50_000,"systemMessage":{"role":"system","content":"CHECKPOINT_PROMPT_MARKER","toolsAdded":[{"name":"bash","description":"CHECKPOINT_TOOL_MARKER"}],"timestamp":1_767_607_209_000_i64},"usage":{"input":900,"output":120,"cacheRead":0,"cacheWrite":0,"totalTokens":1020}}),
+            json!({"type":"custom_message","id":"cm","parentId":"c1","timestamp":"2026-01-05T10:00:10.000Z","customType":"my-ext","content":"CUSTOM_MESSAGE_MARKER","display":true}),
+            json!({"type":"message","id":"bx","parentId":"cm","timestamp":"2026-01-05T10:00:11.000Z","message":{"role":"bashExecution","command":"echo BASH_CMD_MARKER","output":"BASH_OUTPUT_MARKER","exitCode":0,"cancelled":false,"truncated":false,"timestamp":1_767_607_211_000_i64}}),
+            json!({"type":"context_edit","id":"ce","parentId":"bx","timestamp":"2026-01-05T10:00:12.000Z","targetId":"aB","replacement":null}),
+            json!({"type":"label","id":"lb","parentId":"ce","timestamp":"2026-01-05T10:00:13.000Z","targetId":"u1","label":"checkpoint-1"}),
+            json!({"type":"session_info","id":"si","parentId":"lb","timestamp":"2026-01-05T10:00:14.000Z","name":"Named session"}),
+            json!({"type":"message","id":"u2","parentId":"si","timestamp":"2026-01-05T10:00:15.000Z","message":{"role":"user","content":"FOLLOWUP_MARKER"}}),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect()
+    }
+
+    fn scan_single(lines: &[String]) -> NormalizedConversation {
+        let dir = TempDir::new().unwrap();
+        let storage = create_pi_agent_storage(&dir);
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_session_file(&storage, "2026-01-05T10-00-00_branchy.jsonl", &refs);
+        let ctx = ScanContext::local_default(storage, None);
+        let mut convs = PiAgentConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        convs.remove(0)
+    }
+
+    fn message_with<'a>(conv: &'a NormalizedConversation, marker: &str) -> &'a NormalizedMessage {
+        conv.messages
+            .iter()
+            .find(|m| m.content.contains(marker))
+            .unwrap_or_else(|| panic!("no normalized message contains {marker}"))
+    }
+
+    fn cass<'a>(msg: &'a NormalizedMessage, key: &str) -> &'a serde_json::Value {
+        &msg.extra["cass"][key]
+    }
+
+    #[test]
+    fn extended_entries_survive_normalization_with_identifiable_kinds() {
+        let conv = scan_single(&branchy_session_lines());
+
+        let summary = message_with(&conv, "BRANCH_SUMMARY_MARKER");
+        assert_eq!(summary.role, "system");
+        assert_eq!(cass(summary, "entry_kind"), "branch_summary");
+        assert_eq!(cass(summary, "from_id"), "aA");
+        assert_eq!(cass(summary, "source_line"), 8);
+
+        let compaction = message_with(&conv, "COMPACTION_SUMMARY_MARKER");
+        assert_eq!(compaction.role, "system");
+        assert_eq!(cass(compaction, "entry_kind"), "compaction");
+        assert_eq!(cass(compaction, "first_kept_entry_id"), "aB");
+        assert_eq!(cass(compaction, "tokens_before"), 50_000);
+        assert_eq!(cass(compaction, "system_checkpoint"), true);
+        assert!(compaction.content.starts_with("[compaction] "));
+
+        let custom = message_with(&conv, "CUSTOM_MESSAGE_MARKER");
+        assert_eq!(custom.role, "user");
+        assert_eq!(cass(custom, "entry_kind"), "custom_message");
+        assert_eq!(cass(custom, "source_role"), "custom");
+        assert_eq!(cass(custom, "custom_type"), "my-ext");
+
+        let bash = message_with(&conv, "BASH_OUTPUT_MARKER");
+        assert_eq!(bash.content, "$ echo BASH_CMD_MARKER\nBASH_OUTPUT_MARKER");
+        assert_eq!(cass(bash, "entry_kind"), "message");
+        assert_eq!(cass(bash, "source_role"), "bashExecution");
+        assert_eq!(cass(bash, "exitCode"), 0);
+
+        let user = message_with(&conv, "USER_QUESTION_MARKER");
+        assert_eq!(cass(user, "source_role"), "user");
+        assert_eq!(cass(user, "entry_id"), "u1");
+        assert_eq!(cass(user, "parent_id"), "s0");
+        assert_eq!(cass(user, "label"), "checkpoint-1");
+
+        // Ordinary turns still normalize exactly as before.
+        assert_eq!(message_with(&conv, "FOLLOWUP_MARKER").role, "user");
+        assert_eq!(message_with(&conv, "SIBLING_B_MARKER").role, "assistant");
+    }
+
+    #[test]
+    fn system_prompts_and_tool_declarations_are_never_indexed() {
+        let conv = scan_single(&branchy_session_lines());
+        let serialized = serde_json::to_string(&conv).unwrap();
+        for marker in [
+            "SYSTEM_PROMPT_MARKER",
+            "SYSTEM_SECTION_MARKER",
+            "TOOL_DECL_MARKER",
+            "CHECKPOINT_PROMPT_MARKER",
+            "CHECKPOINT_TOOL_MARKER",
+        ] {
+            assert!(
+                !serialized.contains(marker),
+                "{marker} leaked into the normalized conversation"
+            );
+        }
+        assert!(conv.messages.iter().all(|m| m.role != "system"
+            || m.content.starts_with("[compaction] ")
+            || m.content.starts_with("[branch summary] ")));
+        assert_eq!(conv.metadata["system_message_count"], 1);
+        assert_eq!(conv.metadata["compaction_count"], 1);
+    }
+
+    #[test]
+    fn archive_keeps_abandoned_branches_and_marks_branch_and_context_membership() {
+        let conv = scan_single(&branchy_session_lines());
+
+        // The abandoned sibling stays searchable, flagged off-branch.
+        let sibling = message_with(&conv, "SIBLING_A_MARKER");
+        assert_eq!(cass(sibling, "on_active_branch"), false);
+        assert_eq!(cass(sibling, "in_active_context"), false);
+
+        // Summarized by the compaction: on the branch, out of context.
+        let user = message_with(&conv, "USER_QUESTION_MARKER");
+        assert_eq!(cass(user, "on_active_branch"), true);
+        assert_eq!(cass(user, "in_active_context"), false);
+
+        // Inside the kept range but omitted by a context_edit.
+        let edited = message_with(&conv, "SIBLING_B_MARKER");
+        assert_eq!(cass(edited, "on_active_branch"), true);
+        assert_eq!(cass(edited, "in_active_context"), false);
+        assert_eq!(cass(edited, "context_edit"), "omitted");
+
+        for marker in [
+            "COMPAT_B_MARKER",
+            "BRANCH_SUMMARY_MARKER",
+            "COMPACTION_SUMMARY_MARKER",
+            "CUSTOM_MESSAGE_MARKER",
+            "BASH_OUTPUT_MARKER",
+            "FOLLOWUP_MARKER",
+        ] {
+            let msg = message_with(&conv, marker);
+            assert_eq!(cass(msg, "on_active_branch"), true, "{marker}");
+            assert_eq!(cass(msg, "in_active_context"), true, "{marker}");
+        }
+
+        let tree = &conv.metadata["tree"];
+        assert_eq!(tree["integrity"], "ok");
+        assert_eq!(tree["branch_leaf_count"], 2);
+        assert_eq!(tree["off_branch_message_count"], 1);
+        assert_eq!(tree["active_leaf_id"], "u2");
+        assert_eq!(tree["total_entry_count"], 15);
+        assert_eq!(tree["active_branch_entry_count"], 13);
+        assert_eq!(
+            conv.metadata["parent_session"],
+            "2026-01-04T09-00-00_parent-uuid.jsonl"
+        );
+        assert_eq!(conv.metadata["session_version"], 3);
+        assert_eq!(conv.title.as_deref(), Some("Named session"));
+    }
+
+    #[test]
+    fn model_attribution_never_inherits_a_sibling_branch_model() {
+        let conv = scan_single(&branchy_session_lines());
+
+        // Explicit message model is the control.
+        let explicit = message_with(&conv, "SIBLING_B_MARKER");
+        assert_eq!(explicit.author.as_deref(), Some("claude-explicit"));
+
+        // Branch A's fallback comes from branch A's model_change.
+        let a = message_with(&conv, "SIBLING_A_MARKER");
+        assert_eq!(a.author.as_deref(), Some("gpt-branch-a"));
+        assert_eq!(cass(a, "provider"), "openai");
+
+        // Branch B continues after branch A's later model_change was written;
+        // it must still resolve branch B's own selection.
+        let compat = message_with(&conv, "COMPAT_B_MARKER");
+        assert_eq!(compat.author.as_deref(), Some("gemini-branch-b"));
+        assert_eq!(cass(compat, "model"), "gemini-branch-b");
+        assert_eq!(cass(compat, "provider"), "google");
+
+        // The conversation-level selection is the active branch's.
+        assert_eq!(conv.metadata["model_id"], "gemini-branch-b");
+        assert_eq!(conv.metadata["provider"], "google");
+    }
+
+    #[test]
+    fn exact_pi_usage_feeds_token_extraction() {
+        use crate::connectors::token_extraction::{TokenDataSource, extract_tokens_for_agent};
+
+        let conv = scan_single(&branchy_session_lines());
+        let msg = message_with(&conv, "SIBLING_B_MARKER");
+        let usage = extract_tokens_for_agent("pi_agent", &msg.extra, &msg.content, &msg.role);
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+        assert_eq!(usage.input_tokens, Some(11));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.cache_read_tokens, Some(3));
+        assert_eq!(usage.cache_creation_tokens, Some(2));
+        assert_eq!(usage.model_name.as_deref(), Some("claude-explicit"));
+        assert_eq!(usage.provider.as_deref(), Some("anthropic"));
+
+        // Summary generation usage counts toward session totals, as in pi.
+        let compaction = message_with(&conv, "COMPACTION_SUMMARY_MARKER");
+        let usage = extract_tokens_for_agent(
+            "pi_agent",
+            &compaction.extra,
+            &compaction.content,
+            &compaction.role,
+        );
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+        assert_eq!(usage.input_tokens, Some(900));
+
+        // A fallback-attributed message without usage estimates, keeping the
+        // branch-local model.
+        let compat = message_with(&conv, "COMPAT_B_MARKER");
+        let usage =
+            extract_tokens_for_agent("pi_agent", &compat.extra, &compat.content, &compat.role);
+        assert_eq!(usage.data_source, TokenDataSource::Estimated);
+        assert_eq!(usage.model_name.as_deref(), Some("gemini-branch-b"));
+    }
+
+    #[test]
+    fn v1_linear_compaction_by_index_and_missing_parents_are_reported() {
+        // v1: no ids; the compaction addresses its first kept record by file
+        // index (header = 0).
+        let lines: Vec<String> = vec![
+            json!({"type":"session","id":"v1","timestamp":"2026-01-05T10:00:00Z","cwd":"/w"}),
+            json!({"type":"message","timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"old turn"}}),
+            json!({"type":"message","timestamp":"2026-01-05T10:00:02Z","message":{"role":"user","content":"kept turn"}}),
+            json!({"type":"compaction","timestamp":"2026-01-05T10:00:03Z","summary":"v1 summary","firstKeptEntryIndex":2,"tokensBefore":10}),
+            json!({"type":"message","timestamp":"2026-01-05T10:00:04Z","message":{"role":"user","content":"after"}}),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect();
+        let conv = scan_single(&lines);
+        assert_eq!(conv.metadata["tree"]["integrity"], "linear");
+        assert_eq!(conv.metadata["tree"]["branch_leaf_count"], 1);
+        assert_eq!(
+            cass(message_with(&conv, "old turn"), "in_active_context"),
+            false
+        );
+        assert_eq!(
+            cass(message_with(&conv, "kept turn"), "in_active_context"),
+            true
+        );
+        assert_eq!(
+            cass(message_with(&conv, "after"), "in_active_context"),
+            true
+        );
+        assert!(
+            conv.messages
+                .iter()
+                .all(|m| cass(m, "on_active_branch") == true)
+        );
+
+        // A parentId naming an absent entry is treated as a root and flagged.
+        let lines: Vec<String> = vec![
+            json!({"type":"message","id":"x1","parentId":"gone","timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"orphan"}}),
+            json!({"type":"message","id":"x2","parentId":"x1","timestamp":"2026-01-05T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}),
+        ]
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect();
+        let conv = scan_single(&lines);
+        assert_eq!(conv.metadata["tree"]["integrity"], "missing_parent");
+        assert_eq!(conv.messages.len(), 2);
+        assert!(
+            conv.messages
+                .iter()
+                .all(|m| cass(m, "on_active_branch") == true)
+        );
     }
 }

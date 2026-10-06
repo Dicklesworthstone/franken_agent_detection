@@ -1112,4 +1112,75 @@ mod tests {
         assert_eq!(conv.metadata["model_id"], "second-model");
         assert_eq!(conv.metadata["provider"], "openrouter");
     }
+
+    #[test]
+    fn shared_parser_extensions_keep_omp_branches_and_titles_intact() {
+        // franken_agent_detection#27 on the omp side of the shared parser:
+        // the bare-`model` spelling must stay branch-local, the omp `title`
+        // entry keeps precedence, and summaries/system prompts follow the
+        // same archive policy as pi-mono.
+        let dir = tempfile::TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let file = sessions.join("2026-08-23T12-00-00_branchy.jsonl");
+        let lines = [
+            json!({"type":"session","version":3,"id":"omp-br","timestamp":"2026-08-23T12:00:00Z","cwd":"/w"}),
+            json!({"type":"title","id":"t1","parentId":null,"title":"omp generated title"}),
+            json!({"type":"message","id":"s0","parentId":"t1","timestamp":"2026-08-23T12:00:01Z","message":{"role":"system","content":"OMP_SYSTEM_PROMPT"}}),
+            json!({"type":"message","id":"u1","parentId":"s0","timestamp":"2026-08-23T12:00:02Z","message":{"role":"user","content":"question"}}),
+            json!({"type":"model_change","id":"mB","parentId":"u1","timestamp":"2026-08-23T12:00:03Z","provider":"openrouter","model":"branch-b-model"}),
+            json!({"type":"model_change","id":"mA","parentId":"u1","timestamp":"2026-08-23T12:00:04Z","model":"branch-a-model"}),
+            json!({"type":"message","id":"aA","parentId":"mA","timestamp":"2026-08-23T12:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"abandoned reply"},{"type":"toolCall","id":"call_1","name":"read","arguments":{"path":"a.rs"}}]}}),
+            json!({"type":"compaction","id":"c1","parentId":"mB","timestamp":"2026-08-23T12:00:06Z","summary":"OMP_COMPACTION_SUMMARY","firstKeptEntryId":"c1","tokensBefore":1000}),
+            json!({"type":"message","id":"aB","parentId":"c1","timestamp":"2026-08-23T12:00:07Z","message":{"role":"assistant","content":[{"type":"text","text":"active reply"}]}}),
+        ];
+        fs::write(
+            &file,
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let conv =
+            super::super::pi_wire::parse_session_file(&file, &sessions, "omp").expect("parses");
+        assert_eq!(conv.title.as_deref(), Some("omp generated title"));
+        assert!(
+            !serde_json::to_string(&conv)
+                .unwrap()
+                .contains("OMP_SYSTEM_PROMPT")
+        );
+
+        let by_text = |needle: &str| {
+            conv.messages
+                .iter()
+                .find(|m| m.content.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
+        let abandoned = by_text("abandoned reply");
+        assert_eq!(abandoned.author.as_deref(), Some("branch-a-model"));
+        assert_eq!(abandoned.extra["cass"]["on_active_branch"], false);
+        assert_eq!(abandoned.invocations.len(), 1);
+        assert_eq!(abandoned.invocations[0].name, "read");
+
+        let active = by_text("active reply");
+        assert_eq!(active.author.as_deref(), Some("branch-b-model"));
+        assert_eq!(active.extra["cass"]["provider"], "openrouter");
+        assert_eq!(active.extra["cass"]["in_active_context"], true);
+
+        // A retain-none compaction names itself: nothing before it is kept.
+        let compaction = by_text("OMP_COMPACTION_SUMMARY");
+        assert_eq!(compaction.extra["cass"]["entry_kind"], "compaction");
+        assert_eq!(compaction.extra["cass"]["in_active_context"], true);
+        assert_eq!(
+            by_text("question").extra["cass"]["in_active_context"],
+            false
+        );
+
+        assert_eq!(conv.metadata["model_id"], "branch-b-model");
+        assert_eq!(conv.metadata["provider"], "openrouter");
+        assert_eq!(conv.metadata["tree"]["branch_leaf_count"], 2);
+    }
 }

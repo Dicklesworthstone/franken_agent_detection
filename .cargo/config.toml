@@ -1,3 +1,8 @@
 # Parallel rustc front-end (nightly). Added by build-settings sweep.
 [build]
 rustflags = ["-Z", "threads=4"]
+
+[env]
+# fsqlite's async engine builds very large debug-mode futures; some SQLite
+# connector tests overflow the default 2 MiB test-thread stack.
+RUST_MIN_STACK = "16777216"

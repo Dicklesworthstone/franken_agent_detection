@@ -50,6 +50,38 @@ window is since GitHub Release
 
 ## [Unreleased]
 
+### Added
+
+- **Pi / Oh My Pi archive fidelity
+  ([#27](https://github.com/Dicklesworthstone/franken_agent_detection/issues/27)):**
+  the shared pi-family parser now keeps `compaction` and `branch_summary`
+  summaries, `custom_message` entries and in-message `custom`/`hookMessage`
+  roles, and `bashExecution` shell runs, which were previously dropped. Each
+  message's `extra.cass` names its `entry_kind`/`source_role`, entry and
+  parent ids, source line, and whether it is `on_active_branch` (pi's current
+  leaf walked to its root) and `in_active_context` (latest compaction and
+  `context_edit`s applied). Abandoned branches stay indexed. Conversation
+  metadata gains `tree` (integrity, leaf/branch counts, active leaf),
+  `session_version`, `parent_session`, and compaction/system-message counts.
+  Session names (`session_info`) and labels are used.
+- **Pi / Oh My Pi token usage:** token extraction reads pi's exact assistant
+  `usage` block (and compaction/branch-summary generation usage) instead of
+  estimating from content; `omp` is now covered too.
+
+### Fixed
+
+- **Pi / Oh My Pi model attribution:** an assistant message without
+  `message.model` inherits the model selected on its own branch, never a
+  sibling branch's later `model_change`. Conversation-level `model_id` /
+  `provider` are the active branch's. Broken trees (missing parent, cycle)
+  fall back to file order and say so in `tree.integrity`.
+- **Pi / Oh My Pi:** system messages and compaction system checkpoints
+  (prompt sections, tool declarations) are no longer indexed as conversation
+  text.
+- **Tests:** `cargo test` no longer needs `RUST_MIN_STACK` exported by hand:
+  `.cargo/config.toml` raises the test-thread stack for fsqlite's large debug
+  futures.
+
 ### Changed
 
 - **Codebuff / Freebuff:** a scan failure's count of further failed
