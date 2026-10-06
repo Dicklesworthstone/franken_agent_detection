@@ -2287,6 +2287,33 @@ mod tests {
         }
 
         #[test]
+        fn remote_sqlite_sessions_are_not_read() {
+            let dir = TempDir::new().unwrap();
+            let storage = create_pi_agent_storage(&dir);
+            let (header, entries) = rust_session();
+            write_sqlite_session(
+                &storage
+                    .join("sessions")
+                    .join("--w--")
+                    .join("2026-02-01T10-00-00_remote.sqlite"),
+                &header,
+                &entries,
+            );
+            let ctx = ScanContext::with_roots(
+                PathBuf::from("/nonexistent"),
+                vec![ScanRoot::remote(
+                    storage,
+                    crate::types::Origin::remote_with_host("host-a", "host-a.example"),
+                    None,
+                )],
+                None,
+            );
+            let connector = PiAgentConnector::new();
+            assert!(connector.scan(&ctx).unwrap().is_empty());
+            assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
+        }
+
+        #[test]
         fn jsonl_twins_win_and_foreign_sqlite_files_are_skipped() {
             let dir = TempDir::new().unwrap();
             let storage = create_pi_agent_storage(&dir);

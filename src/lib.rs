@@ -395,11 +395,17 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             Some(vec![PathBuf::from(root)])
         }
         "pi_agent" => {
-            let root = read("PI_CODING_AGENT_DIR")?;
-            if root.is_empty() {
-                return None;
+            // Same precedence as the connector: `PI_SESSIONS_DIR` names a
+            // sessions directory directly and is honored independently of
+            // the `PI_CODING_AGENT_DIR` agent home.
+            let mut roots = Vec::new();
+            if let Some(sessions) = read("PI_SESSIONS_DIR").filter(|v| !v.is_empty()) {
+                roots.push(PathBuf::from(sessions));
             }
-            Some(vec![PathBuf::from(root).join("sessions")])
+            if let Some(agent) = read("PI_CODING_AGENT_DIR").filter(|v| !v.is_empty()) {
+                roots.push(PathBuf::from(agent).join("sessions"));
+            }
+            (!roots.is_empty()).then_some(roots)
         }
         "pi_durable" => {
             // The durable host keeps its stores under the same agent dir.

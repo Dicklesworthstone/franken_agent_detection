@@ -1241,11 +1241,17 @@ pub fn parse_sqlite_session(
     let records = match read_sqlite_records(path) {
         Ok(records) => records,
         Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %format!("{err:#}"),
-                "{agent_slug}: skipping unreadable pi SQLite session"
-            );
+            let detail = format!("{err:#}");
+            if detail.starts_with("not a pi SQLite session") {
+                // Another tool's database under the sessions tree.
+                tracing::debug!(path = %path.display(), "{agent_slug}: {detail}");
+            } else {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %detail,
+                    "{agent_slug}: skipping unreadable pi SQLite session"
+                );
+            }
             return None;
         }
     };
@@ -1300,7 +1306,10 @@ fn home_sources(
 
     let home = &root.path;
     let mut out = Vec::new();
-    if cfg!(feature = "pi-sqlite") {
+    // A synced copy of a live SQLite database and its WAL is not one
+    // consistent snapshot (the Shelley / pi_durable rule): remote SQLite
+    // sessions are left to be indexed on their own host.
+    if cfg!(feature = "pi-sqlite") && !root.origin.is_remote() {
         for db in sqlite_session_files(home) {
             if path_is_excluded(&db, excluded_paths)
                 || has_jsonl_twin(&db)
