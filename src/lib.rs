@@ -179,7 +179,9 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "amp" | "amp-cli" => Some("amp"),
         "antigravity" | "agy" | "antigravity-cli" | "antigravity-ide" => Some("antigravity"),
         "chatgpt" | "chat-gpt" | "chatgpt-desktop" => Some("chatgpt"),
-        "claude" | "claude-code" => Some("claude"),
+        // The connector emits `agent_slug = "claude_code"`; the registry's
+        // public slug stays `claude`. Both must resolve.
+        "claude" | "claude-code" | "claude_code" => Some("claude"),
         "clawdbot" | "clawd-bot" => Some("clawdbot"),
         "cline" => Some("cline"),
         "codebuff" | "freebuff" | "manicode" | "codebuff-lineage" => Some("codebuff"),
@@ -2101,6 +2103,36 @@ mod tests {
     /// list) must agree exactly. Range-editing one table has twice silently
     /// dropped a sibling row (kimi/openclaw module arms, "open-claw" alias);
     /// this pins every table to the slug set mechanically.
+    /// Every `agent_slug` a connector writes into its conversations must be
+    /// accepted by detection, so a consumer can go from a conversation back
+    /// to `detect_installed_agents` (bead 8np: `claude_code` vs `claude`).
+    #[test]
+    fn emitted_conversation_slugs_resolve_in_the_registry() {
+        for (emitted, canonical) in [
+            ("claude_code", "claude"),
+            ("copilot", "github-copilot"),
+            ("copilot_cli", "copilot_cli"),
+            ("pi_agent", "pi_agent"),
+            ("pi_durable", "pi_durable"),
+            ("omp", "omp"),
+            ("prime_agent", "prime_agent"),
+            ("grok_bot", "grok_bot"),
+        ] {
+            assert_eq!(
+                canonical_connector_slug(emitted),
+                Some(canonical),
+                "{emitted}"
+            );
+        }
+        let report = detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec!["claude_code".into()]),
+            include_undetected: true,
+            root_overrides: Vec::new(),
+        })
+        .expect("claude_code resolves");
+        assert_eq!(report.installed_agents[0].slug, "claude");
+    }
+
     #[test]
     fn registry_tables_agree_exactly() {
         let known: HashSet<&str> = KNOWN_CONNECTORS.iter().copied().collect();
