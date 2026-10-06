@@ -65,8 +65,8 @@ pub use connectors::{
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
     get_connector_factories, grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector,
     normalize_model, omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
-    parse_timestamp, pi_agent::PiAgentConnector, prime_agent::PrimeAgentConnector,
-    qwen::QwenConnector, token_extraction, vibe::VibeConnector,
+    parse_timestamp, pi_agent::PiAgentConnector, pi_durable::PiDurableConnector,
+    prime_agent::PrimeAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -155,6 +155,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "openclaw",
     "openhands",
     "pi_agent",
+    "pi_durable",
     "prime_agent",
     "qwen",
     "shelley",
@@ -193,6 +194,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "openclaw" | "open-claw" => Some("openclaw"),
         "openhands" | "open-hands" => Some("openhands"),
         "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
+        "pi_durable" | "pi-durable" | "pidurable" => Some("pi_durable"),
         "prime_agent" | "prime-agent" | "primeagent" => Some("prime_agent"),
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
         "shelley" | "shelley-db" => Some("shelley"),
@@ -386,6 +388,18 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                 return None;
             }
             Some(vec![PathBuf::from(root).join("sessions")])
+        }
+        "pi_durable" => {
+            // The durable host keeps its stores under the same agent dir.
+            let root = read("PI_CODING_AGENT_DIR")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![
+                expand_leading_tilde(&root, dirs::home_dir().as_deref())
+                    .join("experimental")
+                    .join("durable-sessions"),
+            ])
         }
         "prime_agent" => {
             // Prime's own precedence: PRIME_AGENT_SESSION_DIR (direct
@@ -896,6 +910,12 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         }
         "pi_agent" => {
             maybe_push(&mut out, &[".pi", "agent", "sessions"]);
+        }
+        "pi_durable" => {
+            maybe_push(
+                &mut out,
+                &[".pi", "agent", "experimental", "durable-sessions"],
+            );
         }
         "prime_agent" => {
             maybe_push(&mut out, &[".prime", "agent", "sessions"]);
@@ -1475,6 +1495,11 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".local", "share", "omp"]),
                 ],
                 "pi_agent" => vec![tilde(&[".pi", "agent", "sessions"])],
+                // Like Shelley, deliberately no remote probes: the default
+                // durable store is a live WAL-mode SQLite database, which
+                // cannot be SSH-synced as one consistent bundle.
+                #[allow(clippy::match_same_arms)]
+                "pi_durable" => vec![],
                 "prime_agent" => vec![
                     tilde(&[".prime", "agent", "sessions"]),
                     tilde(&[".prime", "agent"]),
@@ -2111,7 +2136,7 @@ mod tests {
             // Shelley's arm is intentionally empty: no safe remote
             // export/sync of a live SQLite database exists yet (cass gh#415).
             assert!(
-                !paths.is_empty() || slug == "shelley",
+                !paths.is_empty() || slug == "shelley" || slug == "pi_durable",
                 "connector {slug} has empty tilde paths"
             );
         }

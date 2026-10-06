@@ -40,6 +40,7 @@ pub mod opencode;
 pub mod openhands;
 pub mod path_trie;
 pub mod pi_agent;
+pub mod pi_durable;
 pub mod pi_wire;
 pub mod prime_agent;
 pub mod qwen;
@@ -286,6 +287,11 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         }),
         ("aider", || Box::new(aider::AiderConnector::new())),
         ("pi_agent", || Box::new(pi_agent::PiAgentConnector::new())),
+        // Always registered: JSONL commit-log stores need no SQLite; the
+        // SQLite backend is read only with the `pi-durable` feature.
+        ("pi_durable", || {
+            Box::new(pi_durable::PiDurableConnector::new())
+        }),
         ("prime_agent", || {
             Box::new(prime_agent::PrimeAgentConnector::new())
         }),

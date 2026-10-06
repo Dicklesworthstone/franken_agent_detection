@@ -52,6 +52,26 @@ window is since GitHub Release
 
 ### Added
 
+- **`pi_durable` connector
+  ([#28](https://github.com/Dicklesworthstone/franken_agent_detection/issues/28)):**
+  reads Pi's experimental durable harness (`@earendil-works/pi-durable`).
+  SQLite stores (the host's
+  `~/.pi/agent/experimental/durable-sessions/<cwd-hash>/<ms>-<uuid>/session.sqlite`,
+  schema version 1) are opened read-only in one snapshot that includes the
+  live WAL (new `pi-durable` feature, part of `all-connectors`). JSONL
+  commit-log stores (`main.jsonl` plus `doc-<id>.jsonl` sidecars, format 1)
+  are found under explicit roots and need no SQLite. Only committed state is
+  read: torn final markers, corrupt markers and unconfirmed sidecar records
+  are ignored and reported. Each conversation in a store (root, forks,
+  task-owned children) becomes its own conversation with only its own
+  entries; `metadata.parent` / `metadata.owner` link forks and children.
+  Messages record `in_active_context` (newest reset/compaction `head` and
+  per-target `edits` applied). `pi.system` prompts, task checkpoints and
+  application documents are never indexed; the working directory comes from
+  the conversation's `pi.agent` document. Unsupported versions, remote SQLite
+  stores and builds without SQLite support are reported through
+  `PiDurableConnector::store_diagnostics`. Exact token usage is extracted.
+
 - **Pi / Oh My Pi archive fidelity
   ([#27](https://github.com/Dicklesworthstone/franken_agent_detection/issues/27)):**
   the shared pi-family parser now keeps `compaction` and `branch_summary`

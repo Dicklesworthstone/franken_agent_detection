@@ -381,16 +381,16 @@ pub fn extract_tokens_for_agent(
         // pi counts both in session totals. Tool-result usage (nested model
         // work) is deliberately NOT read: pi keeps it out of the main
         // model-call accounting.
-        "pi_agent" | "omp" => {
+        //
+        // Pi durable (`pi_durable`) keeps the same pi-ai assistant message
+        // under `extra.message`.
+        "pi_agent" | "omp" | "pi_durable" => {
             let entry_type = extra.get("type").and_then(Value::as_str);
+            let is_assistant =
+                extra.pointer("/message/role").and_then(Value::as_str) == Some("assistant");
             let usage = match entry_type {
-                Some("message")
-                    if extra.pointer("/message/role").and_then(Value::as_str)
-                        == Some("assistant") =>
-                {
-                    extra.pointer("/message/usage")
-                }
                 Some("compaction" | "branch_summary") => extra.get("usage"),
+                _ if is_assistant => extra.pointer("/message/usage"),
                 _ => None,
             };
             let model_name = extra

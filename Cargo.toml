@@ -112,6 +112,10 @@ openclaw-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:zst
 # The newer flat-JSON and append-log `chatSessions` generations need no SQLite
 # and are always available with the base `connectors` feature.
 copilot-vscdb = ["connectors", "dep:frankensqlite", "dep:asupersync"]
+# Pi's experimental durable harness (`@earendil-works/pi-durable`): read-only
+# access to its WAL-mode session.sqlite stores. JSONL commit-log stores need no
+# SQLite and are read with the base `connectors` feature (#28).
+pi-durable = ["connectors", "dep:frankensqlite", "dep:asupersync"]
 # All connectors enabled
 all-connectors = [
     "connectors",
@@ -127,6 +131,7 @@ all-connectors = [
     "shelley",
     "openclaw-sqlite",
     "copilot-vscdb",
+    "pi-durable",
 ]
 
 [dev-dependencies]
