@@ -52,7 +52,10 @@ use anyhow::{Result, anyhow};
 use serde_json::{Map, Value, json};
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
@@ -1308,14 +1311,48 @@ impl Connector for PiDurableConnector {
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    /// One store is one source (FAD#22): `main.jsonl` (every committed
+    /// change, `pi.agent` documents included, appends a marker to it) or
+    /// `session.sqlite` with its WAL as a required sidecar. Completion fires
+    /// only after every conversation of the store was delivered and neither
+    /// file changed while it was read.
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
         for candidate in Self::candidates(ctx) {
             if !store_modified_since(&candidate, ctx.since_ts) {
                 continue;
             }
+            let (source, sidecars) = candidate_sources(&candidate);
+            if !hooks.should_scan(&source) {
+                continue;
+            }
             match scan_candidate(&candidate) {
                 Ok(conversations) => {
+                    let emitted = conversations.len();
                     for conversation in conversations {
                         on_conversation(conversation)?;
+                    }
+                    let changed = source.fs_metadata_changed()
+                        || sidecars
+                            .iter()
+                            .any(DiscoveredSourceFile::fs_metadata_changed);
+                    if emitted > 0 && !changed {
+                        hooks.complete(&SourceCompletion {
+                            source,
+                            required_sidecars: sidecars,
+                            conversations_emitted: emitted,
+                        })?;
                     }
                 }
                 Err(err) => {
@@ -1348,48 +1385,63 @@ impl Connector for PiDurableConnector {
             if !store_modified_since(&candidate, ctx.since_ts) {
                 continue;
             }
-            match candidate.backend {
-                DurableBackend::Jsonl => out.push(
-                    DiscoveredSourceFile::new(
-                        "pi_durable",
-                        &candidate.root,
-                        candidate.path.clone(),
-                        DiscoveredSourceRole::PrimarySessionLog,
-                        true,
-                    )
-                    .with_fs_metadata(),
-                ),
-                DurableBackend::Sqlite => {
+            let (source, required) = candidate_sources(&candidate);
+            out.push(source);
+            out.extend(required);
+            if candidate.backend == DurableBackend::Sqlite {
+                let shm = sidecar_path(&candidate.path, "-shm");
+                if shm.is_file() {
                     out.push(
                         DiscoveredSourceFile::new(
                             "pi_durable",
                             &candidate.root,
-                            candidate.path.clone(),
-                            DiscoveredSourceRole::SqliteDatabase,
-                            true,
+                            shm,
+                            DiscoveredSourceRole::MetadataSidecar,
+                            false,
                         )
                         .with_fs_metadata(),
                     );
-                    for (suffix, required) in [("-wal", true), ("-shm", false)] {
-                        let sidecar = sidecar_path(&candidate.path, suffix);
-                        if sidecar.is_file() {
-                            out.push(
-                                DiscoveredSourceFile::new(
-                                    "pi_durable",
-                                    &candidate.root,
-                                    sidecar,
-                                    DiscoveredSourceRole::MetadataSidecar,
-                                    required,
-                                )
-                                .with_fs_metadata(),
-                            );
-                        }
-                    }
                 }
             }
         }
         Ok(out)
     }
+}
+
+/// Pre-parse identity of a store: its primary source and the sidecars whose
+/// fingerprints also authorize a resume skip (a SQLite WAL).
+fn candidate_sources(
+    candidate: &StoreCandidate,
+) -> (DiscoveredSourceFile, Vec<DiscoveredSourceFile>) {
+    let role = match candidate.backend {
+        DurableBackend::Jsonl => DiscoveredSourceRole::PrimarySessionLog,
+        DurableBackend::Sqlite => DiscoveredSourceRole::SqliteDatabase,
+    };
+    let source = DiscoveredSourceFile::new(
+        "pi_durable",
+        &candidate.root,
+        candidate.path.clone(),
+        role,
+        true,
+    )
+    .with_fs_metadata();
+    let mut sidecars = Vec::new();
+    if candidate.backend == DurableBackend::Sqlite {
+        let wal = sidecar_path(&candidate.path, "-wal");
+        if wal.is_file() {
+            sidecars.push(
+                DiscoveredSourceFile::new(
+                    "pi_durable",
+                    &candidate.root,
+                    wal,
+                    DiscoveredSourceRole::MetadataSidecar,
+                    true,
+                )
+                .with_fs_metadata(),
+            );
+        }
+    }
+    (source, sidecars)
 }
 
 #[cfg(test)]
@@ -1898,6 +1950,50 @@ mod tests {
         assert!(is_cwd_hash_dir("0123456789abcdef01234567"));
         assert!(!is_cwd_hash_dir("0123456789ABCDEF01234567"));
         assert!(!is_cwd_hash_dir("0123456789abcdef"));
+    }
+
+    #[test]
+    fn a_store_is_one_resumable_source() {
+        use crate::connectors::SourceScanHooks;
+        let tmp = TempDir::new().unwrap();
+        let main = write_jsonl_store(&tmp.path().join("s"));
+        let connector = PiDurableConnector::new();
+        assert!(connector.supports_source_boundaries());
+        let ctx = explicit_ctx(tmp.path());
+
+        let mut completions = Vec::new();
+        let mut on_complete = |completion: &SourceCompletion| {
+            completions.push((
+                completion.source.source_path.clone(),
+                completion.conversations_emitted,
+            ));
+            Ok(())
+        };
+        let mut hooks = SourceScanHooks {
+            should_scan_source: None,
+            on_source_complete: Some(&mut on_complete),
+        };
+        let mut delivered = 0;
+        connector
+            .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| {
+                delivered += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, 3);
+        assert_eq!(completions, vec![(main, 3)]);
+
+        // A skipped store yields nothing.
+        let mut never = |_: &DiscoveredSourceFile| false;
+        let mut hooks = SourceScanHooks {
+            should_scan_source: Some(&mut never),
+            on_source_complete: None,
+        };
+        connector
+            .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| {
+                panic!("skipped store must not emit")
+            })
+            .unwrap();
     }
 
     #[cfg(feature = "pi-durable")]

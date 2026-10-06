@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, ScanContext, ScanRoot};
+use super::scan::{DiscoveredSourceFile, ScanContext, ScanRoot, SourceScanHooks};
 use super::{Connector, franken_detection_for_connector, utils::dedupe_path_key};
 use crate::types::{DetectionResult, NormalizedConversation};
 /// A Pi session store format that the `pi_agent` connector does not index.
@@ -337,20 +337,50 @@ impl Connector for PiAgentConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let homes: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
+        let mut conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            conversations.push(conversation);
+            Ok(())
+        })?;
+        Ok(conversations)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let roots = Self::source_roots(ctx);
+        let homes: Vec<PathBuf> = roots.iter().map(|root| root.path.clone()).collect();
 
         // Surface Pi storage formats this connector does not index (Session
-        // Store V2 sidecars, SQLite-backed session stores) as explicit,
-        // machine-readable diagnostics so users on non-default storage are not
-        // silently left with zero/partial coverage.
+        // Store V2 sidecars; SQLite sessions without the `pi-sqlite` feature)
+        // as explicit, machine-readable diagnostics so users on non-default
+        // storage are not silently left with zero/partial coverage.
         for store in Self::collect_unsupported_stores(&homes) {
             store.warn();
         }
 
-        super::pi_wire::scan_homes(&homes, ctx, "pi_agent")
+        let tagged: Vec<(ScanRoot, Option<String>)> =
+            roots.into_iter().map(|root| (root, None)).collect();
+        super::pi_wire::scan_roots_with_boundaries(&tagged, ctx, "pi_agent", hooks, on_conversation)
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
@@ -2289,5 +2319,86 @@ mod tests {
                     .is_some_and(|e| e == "jsonl")
             );
         }
+    }
+
+    // =========================================================================
+    // Source boundaries (FAD#22)
+    // =========================================================================
+
+    #[test]
+    fn source_boundaries_complete_each_session_and_honor_the_skip_ledger() {
+        use crate::connectors::{SourceCompletion, SourceScanHooks};
+        use std::collections::HashMap;
+
+        let dir = TempDir::new().unwrap();
+        let storage = create_pi_agent_storage(&dir);
+        for (name, text) in [
+            ("2026-01-01T10-00-00_a.jsonl", "first"),
+            ("2026-01-01T11-00-00_b.jsonl", "second"),
+        ] {
+            write_session_file(
+                &storage,
+                name,
+                &[&json!({"type":"message","timestamp":"2026-01-01T10:00:00Z","message":{"role":"user","content":text}}).to_string()],
+            );
+        }
+        let ctx = ScanContext::local_default(storage, None);
+        let connector = PiAgentConnector::new();
+        assert!(connector.supports_source_boundaries());
+        assert!(connector.supports_streaming_scan());
+
+        // First pass: every source completes, with discovery's identity.
+        let mut ledger: HashMap<PathBuf, (Option<u64>, Option<i64>)> = HashMap::new();
+        let mut emitted = 0;
+        {
+            let mut on_complete = |completion: &SourceCompletion| {
+                assert_eq!(completion.conversations_emitted, 1);
+                ledger.insert(
+                    completion.source.source_path.clone(),
+                    (
+                        completion.source.size_bytes,
+                        completion.source.modified_at_ms,
+                    ),
+                );
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| {
+                    emitted += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(emitted, 2);
+        let discovered = connector.discover_source_files(&ctx).unwrap();
+        assert_eq!(ledger.len(), discovered.len());
+        for source in &discovered {
+            assert_eq!(
+                ledger.get(&source.source_path),
+                Some(&(source.size_bytes, source.modified_at_ms)),
+                "completion identity must match discovery"
+            );
+        }
+
+        // Second pass: the ledger skips unchanged sources before parsing.
+        let mut skip = |source: &DiscoveredSourceFile| {
+            ledger.get(&source.source_path) != Some(&(source.size_bytes, source.modified_at_ms))
+        };
+        let mut hooks = SourceScanHooks {
+            should_scan_source: Some(&mut skip),
+            on_source_complete: None,
+        };
+        let mut resumed = 0;
+        connector
+            .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| {
+                resumed += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(resumed, 0);
     }
 }

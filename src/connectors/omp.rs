@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use super::scan::{DiscoveredSourceFile, ScanContext, ScanRoot};
+use super::scan::{DiscoveredSourceFile, ScanContext, ScanRoot, SourceScanHooks};
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation};
 
@@ -307,11 +307,43 @@ impl Connector for OmpConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let homes: Vec<(PathBuf, Option<String>)> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|(root, profile)| (root.path, profile))
-            .collect();
-        super::pi_wire::scan_homes_tagged(&homes, ctx, "omp")
+        let mut conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            conversations.push(conversation);
+            Ok(())
+        })?;
+        Ok(conversations)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        super::pi_wire::scan_roots_with_boundaries(
+            &Self::source_roots(ctx),
+            ctx,
+            "omp",
+            hooks,
+            on_conversation,
+        )
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {

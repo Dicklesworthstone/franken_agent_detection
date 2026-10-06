@@ -96,6 +96,12 @@ window is since GitHub Release
 - **Pi-family headers:** an explicit `leafId` (pi_agent_rust) selects the
   active branch (`tree.active_leaf_source = "header_leaf_id"`), and
   `branchedFrom` is read as fork ancestry like `parentSession`.
+- **Resumable ingestion for `pi_agent`, `omp` and `pi_durable` (FAD#22):**
+  all three now stream (`supports_streaming_scan`) and report per-source
+  lifecycle events (`supports_source_boundaries`). Each pi session file or
+  SQLite session is one source; each durable store is one source completed
+  after all its conversations (a SQLite WAL is a required sidecar). Discovery
+  and scans share one traversal, so their source identities match exactly.
 - **Pi / Oh My Pi token usage:** token extraction reads pi's exact assistant
   `usage` block (and compaction/branch-summary generation usage) instead of
   estimating from content; `omp` is now covered too.

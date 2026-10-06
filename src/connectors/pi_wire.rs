@@ -1276,9 +1276,93 @@ fn first_line_truncated(content: &str) -> String {
         .collect()
 }
 
-/// Discover deduplicated session files across `roots`, filtered by
-/// `since_ts`, wrapped as primary session-log sources attributed to
-/// `agent_slug`.
+/// One pi-family source: the primary file, the sidecars whose fingerprints
+/// also authorize a resume skip, and whether it is a SQLite session.
+struct HomeSource {
+    source: super::DiscoveredSourceFile,
+    required_sidecars: Vec<super::DiscoveredSourceFile>,
+    sqlite: bool,
+}
+
+/// Every source under one pi-family root, in deterministic order, with
+/// pre-parse identity: SQLite sessions (with `pi-sqlite`), then JSONL
+/// sessions. Exclusions, cross-root path dedupe and `since_ts` apply exactly
+/// as they do for scanning, so discovery and scans name the same sources.
+fn home_sources(
+    root: &super::ScanRoot,
+    ctx: &super::ScanContext,
+    agent_slug: &'static str,
+    excluded_paths: &[PathBuf],
+    seen_session_paths: &mut HashSet<PathBuf>,
+) -> Vec<HomeSource> {
+    use super::{DiscoveredSourceFile, DiscoveredSourceRole};
+    use crate::connectors::file_modified_since;
+
+    let home = &root.path;
+    let mut out = Vec::new();
+    if cfg!(feature = "pi-sqlite") {
+        for db in sqlite_session_files(home) {
+            if path_is_excluded(&db, excluded_paths)
+                || has_jsonl_twin(&db)
+                || !seen_session_paths.insert(dedupe_path_key(&db))
+            {
+                continue;
+            }
+            let wal = sqlite_wal(&db);
+            if !file_modified_since(&db, ctx.since_ts) && !file_modified_since(&wal, ctx.since_ts) {
+                continue;
+            }
+            let wal_source = wal.is_file().then(|| {
+                DiscoveredSourceFile::new(
+                    agent_slug,
+                    root,
+                    wal,
+                    DiscoveredSourceRole::MetadataSidecar,
+                    true,
+                )
+                .with_fs_metadata()
+            });
+            out.push(HomeSource {
+                source: DiscoveredSourceFile::new(
+                    agent_slug,
+                    root,
+                    db,
+                    DiscoveredSourceRole::SqliteDatabase,
+                    true,
+                )
+                .with_fs_metadata(),
+                required_sidecars: wal_source.into_iter().collect(),
+                sqlite: true,
+            });
+        }
+    }
+    for file in session_files(home) {
+        // Match before deduplication and per-source metadata or pre-mirroring.
+        if path_is_excluded(&file, excluded_paths)
+            || !seen_session_paths.insert(dedupe_path_key(&file))
+            || !file_modified_since(&file, ctx.since_ts)
+        {
+            continue;
+        }
+        out.push(HomeSource {
+            source: DiscoveredSourceFile::new(
+                agent_slug,
+                root,
+                file,
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            )
+            .with_fs_metadata(),
+            required_sidecars: Vec::new(),
+            sqlite: false,
+        });
+    }
+    out
+}
+
+/// Discover deduplicated session sources across `roots`, filtered by
+/// `since_ts`, attributed to `agent_slug`: JSONL session logs, plus (with
+/// `pi-sqlite`) SQLite session databases and their required WAL sidecars.
 ///
 /// Takes full [`super::ScanRoot`]s rather than bare paths so each discovered
 /// source keeps its scan-root provenance (`origin`, `platform`) — remote
@@ -1289,71 +1373,23 @@ pub fn discover_sources(
     ctx: &super::ScanContext,
     agent_slug: &'static str,
 ) -> Vec<super::DiscoveredSourceFile> {
-    use super::{DiscoveredSourceFile, DiscoveredSourceRole};
-    use crate::connectors::file_modified_since;
-
     let excluded_paths = excluded_scan_paths_from_env();
-    let mut out = Vec::new();
+    let mut seen_homes: HashSet<PathBuf> = HashSet::new();
     let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::new();
     for root in roots {
-        for file in session_files(&root.path) {
-            // Match before deduplication and per-source metadata or pre-mirroring.
-            if path_is_excluded(&file, &excluded_paths) {
-                continue;
-            }
-            if !seen_session_paths.insert(dedupe_path_key(&file)) {
-                continue;
-            }
-            if !file_modified_since(&file, ctx.since_ts) {
-                continue;
-            }
-            out.push(
-                DiscoveredSourceFile::new(
-                    agent_slug,
-                    root,
-                    file,
-                    DiscoveredSourceRole::PrimarySessionLog,
-                    true,
-                )
-                .with_fs_metadata(),
-            );
-        }
-        if !cfg!(feature = "pi-sqlite") {
+        if !seen_homes.insert(dedupe_path_key(&dedupe_home(&root.path))) {
             continue;
         }
-        for db in sqlite_session_files(&root.path) {
-            if path_is_excluded(&db, &excluded_paths)
-                || has_jsonl_twin(&db)
-                || !seen_session_paths.insert(dedupe_path_key(&db))
-            {
-                continue;
-            }
-            let wal = sqlite_wal(&db);
-            if !file_modified_since(&db, ctx.since_ts) && !file_modified_since(&wal, ctx.since_ts) {
-                continue;
-            }
-            out.push(
-                DiscoveredSourceFile::new(
-                    agent_slug,
-                    root,
-                    db,
-                    DiscoveredSourceRole::SqliteDatabase,
-                    true,
-                )
-                .with_fs_metadata(),
-            );
-            if wal.is_file() {
-                out.push(
-                    DiscoveredSourceFile::new(
-                        agent_slug,
-                        root,
-                        wal,
-                        DiscoveredSourceRole::MetadataSidecar,
-                        true,
-                    )
-                    .with_fs_metadata(),
-                );
-            }
+        for found in home_sources(
+            root,
+            ctx,
+            agent_slug,
+            &excluded_paths,
+            &mut seen_session_paths,
+        ) {
+            out.push(found.source);
+            out.extend(found.required_sidecars);
         }
     }
     out
@@ -1391,10 +1427,46 @@ pub fn scan_homes_tagged(
     ctx: &super::ScanContext,
     agent_slug: &'static str,
 ) -> Result<Vec<NormalizedConversation>> {
-    use crate::connectors::file_modified_since;
+    let roots: Vec<(super::ScanRoot, Option<String>)> = homes
+        .iter()
+        .map(|(home, profile)| (super::ScanRoot::local(home.clone()), profile.clone()))
+        .collect();
+    let mut convs = Vec::new();
+    scan_roots_with_boundaries(
+        &roots,
+        ctx,
+        agent_slug,
+        &mut super::SourceScanHooks::default(),
+        &mut |conversation| {
+            convs.push(conversation);
+            Ok(())
+        },
+    )?;
+    Ok(convs)
+}
+
+/// Streaming pi-family scan with per-source lifecycle events (FAD#22).
+///
+/// Each JSONL session file — and, with `pi-sqlite`, each SQLite session
+/// database — is one source yielding at most one conversation. Source
+/// identity (slug, scan root, origin, path, pre-parse size/mtime) is built
+/// exactly as [`discover_sources`] builds it; `hooks.should_scan()` runs
+/// before the source is opened, and `hooks.complete()` fires only after the
+/// conversation was delivered and the source (and a SQLite WAL) did not
+/// change while it was read.
+///
+/// Roots carry optional Oh My Pi profile provenance (see
+/// [`scan_homes_tagged`]); dedupe is first-wins across the whole list.
+pub fn scan_roots_with_boundaries(
+    roots: &[(super::ScanRoot, Option<String>)],
+    ctx: &super::ScanContext,
+    agent_slug: &'static str,
+    hooks: &mut super::SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
+    use super::{DiscoveredSourceFile, SourceCompletion};
 
     let excluded_paths = excluded_scan_paths_from_env();
-    let mut convs = Vec::new();
     // Symlink-aliased homes (e.g. `~/.omp/agent` -> `~/Library/...`) reach
     // the same session files twice. Canonicalizing every FILE would be far
     // too expensive for hot scans, so resolve each home ONCE and skip a
@@ -1403,12 +1475,12 @@ pub fn scan_homes_tagged(
     let mut seen_homes: HashSet<PathBuf> = HashSet::new();
     let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
 
-    for (home, profile) in homes {
+    for (root, profile) in roots {
+        let home = &root.path;
         let canonical_home = dedupe_home(home);
         if !seen_homes.insert(dedupe_path_key(&canonical_home)) {
             continue;
         }
-
         let sessions = sessions_dir(home);
         let tag = |mut conversation: NormalizedConversation| {
             if let Some(profile) = profile {
@@ -1422,44 +1494,61 @@ pub fn scan_homes_tagged(
             conversation
         };
 
-        #[cfg(feature = "pi-sqlite")]
-        for db in sqlite_session_files(home) {
-            if path_is_excluded(&db, &excluded_paths)
-                || has_jsonl_twin(&db)
-                || !seen_session_paths.insert(dedupe_path_key(&db))
-            {
+        let sources = home_sources(
+            root,
+            ctx,
+            agent_slug,
+            &excluded_paths,
+            &mut seen_session_paths,
+        );
+        for HomeSource {
+            source,
+            required_sidecars: sidecars,
+            sqlite,
+        } in sources
+        {
+            if !hooks.should_scan(&source) {
                 continue;
             }
-            if !file_modified_since(&db, ctx.since_ts)
-                && !file_modified_since(&sqlite_wal(&db), ctx.since_ts)
-            {
+            let parsed = if sqlite {
+                parse_sqlite_source(&source.source_path, &sessions, agent_slug)
+            } else {
+                parse_session_file(&source.source_path, &sessions, agent_slug)
+            };
+            let Some(conversation) = parsed else {
                 continue;
-            }
-            if let Some(conversation) = parse_sqlite_session(&db, &sessions, agent_slug) {
-                convs.push(tag(conversation));
-            }
-        }
-
-        for file in session_files(home) {
-            // Use the same policy as discovery before the source is opened.
-            if path_is_excluded(&file, &excluded_paths) {
-                continue;
-            }
-            // Guard against equivalent-but-differently-spelled file paths.
-            let dedupe_key = dedupe_path_key(&file);
-            if !seen_session_paths.insert(dedupe_key) {
-                continue;
-            }
-            // Skip files not modified since last scan
-            if !file_modified_since(&file, ctx.since_ts) {
-                continue;
-            }
-
-            if let Some(conversation) = parse_session_file(&file, &sessions, agent_slug) {
-                convs.push(tag(conversation));
+            };
+            on_conversation(tag(conversation))?;
+            let changed = source.fs_metadata_changed()
+                || sidecars
+                    .iter()
+                    .any(DiscoveredSourceFile::fs_metadata_changed);
+            if !changed {
+                hooks.complete(&SourceCompletion {
+                    source,
+                    required_sidecars: sidecars,
+                    conversations_emitted: 1,
+                })?;
             }
         }
     }
+    Ok(())
+}
 
-    Ok(convs)
+#[cfg(feature = "pi-sqlite")]
+fn parse_sqlite_source(
+    path: &Path,
+    sessions_dir: &Path,
+    agent_slug: &str,
+) -> Option<NormalizedConversation> {
+    parse_sqlite_session(path, sessions_dir, agent_slug)
+}
+
+#[cfg(not(feature = "pi-sqlite"))]
+const fn parse_sqlite_source(
+    _path: &Path,
+    _sessions_dir: &Path,
+    _agent_slug: &str,
+) -> Option<NormalizedConversation> {
+    None
 }
