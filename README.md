@@ -12,25 +12,25 @@
 
 </div>
 
-A small Rust crate for deterministic, local detection of installed coding-agent tools.
+A Rust crate with two layers for working with local coding-agent tools:
+
+1. **Detection** (always available, no features): which coding agents are
+   installed on this machine, as one stable, JSON-serializable report.
+2. **Connectors** (`connectors` feature and friends): read each agent's own
+   session history into one normalized conversation model, with discovery,
+   provenance, streaming and resumable ingestion. This is the parsing layer
+   [`cass`](https://github.com/Dicklesworthstone/coding_agent_session_search)
+   builds its search index on.
 
 ```bash
-cargo add franken-agent-detection
+cargo add franken-agent-detection                                # detection only
+cargo add franken-agent-detection --features all-connectors      # every connector
 ```
 
-## What this crate does
+Everything is synchronous, local and read-only: no async runtime, no network,
+and no connector ever writes to an agent's store.
 
-Many tools need to answer a simple question: which coding-agent connectors are available on this machine? This crate gives you one consistent report shape, one probe flow, and test-friendly root overrides.
-
-| Capability | `franken-agent-detection` |
-|---|---|
-| Stable JSON-serializable report | Yes |
-| Explicit connector scoping | Yes (`only_connectors`) |
-| Deterministic fixture mode | Yes (`root_overrides`) |
-| Async runtime required | No |
-| Tokio dependency | No |
-
-## Example
+## Detection
 
 ```rust
 use franken_agent_detection::{
@@ -42,16 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = detect_installed_agents(&AgentDetectOptions {
         only_connectors: Some(vec!["codex".into(), "gemini".into()]),
         include_undetected: true,
-        root_overrides: vec![
-            AgentDetectRootOverride {
-                slug: "codex".into(),
-                root: PathBuf::from("/tmp/mock-codex"),
-            },
-            AgentDetectRootOverride {
-                slug: "gemini".into(),
-                root: PathBuf::from("/tmp/mock-gemini"),
-            },
-        ],
+        root_overrides: vec![AgentDetectRootOverride {
+            slug: "codex".into(),
+            root: PathBuf::from("/tmp/mock-codex"),
+        }],
     })?;
 
     println!(
@@ -62,118 +56,167 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+| Item | Purpose |
+|---|---|
+| `detect_installed_agents` | Run filesystem probes and produce the full report |
+| `AgentDetectOptions` | Connector filtering (`only_connectors`), `include_undetected`, `root_overrides` |
+| `InstalledAgentDetectionReport` | `format_version`, `installed_agents` (slug, evidence, root paths), `summary` |
+| `default_probe_paths_tilde` | The `~/…` probe table, e.g. for remote probing over SSH |
+| `AgentDetectError` | `UnknownConnectors` (slug not recognized) |
+
+Slugs are normalized (`claude-code` → `claude`, `oh-my-pi` → `omp`, …);
+unknown slugs are an explicit error. Probe roots honor the agents' own
+environment overrides (`CODEX_HOME`, `PI_CODING_AGENT_DIR`, `CLAUDE_CONFIG_DIR`,
+…) and `root_overrides` makes tests deterministic.
+
+## Connectors
+
+```rust
+use franken_agent_detection::{
+    Connector, PiAgentConnector, ScanContext, ScanRoot, get_connector_factories,
+};
+use std::path::PathBuf;
+
+fn main() -> anyhow::Result<()> {
+    // Default locations for one agent.
+    let ctx = ScanContext::local_default(PathBuf::from("/tmp/cass-state"), None);
+    for conversation in PiAgentConnector::new().scan(&ctx)? {
+        println!("{:?}: {} messages", conversation.title, conversation.messages.len());
+    }
+
+    // Every compiled-in connector, over explicit roots, streaming.
+    let ctx = ScanContext::with_roots(
+        PathBuf::from("/tmp/cass-state"),
+        vec![ScanRoot::local(PathBuf::from("/home/me/.codex"))],
+        None, // or Some(since_ms) for incremental scans
+    );
+    for (slug, make) in get_connector_factories() {
+        make().scan_with_callback(&ctx, &mut |conversation| {
+            println!("{slug}: {:?}", conversation.external_id);
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+```
+
+Every connector produces `NormalizedConversation`s: `agent_slug`,
+`external_id`, `title`, `workspace`, `source_path`, timestamps, `metadata`,
+and `NormalizedMessage`s (`role`, `author`, `content`, `created_at`, structured
+tool `invocations`, and the raw provider record in `extra`). Connector-derived
+annotations live under `extra.cass` (for example branch and context membership
+for Pi sessions). `extract_tokens_for_agent` turns a message's `extra` into
+exact token usage where the agent records it, and an estimate otherwise.
+
+Beyond `scan`:
+
+| API | Purpose |
+|---|---|
+| `discover_source_files` | Pre-parse list of the files a scan will read (role, origin, size/mtime), so hosts can mirror sources before parsing |
+| `scan_with_callback` / `supports_streaming_scan` | Emit conversations incrementally instead of materializing the corpus |
+| `scan_with_source_boundaries` / `supports_source_boundaries` | Resumable ingestion: a pre-parse skip predicate and a per-source completion event (with required sidecars such as SQLite WALs) |
+| `ScanRoot::remote` + `Origin` | Scan synced copies of remote machines, keeping host provenance |
+| `CASS_EXCLUDE_PATHS` | Paths every connector skips before opening them |
+
+### Feature flags
+
+| Feature | Enables |
+|---|---|
+| `connectors` | Connector framework and every connector that needs no extra dependencies |
+| `chatgpt` | ChatGPT desktop, including AES-GCM encrypted v2/v3 conversations |
+| `cursor`, `opencode`, `goose`, `hermes`, `crush`, `devin`, `shelley` | SQLite-backed stores for those agents |
+| `openclaw-sqlite` | OpenClaw 2 per-agent SQLite transcripts (zstd events included) |
+| `copilot-vscdb` | Legacy VS Code Copilot chat sessions in `state.vscdb` |
+| `pi-sqlite` | `pi_agent_rust` SQLite sessions for the Pi family |
+| `pi-durable` | SQLite stores of Pi's experimental durable harness |
+| `codebuff`, `grok-bot` | Codebuff / Freebuff shared history; Grok Bot desktop replicas |
+| `all-connectors` | All of the above |
+
+SQLite stores are read with [FrankenSQLite](https://crates.io/crates/fsqlite)
+opened read-only inside one read transaction, so a live WAL is seen as one
+coherent snapshot and nothing is recovered or checkpointed.
+
+### Coverage
+
+| Slug | Agent | Storage read |
+|---|---|---|
+| `aider` | Aider | `.aider.chat.history.md` |
+| `amp` | Amp | thread JSON |
+| `antigravity` | Antigravity IDE and `agy` CLI | transcripts and conversation stores |
+| `chatgpt` | ChatGPT desktop | conversation JSON (encrypted generations with `chatgpt`) |
+| `claude` | Claude Code | session JSONL (`CLAUDE_CONFIG_DIR`, `XDG_CONFIG_HOME` aware) |
+| `clawdbot` | Clawdbot | session JSONL |
+| `cline` | Cline | task JSON |
+| `codebuff` | Codebuff / Freebuff (one shared store) | `~/.config/manicode` chats |
+| `codex` | Codex CLI | rollout JSONL |
+| `copilot` / `github-copilot` | VS Code Copilot Chat | chat-session JSON and append logs; legacy `state.vscdb` |
+| `copilot_cli` | Copilot CLI | session event logs |
+| `crush` | Charm Crush | SQLite |
+| `cursor` | Cursor | `state.vscdb` and agent transcripts |
+| `devin` | Devin CLI | `sessions.db` (detection-only without `devin`) |
+| `factory` | Factory Droid | session JSONL |
+| `gemini` | Gemini CLI | session JSON |
+| `goose` | Goose | `sessions.db` and legacy JSONL |
+| `grok` / `grok_bot` | Grok Build CLI / Grok Bot desktop | session logs / rolling replicas |
+| `hermes` | Hermes Agent | `state.db` |
+| `kimi`, `kiro`, `qwen`, `vibe`, `muse` | Kimi Code, Kiro CLI, Qwen Code, Mistral Vibe, Muse Code | their session logs |
+| `omp` | Oh My Pi | session JSONL, profiles and XDG layouts |
+| `openclaw` | OpenClaw | session JSONL; OpenClaw 2 SQLite |
+| `opencode` | OpenCode | JSON files and `opencode.db` |
+| `openhands` | OpenHands | conversation event JSON |
+| `pi_agent` | pi-mono and `pi_agent_rust` | session JSONL; SQLite sessions with `pi-sqlite` |
+| `pi_durable` | Pi durable harness | `main.jsonl` commit logs; `session.sqlite` with `pi-durable` |
+| `prime_agent` | Prime Agent | session JSONL |
+| `shelley` | Shelley | `shelley.db` |
+| `continue`, `windsurf` | Continue, Windsurf | detection only |
+
+Pi-family transcripts keep every branch of a session (abandoned branches stay
+searchable), and each message records whether it is on the active branch and
+in the active model context, with summaries, injected context and shell runs
+labeled by kind.
+
 ## Design goals
 
 1. Keep output stable for downstream tooling and snapshot tests.
-2. Keep behavior explicit, including connector normalization and unknown connector errors.
-3. Keep detection local to filesystem probes, with no network dependency.
+2. Keep behavior explicit: connector normalization, unknown slugs, unsupported
+   store versions and incomplete sources are reported, never guessed at.
+3. Stay local and read-only: filesystem and read-only SQLite access only.
 4. Stay runtime-neutral with a synchronous API.
-
-## Comparison
-
-| Approach | Pros | Cons |
-|---|---|---|
-| `franken-agent-detection` | Shared schema, test overrides, consistent connector handling | Focused scope (detection only) |
-| Ad-hoc per-project checks | Fast to start | Drift, inconsistent outputs, repeated bugs |
-| Full search/index systems | Rich capabilities | Unnecessary weight for install detection |
 
 ## Installation
 
-### crates.io (recommended)
-
-```bash
-cargo add franken-agent-detection
-```
-
-### Cargo.toml
-
 ```toml
 [dependencies]
-franken-agent-detection = "0.3.0"
+franken-agent-detection = "0.3"                                          # detection
+franken-agent-detection = { version = "0.3", features = ["all-connectors"] } # parsing
 ```
 
-### From source
+From source:
 
 ```bash
 git clone https://github.com/Dicklesworthstone/franken_agent_detection
 cd franken_agent_detection
-cargo test
-```
-
-## Quick start
-
-1. Add the dependency from crates.io.
-2. Call `detect_installed_agents(&AgentDetectOptions::default())`.
-3. Read `report.installed_agents` and `report.summary`.
-4. Use `only_connectors` when you want to scope checks.
-5. Use `root_overrides` for deterministic tests.
-
-## API reference
-
-| Item | Purpose |
-|---|---|
-| `AgentDetectOptions` | Control connector filtering and override roots |
-| `AgentDetectRootOverride` | Per-connector custom probe root |
-| `detect_installed_agents` | Run probes and produce full report |
-| `InstalledAgentDetectionReport` | Top-level report payload |
-| `AgentDetectError` | `UnknownConnectors` and feature-related errors |
-
-## Configuration
-
-The crate is configured through function inputs, not environment variables:
-
-```rust
-AgentDetectOptions {
-    only_connectors: Some(vec!["codex".into(), "claude".into()]),
-    include_undetected: false,
-    root_overrides: vec![],
-}
-```
-
-## How detection works
-
-```text
-detect_installed_agents(opts)
-        |
-        +--> normalize connector slugs
-        +--> validate known connectors
-        +--> build probe roots (default + overrides)
-        +--> filesystem existence checks
-        +--> stable InstalledAgentDetectionReport
+cargo test --all-features
 ```
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `UnknownConnectors` error | Connector slug not recognized | Use known slugs (`codex`, `claude`, `omp`, `gemini`, etc.) |
-| Empty results | No roots exist on this machine | Set `include_undetected = true` to inspect evidence |
-| Non-deterministic tests | Real home-dir probing in tests | Use `root_overrides` with temp directories |
-| Missing connector in report | Scoped connectors exclude it | Remove or expand `only_connectors` |
-| Docs mismatch | Local version differs from docs.rs | Align crate version with docs URL |
+| `UnknownConnectors` error | Connector slug not recognized | Use known slugs (`codex`, `claude`, `omp`, `gemini`, …) |
+| Empty detection results | No roots exist on this machine | Set `include_undetected = true` to inspect evidence |
+| A connector scans nothing | Its storage needs a cargo feature (SQLite, crypto) | Enable the feature from the table above, or `all-connectors` |
+| Non-deterministic tests | Real home-dir probing | Use `root_overrides` / explicit `ScanRoot`s over temp directories |
+| Stack overflow in SQLite tests | fsqlite's large debug-mode futures | `.cargo/config.toml` sets `RUST_MIN_STACK`; keep it when vendoring |
 
 ## Limitations
 
-- Installation detection only; no session parsing or indexing.
-- Default probe roots are opinionated and can require overrides in custom environments.
-- No background watching; checks run only when called.
-
-## FAQ
-
-### Does this crate require tokio or any async runtime?
-No. It is synchronous and runtime-neutral.
-
-### Is network access required?
-No. Detection is local filesystem probing only.
-
-### Can I test this deterministically in CI?
-Yes. Use `root_overrides` with temporary fixture directories.
-
-### How stable is the report schema?
-The report is meant for machine consumption and versioned with `format_version`.
-
-### Can this detect every possible agent tool?
-It detects a curated connector set and aliases. Unknown connectors return explicit errors.
+- Default probe roots are opinionated; custom layouts need overrides or
+  explicit scan roots.
+- No background watching; scans run only when called (`since_ts` makes them
+  incremental, source boundaries make them resumable).
+- Remote SQLite stores are not read: a live database and its WAL cannot be
+  synced as one consistent snapshot. Index them on their own host.
 
 ## About Contributions
 

@@ -1,6 +1,16 @@
-//! Local coding-agent installation detection.
+//! Local coding-agent detection and session-history connectors.
 //!
-//! Provides synchronous, filesystem-based probes for known coding-agent CLIs.
+//! Two layers, both synchronous, local and read-only:
+//!
+//! - **Detection** (always available): [`detect_installed_agents`] runs
+//!   filesystem probes for known coding agents and returns one stable,
+//!   JSON-serializable report.
+//! - **Connectors** (`connectors` feature; SQLite- and crypto-backed stores
+//!   behind their own features, all of them via `all-connectors`): each
+//!   connector reads one agent's session history into the normalized
+//!   conversation model, with source discovery, provenance, streaming and
+//!   resumable per-source ingestion. See `connectors::Connector` and
+//!   `get_connector_factories`.
 //!
 //! ## Types
 //!
