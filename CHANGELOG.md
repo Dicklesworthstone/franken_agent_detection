@@ -50,7 +50,11 @@ window is since GitHub Release
 
 ## [Unreleased]
 
-No changes yet.
+### Changed
+
+- **Codebuff / Freebuff:** a scan failure's count of further failed
+  transcripts reads "(and N more transcripts failed)" instead of "unparseable",
+  since a read can fail as well as a parse.
 
 ## [0.3.5] -- 2026-10-05
 

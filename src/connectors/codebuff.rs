@@ -413,7 +413,8 @@ impl Connector for CodebuffConnector {
         // other chat (cass GH #511): emit each chat that parses, then fail the
         // scan with the first bad transcript's path and cause. Hosts often
         // show only the top message, so it carries both; the original error
-        // stays in the chain, so an I/O cause is still an I/O cause.
+        // stays in the chain, so an I/O cause is still an I/O cause. The
+        // count says "failed", not "unparseable": a read can fail too.
         let mut first_failure: Option<(PathBuf, anyhow::Error)> = None;
         let mut failures = 0_usize;
         for source in Self::discover(ctx)? {
@@ -436,7 +437,7 @@ impl Connector for CodebuffConnector {
             Some((path, error)) => {
                 let others = match failures - 1 {
                     0 => String::new(),
-                    more => format!(" (and {more} more unparseable transcripts)"),
+                    more => format!(" (and {more} more transcripts failed)"),
                 };
                 let summary = format!("{}: {error:#}{others}", path.display());
                 Err(error.context(summary))
@@ -794,7 +795,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.ends_with("(and 1 more unparseable transcripts)"),
+            message.ends_with("(and 1 more transcripts failed)"),
             "{message}"
         );
         assert!(
