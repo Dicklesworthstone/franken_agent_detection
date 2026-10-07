@@ -126,6 +126,7 @@ Beyond `scan`:
 | `chatgpt` | ChatGPT desktop, including AES-GCM encrypted v2/v3 conversations |
 | `cursor`, `opencode`, `goose`, `hermes`, `crush`, `devin`, `shelley` | SQLite-backed stores for those agents |
 | `openclaw-sqlite` | OpenClaw 2 per-agent SQLite transcripts (zstd events included) |
+| `codex-zstd` | Codex rollouts compressed to `rollout-*.jsonl.zst` (Codex's `local_thread_store_compression`) |
 | `copilot-vscdb` | Legacy VS Code Copilot chat sessions in `state.vscdb` |
 | `pi-sqlite` | `pi_agent_rust` SQLite sessions for the Pi family |
 | `pi-durable` | SQLite stores of Pi's experimental durable harness |
@@ -148,7 +149,7 @@ coherent snapshot and nothing is recovered or checkpointed.
 | `clawdbot` | Clawdbot | session JSONL |
 | `cline` | Cline | task JSON |
 | `codebuff` | Codebuff / Freebuff (one shared store) | `~/.config/manicode` chats |
-| `codex` | Codex CLI | rollout JSONL |
+| `codex` | Codex CLI | rollout JSONL (`.jsonl.zst` with `codex-zstd`) |
 | `copilot` / `github-copilot` | VS Code Copilot Chat | chat-session JSON and append logs; legacy `state.vscdb` |
 | `copilot_cli` | Copilot CLI | session event logs |
 | `crush` | Charm Crush | SQLite |

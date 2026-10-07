@@ -1,7 +1,12 @@
 mod reader;
 mod user_prompts;
 
-pub use reader::{codex_rollout_byte_budget, set_codex_rollout_byte_budget};
+pub use reader::{
+    codex_rollout_byte_budget, is_compressed_rollout, rollout_session_path,
+    set_codex_rollout_byte_budget,
+};
+#[cfg(feature = "codex-zstd")]
+pub use reader::{compressed_rollout_declared_len, decompressed_rollout};
 
 use std::collections::HashSet;
 use std::fs;
@@ -30,6 +35,39 @@ use crate::types::{
 pub struct CodexConnector;
 
 const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+
+/// How a rollout file holds its records, from its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RolloutFormat {
+    /// `rollout-*.jsonl`: one JSON record per line.
+    Jsonl,
+    /// `rollout-*.jsonl.zst`: the same lines, zstd-compressed. Codex's
+    /// `local_thread_store_compression` feature compresses a finished session
+    /// this way. Read only with the `codex-zstd` feature.
+    CompressedJsonl,
+    /// Legacy `rollout-*.json`: one JSON document.
+    Json,
+}
+
+impl RolloutFormat {
+    fn of(path: &Path) -> Option<Self> {
+        if reader::is_compressed_rollout(path) {
+            return cfg!(feature = "codex-zstd").then_some(Self::CompressedJsonl);
+        }
+        let name = path.file_name()?.to_str()?;
+        if !name.starts_with("rollout-") {
+            return None;
+        }
+        let ext = path.extension()?.to_str()?;
+        if ext.eq_ignore_ascii_case("jsonl") {
+            Some(Self::Jsonl)
+        } else if ext.eq_ignore_ascii_case("json") {
+            Some(Self::Json)
+        } else {
+            None
+        }
+    }
+}
 
 enum FileScanMetadata {
     Process(Option<fs::Metadata>),
@@ -87,17 +125,7 @@ impl CodexConnector {
     }
 
     fn is_rollout_file(path: &Path) -> bool {
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-        if !name.starts_with("rollout-") {
-            return false;
-        }
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("jsonl") || ext.eq_ignore_ascii_case("json")
-            })
+        RolloutFormat::of(path).is_some()
     }
 
     fn sessions_dir_for_explicit_file(path: &Path) -> Option<PathBuf> {
@@ -116,18 +144,14 @@ impl CodexConnector {
         }
         for entry in WalkDir::new(sessions).into_iter().flatten() {
             if entry.file_type().is_file() {
-                let name = entry.file_name().to_str().unwrap_or("");
-                // Match both modern .jsonl and legacy .json formats
-                if name.starts_with("rollout-")
-                    && entry
-                        .path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| {
-                            ext.eq_ignore_ascii_case("jsonl") || ext.eq_ignore_ascii_case("json")
-                        })
-                {
-                    out.push(entry.path().to_path_buf());
+                match RolloutFormat::of(entry.path()) {
+                    // Codex removes the plain rollout once the compressed one
+                    // is in place. While both exist they hold one session,
+                    // read from the plain file.
+                    Some(RolloutFormat::CompressedJsonl)
+                        if entry.path().with_extension("").is_file() => {}
+                    Some(_) => out.push(entry.path().to_path_buf()),
+                    None => {}
                 }
             }
         }
@@ -493,7 +517,24 @@ fn scan_codex_with_hooks(
             if !hooks.should_scan(&discovered) {
                 continue;
             }
+            let Some(format) = RolloutFormat::of(&file) else {
+                continue;
+            };
             let file_size_bytes = file_metadata.as_ref().map(std::fs::Metadata::len);
+            // Size a compressed session by its text, as its plain form is sized.
+            #[cfg(feature = "codex-zstd")]
+            let file_size_bytes = if format == RolloutFormat::CompressedJsonl {
+                std::fs::File::open(&file)
+                    .ok()
+                    .and_then(|mut opened| {
+                        reader::compressed_rollout_declared_len(&mut opened)
+                            .ok()
+                            .flatten()
+                    })
+                    .or(file_size_bytes)
+            } else {
+                file_size_bytes
+            };
             let compact_message_extra =
                 CodexConnector::should_compact_large_message_extra(file_size_bytes);
             if compact_message_extra {
@@ -507,17 +548,17 @@ fn scan_codex_with_hooks(
                 .strip_prefix(&sessions_dir)
                 .ok()
                 .and_then(|rel| {
-                    rel.with_extension("")
+                    rollout_session_path(rel)
                         .to_str()
                         .map(std::string::ToString::to_string)
                 })
                 .or_else(|| {
-                    source_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(std::string::ToString::to_string)
+                    source_path.file_name().and_then(|name| {
+                        rollout_session_path(Path::new(name))
+                            .to_str()
+                            .map(std::string::ToString::to_string)
+                    })
                 });
-            let ext = file.extension().and_then(|e| e.to_str());
             let mut messages = Vec::new();
             let mut started_at = None;
             let mut ended_at = None;
@@ -526,8 +567,15 @@ fn scan_codex_with_hooks(
             // Capture stream/turn identity before large-message extra compaction.
             let mut user_prompts = user_prompts::UserPrompts::default();
 
-            if ext == Some("jsonl") {
-                let mut reader = reader::RolloutReader::open(&file, ctx.progress_tick.as_deref())?;
+            if matches!(
+                format,
+                RolloutFormat::Jsonl | RolloutFormat::CompressedJsonl
+            ) {
+                let mut reader = reader::RolloutReader::open(
+                    &file,
+                    format == RolloutFormat::CompressedJsonl,
+                    ctx.progress_tick.as_deref(),
+                )?;
 
                 // Accumulate privately until the complete opened snapshot is validated.
                 while let Some((line_idx, val)) = reader.next_record()? {
@@ -808,7 +856,7 @@ fn scan_codex_with_hooks(
                 }
                 user_prompts.finish(&mut messages);
                 crate::types::reindex_messages(&mut messages);
-            } else if ext == Some("json") {
+            } else {
                 // Legacy single-file rollouts can be huge; enforce the
                 // project's 100MB scan cap (chatgpt policy).
                 let content = match read_capped(&file) {
@@ -902,7 +950,7 @@ fn scan_codex_with_hooks(
                 source_path: source_path.clone(),
                 started_at,
                 ended_at,
-                metadata: serde_json::json!({"source": if ext == Some("json") { "rollout_json" } else { "rollout" }}),
+                metadata: serde_json::json!({"source": if format == RolloutFormat::Json { "rollout_json" } else { "rollout" }}),
                 messages,
             })?;
 
@@ -2240,6 +2288,148 @@ not valid json at all
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 2);
+    }
+
+    #[cfg(not(feature = "codex-zstd"))]
+    #[test]
+    fn compressed_rollouts_need_the_codex_zstd_feature() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("rollout-a.jsonl.zst"), b"x").unwrap();
+        fs::write(sessions.join("rollout-b.jsonl"), b"x").unwrap();
+        let files = CodexConnector::rollout_files(dir.path());
+        assert_eq!(files, vec![sessions.join("rollout-b.jsonl")]);
+    }
+
+    /// GH cass#513: Codex's `local_thread_store_compression` replaces a
+    /// finished session's `rollout-*.jsonl` with `rollout-*.jsonl.zst`.
+    #[cfg(feature = "codex-zstd")]
+    mod compressed_rollouts {
+        use super::*;
+
+        const FIXTURE: &str =
+            "sessions/2026/06/28/rollout-2026-06-28T10-00-00-modern-fixture.jsonl";
+
+        /// A Codex home holding the fixture session, plain or compressed the
+        /// way Codex compresses it: one frame that records the decoded length.
+        fn codex_home(dir: &TempDir, compressed: bool) -> PathBuf {
+            let home = dir.path().join(".codex");
+            let plain = home.join(FIXTURE);
+            fs::create_dir_all(plain.parent().unwrap()).unwrap();
+            let text = fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("fixtures/codex")
+                    .join(FIXTURE),
+            )
+            .unwrap();
+            if compressed {
+                let packed = zstd::bulk::compress(&text, 3).unwrap();
+                fs::write(plain.with_extension("jsonl.zst"), packed).unwrap();
+            } else {
+                fs::write(&plain, text).unwrap();
+            }
+            home
+        }
+
+        fn scan(home: PathBuf, since_ts: Option<i64>) -> Vec<Value> {
+            CodexConnector::new()
+                .scan(&ScanContext::local_default(home, since_ts))
+                .unwrap()
+                .into_iter()
+                .map(|conversation| serde_json::to_value(conversation).unwrap())
+                .collect()
+        }
+
+        #[test]
+        fn a_compressed_rollout_scans_to_the_conversation_its_plain_form_gives() {
+            let plain_dir = TempDir::new().unwrap();
+            let packed_dir = TempDir::new().unwrap();
+            let mut plain = scan(codex_home(&plain_dir, false), None);
+            let mut packed = scan(codex_home(&packed_dir, true), None);
+            assert_eq!(plain.len(), 1);
+            assert_eq!(packed.len(), 1, "the compressed session is found");
+
+            let plain_path = plain[0].as_object_mut().unwrap().remove("source_path");
+            let packed_path = packed[0].as_object_mut().unwrap().remove("source_path");
+            let format_of =
+                |path: Option<Value>| RolloutFormat::of(Path::new(path.unwrap().as_str().unwrap()));
+            assert_eq!(format_of(plain_path), Some(RolloutFormat::Jsonl));
+            assert_eq!(format_of(packed_path), Some(RolloutFormat::CompressedJsonl));
+            // Same id, messages, workspace, times and metadata: a session
+            // indexed before Codex compressed it is the same session after.
+            assert_eq!(packed, plain);
+            assert_eq!(
+                packed[0]["external_id"],
+                "2026/06/28/rollout-2026-06-28T10-00-00-modern-fixture"
+            );
+            assert_eq!(packed[0]["messages"].as_array().unwrap().len(), 6);
+        }
+
+        #[test]
+        fn a_compressed_rollout_keeps_the_modification_time_filter() {
+            let dir = TempDir::new().unwrap();
+            let home = codex_home(&dir, true);
+            let future = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+                + 3_600_000;
+            assert!(scan(home, Some(future)).is_empty());
+        }
+
+        #[test]
+        fn discovery_finds_compressed_rollouts_and_prefers_a_plain_copy() {
+            let dir = TempDir::new().unwrap();
+            let sessions = dir.path().join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            for name in [
+                "rollout-a.jsonl.zst",
+                "rollout-b.JSONL.ZST",
+                // Both exist for a moment while Codex compresses a session.
+                "rollout-c.jsonl",
+                "rollout-c.jsonl.zst",
+                "other-d.jsonl.zst",
+                "rollout-e.zst",
+                "rollout-f.json.zst",
+            ] {
+                fs::write(sessions.join(name), b"x").unwrap();
+            }
+            let names = CodexConnector::rollout_files(dir.path())
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                [
+                    "rollout-a.jsonl.zst",
+                    "rollout-b.JSONL.ZST",
+                    "rollout-c.jsonl"
+                ]
+            );
+        }
+
+        #[test]
+        fn a_cut_short_compressed_rollout_fails_the_scan_instead_of_shortening_it() {
+            let dir = TempDir::new().unwrap();
+            let home = codex_home(&dir, true);
+            let packed = home.join(FIXTURE).with_extension("jsonl.zst");
+            let bytes = fs::read(&packed).unwrap();
+            fs::write(&packed, &bytes[..bytes.len() - 4]).unwrap();
+            let error = CodexConnector::new()
+                .scan(&ScanContext::local_default(home, None))
+                .expect_err("a cut-short compressed rollout is not a complete session");
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::UnexpectedEof),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]

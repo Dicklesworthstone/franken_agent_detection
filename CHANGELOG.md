@@ -52,6 +52,25 @@ window is since GitHub Release
 
 ### Added
 
+- **Codex: compressed rollouts (`codex-zstd` feature,
+  [cass#513](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/513)):**
+  Codex's `local_thread_store_compression` replaces a finished session's
+  `rollout-*.jsonl` with `rollout-*.jsonl.zst`, which the connector did not
+  discover, so those sessions were never indexed. With `codex-zstd` (in
+  `all-connectors`) it reads them. A compressed session has the id, messages,
+  workspace and metadata of its plain form, so a session indexed before
+  compression is the same session after it, and discovery reads the plain file
+  while both exist. The decoded text is held to the rollout byte budget: a
+  length past the budget that the frame header declares is refused before
+  decoding, and decoded text past it fails with `ErrorKind::FileTooLarge`. A
+  file cut short fails with `UnexpectedEof`, and bytes that are not one zstd
+  stream fail too, so a shortened session is never emitted. A compressed
+  session is sized by its declared text for large-session compaction, as its
+  plain form is. New public helpers in `connectors::codex`:
+  `is_compressed_rollout`, `rollout_session_path`, and with the feature
+  `compressed_rollout_declared_len` and `decompressed_rollout`, for hosts that
+  re-read a rollout.
+
 - **`pi_durable` connector
   ([#28](https://github.com/Dicklesworthstone/franken_agent_detection/issues/28)):**
   reads Pi's experimental durable harness (`@earendil-works/pi-durable`).
@@ -108,6 +127,9 @@ window is since GitHub Release
 
 ### Fixed
 
+- **Codex:** a rollout named `.JSONL` or `.JSON` in another letter case was
+  discovered but parsed as neither format, so its session was dropped. The
+  parser is now chosen from the same case-insensitive name match as discovery.
 - **Pi / Oh My Pi model attribution:** an assistant message without
   `message.model` inherits the model selected on its own branch, never a
   sibling branch's later `model_change`. Conversation-level `model_id` /
