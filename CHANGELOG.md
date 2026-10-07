@@ -50,6 +50,11 @@ window is since GitHub Release
 
 ## [Unreleased]
 
+## [0.3.7] -- 2026-10-07
+
+Published from `main`: the Pi-family work below, plus everything in 0.3.6
+(compressed Codex rollouts, the Codebuff failure-count wording).
+
 ### Added
 
 - **`pi_durable` connector
@@ -123,8 +128,7 @@ window is since GitHub Release
 ## [0.3.6] -- 2026-10-07
 
 Published from the `release/0.3.x` branch (0.3.5 plus the entries below), so
-the Pi-family work under Unreleased is not in it. The next release from `main`
-must be newer than 0.3.6.
+the Pi-family work in 0.3.7 is not in it.
 
 ### Added
 
