@@ -107,6 +107,10 @@ shelley = [
 # JSONL sessions need no SQLite and remain available with the base
 # `connectors` feature.
 openclaw-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync", "dep:zstd"]
+# Codex: read `rollout-*.jsonl.zst`, the form Codex's
+# `local_thread_store_compression` feature gives a finished session. Without
+# it those sessions are not discovered.
+codex-zstd = ["connectors", "dep:zstd"]
 # Copilot legacy generation: pre-March-2025 VS Code chat sessions stored in
 # workspace/global `state.vscdb` (`ItemTable` key `interactive.sessions`).
 # The newer flat-JSON and append-log `chatSessions` generations need no SQLite
@@ -115,6 +119,7 @@ copilot-vscdb = ["connectors", "dep:frankensqlite", "dep:asupersync"]
 # All connectors enabled
 all-connectors = [
     "connectors",
+    "codex-zstd",
     "chatgpt",
     "codebuff",
     "cursor",
