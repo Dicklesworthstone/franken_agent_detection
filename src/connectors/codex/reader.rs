@@ -539,6 +539,32 @@ mod tests {
         }
 
         #[test]
+        fn concatenated_frames_read_as_one_text_and_a_cut_later_frame_fails() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("rollout-x.jsonl.zst");
+            let rest = "{\"a\":1}\n".repeat(20_000);
+            let later = undeclared(rest.as_bytes());
+            let mut packed = declared(TEXT.as_bytes());
+            packed.extend_from_slice(&later);
+            fs::write(&path, &packed).unwrap();
+            let joined = format!("{TEXT}{rest}");
+            assert_eq!(
+                read_file(&path).unwrap(),
+                records(Cursor::new(joined)).unwrap()
+            );
+
+            // Cut inside the second frame: unfinished, never the first frame's
+            // records passed off as the whole session.
+            fs::write(&path, &packed[..packed.len() - later.len() / 2]).unwrap();
+            let error = read_file(&path).unwrap_err();
+            assert_eq!(
+                io_kind(&error),
+                Some(io::ErrorKind::UnexpectedEof),
+                "{error:#}"
+            );
+        }
+
+        #[test]
         fn decoded_text_is_held_to_the_budget() {
             let text = "{\"a\":1}\n".repeat(1_000);
             let len = text.len() as u64;
