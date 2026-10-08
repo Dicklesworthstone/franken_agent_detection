@@ -50,6 +50,30 @@ window is since GitHub Release
 
 ## [Unreleased]
 
+## [0.3.8] -- 2026-10-08
+
+Published from `main`.
+
+### Fixed
+
+- **`CASS_EXCLUDE_PATHS` matches every spelling of an excluded path.** The
+  Claude Code, Codex and Pi-family readers compared each source with the
+  entries as written, so an entry given as a relative path, through `..` or
+  through a symlink did not exclude anything, and on Windows neither did a
+  differently-cased spelling of an existing directory. Entries are now also
+  kept in absolute form (a relative entry joins the working directory) and as
+  the canonical form of their nearest existing ancestor, and a source that
+  does not match as given is resolved the same way and compared again. With
+  exclusions set, a source whose location cannot be resolved is treated as
+  excluded; with none set, nothing touches the filesystem. These are the rules
+  cass applies to raw-mirror capture (cass bead 0f1k0).
+
+### Changed
+
+- README: `CASS_EXCLUDE_PATHS` is honored by the Claude Code, Codex and
+  Pi-family connectors; hosts filter other connectors' conversations by
+  `source_path`.
+
 ## [0.3.7] -- 2026-10-07
 
 Published from `main`: the Pi-family work below, plus everything in 0.3.6
