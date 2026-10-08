@@ -27,27 +27,124 @@ pub(crate) fn env_path_nonempty(key: &str) -> Option<PathBuf> {
 /// This is intentionally implemented in the connector crate rather than in CASS
 /// so source discovery and parsing stay aligned: a path excluded here is neither
 /// pre-mirrored nor parsed.
+///
+/// Each entry is kept as written and, when it resolves, also as an absolute
+/// path (a relative entry joins the working directory) and as the canonical
+/// form of its nearest existing ancestor. A symlink alias, a `..` spelling, a
+/// relative spelling or (on Windows) a differently-cased spelling of the same
+/// directory therefore still excludes it. These are the semantics CASS applies
+/// to raw-mirror capture (`connectors::codex::path_policy::ScanExclusions`), so
+/// parsing and capture agree on what an exclusion covers.
 pub(crate) fn excluded_scan_paths_from_env() -> Vec<PathBuf> {
-    env_var_nonempty("CASS_EXCLUDE_PATHS")
-        .into_iter()
-        .flat_map(|value| {
-            value
-                .split([',', '\n'])
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .map(PathBuf::from)
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    let Some(value) = env_var_nonempty("CASS_EXCLUDE_PATHS") else {
+        return Vec::new();
+    };
+    excluded_scan_paths_from(&value, std::env::current_dir().ok().as_deref())
+}
+
+fn excluded_scan_paths_from(value: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    };
+    for written in value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(PathBuf::from)
+    {
+        if let Some(absolute) = absolute_path(&written, cwd) {
+            if let Ok(resolved) = resolve_existing_ancestor(&absolute) {
+                push(resolved);
+            }
+            push(absolute);
+        }
+        push(written);
+    }
+    out
+}
+
+fn absolute_path(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd?.join(path)
+    };
+    // On Windows a drive-relative path such as `C:foo` stays relative after
+    // the join; do not guess another drive's working directory.
+    absolute.is_absolute().then_some(absolute)
+}
+
+/// Canonicalize the nearest existing ancestor of `path` and re-append the
+/// missing remainder, folding `.` and `..` only after the existing part is
+/// resolved (a symlink followed by `..` names the target's parent).
+fn resolve_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+    for ancestor in path.ancestors() {
+        match std::fs::canonicalize(ancestor) {
+            Ok(resolved_ancestor) => {
+                let remainder = path.strip_prefix(ancestor).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "exclusion path is not under its own ancestor",
+                    )
+                })?;
+                let mut resolved = PathBuf::new();
+                for component in resolved_ancestor.join(remainder).components() {
+                    match component {
+                        Component::CurDir => {}
+                        Component::ParentDir => {
+                            resolved.pop();
+                        }
+                        other => resolved.push(other.as_os_str()),
+                    }
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "exclusion path has no existing ancestor",
+    ))
 }
 
 /// Return true when `path` should be skipped because it equals or is under one
-/// of the configured exclusions.
+/// of the configured exclusions (see [`excluded_scan_paths_from_env`]).
+///
+/// The path as given is compared first, without touching the filesystem.
+/// Otherwise the path is resolved the same way the entries were and compared
+/// again. With exclusions configured, a source whose location cannot be
+/// resolved is treated as excluded: failing to establish where it lives is no
+/// evidence that it is outside every excluded directory.
 #[must_use]
 pub(crate) fn path_is_excluded(path: &Path, excluded_paths: &[PathBuf]) -> bool {
-    excluded_paths
+    if excluded_paths.is_empty() {
+        return false;
+    }
+    if excluded_paths
         .iter()
-        .any(|excluded| path == excluded || path.starts_with(excluded))
+        .any(|excluded| path.starts_with(excluded))
+    {
+        return true;
+    }
+    let cwd = if path.is_absolute() {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
+    let Some(absolute) = absolute_path(path, cwd.as_deref()) else {
+        return true;
+    };
+    resolve_existing_ancestor(&absolute).map_or(true, |resolved| {
+        excluded_paths
+            .iter()
+            .any(|excluded| resolved.starts_with(excluded))
+    })
 }
 
 /// Maximum session-store file size connectors will read into memory
@@ -224,6 +321,112 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::{excluded_scan_paths_from, path_is_excluded};
+    use std::path::Path;
+
+    fn tree() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        for file in [
+            "projects/secret/a.jsonl",
+            "projects/open/b.jsonl",
+            "sessions/c.jsonl",
+        ] {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}").unwrap();
+        }
+        dir
+    }
+
+    fn excludes(value: &str, cwd: &Path, source: &Path) -> bool {
+        path_is_excluded(source, &excluded_scan_paths_from(value, Some(cwd)))
+    }
+
+    #[test]
+    fn no_exclusions_match_nothing() {
+        assert!(excluded_scan_paths_from(" ,\n , ", None).is_empty());
+        assert!(!path_is_excluded(Path::new("/nonexistent/a.jsonl"), &[]));
+    }
+
+    #[test]
+    fn entries_match_whole_components_not_string_prefixes() {
+        let dir = tree();
+        let root = dir.path();
+        let source = root.join("sessions/c.jsonl");
+        assert!(!excludes(
+            &root.join("sess").display().to_string(),
+            root,
+            &source
+        ));
+        assert!(excludes(
+            &root.join("sessions").display().to_string(),
+            root,
+            &source
+        ));
+        assert!(excludes(&source.display().to_string(), root, &source));
+    }
+
+    #[test]
+    fn a_missing_entry_still_matches_as_written() {
+        let dir = tree();
+        let gone = dir.path().join("gone/dir");
+        assert!(excludes(
+            &gone.display().to_string(),
+            dir.path(),
+            &gone.join("x.jsonl")
+        ));
+        assert!(!excludes(
+            &gone.display().to_string(),
+            dir.path(),
+            &dir.path().join("projects/open/b.jsonl")
+        ));
+    }
+
+    #[test]
+    fn dotdot_and_relative_spellings_exclude_the_same_directory() {
+        let dir = tree();
+        let root = dir.path();
+        let secret = root.join("projects/secret/a.jsonl");
+        let open = root.join("projects/open/b.jsonl");
+        let dotdot = root
+            .join("projects/../projects/secret")
+            .display()
+            .to_string();
+        for value in [
+            dotdot.as_str(),
+            "projects/secret",
+            "./projects/open/../secret",
+        ] {
+            assert!(
+                excludes(value, root, &secret),
+                "{value} must exclude {secret:?}"
+            );
+            assert!(
+                !excludes(value, root, &open),
+                "{value} must not exclude {open:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_alias_on_either_side_excludes_the_target() {
+        let dir = tree();
+        let root = dir.path();
+        std::os::unix::fs::symlink(root.join("projects/secret"), root.join("alias")).unwrap();
+        let secret = root.join("projects/secret/a.jsonl");
+        let open = root.join("projects/open/b.jsonl");
+        let alias = root.join("alias").display().to_string();
+        assert!(excludes(&alias, root, &secret));
+        assert!(!excludes(&alias, root, &open));
+        // A source reached through the alias is under the real directory.
+        let real = root.join("projects/secret").display().to_string();
+        assert!(excludes(&real, root, &root.join("alias/a.jsonl")));
+    }
 }
 
 #[cfg(test)]

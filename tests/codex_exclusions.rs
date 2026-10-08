@@ -262,3 +262,20 @@ fn codex_exclusions_empty_or_unrelated_preserve_all_sources() {
         &[0, 1, 2, 3, 4],
     );
 }
+
+#[test]
+fn codex_exclusions_resolve_relative_dotdot_and_alias_spellings() {
+    let fixture = Fixture::new();
+    // Children run with the fixture root as their working directory.
+    fixture.run(".codex/sessions/2026/09/18", &[3, 4]);
+    let dotdot = fixture.root.path().join(".codex/sessions/2026/09/19/../18");
+    fixture.run(dotdot.to_str().unwrap(), &[3, 4]);
+    #[cfg(unix)]
+    {
+        // Keep the alias outside every scan root so no walker can reach it.
+        let elsewhere = TempDir::new().unwrap();
+        let alias = elsewhere.path().join("private-alias");
+        std::os::unix::fs::symlink(fixture.files[0].parent().unwrap(), &alias).unwrap();
+        fixture.run(alias.to_str().unwrap(), &[3, 4]);
+    }
+}

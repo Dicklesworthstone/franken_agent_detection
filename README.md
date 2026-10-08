@@ -116,7 +116,7 @@ Beyond `scan`:
 | `scan_with_callback` / `supports_streaming_scan` | Emit conversations incrementally instead of materializing the corpus |
 | `scan_with_source_boundaries` / `supports_source_boundaries` | Resumable ingestion: a pre-parse skip predicate and a per-source completion event (with required sidecars such as SQLite WALs) |
 | `ScanRoot::remote` + `Origin` | Scan synced copies of remote machines, keeping host provenance |
-| `CASS_EXCLUDE_PATHS` | Paths every connector skips before opening them |
+| `CASS_EXCLUDE_PATHS` | Comma/newline-separated files or directories the Claude Code, Codex and Pi-family connectors skip before opening them. Entries match whole path components; relative, `..` and symlinked spellings of an existing directory match too. Other connectors read every source; hosts filter their conversations by `source_path` |
 
 ### Feature flags
 
