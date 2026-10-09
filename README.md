@@ -186,9 +186,17 @@ labeled by kind.
 
 ## Installation
 
+For detection only:
+
 ```toml
 [dependencies]
 franken-agent-detection = "0.3"                                          # detection
+```
+
+For the full parsing layer:
+
+```toml
+[dependencies]
 franken-agent-detection = { version = "0.3", features = ["all-connectors"] } # parsing
 ```
 
