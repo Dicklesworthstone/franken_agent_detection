@@ -1790,7 +1790,8 @@ mod tests {
             r#"{"type":"usage.record","usage":{"input_tokens":100,"output_tokens":30},"time":"2026-01-01T00:00:04Z"}"#,
             r#"{"type":"context.append_loop_event","event":{"type":"step.begin"},"time":"2026-01-01T00:00:05Z"}"#,
         ];
-        write_modern_wire_file(&storage, "wdk-u", "sess-tok", "main", &lines);
+        let wire_path = write_modern_wire_file(&storage, "wdk-u", "sess-tok", "main", &lines);
+        let source_before = fs::read(&wire_path).unwrap();
         write_modern_state(
             &storage,
             "wdk-u",
@@ -1810,6 +1811,156 @@ mod tests {
         assert_eq!(usage["input_tokens"], 100);
         assert_eq!(usage["output_tokens"], 30);
         assert_eq!(usage["data_source"], "api");
+
+        let message = &convs[0].messages[1];
+        let extracted = crate::connectors::extract_tokens_for_agent(
+            &convs[0].agent_slug,
+            &message.extra,
+            &message.content,
+            &message.role,
+        );
+        assert_eq!(extracted.input_tokens, Some(100));
+        assert_eq!(extracted.output_tokens, Some(30));
+        assert_eq!(extracted.total_tokens(), Some(130));
+        assert_eq!(
+            extracted.data_source,
+            crate::connectors::TokenDataSource::Api
+        );
+        assert_eq!(fs::read(&wire_path).unwrap(), source_before);
+    }
+
+    #[test]
+    fn modern_usage_record_shapes_reach_public_token_extraction() {
+        use crate::connectors::{TokenDataSource, extract_tokens_for_agent};
+
+        for (usage_line, expected_input, expected_output) in [
+            (
+                r#"{"type":"usage.record","input_tokens":100,"output_tokens":30}"#,
+                Some(100),
+                Some(30),
+            ),
+            (
+                r#"{"type":"usage.record","usage":{"input_tokens":100,"output_tokens":30}}"#,
+                Some(100),
+                Some(30),
+            ),
+            (
+                r#"{"type":"usage.record","tokens":{"input_tokens":100,"output_tokens":30}}"#,
+                Some(100),
+                Some(30),
+            ),
+            (
+                r#"{"type":"usage.record","usage":{"tokens":{"input_tokens":100,"output_tokens":30}}}"#,
+                Some(100),
+                Some(30),
+            ),
+            (
+                r#"{"type":"usage.record","usage":{"input_tokens":0}}"#,
+                Some(0),
+                None,
+            ),
+            (
+                r#"{"type":"usage.record","usage":{"output_tokens":17}}"#,
+                None,
+                Some(17),
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let storage = create_kimi_code_storage(&dir);
+            let wire_path = write_modern_wire_file(
+                &storage,
+                "wdk-usage",
+                "session",
+                "main",
+                &[
+                    r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"Looking now."}}}"#,
+                    usage_line,
+                ],
+            );
+            let source_before = fs::read(&wire_path).unwrap();
+            let ctx = ScanContext::local_default(storage, None);
+            let conversations = KimiConnector::new().scan(&ctx).unwrap();
+            assert_eq!(conversations.len(), 1);
+            assert_eq!(conversations[0].messages.len(), 1);
+            let message = &conversations[0].messages[0];
+            let usage = extract_tokens_for_agent(
+                &conversations[0].agent_slug,
+                &message.extra,
+                &message.content,
+                &message.role,
+            );
+            assert_eq!(usage.input_tokens, expected_input, "{usage_line}");
+            assert_eq!(usage.output_tokens, expected_output, "{usage_line}");
+            assert_eq!(usage.data_source, TokenDataSource::Api, "{usage_line}");
+            assert_eq!(fs::read(&wire_path).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn modern_repeated_usage_updates_keep_one_attachment_per_assistant() {
+        use crate::connectors::{TokenDataSource, extract_tokens_for_agent};
+
+        let dir = TempDir::new().unwrap();
+        let storage = create_kimi_code_storage(&dir);
+        let wire_path = write_modern_wire_file(
+            &storage,
+            "wdk-usage",
+            "session",
+            "main",
+            &[
+                // Orphan bookkeeping must not become an independently counted message.
+                r#"{"type":"usage.record","input_tokens":9000,"output_tokens":9000}"#,
+                r#"{"type":"turn.prompt","input":"Explain the result"}"#,
+                r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"Looking now."}}}"#,
+                r#"{"type":"usage.record","usage":{"input_tokens":100,"output_tokens":30}}"#,
+                r#"{"type":"usage.record","usage":{"input_tokens":100,"output_tokens":30}}"#,
+                r#"{"type":"usage.record","usage":{"input_tokens":110,"output_tokens":33,"cached_input_tokens":90,"cache_read_tokens":90}}"#,
+                // Identical visible text still represents a separate assistant turn.
+                r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"Looking now."}}}"#,
+                r#"{"type":"usage.record","tokens":{"input_tokens":200,"output_tokens":40}}"#,
+                // Unknown or cumulative-only fields must not overwrite known per-message counts.
+                r#"{"type":"usage.record","usage":{"total_tokens":999999,"total_token_usage":{"input_tokens":999000,"output_tokens":999}}}"#,
+                r#"{"type":"usage.record","usage":{"input_tokens":"invalid","output_tokens":null}}"#,
+            ],
+        );
+        let source_before = fs::read(&wire_path).unwrap();
+        let ctx = ScanContext::local_default(storage, None);
+        let connector = KimiConnector::new();
+        let conversations = connector.scan(&ctx).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].messages.len(), 3);
+        let api_usage: Vec<_> = conversations[0]
+            .messages
+            .iter()
+            .map(|message| {
+                extract_tokens_for_agent(
+                    &conversations[0].agent_slug,
+                    &message.extra,
+                    &message.content,
+                    &message.role,
+                )
+            })
+            .filter(|usage| usage.data_source == TokenDataSource::Api)
+            .collect();
+        assert_eq!(api_usage.len(), 2);
+        assert_eq!(api_usage[0].input_tokens, Some(110));
+        assert_eq!(api_usage[0].output_tokens, Some(33));
+        assert_eq!(api_usage[1].input_tokens, Some(200));
+        assert_eq!(api_usage[1].output_tokens, Some(40));
+        assert_eq!(
+            api_usage
+                .iter()
+                .filter_map(crate::connectors::ExtractedTokenUsage::total_tokens)
+                .sum::<i64>(),
+            383,
+        );
+        assert_eq!(
+            conversations[0].messages[1].extra["cass"]["token_usage"]["cache_read_tokens"], 90,
+            "ambiguous cache metadata is preserved without adding it to totals",
+        );
+        assert_eq!(api_usage[0].cache_read_tokens, None);
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
+        assert_eq!(fs::read(&wire_path).unwrap(), source_before);
     }
 
     #[test]

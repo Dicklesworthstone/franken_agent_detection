@@ -331,6 +331,27 @@ pub fn extract_tokens_for_agent(
     let extracted = match agent_slug {
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
+        // The modern Kimi parser attaches recognized usage.record input and
+        // output counts to the preceding assistant message. Read only that
+        // attachment: raw bookkeeping events and cumulative/session totals
+        // are not independently countable messages. Cache fields remain
+        // metadata because Kimi's additive/subset semantics are unknown.
+        "kimi" => {
+            let usage = extra.pointer("/cass/token_usage");
+            let read = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
+            let input_tokens = read("input_tokens");
+            let output_tokens = read("output_tokens");
+            ExtractedTokenUsage {
+                input_tokens,
+                output_tokens,
+                data_source: if input_tokens.is_some() || output_tokens.is_some() {
+                    TokenDataSource::Api
+                } else {
+                    TokenDataSource::Estimated
+                },
+                ..Default::default()
+            }
+        }
         // Prime Agent assistant messages carry a full usage block
         // (`input`/`output`/`cacheRead`/`cacheWrite`), which the connector
         // preserves under `extra.usage`. Child-usage attribution entries are
@@ -677,6 +698,69 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(20));
         assert_eq!(usage.data_source, TokenDataSource::Api);
+    }
+
+    #[test]
+    fn kimi_attached_usage_is_exact_without_guessing_cache_semantics() {
+        let raw = serde_json::json!({
+            "cass": {
+                "token_usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 30,
+                    "cached_input_tokens": 80,
+                    "cache_read_tokens": 90,
+                    "total_tokens": 999,
+                    "data_source": "api"
+                }
+            }
+        });
+        let usage = extract_tokens_for_agent("kimi", &raw, "Looking now.", "assistant");
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(30));
+        assert_eq!(usage.total_tokens(), Some(130));
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.cache_creation_tokens, None);
+        assert_eq!(usage.model_name, None);
+        assert_eq!(usage.provider, None);
+    }
+
+    #[test]
+    fn kimi_partial_and_zero_usage_remain_api_counts() {
+        for (attached, expected_input, expected_output) in [
+            (serde_json::json!({"input_tokens": 0}), Some(0), None),
+            (serde_json::json!({"output_tokens": 17}), None, Some(17)),
+            (
+                serde_json::json!({"input_tokens": 0, "output_tokens": 0}),
+                Some(0),
+                Some(0),
+            ),
+        ] {
+            let extra = serde_json::json!({"cass": {"token_usage": attached}});
+            let usage = extract_tokens_for_agent("kimi", &extra, "Some answer", "assistant");
+            assert_eq!(usage.input_tokens, expected_input);
+            assert_eq!(usage.output_tokens, expected_output);
+            assert_eq!(usage.data_source, TokenDataSource::Api);
+        }
+    }
+
+    #[test]
+    fn kimi_unrecognized_usage_keeps_estimation_fallback() {
+        for extra in [
+            Value::Null,
+            serde_json::json!({"usage": {"input_tokens": 100, "output_tokens": 30}}),
+            serde_json::json!({"cass": {"token_usage": {"data_source": "api"}}}),
+            serde_json::json!({"cass": {"token_usage": {"cache_read_tokens": 90}}}),
+            serde_json::json!({"cass": {"token_usage": {"total_tokens": 999}}}),
+            serde_json::json!({"cass": {"token_usage": {
+                "input_tokens": "100", "output_tokens": null
+            }}}),
+        ] {
+            let usage = extract_tokens_for_agent("kimi", &extra, "Looking now.", "assistant");
+            assert_eq!(usage.input_tokens, None);
+            assert_eq!(usage.output_tokens, Some(3));
+            assert_eq!(usage.data_source, TokenDataSource::Estimated);
+        }
     }
 
     #[test]
