@@ -2,6 +2,7 @@
 
 mod capped;
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 /// Read an environment variable, trimming whitespace and treating empty strings as unset.
@@ -28,21 +29,30 @@ pub(crate) fn env_path_nonempty(key: &str) -> Option<PathBuf> {
 /// so source discovery and parsing stay aligned: a path excluded here is neither
 /// pre-mirrored nor parsed.
 ///
-/// Each entry is kept as written and, when it resolves, also as an absolute
+/// Each entry is kept as written and also as an absolute
 /// path (a relative entry joins the working directory) and as the canonical
 /// form of its nearest existing ancestor. A symlink alias, a `..` spelling, a
 /// relative spelling or (on Windows) a differently-cased spelling of the same
 /// directory therefore still excludes it. These are the semantics CASS applies
 /// to raw-mirror capture (`connectors::codex::path_policy::ScanExclusions`), so
 /// parsing and capture agree on what an exclusion covers.
-pub(crate) fn excluded_scan_paths_from_env() -> Vec<PathBuf> {
-    let Some(value) = env_var_nonempty("CASS_EXCLUDE_PATHS") else {
-        return Vec::new();
+///
+/// Invalid policy input is an error, never an empty policy. Relative entries
+/// require a usable working directory; absolute entries do not. Entries are
+/// literal filesystem paths (no shell or tilde expansion).
+pub(crate) fn excluded_scan_paths_from_env() -> anyhow::Result<Vec<PathBuf>> {
+    let value = match dotenvy::var("CASS_EXCLUDE_PATHS") {
+        Ok(value) => value,
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => return Ok(Vec::new()),
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotUnicode(_))) => {
+            anyhow::bail!("CASS_EXCLUDE_PATHS must contain valid Unicode");
+        }
+        Err(error) => return Err(error).context("could not read CASS_EXCLUDE_PATHS"),
     };
     excluded_scan_paths_from(&value, std::env::current_dir().ok().as_deref())
 }
 
-fn excluded_scan_paths_from(value: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
+fn excluded_scan_paths_from(value: &str, cwd: Option<&Path>) -> anyhow::Result<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut push = |path: PathBuf| {
         if !out.contains(&path) {
@@ -55,15 +65,23 @@ fn excluded_scan_paths_from(value: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
         .filter(|part| !part.is_empty())
         .map(PathBuf::from)
     {
-        if let Some(absolute) = absolute_path(&written, cwd) {
-            if let Ok(resolved) = resolve_existing_ancestor(&absolute) {
-                push(resolved);
-            }
-            push(absolute);
-        }
+        let absolute = absolute_path(&written, cwd).with_context(|| {
+            format!(
+                "cannot resolve CASS_EXCLUDE_PATHS entry '{}' without an absolute working directory",
+                written.display()
+            )
+        })?;
+        let resolved = resolve_existing_ancestor(&absolute).with_context(|| {
+            format!(
+                "cannot resolve CASS_EXCLUDE_PATHS entry '{}'",
+                written.display()
+            )
+        })?;
+        push(resolved);
+        push(absolute);
         push(written);
     }
-    out
+    Ok(out)
 }
 
 fn absolute_path(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
@@ -343,13 +361,55 @@ mod exclusion_tests {
     }
 
     fn excludes(value: &str, cwd: &Path, source: &Path) -> bool {
-        path_is_excluded(source, &excluded_scan_paths_from(value, Some(cwd)))
+        path_is_excluded(source, &excluded_scan_paths_from(value, Some(cwd)).unwrap())
     }
 
     #[test]
     fn no_exclusions_match_nothing() {
-        assert!(excluded_scan_paths_from(" ,\n , ", None).is_empty());
+        assert!(
+            excluded_scan_paths_from(" ,\n , ", None)
+                .unwrap()
+                .is_empty()
+        );
         assert!(!path_is_excluded(Path::new("/nonexistent/a.jsonl"), &[]));
+    }
+
+    #[test]
+    fn relative_policy_requires_an_absolute_working_directory() {
+        for cwd in [None, Some(Path::new("relative-cwd"))] {
+            let error = excluded_scan_paths_from("private", cwd).unwrap_err();
+            assert!(error.to_string().contains("CASS_EXCLUDE_PATHS"));
+            assert!(error.to_string().contains("working directory"));
+        }
+        let dir = tree();
+        let mixed = format!("{},private", dir.path().display());
+        assert!(excluded_scan_paths_from(&mixed, None).is_err());
+    }
+
+    #[test]
+    fn absolute_policy_remains_effective_without_a_working_directory() {
+        let dir = tree();
+        let private = dir.path().join("projects/secret");
+        let excluded = excluded_scan_paths_from(private.to_str().unwrap(), None).unwrap();
+        assert!(path_is_excluded(&private.join("a.jsonl"), &excluded));
+        assert!(!path_is_excluded(
+            &dir.path().join("projects/open/b.jsonl"),
+            &excluded
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolvable_policy_is_an_error_not_a_partial_policy() {
+        let dir = tree();
+        let alias = dir.path().join("loop");
+        std::os::unix::fs::symlink(&alias, &alias).unwrap();
+        let mixed = format!(
+            "{},{}",
+            dir.path().join("projects/secret").display(),
+            alias.display()
+        );
+        assert!(excluded_scan_paths_from(&mixed, Some(dir.path())).is_err());
     }
 
     #[test]

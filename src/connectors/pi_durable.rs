@@ -157,7 +157,9 @@ impl PiDurableConnector {
 
     /// Every store reachable from the scan context, deduplicated, honoring
     /// `CASS_EXCLUDE_PATHS`.
-    fn candidates(ctx: &ScanContext) -> Vec<StoreCandidate> {
+    fn candidates(ctx: &ScanContext) -> Result<Vec<StoreCandidate>> {
+        // Validate before collection, which may inspect a JSONL format marker.
+        let excluded = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         if ctx.use_default_detection() {
             let roots = if is_durable_root(&ctx.data_dir) {
@@ -177,18 +179,17 @@ impl PiDurableConnector {
             }
         } else {
             for scan_root in &ctx.scan_roots {
-                collect_explicit(scan_root, &mut out);
+                collect_explicit(scan_root, &excluded, &mut out);
             }
         }
 
-        let excluded = excluded_scan_paths_from_env();
         let mut seen = HashSet::new();
         out.retain(|candidate| {
             !path_is_excluded(&candidate.path, &excluded)
                 && seen.insert(dedupe_path_key(&candidate.path))
         });
         out.sort_by(|a, b| a.path.cmp(&b.path));
-        out
+        Ok(out)
     }
 
     /// Stores that were found but cannot be read in full, with the reason.
@@ -197,10 +198,19 @@ impl PiDurableConnector {
     /// explicitly instead of implying full coverage: unsupported format or
     /// schema versions, SQLite stores in builds without the `pi-durable`
     /// feature, remote SQLite stores, and incomplete JSONL commit logs.
+    /// Invalid exclusion settings fail closed, logging the error without
+    /// opening any stores; the scan and discovery APIs return that error.
     #[must_use]
     pub fn store_diagnostics(&self, ctx: &ScanContext) -> Vec<DurableStoreDiagnostic> {
         let mut out = Vec::new();
-        for candidate in Self::candidates(ctx) {
+        let candidates = match Self::candidates(ctx) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::warn!(%error, "pi_durable diagnostics blocked by invalid exclusion policy");
+                return out;
+            }
+        };
+        for candidate in candidates {
             match read_store(&candidate) {
                 Ok(store) => {
                     for note in &store.notes {
@@ -305,8 +315,11 @@ fn looks_like_jsonl_store(main: &Path) -> bool {
 
 /// Expand one explicit scan root: a store file, a store directory, an agent
 /// dir, a durable-sessions root, or any directory containing stores.
-fn collect_explicit(scan_root: &ScanRoot, out: &mut Vec<StoreCandidate>) {
+fn collect_explicit(scan_root: &ScanRoot, excluded: &[PathBuf], out: &mut Vec<StoreCandidate>) {
     let path = &scan_root.path;
+    if path_is_excluded(path, excluded) {
+        return;
+    }
     if path.is_file() {
         if path.file_name().is_some_and(|n| n == MAIN_FILE) {
             if looks_like_jsonl_store(path) {
@@ -337,6 +350,7 @@ fn collect_explicit(scan_root: &ScanRoot, out: &mut Vec<StoreCandidate>) {
     for entry in WalkDir::new(path)
         .max_depth(EXPLICIT_WALK_DEPTH)
         .into_iter()
+        .filter_entry(|entry| !path_is_excluded(entry.path(), excluded))
         .flatten()
     {
         if !entry.file_type().is_file() {
@@ -1336,7 +1350,7 @@ impl Connector for PiDurableConnector {
         hooks: &mut SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        for candidate in Self::candidates(ctx) {
+        for candidate in Self::candidates(ctx)? {
             if !store_modified_since(&candidate, ctx.since_ts) {
                 continue;
             }
@@ -1388,7 +1402,7 @@ impl Connector for PiDurableConnector {
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let mut out = Vec::new();
-        for candidate in Self::candidates(ctx) {
+        for candidate in Self::candidates(ctx)? {
             if !store_modified_since(&candidate, ctx.since_ts) {
                 continue;
             }
@@ -1903,7 +1917,11 @@ mod tests {
             "{\"type\":\"message\",\"content\":\"x\"}\n",
         )
         .unwrap();
-        assert!(PiDurableConnector::candidates(&explicit_ctx(tmp.path())).is_empty());
+        assert!(
+            PiDurableConnector::candidates(&explicit_ctx(tmp.path()))
+                .unwrap()
+                .is_empty()
+        );
 
         // A corrupt interior marker stops replay; earlier commits survive.
         let dir = tmp.path().join("store");

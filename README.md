@@ -134,7 +134,16 @@ Beyond `scan`:
 | `scan_with_callback` / `supports_streaming_scan` | Emit conversations incrementally instead of materializing the corpus |
 | `scan_with_source_boundaries` / `supports_source_boundaries` | Resumable ingestion: a pre-parse skip predicate and a per-source completion event (with required sidecars such as SQLite WALs) |
 | `ScanRoot::remote` + `Origin` | Scan synced copies of remote machines, keeping host provenance |
-| `CASS_EXCLUDE_PATHS` | Comma/newline-separated files or directories the Claude Code, Codex and Pi-family connectors skip before opening them. Entries match whole path components; relative, `..` and symlinked spellings of an existing directory match too. Other connectors read every source; hosts filter their conversations by `source_path` |
+| `CASS_EXCLUDE_PATHS` | Comma/newline-separated files or directories the Claude Code, Codex and Pi-family connectors skip before opening them. Entries match whole path components; relative, `..` and symlinked spellings of an existing directory match too. Exact Codex JSONL exclusions cover both the plain and compressed (`.jsonl.zst`) representation. Other connectors read every source; hosts filter their conversations by `source_path` |
+
+Exclusion entries are literal paths, without shell or tilde expansion. An unset
+or empty `CASS_EXCLUDE_PATHS` leaves scans unrestricted. Invalid Unicode,
+unresolvable entries, or relative entries without a usable working directory
+return an error from affected connectors' scan and discovery methods before
+source hooks or parsing. Absolute entries remain usable without a working
+directory. The existing infallible Pi `discover_sources` and durable
+`store_diagnostics` helpers log invalid-policy errors and return no sources;
+`pi_wire::try_discover_sources` exposes the discovery error to direct callers.
 
 ### Feature flags
 

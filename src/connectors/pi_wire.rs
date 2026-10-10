@@ -1395,13 +1395,30 @@ fn home_sources(
 /// Takes full [`super::ScanRoot`]s rather than bare paths so each discovered
 /// source keeps its scan-root provenance (`origin`, `platform`) — remote
 /// roots must not be downgraded to local during discovery.
+///
+/// Invalid exclusion settings fail closed: this compatibility helper logs the
+/// error and discovers no sources. Use [`try_discover_sources`] to receive the
+/// error, as the Pi-family [`super::Connector`] implementations do.
 #[must_use]
 pub fn discover_sources(
     roots: &[super::ScanRoot],
     ctx: &super::ScanContext,
     agent_slug: &'static str,
 ) -> Vec<super::DiscoveredSourceFile> {
-    let excluded_paths = excluded_scan_paths_from_env();
+    try_discover_sources(roots, ctx, agent_slug).unwrap_or_else(|error| {
+        tracing::warn!(agent_slug, %error, "pi discovery blocked by invalid exclusion policy");
+        Vec::new()
+    })
+}
+
+/// Checked form of [`discover_sources`]; invalid exclusion settings are
+/// reported before any source is discovered or opened.
+pub fn try_discover_sources(
+    roots: &[super::ScanRoot],
+    ctx: &super::ScanContext,
+    agent_slug: &'static str,
+) -> Result<Vec<super::DiscoveredSourceFile>> {
+    let excluded_paths = excluded_scan_paths_from_env()?;
     let mut seen_homes: HashSet<PathBuf> = HashSet::new();
     let mut seen_session_paths: HashSet<PathBuf> = HashSet::new();
     let mut out = Vec::new();
@@ -1420,7 +1437,7 @@ pub fn discover_sources(
             out.extend(found.required_sidecars);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Scan every deduplicated, time-filtered session file across `homes` into
@@ -1494,7 +1511,7 @@ pub fn scan_roots_with_boundaries(
 ) -> Result<()> {
     use super::{DiscoveredSourceFile, SourceCompletion};
 
-    let excluded_paths = excluded_scan_paths_from_env();
+    let excluded_paths = excluded_scan_paths_from_env()?;
     // Symlink-aliased homes (e.g. `~/.omp/agent` -> `~/Library/...`) reach
     // the same session files twice. Canonicalizing every FILE would be far
     // too expensive for hot scans, so resolve each home ONCE and skip a

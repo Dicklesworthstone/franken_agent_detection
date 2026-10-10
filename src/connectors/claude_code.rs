@@ -263,8 +263,11 @@ impl ClaudeCodeConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
-        Self::discover_sources_with_exclusions(ctx, &excluded_scan_paths_from_env())
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        Ok(Self::discover_sources_with_exclusions(
+            ctx,
+            &excluded_scan_paths_from_env()?,
+        ))
     }
 
     fn discover_sources_with_exclusions(
@@ -524,7 +527,7 @@ fn scan_claude_with_callback(
     scan_claude_with_callback_with_exclusions(
         ctx,
         on_conversation,
-        &excluded_scan_paths_from_env(),
+        &excluded_scan_paths_from_env()?,
         &mut SourceScanHooks::default(),
     )
 }
@@ -1023,7 +1026,7 @@ impl Connector for ClaudeCodeConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 
     fn scan_with_callback(
@@ -1047,7 +1050,7 @@ impl Connector for ClaudeCodeConnector {
         scan_claude_with_callback_with_exclusions(
             ctx,
             on_conversation,
-            &excluded_scan_paths_from_env(),
+            &excluded_scan_paths_from_env()?,
             hooks,
         )
     }

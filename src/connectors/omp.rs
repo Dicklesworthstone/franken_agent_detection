@@ -290,14 +290,14 @@ impl OmpConnector {
         homes
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         // Pass full ScanRoots (profile tags don't participate in discovery)
         // so remote-origin/platform provenance survives into each source.
         let roots: Vec<ScanRoot> = Self::source_roots(ctx)
             .into_iter()
             .map(|(root, _)| root)
             .collect();
-        super::pi_wire::discover_sources(&roots, ctx, "omp")
+        super::pi_wire::try_discover_sources(&roots, ctx, "omp")
     }
 }
 
@@ -347,7 +347,7 @@ impl Connector for OmpConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

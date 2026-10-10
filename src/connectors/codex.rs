@@ -8,6 +8,7 @@ pub use reader::{
 #[cfg(feature = "codex-zstd")]
 pub use reader::{compressed_rollout_declared_len, decompressed_rollout};
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -72,6 +73,66 @@ impl RolloutFormat {
 enum FileScanMetadata {
     Process(Option<fs::Metadata>),
     Skip,
+}
+
+/// An exact JSONL exclusion applies to the plain and compressed representation
+/// of that file. Directory exclusions keep their ordinary prefix semantics.
+/// Build the logical keys once per operation, before discovery or scan hooks.
+struct CodexScanExclusions {
+    physical_paths: Vec<PathBuf>,
+    jsonl_files: HashSet<PathBuf>,
+}
+
+impl CodexScanExclusions {
+    fn from_env() -> Result<Self> {
+        let physical_paths = excluded_scan_paths_from_env()?;
+        let jsonl_files = physical_paths
+            .iter()
+            // An existing directory named `rollout-*.jsonl[.zst]` is still a
+            // directory policy, not an exact rollout-file exclusion.
+            .filter(|path| !path.is_dir())
+            .filter_map(|path| Self::jsonl_path(path).map(Cow::into_owned))
+            .collect();
+        Ok(Self {
+            physical_paths,
+            jsonl_files,
+        })
+    }
+
+    fn jsonl_path(path: &Path) -> Option<Cow<'_, Path>> {
+        if reader::is_compressed_rollout(path) {
+            // Preserve the actual JSONL suffix and stem spelling. The reader
+            // accepts `.JSONL.ZST`, and paths can be case-sensitive.
+            Some(Cow::Owned(path.with_extension("")))
+        } else if RolloutFormat::of(path) == Some(RolloutFormat::Jsonl) {
+            Some(Cow::Borrowed(path))
+        } else {
+            None
+        }
+    }
+
+    fn excludes(&self, path: &Path) -> bool {
+        if path_is_excluded(path, &self.physical_paths) {
+            return true;
+        }
+        if self.jsonl_files.is_empty() {
+            return false;
+        }
+        let Some(logical) = Self::jsonl_path(path) else {
+            return false;
+        };
+        if self.jsonl_files.contains(logical.as_ref()) {
+            return true;
+        }
+        // Resolve the source itself before removing its compression suffix:
+        // an explicitly scoped leaf symlink may have a different rollout name
+        // from its target. The policy reader already retains resolved entries.
+        // With a configured policy, an unresolvable source is not known safe.
+        fs::canonicalize(path).map_or(true, |resolved| {
+            Self::jsonl_path(&resolved)
+                .is_some_and(|logical| self.jsonl_files.contains(logical.as_ref()))
+        })
+    }
 }
 
 impl Default for CodexConnector {
@@ -280,8 +341,8 @@ impl CodexConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
-        let excluded_paths = excluded_scan_paths_from_env();
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = CodexScanExclusions::from_env()?;
         let roots = Self::source_roots(ctx);
         let mut out = Vec::new();
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
@@ -306,7 +367,7 @@ impl CodexConnector {
 
             for file in files {
                 // Explicit-file roots bypass rollout_files(), so filter here.
-                if path_is_excluded(&file, &excluded_paths) {
+                if excluded_paths.excludes(&file) {
                     continue;
                 }
                 if !seen_files.insert(dedupe_path_key(&file)) {
@@ -331,7 +392,7 @@ impl CodexConnector {
             }
         }
 
-        out
+        Ok(out)
     }
 
     fn compact_message_extra(raw: &Value) -> Value {
@@ -460,7 +521,7 @@ fn scan_codex_with_hooks(
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    let excluded_paths = excluded_scan_paths_from_env();
+    let excluded_paths = CodexScanExclusions::from_env()?;
     let roots: Vec<ScanRoot> = CodexConnector::source_roots(ctx);
 
     if roots.is_empty() {
@@ -493,7 +554,7 @@ fn scan_codex_with_hooks(
 
         for file in files {
             // Excluded sources must not reach pre-parse hooks or completions.
-            if path_is_excluded(&file, &excluded_paths) {
+            if excluded_paths.excludes(&file) {
                 continue;
             }
             if !seen_files.insert(dedupe_path_key(&file)) {
@@ -988,7 +1049,7 @@ impl Connector for CodexConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 
     fn scan_with_callback(

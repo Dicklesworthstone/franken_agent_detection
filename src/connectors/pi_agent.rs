@@ -243,10 +243,10 @@ impl PiAgentConnector {
         homes
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         // Pass full ScanRoots so remote-origin/platform provenance survives
         // into each discovered source.
-        super::pi_wire::discover_sources(&Self::source_roots(ctx), ctx, "pi_agent")
+        super::pi_wire::try_discover_sources(&Self::source_roots(ctx), ctx, "pi_agent")
     }
 
     /// Detect Pi session stores under `root` that this connector cannot index.
@@ -389,7 +389,7 @@ impl Connector for PiAgentConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

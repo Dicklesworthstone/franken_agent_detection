@@ -1,4 +1,5 @@
-//! Regression coverage for `coding_agent_session_search#486`.
+//! Regression coverage for `coding_agent_session_search#486` and
+//! `franken_agent_detection#29` (compressed representation exclusions).
 //!
 //! Exercise the public APIs with the real environment reader. Each case runs in
 //! a child test process: changing a process-global environment variable in a
@@ -26,40 +27,56 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_paths(
+            [
+                "18/rollout-private.jsonl",
+                "18/rollout-legacy.json",
+                "18/rollout-private.jsonl-copy.jsonl",
+                "18-copy/rollout-sibling.jsonl",
+                "19/rollout-public.jsonl",
+            ]
+            .map(|path| PathBuf::from(".codex/sessions/2026/09").join(path)),
+        )
+    }
+
+    fn with_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
         let root = TempDir::new().unwrap();
-        let month = root.path().join(".codex/sessions/2026/09");
-        let private = month.join("18");
-        let files = vec![
-            private.join("rollout-private.jsonl"),
-            private.join("rollout-legacy.json"),
-            private.join("rollout-private.jsonl-copy.jsonl"),
-            month.join("18-copy/rollout-sibling.jsonl"),
-            month.join("19/rollout-public.jsonl"),
-        ];
+        let files: Vec<_> = paths
+            .into_iter()
+            .map(|path| root.path().join(path))
+            .collect();
         for file in &files {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            let content = if file.extension().unwrap() == "json" {
-                r#"{"items":[{"role":"user","content":"fixture message"}]}"#
-            } else {
-                r#"{"type":"response_item","payload":{"role":"user","content":"fixture message"}}"#
-            };
-            std::fs::write(file, content).unwrap();
+            write_rollout(file);
         }
         Self { root, files }
     }
 
     fn run(&self, exclusions: &str, expected_indices: &[usize]) {
+        self.run_modes(
+            exclusions,
+            expected_indices,
+            &[
+                "default",
+                "home",
+                "codex",
+                "sessions",
+                "files",
+                "overlapping",
+            ],
+        );
+    }
+
+    fn run_modes(&self, exclusions: &str, expected_indices: &[usize], modes: &[&str]) {
         let expected: Vec<_> = expected_indices.iter().map(|&i| &self.files[i]).collect();
         let expected = serde_json::to_string(&expected).unwrap();
         let files = serde_json::to_string(&self.files).unwrap();
-        for mode in [
-            "default",
-            "home",
-            "codex",
-            "sessions",
-            "files",
-            "overlapping",
-        ] {
+        let before: Vec<_> = self
+            .files
+            .iter()
+            .map(|file| std::fs::read(file).unwrap())
+            .collect();
+        for mode in modes {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "codex_exclusions_child", "--nocapture"])
                 .current_dir(self.root.path())
@@ -78,7 +95,32 @@ impl Fixture {
                 String::from_utf8_lossy(&output.stderr),
             );
         }
+        for (file, expected_bytes) in self.files.iter().zip(before) {
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                expected_bytes,
+                "source changed: {}",
+                file.display()
+            );
+        }
     }
+}
+
+fn write_rollout(file: &Path) {
+    let content = if file.extension().unwrap() == "json" {
+        r#"{"items":[{"role":"user","content":"fixture message"}]}"#
+    } else {
+        r#"{"type":"response_item","payload":{"role":"user","content":"fixture message"}}"#
+    };
+    #[cfg(feature = "codex-zstd")]
+    if franken_agent_detection::connectors::codex::is_compressed_rollout(file) {
+        // Real zstd frames, consumed through the production decoder in baseline
+        // scans before testing the pre-parse exclusion gates.
+        let compressed = zstd::stream::encode_all(content.as_bytes(), 0).unwrap();
+        std::fs::write(file, compressed).unwrap();
+        return;
+    }
+    std::fs::write(file, content).unwrap();
 }
 
 fn context(root: &Path, files: &[PathBuf], mode: &str, since: Option<i64>) -> ScanContext {
@@ -278,4 +320,183 @@ fn codex_exclusions_resolve_relative_dotdot_and_alias_spellings() {
         std::os::unix::fs::symlink(fixture.files[0].parent().unwrap(), &alias).unwrap();
         fixture.run(alias.to_str().unwrap(), &[3, 4]);
     }
+}
+
+fn ascii_case_spellings(word: &str) -> Vec<String> {
+    (0..(1 << word.len()))
+        .map(|mask| {
+            word.bytes()
+                .enumerate()
+                .map(|(bit, byte)| {
+                    char::from(if mask & (1 << bit) == 0 {
+                        byte
+                    } else {
+                        byte.to_ascii_uppercase()
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn representation_fixture(compressed: bool) -> (Fixture, String) {
+    let mut paths = Vec::new();
+    let mut aliases = Vec::new();
+    // The reader accepts all 32 JSONL spellings and all 8 ZST spellings.
+    // Give every pair a distinct stem so this also works on case-insensitive
+    // filesystems without inventing multiple files with the same identity.
+    for jsonl in ascii_case_spellings("jsonl") {
+        for zst in ascii_case_spellings("zst") {
+            let id = paths.len();
+            let plain = PathBuf::from(format!(".codex/sessions/rollout-private-{id}.{jsonl}"));
+            let encoded = plain.with_extension(format!("{jsonl}.{zst}"));
+            if compressed {
+                paths.push(encoded);
+                aliases.push(plain);
+            } else {
+                paths.push(plain);
+                aliases.push(encoded);
+            }
+        }
+    }
+    paths.push(PathBuf::from(".codex/sessions/rollout-public.jsonl"));
+    paths.push(PathBuf::from(
+        ".codex/sessions/rollout-private-0.jsonl-copy.jsonl",
+    ));
+    let fixture = Fixture::with_paths(paths);
+    let exclusions = aliases
+        .into_iter()
+        .map(|path| fixture.root.path().join(path).to_str().unwrap().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (fixture, exclusions)
+}
+
+#[test]
+fn codex_exclusions_compressed_names_cover_plain_twins_for_every_suffix_spelling() {
+    let (fixture, exclusions) = representation_fixture(false);
+    fixture.run("", &(0..fixture.files.len()).collect::<Vec<_>>());
+    fixture.run(&exclusions, &[256, 257]);
+}
+
+#[test]
+#[cfg(feature = "codex-zstd")]
+fn codex_exclusions_plain_names_cover_compressed_twins_for_every_suffix_spelling() {
+    let (fixture, exclusions) = representation_fixture(true);
+    // Establish that all 256 frames really decode and emit the same fixture
+    // record before any policy is configured.
+    fixture.run("", &(0..fixture.files.len()).collect::<Vec<_>>());
+    fixture.run(&exclusions, &[256, 257]);
+}
+
+#[test]
+#[cfg(feature = "codex-zstd")]
+fn codex_exclusions_cover_coexisting_twins_and_explicit_compressed_roots() {
+    let mut fixture = Fixture::new();
+    let plain = fixture.files[0].clone();
+    let compressed = plain.with_extension("jsonl.zst");
+    write_rollout(&compressed);
+
+    // Directory discovery prefers the plain twin, and the compressed spelling
+    // must still exclude it. The unrelated legacy JSON and siblings survive.
+    fixture.run("", &[0, 1, 2, 3, 4]);
+    fixture.run(compressed.to_str().unwrap(), &[1, 2, 3, 4]);
+
+    // Explicitly scoping the compressed file bypasses directory twin selection.
+    // Its plain spelling must exclude it at the same public API gates.
+    fixture.files[0] = compressed;
+    fixture.run_modes("", &[0, 1, 2, 3, 4], &["files"]);
+    fixture.run_modes(plain.to_str().unwrap(), &[1, 2, 3, 4], &["files"]);
+}
+
+#[test]
+#[cfg(feature = "codex-zstd")]
+fn codex_exclusions_compressed_twins_keep_relative_dotdot_and_symlink_resolution() {
+    let fixture = Fixture::with_paths([
+        PathBuf::from(".codex/sessions/private/rollout-private.JSONL.zSt"),
+        PathBuf::from(".codex/sessions/public/rollout-public.jsonl"),
+    ]);
+    fixture.run("", &[0, 1]);
+    fixture.run(".codex/sessions/private/rollout-private.JSONL", &[1]);
+    fixture.run(
+        ".codex/sessions/public/../private/rollout-private.JSONL",
+        &[1],
+    );
+    #[cfg(unix)]
+    {
+        let elsewhere = TempDir::new().unwrap();
+        let alias = elsewhere.path().join("private-alias");
+        std::os::unix::fs::symlink(fixture.files[0].parent().unwrap(), &alias).unwrap();
+        fixture.run(alias.join("rollout-private.JSONL").to_str().unwrap(), &[1]);
+    }
+}
+
+#[test]
+#[cfg(all(feature = "codex-zstd", unix))]
+fn codex_exclusions_resolve_leaf_symlinks_before_matching_compressed_twins() {
+    let mut fixture = Fixture::new();
+    let plain = fixture.files[0].clone();
+    let compressed = plain.with_extension("jsonl.zst");
+    write_rollout(&compressed);
+    let elsewhere = TempDir::new().unwrap();
+
+    // A policy can be a leaf symlink with no rollout-shaped filename. The
+    // canonical compressed target also excludes its selected plain twin.
+    let policy_alias = elsewhere.path().join("private-policy");
+    std::os::unix::fs::symlink(&compressed, &policy_alias).unwrap();
+    fixture.run(policy_alias.to_str().unwrap(), &[1, 2, 3, 4]);
+
+    // Conversely, an explicitly scoped compressed source can have a different
+    // stem. Excluding the canonical target's plain twin must still block it.
+    let source_alias = elsewhere.path().join("rollout-other-name.jsonl.zst");
+    std::os::unix::fs::symlink(&compressed, &source_alias).unwrap();
+    fixture.files[0] = source_alias;
+    fixture.run_modes("", &[0, 1, 2, 3, 4], &["files"]);
+    fixture.run_modes(plain.to_str().unwrap(), &[1, 2, 3, 4], &["files"]);
+}
+
+#[test]
+fn codex_exclusions_representation_aliases_do_not_expand_directory_policies() {
+    let fixture = Fixture::with_paths([
+        PathBuf::from(".codex/sessions/rollout-folder.jsonl/rollout-public.jsonl"),
+        PathBuf::from(".codex/sessions/rollout-public.jsonl"),
+    ]);
+    let compressed_directory = fixture
+        .root
+        .path()
+        .join(".codex/sessions/rollout-folder.jsonl.zst");
+    std::fs::create_dir_all(&compressed_directory).unwrap();
+    fixture.run(compressed_directory.to_str().unwrap(), &[0, 1]);
+
+    // Even a missing compressed spelling is an exact logical-file alias. It
+    // does not become a prefix exclusion for a similarly named directory.
+    let missing_compressed = fixture.files[0]
+        .parent()
+        .unwrap()
+        .with_extension("jsonl.ZST");
+    fixture.run(missing_compressed.to_str().unwrap(), &[0, 1]);
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_exclusions_representation_aliases_preserve_stem_and_jsonl_case() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = Fixture::with_paths([
+        PathBuf::from(".codex/sessions/rollout-Private.jsonl"),
+        PathBuf::from(".codex/sessions/rollout-private.jsonl"),
+        PathBuf::from(".codex/sessions/rollout-Private.JSONL"),
+        PathBuf::from(".codex/sessions/rollout-Private.json"),
+    ]);
+    // macOS may use a case-insensitive filesystem. Its case variants name the
+    // same file, so only assert distinct-file behavior where they are distinct.
+    let first = std::fs::metadata(&fixture.files[0]).unwrap();
+    if fixture.files[1..=2].iter().any(|path| {
+        let other = std::fs::metadata(path).unwrap();
+        (first.dev(), first.ino()) == (other.dev(), other.ino())
+    }) {
+        return;
+    }
+    let excluded = fixture.files[0].with_extension("jsonl.zst");
+    fixture.run(excluded.to_str().unwrap(), &[1, 2, 3]);
 }
