@@ -175,19 +175,7 @@ impl GeminiConnector {
     }
 
     fn is_session_file(path: &Path) -> bool {
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        name.starts_with("session-")
-            && path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonl")
-                })
-            && path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                == Some("chats")
+        crate::is_gemini_session_file(path)
     }
 
     /// Find all legacy JSON and current event-sourced JSONL session files.

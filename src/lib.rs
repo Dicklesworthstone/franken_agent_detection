@@ -328,6 +328,7 @@ fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
 #[allow(clippy::too_many_lines)]
 fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
     let read = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string());
+    let read_path = |key: &str| read(key).filter(|v| !v.is_empty()).map(PathBuf::from);
 
     match slug {
         "codebuff" => {
@@ -380,6 +381,38 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root).join("sessions")])
         }
+        "crush" => read_path("CRUSH_SQLITE_DB")
+            .filter(|path| path.is_file())
+            .map(|path| vec![path]),
+        "cursor" => {
+            let projects = read_path("CASS_CURSOR_PROJECTS_ROOT")?;
+            let mut roots: Vec<_> = projects.is_dir().then_some(projects).into_iter().collect();
+            // The projects override replaces Agent transcripts, but Composer
+            // remains an independent store. Do not fall back to ~/.cursor
+            // when the configured transcript directory is missing.
+            let agent_home = home_join(&[".cursor"]);
+            for root in default_probe_roots(slug) {
+                if Some(&root) != agent_home.as_ref() && !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+            Some(roots)
+        }
+        "gemini" => {
+            let root = read_path("GEMINI_HOME")?;
+            // GEMINI_HOME directly replaces the session root, even if it is
+            // missing. A file root must satisfy the scanner's path admission.
+            let admitted = root.is_dir() || (root.is_file() && is_gemini_session_file(&root));
+            Some(admitted.then_some(root).into_iter().collect())
+        }
+        "hermes" => read_path("HERMES_SQLITE_DB")
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                read_path("HERMES_HOME")
+                    .map(|home| home.join("state.db"))
+                    .filter(|path| path.is_file())
+            })
+            .map(|path| vec![path]),
         "kimi" => {
             let root = read("KIMI_CODE_HOME")?;
             if root.is_empty() {
@@ -393,6 +426,26 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                 return None;
             }
             Some(vec![PathBuf::from(root)])
+        }
+        "opencode" => {
+            // The legacy storage root and SQLite databases are independent.
+            // SQLite overrides add a candidate; they never hide default DBs.
+            let mut roots: Vec<_> = [
+                read_path("OPENCODE_SQLITE_DB").filter(|path| path.is_file()),
+                read_path("OPENCODE_STORAGE_ROOT").filter(|path| path.is_dir()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if roots.is_empty() {
+                return None;
+            }
+            for root in default_probe_roots(slug) {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+            Some(roots)
         }
         "pi_agent" => {
             // A sessions-only override is additive: the connector still
@@ -444,11 +497,35 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             Some(vec![expand(&root).join("sessions")])
         }
         "goose" => {
-            let root = read("GOOSE_PATH_ROOT")?;
-            if root.is_empty() {
+            let explicit_db = read_path("GOOSE_SQLITE_DB");
+            let explicit_root = read_path("GOOSE_PATH_ROOT");
+            if explicit_db.is_none() && explicit_root.is_none() {
                 return None;
             }
-            Some(vec![PathBuf::from(root).join("data").join("sessions")])
+            let mut sessions: Vec<_> = explicit_root
+                .map(|root| root.join("data/sessions"))
+                .into_iter()
+                .collect();
+            if let Some(data) = dirs::data_local_dir() {
+                sessions.push(data.join("goose/sessions"));
+            }
+            if let Some(home) = dirs::home_dir() {
+                sessions.push(home.join(".local/share/goose/sessions"));
+                sessions.push(home.join(".goose/sessions"));
+            }
+            let mut seen = HashSet::new();
+            sessions.retain(|path| seen.insert(path.clone()));
+
+            // SQLite and legacy JSONL select their fallbacks independently.
+            // In particular, a missing GOOSE_PATH_ROOT must not mask an
+            // explicit database, nor may that DB hide default JSONL history.
+            let db = explicit_db
+                .into_iter()
+                .chain(sessions.iter().map(|root| root.join("sessions.db")))
+                .find(|path| path.is_file());
+            let directory = sessions.into_iter().find(|path| path.is_dir());
+            let roots: Vec<_> = db.into_iter().chain(directory).collect();
+            (!roots.is_empty()).then_some(roots)
         }
         "muse" => {
             let root = read("CASS_MUSE_DATA_ROOT")?;
@@ -487,6 +564,24 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
         }
         _ => None,
     }
+}
+
+/// Path admission shared by Gemini detection and session scanning.
+fn is_gemini_session_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("session-"))
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonl")
+            })
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("chats")
 }
 
 /// Claude Code detection roots when `CLAUDE_CONFIG_DIR` is set (cass #448).

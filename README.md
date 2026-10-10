@@ -74,6 +74,25 @@ Setting `PI_CODING_AGENT_DIR` replaces that default agent home while keeping
 the separate sessions override. A missing additive sessions directory does
 not hide an existing default history.
 
+Custom history stores use the same environment settings as their connectors:
+
+| Agent | Environment settings | Detection policy |
+|---|---|---|
+| Gemini | `GEMINI_HOME` | Replaces the default session root; accepts a directory or an admitted `chats/session-*.json` / `.jsonl` file |
+| OpenCode | `OPENCODE_STORAGE_ROOT`, `OPENCODE_SQLITE_DB` | Keeps legacy storage and SQLite independent, with default database candidates still available |
+| Hermes | `HERMES_SQLITE_DB`, `HERMES_HOME` | Prefers an existing explicit database, then `$HERMES_HOME/state.db`, then the default store |
+| Crush | `CRUSH_SQLITE_DB` | Prefers an existing explicit global database, with the default as fallback |
+| Goose | `GOOSE_SQLITE_DB`, `GOOSE_PATH_ROOT` | Resolves the database and JSONL sessions directory independently, including their default fallbacks |
+| Cursor | `CASS_CURSOR_PROJECTS_ROOT` | Replaces the Agent transcript root while retaining Composer detection |
+
+These remain filesystem installation probes. A configured database path must
+be a file; detection does not open databases or validate their schemas. The
+probes work without optional connector features, while reading each store
+requires its connector's feature. Explicit detector `root_overrides` stay
+restricted to the supplied paths. Reported roots are candidate locations;
+passing a database file as a scan context deliberately scopes applicable
+connectors to that file.
+
 ## Connectors
 
 ```rust
