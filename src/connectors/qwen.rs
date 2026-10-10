@@ -1,29 +1,52 @@
 //! Connector for Qwen Code (Alibaba) session logs.
 //!
-//! Qwen Code stores sessions as JSON files at:
-//! - `~/.qwen/tmp/<project-hash>/chats/session-<timestamp>-<id>.json`
+//! Qwen Code stores current sessions as UUID-named JSONL files under
+//! `~/.qwen/projects/<project>/chats/` (including `chats/archive/`).
+//! Legacy JSON sessions live at
+//! `~/.qwen/tmp/<project-hash>/chats/session-<timestamp>-<id>.json`.
 //!
-//! Each file is a complete JSON object containing:
+//! Each legacy file is a complete JSON object containing:
 //! - `sessionId`, `projectHash`, `startTime`, `lastUpdated`
 //! - `messages` array with objects: `id`, `timestamp`, `type`, `content`, `tokens`
 //!
-//! Message types: `user`, `qwen` (assistant)
+//! Legacy message types: `user`, `qwen` (assistant). Native JSONL uses
+//! `user`, `assistant`, `tool_result` and parent-linked `system` records.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::read_capped;
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp, utils::dedupe_path_key,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
+
+const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+const QWEN_USAGE_KEYS: [&str; 6] = [
+    "promptTokenCount",
+    "candidatesTokenCount",
+    "totalTokenCount",
+    "cachedContentTokenCount",
+    "thoughtsTokenCount",
+    "toolUsePromptTokenCount",
+];
+
+struct QwenSourceRoot {
+    root: ScanRoot,
+    include_legacy: bool,
+}
+
 pub struct QwenConnector;
 
 impl Default for QwenConnector {
@@ -38,52 +61,84 @@ impl QwenConnector {
         Self
     }
 
-    /// Get the Qwen tmp root directory.
-    fn tmp_root() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".qwen")
-            .join("tmp")
+    fn default_root() -> PathBuf {
+        crate::qwen_runtime_root_from_env()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".qwen"))
     }
 
     fn looks_like_qwen_storage(path: &Path) -> bool {
-        // Structural, not substring-based: a `.qwen` directory containing
-        // `tmp/`, or a `tmp/` directory whose parent is `.qwen`.
-        // (`~/.qwen/tmp` is the session root.) A substring test
-        // mis-scoped default detection onto lookalike directories such as
-        // `/data/tmp-mirror/.qwen-tools`, silently finding nothing.
-        if path.file_name().is_some_and(|n| n == "tmp")
-            && path
-                .parent()
-                .is_some_and(|p| p.file_name().is_some_and(|n| n == ".qwen"))
-        {
-            return true;
-        }
-        path.file_name().is_some_and(|n| n == ".qwen") && path.join("tmp").is_dir()
+        // Keep the provider identity structural, including exact sources and
+        // project/chats subdirectories returned by discovery.
+        path.ancestors()
+            .any(|ancestor| ancestor.file_name().is_some_and(|n| n == ".qwen"))
     }
 
-    fn append_qwen_roots(roots: &mut Vec<PathBuf>, base: &Path) {
+    fn append_qwen_roots(roots: &mut Vec<QwenSourceRoot>, scan_root: &ScanRoot) {
+        let base = &scan_root.path;
         if Self::looks_like_qwen_storage(base) {
-            roots.push(base.to_path_buf());
+            roots.push(QwenSourceRoot {
+                root: scan_root.clone(),
+                include_legacy: true,
+            });
             return;
         }
 
-        if base.file_name().is_some_and(|name| name == ".qwen") {
-            let candidate = base.join("tmp");
-            if candidate.exists() {
-                roots.push(candidate);
-            }
-            return;
+        let candidate = base.join(".qwen");
+        if candidate.is_dir() {
+            roots.push(QwenSourceRoot {
+                root: scan_root.with_path(candidate),
+                include_legacy: true,
+            });
         }
 
-        let candidate = base.join(".qwen/tmp");
-        if candidate.exists() {
-            roots.push(candidate);
+        if Self::looks_like_native_root(base) {
+            // Unmarked copies only admit the current, distinctive filename
+            // and record schema. Gemini's session-*.json is not Qwen evidence.
+            roots.push(QwenSourceRoot {
+                root: scan_root.clone(),
+                include_legacy: false,
+            });
         }
     }
 
-    /// Find all session-*.json files under a root.
-    fn session_files(root: &Path) -> Vec<PathBuf> {
+    fn is_native_session_file(path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let Some(id) = name.strip_suffix(".jsonl") else {
+            return false;
+        };
+        let in_chats = path.parent().is_some_and(|parent| {
+            parent.file_name().is_some_and(|n| n == "chats")
+                || (parent.file_name().is_some_and(|n| n == "archive")
+                    && parent
+                        .parent()
+                        .is_some_and(|p| p.file_name().is_some_and(|n| n == "chats")))
+        });
+        in_chats
+            && (32..=36).contains(&id.len())
+            && id.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-')
+    }
+
+    fn looks_like_native_root(path: &Path) -> bool {
+        Self::is_native_session_file(path)
+            || path.file_name().is_some_and(|name| name == "chats")
+            || (path.file_name().is_some_and(|name| name == "archive")
+                && path
+                    .parent()
+                    .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "chats")))
+            || path.join("projects").is_dir()
+            || path.join("chats").is_dir()
+            || fs::read_dir(path).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    Self::is_native_session_file(&entry.path())
+                        || entry.path().join("chats").is_dir()
+                })
+            })
+    }
+
+    /// Discovery stays pre-parse so malformed source artifacts can be mirrored.
+    fn session_files(root: &Path, include_legacy: bool) -> Vec<PathBuf> {
         let mut out = Vec::new();
         if !root.exists() {
             return out;
@@ -95,12 +150,14 @@ impl QwenConnector {
             }
 
             let name = entry.file_name().to_str().unwrap_or("");
-            if name.starts_with("session-")
-                && entry
-                    .path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            if Self::is_native_session_file(entry.path())
+                || (include_legacy
+                    && name.starts_with("session-")
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("json")))
             {
                 out.push(entry.path().to_path_buf());
             }
@@ -110,48 +167,46 @@ impl QwenConnector {
         out
     }
 
-    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
-        let mut roots: Vec<ScanRoot> = Vec::new();
+    fn source_roots(ctx: &ScanContext) -> Vec<QwenSourceRoot> {
+        let mut roots = Vec::new();
         if ctx.use_default_detection() {
             // Exclusive scoping (house pattern): a data_dir that IS qwen
             // storage scopes the scan to it; only otherwise probe the
-            // default tmp root. Scanning both leaked live-machine sessions
+            // default runtime root. Scanning both leaked live-machine sessions
             // into scoped mirror ingests.
-            if Self::looks_like_qwen_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            if Self::looks_like_qwen_storage(&ctx.data_dir)
+                || Self::looks_like_native_root(&ctx.data_dir)
+            {
+                Self::append_qwen_roots(&mut roots, &ScanRoot::local(ctx.data_dir.clone()));
             } else {
-                let root = Self::tmp_root();
-                if root.exists() {
-                    roots.push(ScanRoot::local(root));
+                let root = Self::default_root();
+                if root.is_dir() {
+                    roots.push(QwenSourceRoot {
+                        root: ScanRoot::local(root),
+                        include_legacy: true,
+                    });
                 }
             }
         } else {
             for scan_root in &ctx.scan_roots {
-                let mut candidates = Vec::new();
-                Self::append_qwen_roots(&mut candidates, &scan_root.path);
-                roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
-            }
-
-            if ctx.data_dir.exists() {
-                let mut candidates = Vec::new();
-                Self::append_qwen_roots(&mut candidates, &ctx.data_dir);
-                roots.extend(candidates.into_iter().map(ScanRoot::local));
+                Self::append_qwen_roots(&mut roots, scan_root);
             }
         }
 
-        roots.sort_by(|a, b| a.path.cmp(&b.path));
-        roots.dedup_by(|a, b| a.path == b.path);
+        roots.sort_by(|a, b| a.root.path.cmp(&b.root.path));
+        roots.dedup_by(|a, b| a.root.path == b.root.path);
         roots
     }
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         let mut out = Vec::new();
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
-        for root in Self::source_roots(ctx) {
+        for source_root in Self::source_roots(ctx) {
+            let root = source_root.root;
             if !root.path.exists() {
                 continue;
             }
-            for session_path in Self::session_files(&root.path) {
+            for session_path in Self::session_files(&root.path, source_root.include_legacy) {
                 if !seen_files.insert(dedupe_path_key(&session_path)) {
                     continue;
                 }
@@ -168,7 +223,12 @@ impl QwenConnector {
                     )
                     .with_fs_metadata(),
                 );
-                if let Some(project_dir) = session_path.parent().and_then(Path::parent) {
+                if session_path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                    && let Some(project_dir) = session_path.parent().and_then(Path::parent)
+                {
                     let config = project_dir.join("config.json");
                     if config.exists() {
                         out.push(
@@ -195,27 +255,31 @@ impl Connector for QwenConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
-
-        if roots.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        roots.sort();
-        roots.dedup();
-
         let mut convs = Vec::new();
-        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            convs.push(conversation);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
 
-        for root in roots {
-            if !root.exists() {
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let mut seen_files: HashSet<PathBuf> = HashSet::new();
+        for source_root in Self::source_roots(ctx) {
+            let root = source_root.root;
+            if !root.path.exists() {
                 continue;
             }
 
-            for session_path in Self::session_files(&root) {
+            for session_path in Self::session_files(&root.path, source_root.include_legacy) {
                 if !seen_files.insert(dedupe_path_key(&session_path)) {
                     continue;
                 }
@@ -225,7 +289,7 @@ impl Connector for QwenConnector {
                 }
 
                 match parse_qwen_session(&session_path) {
-                    Ok(Some(conv)) => convs.push(conv),
+                    Ok(Some(conv)) => on_conversation(conv)?,
                     Ok(None) => {}
                     Err(e) => {
                         tracing::debug!(
@@ -238,7 +302,7 @@ impl Connector for QwenConnector {
             }
         }
 
-        Ok(convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
@@ -246,8 +310,449 @@ impl Connector for QwenConnector {
     }
 }
 
-/// Parse a Qwen session JSON file into a `NormalizedConversation`.
+// Native JSONL semantics follow QwenLM/qwen-code at
+// a238b91e7c6fc2b0e36e23436b0e4ced5296617b:
+// services/chatRecordingService.ts and utils/transcript-records.ts. UUID
+// duplicates are fragments, not replacement snapshots: append their parts,
+// keep the first parent/model, and replace usage with the latest observation.
+fn merge_qwen_fragments(base: &mut Value, mut fragment: Value) {
+    if let Some(message) = fragment.get_mut("message") {
+        if let Some(base_message) = base.get_mut("message").and_then(Value::as_object_mut) {
+            if let Some(parts) = message.get_mut("parts").and_then(Value::as_array_mut) {
+                let base_parts = base_message
+                    .entry("parts")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(base_parts) = base_parts.as_array_mut() {
+                    base_parts.append(parts);
+                }
+            }
+        } else {
+            base["message"] = message.take();
+        }
+    }
+    for key in ["usageMetadata", "model", "toolCallResult"] {
+        if let Some(value) = fragment.get(key)
+            && (value.is_object() || key == "model" && value_is_nonempty_string(value))
+        {
+            // The latest usage is one logical reply's total, never a sum of
+            // the intermediate fragment totals.
+            if key == "usageMetadata"
+                || base.get(key).is_none_or(Value::is_null)
+                || key == "model" && !value_is_nonempty_string(&base[key])
+            {
+                base[key] = fragment[key].take();
+            }
+        }
+    }
+    if fragment["timestamp"].as_str() > base["timestamp"].as_str() {
+        base["timestamp"] = fragment["timestamp"].take();
+    }
+}
+
+fn value_is_nonempty_string(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| !text.trim().is_empty())
+}
+
+fn is_qwen_record(record: &Value) -> bool {
+    value_is_nonempty_string(&record["uuid"])
+        && value_is_nonempty_string(&record["sessionId"])
+        && record
+            .get("parentUuid")
+            .is_some_and(|parent| parent.is_null() || parent.is_string())
+        && matches!(
+            record["type"].as_str(),
+            Some("user" | "assistant" | "tool_result" | "system")
+        )
+}
+
+fn is_qwen_side_record(record: &Value) -> bool {
+    record["type"] == "system"
+        && matches!(
+            record["subtype"].as_str(),
+            Some(
+                "session_artifact_event" | "session_artifact_snapshot" | "session_sources_snapshot"
+            )
+        )
+}
+
+#[derive(Default)]
+struct QwenHistory {
+    records: HashMap<String, Value>,
+    leaf: Option<String>,
+    session_id: Option<String>,
+    workspace: Option<PathBuf>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    native_signature: bool,
+}
+
+fn read_qwen_jsonl(reader: impl BufRead) -> Result<QwenHistory> {
+    let mut history = QwenHistory::default();
+    for line in JsonlLines::new(reader) {
+        let line = line?;
+        let Ok(mut record) = serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}'))
+        else {
+            continue;
+        };
+        if record["subtype"]
+            .as_str()
+            .is_some_and(|subtype| subtype.starts_with("managed_session_"))
+            || (record["subtype"] == "session_execution_engine"
+                && record
+                    .pointer("/systemPayload/engine")
+                    .and_then(Value::as_str)
+                    == Some("managed"))
+        {
+            anyhow::bail!("qwen: managed session transcripts require a separate format adapter");
+        }
+        if !is_qwen_record(&record) {
+            continue;
+        }
+        history.native_signature |= record
+            .pointer("/message/parts")
+            .is_some_and(Value::is_array)
+            || QWEN_USAGE_KEYS.iter().any(|key| {
+                record
+                    .get("usageMetadata")
+                    .and_then(|usage| usage.get(key))
+                    .is_some_and(Value::is_number)
+            });
+        // A malformed body does not erase its parent link and disconnect
+        // earlier valid messages. Native parts/usage evidence still gates the
+        // entire source, so a renamed Claude or Gemini transcript is not Qwen.
+        if record.get("message").is_some_and(|message| {
+            !message.is_object() || !message.get("parts").is_some_and(Value::is_array)
+        }) {
+            record
+                .as_object_mut()
+                .expect("validated object")
+                .remove("message");
+        }
+        let id = record["sessionId"].as_str().expect("validated session ID");
+        if history
+            .session_id
+            .as_deref()
+            .is_some_and(|expected| expected != id)
+        {
+            anyhow::bail!("qwen: transcript contains mixed session IDs");
+        }
+        if history.session_id.is_none() {
+            history.session_id = Some(id.to_string());
+            history.workspace = record["cwd"]
+                .as_str()
+                .filter(|cwd| !cwd.is_empty())
+                .map(PathBuf::from);
+        }
+        if let Some(timestamp) = record.get("timestamp").and_then(parse_timestamp) {
+            history.started_at = Some(
+                history
+                    .started_at
+                    .map_or(timestamp, |start: i64| start.min(timestamp)),
+            );
+            history.ended_at = Some(
+                history
+                    .ended_at
+                    .map_or(timestamp, |end: i64| end.max(timestamp)),
+            );
+        } else if let Some(object) = record.as_object_mut() {
+            object.remove("timestamp");
+        }
+        if is_qwen_side_record(&record) {
+            continue;
+        }
+        if record["type"] == "system" && record["subtype"] != "custom_title" {
+            // System history.records carry parent links but can also embed full file
+            // snapshots or compressed histories. Their payload is not needed
+            // to reconstruct the visible conversation.
+            if let Some(object) = record.as_object_mut() {
+                object.remove("systemPayload");
+                object.remove("message");
+            }
+        }
+        let uuid = record["uuid"]
+            .as_str()
+            .expect("validated message UUID")
+            .to_string();
+        history.leaf = Some(uuid.clone());
+        if let Some(base) = history.records.get_mut(&uuid) {
+            merge_qwen_fragments(base, record);
+        } else {
+            history.records.insert(uuid, record);
+        }
+    }
+    Ok(history)
+}
+
+fn parse_qwen_jsonl(
+    reader: impl BufRead,
+    path: &Path,
+    compact: bool,
+) -> Result<Option<NormalizedConversation>> {
+    let QwenHistory {
+        mut records,
+        leaf,
+        session_id,
+        workspace,
+        started_at,
+        ended_at,
+        native_signature,
+    } = read_qwen_jsonl(reader)?;
+    if !native_signature {
+        return Ok(None);
+    }
+
+    // Remove each payload while walking backwards. This both bounds cycle
+    // handling and avoids a second full collection of raw record clones.
+    let mut chain = Vec::<Value>::new();
+    let mut cursor = leaf.clone();
+    let mut missing_parent = None;
+    let mut cycle_uuid = None;
+    while let Some(uuid) = cursor {
+        let Some(record) = records.remove(&uuid) else {
+            if chain.iter().any(|record| record["uuid"] == uuid) {
+                cycle_uuid = Some(uuid);
+            } else {
+                missing_parent = Some(uuid);
+            }
+            break;
+        };
+        cursor = record["parentUuid"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        chain.push(record);
+    }
+    drop(records);
+    chain.reverse();
+    let title = chain.iter().rev().find_map(|record| {
+        (record["type"] == "system" && record["subtype"] == "custom_title")
+            .then(|| {
+                record
+                    .pointer("/systemPayload/customTitle")
+                    .and_then(Value::as_str)
+            })
+            .flatten()
+            .filter(|title| !title.trim().is_empty())
+            .map(String::from)
+    });
+    let mut messages: Vec<_> = chain
+        .into_iter()
+        .filter_map(|record| normalize_qwen_record(record, compact))
+        .collect();
+    if messages.is_empty() {
+        return Ok(None);
+    }
+    crate::types::reindex_messages(&mut messages);
+    let title = title.or_else(|| {
+        messages
+            .iter()
+            .find(|message| message.role == "user")
+            .map(|message| {
+                message
+                    .content
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(100)
+                    .collect()
+            })
+    });
+    let mut metadata = serde_json::json!({
+        "source": "qwen", "format": "jsonl", "sessionId": session_id,
+        "active_leaf_uuid": leaf,
+    });
+    if let Some(parent) = missing_parent {
+        metadata["history_gap_parent_uuid"] = Value::String(parent);
+    }
+    if let Some(uuid) = cycle_uuid {
+        metadata["history_cycle_uuid"] = Value::String(uuid);
+    }
+    Ok(Some(NormalizedConversation {
+        agent_slug: "qwen".into(),
+        external_id: session_id,
+        title,
+        workspace,
+        source_path: path.to_path_buf(),
+        started_at,
+        ended_at,
+        metadata,
+        messages,
+    }))
+}
+
+fn push_qwen_text(content: &mut String, text: &str) {
+    if !text.is_empty() {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(text);
+    }
+}
+
+fn qwen_user_display(record: &Value) -> (Option<&str>, &[Value]) {
+    const OPEN: &str = "<qwen:user-prompt-submit-context>";
+    const CLOSE: &str = "</qwen:user-prompt-submit-context>";
+    let mut parts = record
+        .pointer("/message/parts")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let has_final_hook = parts.len() > 1
+        && parts
+            .last()
+            .and_then(|part| part["text"].as_str())
+            .is_some_and(|text| {
+                text.trim()
+                    .strip_prefix(OPEN)
+                    .and_then(|text| text.strip_prefix('\n'))
+                    .and_then(|text| text.strip_suffix(CLOSE))
+                    .and_then(|text| text.strip_suffix('\n'))
+                    .is_some_and(|body| !body.contains(OPEN) && !body.contains(CLOSE))
+            });
+    let payload = record.get("systemPayload").and_then(Value::as_object);
+    let display_text = payload.and_then(|payload| {
+        (payload.get("hookContext").is_some_and(Value::is_string) || has_final_hook)
+            .then(|| payload.get("displayText").and_then(Value::as_str))
+            .flatten()
+    });
+    if display_text.is_none() && payload.is_none() && has_final_hook {
+        parts = &parts[..parts.len() - 1];
+    }
+    (display_text, parts)
+}
+
+fn normalize_qwen_record(record: Value, compact: bool) -> Option<NormalizedMessage> {
+    let role = match record["type"].as_str()? {
+        "user" => "user",
+        "assistant" => "assistant",
+        "tool_result" => "tool",
+        _ => return None,
+    };
+    let mut content = String::new();
+    let mut invocations = Vec::new();
+    let mut author = None;
+    let (display_text, parts) = if role == "user" {
+        qwen_user_display(&record)
+    } else {
+        (
+            None,
+            record
+                .pointer("/message/parts")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice),
+        )
+    };
+    if let Some(text) = display_text {
+        push_qwen_text(&mut content, text);
+    }
+    {
+        for part in parts {
+            if display_text.is_none()
+                && let Some(text) = part["text"].as_str()
+            {
+                if part["thought"] == true {
+                    push_qwen_text(&mut content, &format!("[Thinking] {text}"));
+                } else {
+                    push_qwen_text(&mut content, text);
+                }
+            }
+            if let Some(call) = part.get("functionCall")
+                && let Some(name) = call["name"].as_str().filter(|name| !name.trim().is_empty())
+            {
+                push_qwen_text(&mut content, &format!("[Tool: {name}]"));
+                invocations.push(NormalizedInvocation {
+                    kind: "tool".into(),
+                    name: name.to_string(),
+                    raw_name: None,
+                    call_id: call["id"].as_str().map(String::from),
+                    arguments: call.get("args").cloned(),
+                });
+            }
+            if let Some(result) = part.get("functionResponse")
+                && let Some(name) = result["name"]
+                    .as_str()
+                    .filter(|name| !name.trim().is_empty())
+            {
+                author.get_or_insert_with(|| name.to_string());
+                push_qwen_text(&mut content, &format!("[Tool Result: {name}]"));
+                if let Some(text) = result.pointer("/response/output").and_then(Value::as_str) {
+                    push_qwen_text(&mut content, text);
+                }
+                if let Some(error) = result.pointer("/response/error").and_then(Value::as_str) {
+                    push_qwen_text(&mut content, &format!("[Error] {error}"));
+                }
+            }
+        }
+    }
+    if content.trim().is_empty() && record.get("usageMetadata").is_none() {
+        return None;
+    }
+    let created_at = record.get("timestamp").and_then(parse_timestamp);
+    let extra = if compact {
+        compact_qwen_record(&record, invocations.len())
+    } else {
+        record
+    };
+    Some(NormalizedMessage {
+        idx: 0,
+        role: role.into(),
+        author,
+        content,
+        created_at,
+        extra,
+        invocations,
+        snippets: Vec::new(),
+    })
+}
+
+fn compact_qwen_record(record: &Value, tool_call_count: usize) -> Value {
+    let mut cass = serde_json::Map::new();
+    for (native, compact) in [
+        ("uuid", "message_id"),
+        ("parentUuid", "parent_uuid"),
+        ("sessionId", "session_id"),
+        ("model", "model"),
+        ("subtype", "subtype"),
+        ("agentId", "agent_id"),
+        ("agentName", "agent_name"),
+    ] {
+        if let Some(value) = record.get(native).filter(|value| value.is_string()) {
+            cass.insert(compact.into(), value.clone());
+        }
+    }
+    if let Some(value) = record.get("isSidechain").filter(|value| value.is_boolean()) {
+        cass.insert("is_sidechain".into(), value.clone());
+    }
+    let mut usage = serde_json::Map::new();
+    for key in QWEN_USAGE_KEYS {
+        if let Some(value) = record.get("usageMetadata").and_then(|usage| usage.get(key)) {
+            if value.as_i64().is_some() {
+                usage.insert(key.into(), value.clone());
+            } else if key == "toolUsePromptTokenCount" {
+                // Missing tool usage means zero when reconciling a complete
+                // total; present-but-invalid usage makes that inference
+                // unsafe. Retain its presence without cloning the payload.
+                usage.insert(key.into(), Value::Null);
+            }
+        }
+    }
+    if !usage.is_empty() {
+        cass.insert("usage".into(), Value::Object(usage));
+    }
+    cass.insert("tool_call_count".into(), tool_call_count.into());
+    serde_json::json!({ "cass": cass })
+}
+
+/// Parse a Qwen session file into a `NormalizedConversation`.
 fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "jsonl")
+    {
+        let file = fs::File::open(path)?;
+        let compact = file.metadata()?.len() >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES;
+        return parse_qwen_jsonl(BufReader::new(file), path, compact);
+    }
     // Whole-session JSON loads into a full DOM; enforce the project's
     // 100MB scan cap (chatgpt policy).
     let content = match read_capped(path) {
@@ -395,6 +900,59 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn native_reader_discards_valid_prefix_on_underlying_io_failure() {
+        use std::io::{self, Cursor, ErrorKind, Read};
+
+        struct FailingReader {
+            prefix: Cursor<Vec<u8>>,
+            kind: ErrorKind,
+        }
+
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                unreachable!("JSONL reads use BufRead directly")
+            }
+        }
+
+        impl BufRead for FailingReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if usize::try_from(self.prefix.position()).unwrap() < self.prefix.get_ref().len() {
+                    self.prefix.fill_buf()
+                } else {
+                    Err(io::Error::new(self.kind, "native source read failed"))
+                }
+            }
+
+            fn consume(&mut self, amount: usize) {
+                self.prefix.consume(amount);
+            }
+        }
+
+        let record = serde_json::json!({
+            "uuid": "user", "parentUuid": null, "sessionId": "session",
+            "type": "user", "message": { "role": "user", "parts": [{ "text": "Complete prefix" }] },
+        });
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::InvalidData,
+            ErrorKind::Interrupted,
+        ] {
+            let result = parse_qwen_jsonl(
+                FailingReader {
+                    prefix: Cursor::new(format!("{record}\n").into_bytes()),
+                    kind,
+                },
+                Path::new("/fixture/chats/session.jsonl"),
+                false,
+            );
+            let error = result.unwrap_err();
+            let io_error = error.downcast_ref::<io::Error>().unwrap();
+            assert_eq!(io_error.kind(), kind);
+            assert_eq!(io_error.to_string(), "native source read failed");
+        }
+    }
 
     // =========================================================================
     // Constructor tests

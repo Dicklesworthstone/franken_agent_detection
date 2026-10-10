@@ -360,6 +360,125 @@ fn extract_gemini_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
     extracted
 }
 
+fn qwen_tool_call_count(extra: &Value) -> u32 {
+    if let Some(count) = extra
+        .pointer("/cass/tool_call_count")
+        .and_then(Value::as_u64)
+    {
+        return u32::try_from(count).unwrap_or(u32::MAX);
+    }
+    let count = extra
+        .pointer("/message/parts")
+        .and_then(Value::as_array)
+        .map_or(0, |parts| {
+            parts
+                .iter()
+                .filter(|part| {
+                    part.pointer("/functionCall/name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.trim().is_empty())
+                })
+                .count()
+        });
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// Qwen uses Google's usage shape for several providers, including `OpenAI`.
+/// Those conversions preserve reasoning inside candidates and can estimate
+/// `thoughtsTokenCount`, so thoughts cannot be added unconditionally.
+fn extract_qwen_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
+    let model_name = extra
+        .get("model")
+        .or_else(|| extra.pointer("/cass/model"))
+        .or_else(|| extra.pointer("/message/model"))
+        .or_else(|| extra.pointer("/modelConfig/modelName"))
+        .or_else(|| extra.get("modelType"))
+        .or_else(|| extra.get("modelID"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let provider = model_name
+        .as_deref()
+        .map(|name| normalize_model(name).provider);
+    let tool_call_count = qwen_tool_call_count(extra);
+    let mut extracted = ExtractedTokenUsage {
+        model_name,
+        provider,
+        has_tool_calls: tool_call_count > 0,
+        tool_call_count,
+        ..Default::default()
+    };
+    if role != "assistant" {
+        return extracted;
+    }
+
+    let native = extra
+        .get("usageMetadata")
+        .or_else(|| extra.pointer("/cass/usage"));
+    let usage = native.or_else(|| extra.get("tokens"));
+    let value = |native_key, legacy_key| {
+        usage.and_then(|usage| {
+            usage.get(if native.is_some() {
+                native_key
+            } else {
+                legacy_key
+            })
+        })
+    };
+    let read = |native_key, legacy_key| {
+        value(native_key, legacy_key)
+            .and_then(Value::as_i64)
+            .filter(|count| *count >= 0)
+    };
+    let prompt = read("promptTokenCount", "input");
+    let candidates = read("candidatesTokenCount", "output");
+    let has_primary_counts = prompt.is_some() || candidates.is_some();
+    // OpenAI's total-only conversion materializes auxiliary zeroes despite
+    // omitting input/output. Those zeroes do not establish a usable breakdown.
+    let cached = read("cachedContentTokenCount", "cached")
+        .filter(|cached| has_primary_counts || *cached > 0)
+        .filter(|cached| prompt.is_none_or(|prompt| *cached <= prompt));
+    let tool =
+        read("toolUsePromptTokenCount", "tool").filter(|tool| has_primary_counts || *tool > 0);
+    let uncached = match (prompt, cached) {
+        (Some(prompt), Some(cached)) => prompt.checked_sub(cached),
+        (prompt, _) => prompt,
+    };
+    extracted.input_tokens = match (uncached, tool) {
+        (Some(input), Some(tool)) => input.checked_add(tool),
+        (input, tool) => input.or(tool),
+    };
+    extracted.cache_read_tokens = cached;
+    extracted.output_tokens = candidates;
+
+    // Only a complete, consistent recorded total can establish that thoughts
+    // are separate. Never infer a residual or guess overlap from model names.
+    let tool_for_total = if value("toolUsePromptTokenCount", "tool").is_none() {
+        Some(0)
+    } else {
+        tool
+    };
+    let base_total = prompt
+        .zip(candidates)
+        .and_then(|(prompt, candidates)| prompt.checked_add(candidates))
+        .zip(tool_for_total)
+        .and_then(|(base, tool)| base.checked_add(tool));
+    if let (Some(base), Some(thoughts), Some(total)) = (
+        base_total,
+        read("thoughtsTokenCount", "thoughts"),
+        read("totalTokenCount", "total"),
+    ) && base != total
+        && base.checked_add(thoughts) == Some(total)
+    {
+        extracted.output_tokens = candidates.and_then(|output| output.checked_add(thoughts));
+    }
+    // The serialized record lacks provenance for locally estimated thoughts.
+    // Leave thinking_tokens unset even when total reconciliation is possible.
+    if extracted.has_token_data() {
+        extracted.data_source = TokenDataSource::Api;
+    }
+    extracted
+}
+
 /// Estimate tokens from content length for agents that do not provide token data.
 #[must_use]
 pub fn estimate_tokens_from_content(content: &str, role: &str) -> ExtractedTokenUsage {
@@ -393,6 +512,7 @@ pub fn extract_tokens_for_agent(
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
         "gemini" => extract_gemini_tokens(extra, role),
+        "qwen" => extract_qwen_tokens(extra, role),
         // The modern Kimi parser attaches recognized usage.record input and
         // output counts to the preceding assistant message. Read only that
         // attachment: raw bookkeeping events and cumulative/session totals

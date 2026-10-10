@@ -79,6 +79,7 @@ Custom history stores use the same environment settings as their connectors:
 | Agent | Environment settings | Detection policy |
 |---|---|---|
 | Gemini | `GEMINI_HOME` | Replaces the default session root; accepts a directory or an admitted `chats/session-*.json` / `.jsonl` file |
+| Qwen Code | `QWEN_RUNTIME_DIR`, `QWEN_HOME` | Runtime directory takes precedence over the home override; detects current `projects` and legacy `tmp` stores without falling back from a missing configured root |
 | OpenCode | `OPENCODE_STORAGE_ROOT`, `OPENCODE_SQLITE_DB` | Keeps legacy storage and SQLite independent, with default database candidates still available |
 | Hermes | `HERMES_SQLITE_DB`, `HERMES_HOME` | Prefers an existing explicit database, then `$HERMES_HOME/state.db`, then the default store |
 | Crush | `CRUSH_SQLITE_DB` | Prefers an existing explicit global database, with the default as fallback |
@@ -206,6 +207,27 @@ prompt tokens count as input, and generated thoughts count as output.
 `thinking_tokens` describes the reasoning subset already included in output;
 the aggregate counts it once. Invalid token fields are ignored, and messages
 without usable API counts retain the existing estimation fallback.
+
+Qwen Code reads current UUID-named JSONL sessions in
+`projects/<project>/chats/`, including `chats/archive/`, alongside its legacy
+`tmp/<project>/chats/session-*.json` histories. Native UUID fragments form one
+message with the latest recorded usage, and parent links select the active
+conversation branch. Thought text, tool calls and readable results, authored
+user display text, and custom titles are preserved. Exact discovered files
+and recognizable copied stores remain scoped to their supplied roots;
+explicit scan roots exclude unrelated local stores. Configured Qwen paths
+support the agent's tilde expansion and relative-path resolution.
+
+At 32 MiB, Qwen JSONL metadata retains reply identity, model, selected scalar
+usage fields and tool-call counts without duplicating the raw content or
+tool payloads. Its public token extractor keeps cached input separate and
+uses the recorded total to distinguish additional Google reasoning tokens
+from reasoning already included in OpenAI-compatible output. Ambiguous
+reasoning stays in metadata; total-only records retain estimation instead
+of receiving a guessed input/output split. Native transcript I/O failures
+discard the incomplete conversation. Qwen streams completed conversations;
+per-source completion hooks and the distinct managed-session format are
+not supported.
 
 Claude Code streaming scans continue to deliver healthy sources after a source
 open/read failure, then return an error with the failure count and the first

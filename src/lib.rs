@@ -265,6 +265,45 @@ fn cwd_join(parts: &[&str]) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Qwen's runtime store follows its own environment precedence, including
+/// tilde expansion and paths relative to the process working directory.
+/// Keep this shared by detection and scanning so relocated stores agree.
+pub(crate) fn qwen_runtime_root_from_env() -> Option<PathBuf> {
+    let raw = ["QWEN_RUNTIME_DIR", "QWEN_HOME"]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))?;
+    let path = if raw == "~" {
+        dirs::home_dir()?
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        let mut home = dirs::home_dir()?;
+        for segment in rest.split(['/', '\\']).filter(|part| !part.is_empty()) {
+            home.push(segment);
+        }
+        home
+    } else {
+        PathBuf::from(raw)
+    };
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    // Storage resolves its runtime base lexically before filesystem lookup.
+    // Canonicalizing instead would follow symlinks and require every prefix
+    // to exist, potentially selecting a different store for `link/../root`.
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
 fn amp_xdg_probe_root_from_env_value(xdg_data_home: &str) -> Option<PathBuf> {
     let trimmed = xdg_data_home.trim();
     if trimmed.is_empty() {
@@ -419,6 +458,17 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                 return None;
             }
             Some(vec![PathBuf::from(root).join("sessions")])
+        }
+        "qwen" => {
+            let root = qwen_runtime_root_from_env()?;
+            // The runtime override replaces the default store even when it
+            // is absent. Native histories live in projects; tmp is legacy.
+            Some(
+                [root.join("projects"), root.join("tmp"), root]
+                    .into_iter()
+                    .filter(|path| path.is_dir())
+                    .collect(),
+            )
         }
         "openhands" => {
             let root = read("CASS_OPENHANDS_DATA_ROOT")?;
@@ -1051,6 +1101,7 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &["shelley.db"]);
         }
         "qwen" => {
+            maybe_push(&mut out, &[".qwen", "projects"]);
             maybe_push(&mut out, &[".qwen", "tmp"]);
             maybe_push(&mut out, &[".qwen"]);
         }
@@ -1626,7 +1677,11 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 // the wildcard) documents that this emptiness is deliberate.
                 #[allow(clippy::match_same_arms)]
                 "shelley" => vec![],
-                "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],
+                "qwen" => vec![
+                    tilde(&[".qwen", "projects"]),
+                    tilde(&[".qwen", "tmp"]),
+                    tilde(&[".qwen"]),
+                ],
                 "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],
                 "windsurf" => vec![tilde(&[".windsurf"]), tilde(&[".config", "windsurf"])],
                 _ => vec![],
