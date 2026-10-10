@@ -160,6 +160,13 @@ Beyond `scan`:
 | `ScanRoot::remote` + `Origin` | Scan synced copies of remote machines, keeping host provenance |
 | `CASS_EXCLUDE_PATHS` | Comma/newline-separated files or directories the Claude Code, Codex and Pi-family connectors skip before opening them. Entries match whole path components; relative, `..` and symlinked spellings of an existing directory match too. Exact Codex JSONL exclusions cover both the plain and compressed (`.jsonl.zst`) representation. Other connectors read every source; hosts filter their conversations by `source_path` |
 
+Aider accepts an exact `.aider.chat.history.md` as its scan context, including
+an intentionally selected archived copy. A missing exact file yields no
+history. Directory contexts keep the existing Cass state-directory fallback,
+but names such as `cassie` and `cassette-player` remain scoped to that
+directory. `CASS_AIDER_DATA_ROOT` takes precedence over the context directory;
+explicit `ScanRoot`s take precedence over both.
+
 Exclusion entries are literal paths, without shell or tilde expansion. An unset
 or empty `CASS_EXCLUDE_PATHS` leaves scans unrestricted. Invalid Unicode,
 unresolvable entries, or relative entries without a usable working directory

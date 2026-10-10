@@ -198,32 +198,36 @@ impl AiderConnector {
         };
 
         if ctx.use_default_detection() {
-            let data_root = if ctx
+            let data_is_history_file = ctx
                 .data_dir
                 .file_name()
-                .is_some_and(|n| n == ".aider.chat.history.md")
-            {
-                ctx.data_dir
-                    .parent()
-                    .map_or_else(|| ctx.data_dir.clone(), PathBuf::from)
-            } else {
-                ctx.data_dir.clone()
-            };
-
+                .is_some_and(|n| n == ".aider.chat.history.md");
             // Guard against ingesting archived/copied aider histories that
             // live inside the cass state dir as phantom live conversations.
             // The agent_search.db marker alone misses fresh/partly-
             // initialised state dirs; also exclude when the data_dir IS
             // (or is under) a directory explicitly named for cass state.
-            let is_cass_db_dir = data_root.join("agent_search.db").exists()
-                || data_root.to_string_lossy().to_lowercase().contains("cass");
+            // Match a complete name token (cass, .cass, cass-state, etc.),
+            // not an arbitrary substring in a user or project name such as
+            // /home/cassie/projects/cassette-player.
+            let is_cass_db_dir = ctx.data_dir.join("agent_search.db").exists()
+                || ctx.data_dir.components().any(|component| {
+                    component.as_os_str().to_str().is_some_and(|name| {
+                        name.split(|ch: char| !ch.is_ascii_alphanumeric())
+                            .any(|token| token.eq_ignore_ascii_case("cass"))
+                    })
+                });
 
             if let Ok(override_root) = dotenvy::var("CASS_AIDER_DATA_ROOT")
                 && !override_root.trim().is_empty()
             {
                 add_root(ScanRoot::local(PathBuf::from(override_root.trim())));
-            } else if !is_cass_db_dir && data_root.exists() && data_root.is_dir() {
-                add_root(ScanRoot::local(data_root));
+            } else if data_is_history_file || (!is_cass_db_dir && ctx.data_dir.is_dir()) {
+                // A named history file is an exact scope, including when it
+                // is missing. Expanding it to its parent can ingest unrelated
+                // projects instead of returning an empty result. An explicit
+                // file also takes precedence over the directory-name heuristic.
+                add_root(ScanRoot::local(ctx.data_dir.clone()));
             } else {
                 if let Ok(cwd) = std::env::current_dir() {
                     add_root(ScanRoot::local(cwd));
