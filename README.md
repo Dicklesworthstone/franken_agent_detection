@@ -108,6 +108,15 @@ annotations live under `extra.cass` (for example branch and context membership
 for Pi sessions). `extract_tokens_for_agent` turns a message's `extra` into
 exact token usage where the agent records it, and an estimate otherwise.
 
+Claude Code sessions of at least 32 MiB compact per-message `extra` into
+`extra.cass`, omitting the duplicated raw message body. Reply identifiers are
+preserved as `cass.message_id` and `cass.request_id` when present as strings;
+smaller sessions retain `message.id` and `requestId` in the raw `extra`.
+Claude Code may repeat a reply's full usage on multiple content-block records.
+Hosts aggregating usage should deduplicate by the pair of identifiers within
+one session; `extract_tokens_for_agent` extracts usage per record and does not
+perform aggregation. Missing identifiers are omitted, not synthesized.
+
 Beyond `scan`:
 
 | API | Purpose |

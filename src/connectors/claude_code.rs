@@ -320,6 +320,15 @@ impl ClaudeCodeConnector {
             cass.insert("model".to_string(), Value::String(model.to_string()));
         }
 
+        // One reply can span multiple JSONL content-block records, each repeating
+        // its full usage. Keep only the identity strings hosts need to dedupe
+        // by (message_id, request_id), without retaining the message body.
+        for (key, pointer) in [("message_id", "/message/id"), ("request_id", "/requestId")] {
+            if let Some(value) = raw.pointer(pointer).and_then(Value::as_str) {
+                cass.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
+
         let usage = raw.pointer("/message/usage");
         let mut token_usage = serde_json::Map::new();
         if let Some(input_tokens) = usage
@@ -1491,7 +1500,9 @@ mod tests {
     #[test]
     fn compact_message_extra_keeps_only_compact_cass_metadata() {
         let raw = json!({
+            "requestId": "req_1",
             "message": {
+                "id": "msg_1",
                 "model": "claude-opus-4-6",
                 "usage": {
                     "input_tokens": 100,
@@ -1512,6 +1523,11 @@ mod tests {
 
         let compact = ClaudeCodeConnector::compact_message_extra(&raw);
         assert_eq!(compact["cass"]["model"], "claude-opus-4-6");
+        assert_eq!(compact["cass"]["message_id"], "msg_1");
+        assert_eq!(compact["cass"]["request_id"], "req_1");
+        assert_eq!(compact.as_object().unwrap().len(), 1);
+        assert!(compact.get("message").is_none());
+        assert!(compact.get("requestId").is_none());
         assert_eq!(compact["cass"]["token_usage"]["input_tokens"], 100);
         assert_eq!(compact["cass"]["token_usage"]["output_tokens"], 50);
         assert_eq!(compact["cass"]["token_usage"]["cache_read_tokens"], 20);
@@ -1520,6 +1536,135 @@ mod tests {
         assert_eq!(compact["cass"]["tool_call_count"], 2);
         assert_eq!(compact["cass"]["attachments"][0]["path"], "/tmp/log.txt");
         assert!(compact.get("summary").is_none());
+    }
+
+    #[test]
+    fn compact_message_extra_preserves_only_string_identifiers() {
+        for raw in [
+            json!({}),
+            json!({"message": {"id": null}, "requestId": 42}),
+            json!({"message": {"id": {"body": "do not retain"}}, "requestId": []}),
+        ] {
+            let compact = ClaudeCodeConnector::compact_message_extra(&raw);
+            assert!(compact.pointer("/cass/message_id").is_none());
+            assert!(compact.pointer("/cass/request_id").is_none());
+        }
+        for raw in [
+            json!({"message": {"id": "msg_only"}}),
+            json!({"requestId": "req_only"}),
+        ] {
+            let compact = ClaudeCodeConnector::compact_message_extra(&raw);
+            assert_eq!(
+                compact.pointer("/cass/message_id"),
+                raw.pointer("/message/id")
+            );
+            assert_eq!(compact.pointer("/cass/request_id"), raw.get("requestId"));
+        }
+    }
+
+    #[test]
+    fn scan_preserves_reply_identity_and_usage_across_compaction_boundary() {
+        use crate::connectors::token_extraction::extract_tokens_for_agent;
+        use std::collections::HashSet;
+        use std::io::{Read, Write};
+
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session_file = claude_dir.join("session.jsonl");
+        let mut file = fs::File::create(&session_file).unwrap();
+        // First two records are different content blocks of the same reply.
+        // Both components of the identity matter; unidentified records must
+        // remain separate rather than collapsing onto a shared missing key.
+        for (message_id, request_id, text) in [
+            (Some("msg_1"), Some("req_1"), "first block"),
+            (Some("msg_1"), Some("req_1"), "second block"),
+            (Some("msg_1"), Some("req_2"), "different request"),
+            (Some("msg_2"), Some("req_1"), "different message"),
+            (None, None, "unidentified first"),
+            (None, None, "unidentified second"),
+        ] {
+            let mut raw = json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant", "model": "claude-opus-4-6",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": {"input_tokens": 100, "output_tokens": 50,
+                        "cache_read_input_tokens": 20, "cache_creation_input_tokens": 5}
+                }
+            });
+            if let Some(id) = message_id {
+                raw["message"]["id"] = json!(id);
+            }
+            if let Some(id) = request_id {
+                raw["requestId"] = json!(id);
+            }
+            writeln!(file, "{raw}").unwrap();
+        }
+        let record_bytes = file.metadata().unwrap().len();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let mut previous_size = record_bytes;
+        for size in [
+            LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES - 1,
+            LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES,
+            LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES + 1,
+        ] {
+            // A blank whitespace line grows the source without introducing
+            // extra messages or a giant duplicated message body in the test.
+            std::io::copy(
+                &mut std::io::repeat(b' ').take(size - previous_size),
+                &mut file,
+            )
+            .unwrap();
+            file.flush().unwrap();
+            previous_size = size;
+            assert_eq!(fs::metadata(&session_file).unwrap().len(), size);
+            let conversations = ClaudeCodeConnector::new().scan(&ctx).unwrap();
+            assert_eq!(conversations.len(), 1);
+            let conversation = &conversations[0];
+            assert_eq!(conversation.messages.len(), 6);
+            assert_eq!(conversation.messages[0].content, "first block");
+            assert_eq!(conversation.messages[1].content, "second block");
+            let mut seen = HashSet::new();
+            let mut total = 0;
+            let mut undeduplicated_total = 0;
+            for message in &conversation.messages {
+                let compact = size >= LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES;
+                let extra = &message.extra;
+                let (message_pointer, request_pointer) = if compact {
+                    assert_eq!(extra.as_object().unwrap().len(), 1);
+                    assert!(extra.get("message").is_none());
+                    assert!(extra.to_string().len() < 512);
+                    ("/cass/message_id", "/cass/request_id")
+                } else {
+                    assert!(extra.pointer("/message/content").is_some());
+                    ("/message/id", "/requestId")
+                };
+                let identity = extra
+                    .pointer(message_pointer)
+                    .and_then(Value::as_str)
+                    .zip(extra.pointer(request_pointer).and_then(Value::as_str));
+                let usage = extract_tokens_for_agent(
+                    &conversation.agent_slug,
+                    extra,
+                    &message.content,
+                    &message.role,
+                );
+                assert_eq!(usage.input_tokens, Some(100));
+                assert_eq!(usage.output_tokens, Some(50));
+                assert_eq!(usage.cache_read_tokens, Some(20));
+                assert_eq!(usage.cache_creation_tokens, Some(5));
+                let tokens = usage.total_tokens().unwrap();
+                undeduplicated_total += tokens;
+                // Model a host consumer: extraction is per record; aggregation
+                // dedupes only records carrying a complete reply identity.
+                if identity.is_none_or(|key| seen.insert(key)) {
+                    total += tokens;
+                }
+            }
+            assert_eq!(seen.len(), 3);
+            assert_eq!(undeduplicated_total, 1050);
+            assert_eq!(total, 875);
+        }
     }
 
     #[test]
