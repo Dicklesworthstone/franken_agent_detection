@@ -108,14 +108,23 @@ annotations live under `extra.cass` (for example branch and context membership
 for Pi sessions). `extract_tokens_for_agent` turns a message's `extra` into
 exact token usage where the agent records it, and an estimate otherwise.
 
-Claude Code sessions of at least 32 MiB compact per-message `extra` into
-`extra.cass`, omitting the duplicated raw message body. Reply identifiers are
-preserved as `cass.message_id` and `cass.request_id` when present as strings;
-smaller sessions retain `message.id` and `requestId` in the raw `extra`.
-Claude Code may repeat a reply's full usage on multiple content-block records.
-Hosts aggregating usage should deduplicate by the pair of identifiers within
-one session; `extract_tokens_for_agent` extracts usage per record and does not
-perform aggregation. Missing identifiers are omitted, not synthesized.
+Claude Code session files of **32 MiB or larger** retain compact metadata in
+`extra.cass` instead of duplicating the full raw record. Reply identifiers are
+preserved as strings at these locations:
+
+| Identifier | Raw `extra` | Compact `extra` |
+|---|---|---|
+| Message ID | `message.id` | `cass.message_id` |
+| Request ID | `requestId` | `cass.request_id` |
+
+Claude Code can repeat a reply's full token usage in multiple content-block
+records. Compaction does not merge or remove normalized messages, and token
+extraction is per record. Consumers aggregating usage should count each
+identified `(message_id, request_id)` pair once within a conversation.
+Compaction omits missing or non-string identifiers. Records without both
+nonblank identifiers must not be merged under a shared default key.
+Compaction retains the model, usage, tool-call count, and existing attachment
+metadata without retaining the raw message content a second time.
 
 Beyond `scan`:
 

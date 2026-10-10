@@ -1514,7 +1514,7 @@ mod tests {
                 "content": [
                     {"type": "tool_use", "name": "Read"},
                     {"type": "tool_use", "name": "Edit"},
-                    {"type": "text", "text": "large duplicated content"}
+                    {"type": "text", "text": "large duplicated content".repeat(4096)}
                 ]
             },
             "attachments": [{"path": "/tmp/log.txt"}],
@@ -1536,6 +1536,60 @@ mod tests {
         assert_eq!(compact["cass"]["tool_call_count"], 2);
         assert_eq!(compact["cass"]["attachments"][0]["path"], "/tmp/log.txt");
         assert!(compact.get("summary").is_none());
+        assert!(serde_json::to_vec(&compact).unwrap().len() < 1024);
+    }
+
+    #[test]
+    fn compact_message_extra_preserves_optional_identifiers_without_usage() {
+        for message_id in [None, Some(""), Some(" msg_\u{65e5}\u{672c}\u{8a9e} ")] {
+            for request_id in [None, Some(""), Some(" req_\u{3b1} ")] {
+                let mut raw = json!({"uuid": "record-id", "message": {}});
+                let mut expected = Map::new();
+                if let Some(id) = message_id {
+                    raw["message"]["id"] = json!(id);
+                    expected.insert("message_id".to_string(), json!(id));
+                }
+                if let Some(id) = request_id {
+                    raw["requestId"] = json!(id);
+                    expected.insert("request_id".to_string(), json!(id));
+                }
+
+                let compact = ClaudeCodeConnector::compact_message_extra(&raw);
+                let expected = if expected.is_empty() {
+                    json!({})
+                } else {
+                    json!({"cass": expected})
+                };
+                assert_eq!(compact, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_message_extra_omits_non_string_identifiers_independently() {
+        for invalid in [json!(null), json!(false), json!(42), json!([]), json!({})] {
+            let raw = json!({
+                "uuid": "record-id",
+                "id": "unrelated-id",
+                "requestId": invalid,
+                "message": {"id": invalid}
+            });
+            assert_eq!(ClaudeCodeConnector::compact_message_extra(&raw), json!({}));
+
+            let mut message_only = raw.clone();
+            message_only["message"]["id"] = json!("msg_1");
+            assert_eq!(
+                ClaudeCodeConnector::compact_message_extra(&message_only),
+                json!({"cass": {"message_id": "msg_1"}})
+            );
+
+            let mut request_only = raw;
+            request_only["requestId"] = json!("req_1");
+            assert_eq!(
+                ClaudeCodeConnector::compact_message_extra(&request_only),
+                json!({"cass": {"request_id": "req_1"}})
+            );
+        }
     }
 
     #[test]
@@ -1674,6 +1728,9 @@ mod tests {
         ));
         assert!(ClaudeCodeConnector::should_compact_large_message_extra(
             Some(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES,)
+        ));
+        assert!(ClaudeCodeConnector::should_compact_large_message_extra(
+            Some(LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES + 1,)
         ));
         assert!(!ClaudeCodeConnector::should_compact_large_message_extra(
             None
