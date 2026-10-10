@@ -27,10 +27,11 @@ use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
+use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::dedupe_path_key;
 use super::{Connector, franken_detection_for_connector, parse_timestamp};
@@ -459,21 +460,25 @@ fn active_branch_indices(entries: &[PrimeEntry]) -> Option<Vec<usize>> {
 /// Returns `Ok(None)` for files this connector must skip: a non-Prime first
 /// record, an unsupported future version (structured diagnostic), or a
 /// header-only shell with no searchable content.
-#[allow(clippy::too_many_lines)]
 fn parse_session_file(path: &Path) -> Result<Option<NormalizedConversation>> {
-    let file = fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
+    let file =
+        fs::File::open(path).with_context(|| format!("open Prime session {}", path.display()))?;
+    parse_session_reader(path, std::io::BufReader::new(file))
+}
 
+#[allow(clippy::too_many_lines)]
+fn parse_session_reader(
+    path: &Path,
+    reader: impl BufRead,
+) -> Result<Option<NormalizedConversation>> {
     let mut header: Option<Value> = None;
     let mut entries: Vec<PrimeEntry> = Vec::new();
     let mut malformed_interior = 0_usize;
     let mut pending_malformed: Option<usize> = None;
     let mut line_number = 0_usize;
 
-    for line_result in reader.lines() {
-        let Ok(line) = line_result else {
-            break;
-        };
+    for line_result in JsonlLines::new(reader) {
+        let line = line_result.with_context(|| format!("read Prime session {}", path.display()))?;
         line_number += 1;
         let trimmed = line.trim_start_matches('\u{feff}').trim();
         if trimmed.is_empty() {
@@ -1005,7 +1010,7 @@ impl Connector for PrimeAgentConnector {
                         tracing::debug!(
                             connector = "prime_agent",
                             path = %file.display(),
-                            error = %error,
+                            error = %format_args!("{error:#}"),
                             "prime_agent: skipping unreadable session file"
                         );
                     }
@@ -1024,6 +1029,7 @@ impl Connector for PrimeAgentConnector {
 mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
+    use std::io::{self, BufReader, Cursor, Read};
     use tempfile::TempDir;
 
     fn sessions_dir(tmp: &TempDir) -> PathBuf {
@@ -1045,6 +1051,83 @@ mod tests {
         format!(
             r#"{{"type":"message","id":"{id}","parentId":{parent},"timestamp":"2026-01-05T10:00:01.000Z","message":{message}}}"#
         )
+    }
+
+    struct FailingReader(io::ErrorKind);
+
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "simulated Prime source failure"))
+        }
+    }
+
+    #[test]
+    fn read_failure_discards_a_complete_session_prefix() {
+        let path = Path::new("prime-session.jsonl");
+        let prefix = format!(
+            "{HEADER}\n{}\n",
+            msg("aaaa0001", None, r#"{"role":"user","content":"prefix"}"#)
+        );
+        let complete = parse_session_reader(path, Cursor::new(&prefix))
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.messages.len(), 1);
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Interrupted,
+        ] {
+            let reader = BufReader::new(prefix.as_bytes().chain(FailingReader(kind)));
+            let error = parse_session_reader(path, reader).unwrap_err();
+            assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+            assert!(error.to_string().contains("prime-session.jsonl"));
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_record_does_not_hide_the_active_branch_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let dir = sessions_dir(&tmp);
+        let path = dir.join("damaged-utf8.jsonl");
+        let mut bytes = format!(
+            "{HEADER}\n{}\n",
+            msg("aaaa0001", None, r#"{"role":"user","content":"before"}"#)
+        )
+        .into_bytes();
+        bytes.extend_from_slice(b"\xff\xfe damaged record\n");
+        bytes.extend_from_slice(
+            msg(
+                "aaaa0002",
+                Some("aaaa0001"),
+                r#"{"role":"assistant","content":"after"}"#,
+            )
+            .as_bytes(),
+        );
+        fs::write(&path, &bytes).unwrap();
+
+        let connector = PrimeAgentConnector::new();
+        let ctx = ScanContext::with_roots(
+            tmp.path().join("cass-data"),
+            vec![ScanRoot::local(path.clone())],
+            None,
+        );
+        let sources = connector.discover_source_files(&ctx).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_path, path);
+        let conversations = connector.scan(&ctx).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].source_path, path);
+        assert_eq!(conversations[0].metadata["tree_integrity"], "ok");
+        assert_eq!(conversations[0].metadata["total_entry_count"], 2);
+        assert_eq!(
+            conversations[0]
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "after"]
+        );
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]

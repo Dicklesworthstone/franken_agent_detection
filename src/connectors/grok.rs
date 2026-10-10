@@ -51,6 +51,7 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 use super::flatten_content;
+use super::jsonl::JsonlLines;
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
@@ -505,23 +506,14 @@ fn extract_tagged_blocks(content: &str, tag: &str) -> Vec<String> {
 fn parse_updates(
     updates_path: &Path,
     model_name: Option<&str>,
-) -> (Vec<NormalizedMessage>, Option<i64>, Option<i64>) {
+    reader: impl BufRead,
+) -> Result<(Vec<NormalizedMessage>, Option<i64>, Option<i64>)> {
     let mut builder = MessageBuilder::default();
     let mut started_at: Option<i64> = None;
     let mut ended_at: Option<i64> = None;
 
-    let Ok(file) = fs::File::open(updates_path) else {
-        return (Vec::new(), None, None);
-    };
-    for (lineno, line) in BufReader::new(file).lines().enumerate() {
-        let Ok(line) = line else {
-            tracing::warn!(
-                updates = %updates_path.display(),
-                line = lineno + 1,
-                "grok: stopping at unreadable updates line"
-            );
-            break;
-        };
+    for (lineno, line) in JsonlLines::new(reader).enumerate() {
+        let line = line.with_context(|| format!("read Grok updates {}", updates_path.display()))?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -584,7 +576,7 @@ fn parse_updates(
         }
     }
 
-    (builder.finish(), started_at, ended_at)
+    Ok((builder.finish(), started_at, ended_at))
 }
 
 /// Fallback: recover user prompts (and any assistant text) from
@@ -592,15 +584,14 @@ fn parse_updates(
 /// events (e.g. every model call failed). Real user prompts carry a
 /// `prompt_index` field and wrap the prompt in `<user_query>…</user_query>`;
 /// synthetic context injections carry `synthetic_reason` and are skipped.
-fn parse_chat_history_fallback(chat_history_path: &Path) -> Vec<NormalizedMessage> {
-    let Ok(file) = fs::File::open(chat_history_path) else {
-        return Vec::new();
-    };
+fn parse_chat_history_fallback(
+    chat_history_path: &Path,
+    reader: impl BufRead,
+) -> Result<Vec<NormalizedMessage>> {
     let mut messages: Vec<NormalizedMessage> = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            break;
-        };
+    for line in JsonlLines::new(reader) {
+        let line = line
+            .with_context(|| format!("read Grok chat history {}", chat_history_path.display()))?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -664,10 +655,19 @@ fn parse_chat_history_fallback(chat_history_path: &Path) -> Vec<NormalizedMessag
         }
     }
     reindex_messages(&mut messages);
-    messages
+    Ok(messages)
 }
 
-fn parse_session(session_dir: &Path) -> Option<NormalizedConversation> {
+fn parse_session(session_dir: &Path) -> Result<Option<NormalizedConversation>> {
+    parse_session_with_readers(session_dir, &mut |path| {
+        fs::File::open(path).map(BufReader::new)
+    })
+}
+
+fn parse_session_with_readers<R: BufRead>(
+    session_dir: &Path,
+    open_reader: &mut impl FnMut(&Path) -> std::io::Result<R>,
+) -> Result<Option<NormalizedConversation>> {
     let updates_path = session_dir.join("updates.jsonl");
     let chat_history_path = session_dir.join("chat_history.jsonl");
 
@@ -701,12 +701,16 @@ fn parse_session(session_dir: &Path) -> Option<NormalizedConversation> {
         .map(String::from);
 
     let (mut messages, mut started_at, mut ended_at) = if updates_path.is_file() {
-        parse_updates(&updates_path, model_name.as_deref())
+        let reader = open_reader(&updates_path)
+            .with_context(|| format!("open Grok updates {}", updates_path.display()))?;
+        parse_updates(&updates_path, model_name.as_deref(), reader)?
     } else {
         (Vec::new(), None, None)
     };
     let source_path = if messages.is_empty() && chat_history_path.is_file() {
-        messages = parse_chat_history_fallback(&chat_history_path);
+        let reader = open_reader(&chat_history_path)
+            .with_context(|| format!("open Grok chat history {}", chat_history_path.display()))?;
+        messages = parse_chat_history_fallback(&chat_history_path, reader)?;
         // The normalized messages came from the fallback history, so preserve
         // that exact provenance even when an update stream exists but contains
         // only non-message telemetry (for example a failed model turn).
@@ -716,7 +720,7 @@ fn parse_session(session_dir: &Path) -> Option<NormalizedConversation> {
     };
     if messages.is_empty() {
         // An un-run or content-less session; nothing to index.
-        return None;
+        return Ok(None);
     }
 
     // Summary timestamps take precedence over message-derived bounds.
@@ -735,17 +739,15 @@ fn parse_session(session_dir: &Path) -> Option<NormalizedConversation> {
 
     let title = summary
         .as_ref()
-        .and_then(|s| s.get("generated_title"))
-        .and_then(Value::as_str)
-        .filter(|t| !t.trim().is_empty())
-        .map(String::from)
-        .or_else(|| {
-            summary
-                .as_ref()
-                .and_then(|s| s.get("session_summary"))
-                .and_then(Value::as_str)
-                .filter(|t| !t.trim().is_empty())
-                .map(String::from)
+        .and_then(|s| {
+            ["generated_title", "session_summary"]
+                .into_iter()
+                .find_map(|key| {
+                    s.get(key)
+                        .and_then(Value::as_str)
+                        .filter(|t| !t.trim().is_empty())
+                        .map(String::from)
+                })
         })
         .or_else(|| {
             messages
@@ -769,7 +771,7 @@ fn parse_session(session_dir: &Path) -> Option<NormalizedConversation> {
         }
     }
 
-    Some(NormalizedConversation {
+    Ok(Some(NormalizedConversation {
         agent_slug: AGENT_SLUG.to_string(),
         external_id,
         title,
@@ -779,7 +781,7 @@ fn parse_session(session_dir: &Path) -> Option<NormalizedConversation> {
         ended_at,
         metadata: Value::Object(metadata),
         messages,
-    })
+    }))
 }
 
 fn scan_grok_with_callback(
@@ -793,6 +795,15 @@ fn scan_grok_with_hooks(
     ctx: &ScanContext,
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
+    scan_grok_with_parser(ctx, hooks, on_conversation, &mut parse_session)
+}
+
+fn scan_grok_with_parser(
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    parse: &mut impl FnMut(&Path) -> Result<Option<NormalizedConversation>>,
 ) -> Result<()> {
     let roots = GrokConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -818,30 +829,22 @@ fn scan_grok_with_hooks(
             let chat_history = session_dir.join("chat_history.jsonl");
             let summary = session_dir.join("summary.json");
             let primary = if updates.is_file() {
-                Some(
-                    DiscoveredSourceFile::new(
-                        AGENT_SLUG,
-                        &root,
-                        updates,
-                        DiscoveredSourceRole::PrimarySessionLog,
-                        true,
-                    )
-                    .with_fs_metadata(),
-                )
+                Some((updates, true))
             } else if chat_history.is_file() {
-                Some(
-                    DiscoveredSourceFile::new(
-                        AGENT_SLUG,
-                        &root,
-                        chat_history.clone(),
-                        DiscoveredSourceRole::PrimarySessionLog,
-                        false,
-                    )
-                    .with_fs_metadata(),
-                )
+                Some((chat_history.clone(), false))
             } else {
                 None
-            };
+            }
+            .map(|(path, required)| {
+                DiscoveredSourceFile::new(
+                    AGENT_SLUG,
+                    &root,
+                    path,
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    required,
+                )
+                .with_fs_metadata()
+            });
             let mut sidecars: Vec<DiscoveredSourceFile> = Vec::new();
             if let Some(primary) = primary.as_ref() {
                 if chat_history.is_file() && primary.source_path != chat_history {
@@ -872,7 +875,18 @@ fn scan_grok_with_hooks(
                     continue;
                 }
             }
-            if let Some(conversation) = parse_session(&session_dir) {
+            let conversation = match parse(&session_dir) {
+                Ok(conversation) => conversation,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %session_dir.display(),
+                        error = %format_args!("{error:#}"),
+                        "grok: skipping unreadable session"
+                    );
+                    continue;
+                }
+            };
+            if let Some(conversation) = conversation {
                 on_conversation(conversation)
                     .with_context(|| format!("emit grok conversation {}", session_dir.display()))?;
                 if let Some(primary) = primary {
@@ -1008,6 +1022,7 @@ mod tests {
     use super::*;
     use crate::connectors::assert_discovery_covers_scan_sources;
     use serde_json::json;
+    use std::io::{self, Cursor, Read};
     use tempfile::TempDir;
 
     const SESSION_ID: &str = "019f75d0-ebe1-7db0-a59a-60af9ffa9e71";
@@ -1071,6 +1086,211 @@ mod tests {
             scan_roots: vec![ScanRoot::local(root.to_path_buf())],
             since_ts: None,
             progress_tick: None,
+        }
+    }
+
+    struct FailingReader(io::ErrorKind);
+
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "simulated Grok source failure"))
+        }
+    }
+
+    fn chat_record(role: &str, text: &str) -> String {
+        json!({"type": role, "prompt_index": 0, "content": text}).to_string()
+    }
+
+    #[test]
+    fn invalid_utf8_records_preserve_later_history_and_complete_only_after_delivery() {
+        for fallback in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let session_dir = write_session(tmp.path(), &[]);
+            let (path, before, after) = if fallback {
+                (
+                    session_dir.join("chat_history.jsonl"),
+                    chat_record("user", "before"),
+                    chat_record("assistant", "after"),
+                )
+            } else {
+                (
+                    session_dir.join("updates.jsonl"),
+                    envelope(&text_chunk("user_message_chunk", "before"), 1_800_000_000),
+                    envelope(&text_chunk("agent_message_chunk", "after"), 1_800_000_001),
+                )
+            };
+            let mut bytes = format!("{before}\n").into_bytes();
+            bytes.extend_from_slice(b"\xff\xfe corrupt record\n");
+            bytes.extend_from_slice(after.as_bytes());
+            fs::write(&path, &bytes).unwrap();
+
+            let connector = GrokConnector::new();
+            let ctx = ctx_for(tmp.path());
+            let discovered = connector.discover_source_files(&ctx).unwrap();
+            let mut conversations = Vec::new();
+            let mut completions = Vec::new();
+            let mut complete = |completion: &SourceCompletion| {
+                completions.push(completion.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                on_source_complete: Some(&mut complete),
+                ..SourceScanHooks::default()
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+                    conversations.push(conversation);
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(conversations.len(), 1);
+            assert_eq!(conversations[0].source_path, path);
+            assert_eq!(
+                conversations[0]
+                    .messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>(),
+                ["before", "after"]
+            );
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].conversations_emitted, 1);
+            assert!(discovered.contains(&completions[0].source));
+            if fallback {
+                assert!(
+                    completions[0]
+                        .required_sidecars
+                        .iter()
+                        .any(|source| source.source_path == path)
+                );
+            }
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn reader_failures_discard_both_update_and_fallback_prefixes() {
+        let updates_path = Path::new("updates.jsonl");
+        let history_path = Path::new("chat_history.jsonl");
+        let update = format!(
+            "{}\n",
+            envelope(&text_chunk("user_message_chunk", "prefix"), 1_800_000_000)
+        );
+        let history = format!("{}\n", chat_record("user", "prefix"));
+        assert_eq!(
+            parse_updates(updates_path, None, Cursor::new(&update))
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        assert_eq!(
+            parse_chat_history_fallback(history_path, Cursor::new(&history))
+                .unwrap()
+                .len(),
+            1
+        );
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Interrupted,
+        ] {
+            let reader = BufReader::new(update.as_bytes().chain(FailingReader(kind)));
+            let error = parse_updates(updates_path, None, reader).unwrap_err();
+            assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+            assert!(error.to_string().contains("updates.jsonl"));
+
+            let reader = BufReader::new(history.as_bytes().chain(FailingReader(kind)));
+            let error = parse_chat_history_fallback(history_path, reader).unwrap_err();
+            assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+            assert!(error.to_string().contains("chat_history.jsonl"));
+        }
+    }
+
+    #[test]
+    fn failed_transcript_never_emits_or_completes_and_healthy_sessions_continue() {
+        for fallback in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let failed_root = tmp.path().join("a-failed");
+            let healthy_root = tmp.path().join("b-healthy");
+            let update = envelope(&text_chunk("user_message_chunk", "prefix"), 1_800_000_000);
+            let failed_session = write_session(
+                &failed_root,
+                if fallback {
+                    &[]
+                } else {
+                    std::slice::from_ref(&update)
+                },
+            );
+            let history = format!("{}\n", chat_record("user", "fallback prefix"));
+            fs::write(failed_session.join("chat_history.jsonl"), &history).unwrap();
+            let healthy_session = write_session(
+                &healthy_root,
+                &[envelope(
+                    &text_chunk("user_message_chunk", "healthy"),
+                    1_800_000_001,
+                )],
+            );
+            let failed_path = failed_session.join(if fallback {
+                "chat_history.jsonl"
+            } else {
+                "updates.jsonl"
+            });
+            let prefix = if fallback {
+                history
+            } else {
+                format!("{update}\n")
+            };
+            let ctx = ScanContext::with_roots(
+                tmp.path().join("cass-data"),
+                vec![ScanRoot::local(failed_root), ScanRoot::local(healthy_root)],
+                None,
+            );
+            let mut opened = Vec::new();
+            let mut parse = |session_dir: &Path| {
+                parse_session_with_readers(
+                    session_dir,
+                    &mut |path| -> io::Result<Box<dyn BufRead>> {
+                        opened.push(path.to_path_buf());
+                        if path == failed_path {
+                            Ok(Box::new(BufReader::new(
+                                Cursor::new(prefix.as_bytes().to_vec())
+                                    .chain(FailingReader(io::ErrorKind::Other)),
+                            )))
+                        } else {
+                            Ok(Box::new(BufReader::new(fs::File::open(path)?)))
+                        }
+                    },
+                )
+            };
+            let mut delivered = Vec::new();
+            let mut completed = Vec::new();
+            let mut on_complete = |completion: &SourceCompletion| {
+                completed.push(completion.source.source_path.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                on_source_complete: Some(&mut on_complete),
+                ..SourceScanHooks::default()
+            };
+            scan_grok_with_parser(
+                &ctx,
+                &mut hooks,
+                &mut |conversation| {
+                    delivered.push(conversation.source_path);
+                    Ok(())
+                },
+                &mut parse,
+            )
+            .unwrap();
+            let healthy_path = healthy_session.join("updates.jsonl");
+            assert_eq!(delivered.as_slice(), std::slice::from_ref(&healthy_path));
+            assert_eq!(completed, [healthy_path]);
+            assert!(opened.contains(&failed_path));
+            if !fallback {
+                assert!(!opened.contains(&failed_session.join("chat_history.jsonl")));
+            }
         }
     }
 
@@ -1153,7 +1373,9 @@ mod tests {
         ];
         let session_dir = write_session(tmp.path(), &lines);
 
-        let conv = parse_session(&session_dir).expect("session parses");
+        let conv = parse_session(&session_dir)
+            .unwrap()
+            .expect("session parses");
         assert_eq!(conv.agent_slug, "grok");
         assert_eq!(conv.external_id.as_deref(), Some(SESSION_ID));
         assert_eq!(conv.title.as_deref(), Some("Fix the flaky test"));
@@ -1227,7 +1449,9 @@ mod tests {
         )
         .expect("write chat history");
 
-        let conv = parse_session(&session_dir).expect("fallback parses");
+        let conv = parse_session(&session_dir)
+            .unwrap()
+            .expect("fallback parses");
         assert_eq!(conv.source_path, session_dir.join("chat_history.jsonl"));
         assert_eq!(conv.messages.len(), 1);
         assert_eq!(conv.messages[0].role, "user");
@@ -1245,7 +1469,7 @@ mod tests {
     fn unrun_session_yields_no_conversation() {
         let tmp = TempDir::new().expect("tempdir");
         let session_dir = write_session(tmp.path(), &[]);
-        assert!(parse_session(&session_dir).is_none());
+        assert!(parse_session(&session_dir).unwrap().is_none());
     }
 
     #[test]
@@ -1300,7 +1524,7 @@ mod tests {
         )
         .expect("write updates");
         // No summary.json → workspace comes from the group directory name.
-        let conv = parse_session(&session_dir).expect("parses");
+        let conv = parse_session(&session_dir).unwrap().expect("parses");
         assert_eq!(
             conv.workspace.as_deref(),
             Some(Path::new("/data/projects/demo"))
@@ -1320,7 +1544,7 @@ mod tests {
             envelope(&text_chunk("user_message_chunk", "hi"), 1_784_388_057) + "\n",
         )
         .expect("write updates");
-        let conv = parse_session(&session_dir).expect("parses");
+        let conv = parse_session(&session_dir).unwrap().expect("parses");
         assert_eq!(
             conv.workspace.as_deref(),
             Some(Path::new("/real/workspace/path"))

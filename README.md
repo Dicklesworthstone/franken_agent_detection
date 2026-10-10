@@ -169,8 +169,9 @@ directory. The existing infallible Pi `discover_sources` and durable
 `store_diagnostics` helpers log invalid-policy errors and return no sources;
 `pi_wire::try_discover_sources` exposes the discovery error to direct callers.
 
-Claude Code, Factory, Kimi, Clawdbot, Vibe, OpenClaw and Muse stop reading a
-transcript after an underlying I/O error and discard its incomplete contents.
+Claude Code, Factory, Kimi, Clawdbot, Vibe, OpenClaw, Muse, Grok and Prime
+stop reading a transcript after an underlying I/O error and discard its
+incomplete contents.
 Their JSONL readers still skip individual malformed JSON or invalid UTF-8
 records and retain later valid records. The shared line reader buffers only
 the current line and adds no full-transcript copy.
