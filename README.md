@@ -185,6 +185,13 @@ headers and legacy messages without IDs remain supported. Replay keeps one
 payload per surviving ID, and the existing 32 MiB metadata compaction
 threshold is unchanged.
 
+Gemini messages also retain stored thought summaries and tool activity when
+ordinary text is empty. Each native message remains one normalized message;
+tool names, call IDs and arguments are exposed through `invocations`.
+Readable tool results are included in searchable content, while binary
+result parts are omitted. Compact metadata does not duplicate the raw
+thought, tool-call or result payloads.
+
 Claude Code streaming scans continue to deliver healthy sources after a source
 open/read failure, then return an error with the failure count and the first
 original I/O error. Failed sources emit no conversation or completion event.

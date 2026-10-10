@@ -17,7 +17,9 @@ use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 /// Final JSONL history in insertion order, with one retained value per native ID.
 /// Replacing a streamed message drops its previous payload immediately. The
@@ -618,6 +620,150 @@ impl GeminiConnector {
     }
 }
 
+/// Append only readable text, retaining its original whitespace and avoiding
+/// a second serialized copy of provider objects or binary result payloads.
+fn append_gemini_text(content: &mut String, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(text);
+}
+
+/// Gemini stores results as `PartListUnion`; textual `FunctionResponse` results
+/// are `response.output` strings (`generateContentResponseUtilities.ts` at
+/// gemini-cli 9b6e0265d16b). Never stringify arbitrary parts: they can contain
+/// `inlineData`, `fileData`, or `__binary_injection__` alongside readable output.
+fn append_gemini_tool_result(
+    content: &mut String,
+    result: &Value,
+    tool_name: &str,
+    has_result: &mut bool,
+) {
+    if let Some(parts) = result.as_array() {
+        for part in parts {
+            append_gemini_tool_result(content, part, tool_name, has_result);
+        }
+        return;
+    }
+    // Failed/cancelled calls use response.error; cancellation can retain
+    // both output and error (scheduler/tool-executor.ts at the same revision).
+    for (text, is_error) in [
+        (
+            result
+                .as_str()
+                .or_else(|| result.get("text").and_then(Value::as_str)),
+            false,
+        ),
+        (
+            result
+                .pointer("/functionResponse/response/output")
+                .and_then(Value::as_str),
+            false,
+        ),
+        (
+            result
+                .pointer("/functionResponse/response/error")
+                .and_then(Value::as_str),
+            true,
+        ),
+    ] {
+        let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
+            continue;
+        };
+        if *has_result {
+            content.push('\n');
+        } else {
+            append_gemini_text(content, "[Tool result: ");
+            content.push_str(tool_name);
+            content.push_str("] ");
+            *has_result = true;
+        }
+        if is_error {
+            content.push_str("[Error] ");
+        }
+        content.push_str(text);
+    }
+}
+
+/// One native Gemini message can carry only thoughts or tools. Keep its
+/// readable parts and structured calls in one normalized message, so its
+/// identity and any native usage metadata are not copied to extra rows.
+fn normalize_gemini_message_content(
+    raw: &Value,
+    role: &str,
+) -> (String, Vec<NormalizedInvocation>) {
+    let plain = raw.get("content").map(flatten_content).unwrap_or_default();
+    if role != "assistant" {
+        return (plain, Vec::new());
+    }
+
+    let mut content = String::new();
+    if let Some(thoughts) = raw.get("thoughts").and_then(Value::as_array) {
+        for thought in thoughts {
+            let subject = thought
+                .get("subject")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty());
+            let description = thought
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty());
+            let Some(first) = subject.or(description) else {
+                continue;
+            };
+            append_gemini_text(&mut content, "[Thinking] ");
+            content.push_str(first);
+            if subject.is_some()
+                && let Some(description) = description
+            {
+                append_gemini_text(&mut content, description);
+            }
+        }
+    }
+    if content.is_empty() {
+        // Preserve the text-only path's single allocation, even for a large
+        // body. Only prepend into a new string when real thoughts need it.
+        content = plain;
+    } else {
+        append_gemini_text(&mut content, &plain);
+    }
+
+    let mut invocations = Vec::new();
+    if let Some(calls) = raw.get("toolCalls").and_then(Value::as_array) {
+        for call in calls {
+            let Some(name) = call
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+            else {
+                continue;
+            };
+            append_gemini_text(&mut content, "[Tool: ");
+            content.push_str(name);
+            content.push(']');
+            invocations.push(NormalizedInvocation {
+                kind: "tool".to_owned(),
+                name: name.to_owned(),
+                raw_name: None,
+                call_id: call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned),
+                arguments: call.get("args").cloned(),
+            });
+            if let Some(result) = call.get("result") {
+                let mut has_result = false;
+                append_gemini_tool_result(&mut content, result, name, &mut has_result);
+            }
+        }
+    }
+    (content, invocations)
+}
+
 #[allow(clippy::too_many_lines)]
 fn scan_gemini_with_callback(
     ctx: &ScanContext,
@@ -727,10 +873,9 @@ fn scan_gemini_with_hooks(
                     (None, None) => None,
                 };
 
-                // Extract content using flatten_content for consistency
-                let content_str = item.get("content").map(flatten_content).unwrap_or_default();
+                let (content_str, invocations) = normalize_gemini_message_content(&item, role);
 
-                // Skip entries with empty content
+                // Empty text with no readable thoughts or named tools is not a message.
                 if content_str.trim().is_empty() {
                     continue;
                 }
@@ -746,7 +891,7 @@ fn scan_gemini_with_hooks(
                     } else {
                         item
                     },
-                    invocations: Vec::new(),
+                    invocations,
                     snippets: Vec::new(),
                 });
             }

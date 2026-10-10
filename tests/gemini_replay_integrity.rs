@@ -62,9 +62,22 @@ impl Fixture {
         Self::from_bytes(encode(records), None)
     }
 
+    fn legacy(messages: &[Value]) -> Self {
+        let mut session = header();
+        session["messages"] = json!(messages);
+        Self::from_bytes_with_extension(serde_json::to_vec(&session).unwrap(), None, "json")
+    }
+
     fn from_bytes(prefix: Vec<u8>, size: Option<u64>) -> Self {
+        Self::from_bytes_with_extension(prefix, size, "jsonl")
+    }
+
+    fn from_bytes_with_extension(prefix: Vec<u8>, size: Option<u64>, extension: &str) -> Self {
         let root = TempDir::new().unwrap();
-        let path = root.path().join("project/chats/session-replay.jsonl");
+        let path = root
+            .path()
+            .join("project/chats/session-replay")
+            .with_extension(extension);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let size = size.unwrap_or_else(|| u64::try_from(prefix.len()).unwrap());
         let mut remaining = usize::try_from(size).unwrap() - prefix.len();
@@ -277,7 +290,10 @@ fn content_and_tool_result_patches_preserve_unpatched_message_fields() {
     assert_eq!(conversation.title.as_deref(), Some("Revised question"));
     assert_eq!(conversation.messages[0].role, "user");
     assert_eq!(conversation.messages[1].role, "assistant");
-    assert_eq!(conversation.messages[1].content, "Patched answer");
+    assert_eq!(
+        conversation.messages[1].content,
+        "Patched answer\n[Tool: read_file]\n[Tool result: read_file] updated tool result\n[Tool: list_directory]",
+    );
     reply["content"] = json!([{"text": "Patched answer"}]);
     reply["toolCalls"][0]["result"] = json!([{"text": "updated tool result"}]);
     reply["toolCalls"][1]["result"] = Value::Null;
@@ -524,5 +540,237 @@ fn skipped_sources_and_failed_callbacks_never_report_replay_completion() {
         }
         assert_eq!(completed, 0);
         fixture.assert_unchanged(&before);
+    }
+}
+
+#[test]
+fn thought_and_tool_only_messages_survive_legacy_json_and_jsonl() {
+    let plain = message("plain", "model", "  Plain text stays unchanged.\n");
+    let mut thoughts = message("thoughts", "gemini", "");
+    thoughts["thoughts"] = json!([
+        {"subject": "Plan", "description": "Inspect the parser"},
+        {"subject": "", "description": "Check the result"},
+        {"subject": "Final note", "description": ""},
+    ]);
+    let mut tools = message("tools", "gemini", "");
+    tools["toolCalls"] = json!([
+        {"id": "read-call", "name": "read_file", "args": {"path": "src/lib.rs"},
+         "status": "success", "timestamp": "2026-10-09T10:00:02Z",
+         "result": {"functionResponse": {"id": "read-call", "name": "read_file",
+                    "response": {"output": "File contents"}}}},
+        {"name": "run_shell_command", "args": {"command": "cargo check"},
+         "status": "success", "timestamp": "2026-10-09T10:00:03Z",
+         "result": [{"text": "Command succeeded"}]},
+    ]);
+    let mut mixed = message("mixed", "gemini", "Final answer.");
+    mixed["thoughts"] = json!([{"subject": "Review", "description": "Verify the result"}]);
+    mixed["toolCalls"] = json!([
+        {"id": "mixed-call", "name": "list_directory", "args": {"path": "src"}}
+    ]);
+    let messages = [plain, thoughts, tools, mixed];
+    for legacy in [true, false] {
+        let fixture = if legacy {
+            Fixture::legacy(&messages)
+        } else {
+            let mut records = vec![header()];
+            records.extend_from_slice(&messages);
+            Fixture::new(&records)
+        };
+        let conversation = fixture.scan_all_routes();
+        assert_eq!(ids(&conversation), ["plain", "thoughts", "tools", "mixed"]);
+        assert_eq!(
+            conversation.messages[0].content,
+            "  Plain text stays unchanged.\n"
+        );
+        assert_eq!(conversation.messages[0].role, "assistant");
+        assert!(conversation.messages[0].invocations.is_empty());
+        assert_eq!(
+            conversation.messages[1].content,
+            "[Thinking] Plan\nInspect the parser\n[Thinking] Check the result\n[Thinking] Final note",
+        );
+        assert!(conversation.messages[1].invocations.is_empty());
+        assert_eq!(
+            conversation.messages[2].content,
+            "[Tool: read_file]\n[Tool result: read_file] File contents\n[Tool: run_shell_command]\n[Tool result: run_shell_command] Command succeeded",
+        );
+        let calls = &conversation.messages[2].invocations;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].kind, "tool");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].raw_name, None);
+        assert_eq!(calls[0].call_id.as_deref(), Some("read-call"));
+        assert_eq!(calls[0].arguments, Some(json!({"path": "src/lib.rs"})));
+        assert_eq!(calls[1].name, "run_shell_command");
+        assert_eq!(calls[1].call_id, None);
+        assert_eq!(calls[1].arguments, Some(json!({"command": "cargo check"})));
+        assert_eq!(
+            conversation.messages[3].content,
+            "[Thinking] Review\nVerify the result\nFinal answer.\n[Tool: list_directory]",
+        );
+        assert_eq!(conversation.messages[3].invocations.len(), 1);
+        for (normalized, raw) in conversation.messages.iter().zip(&messages) {
+            assert_eq!(&normalized.extra, raw);
+        }
+    }
+}
+
+#[test]
+fn malformed_supplements_and_binary_results_are_not_searchable_text() {
+    let mut malformed = message("malformed", "gemini", "");
+    malformed["thoughts"] = json!([
+        null, 17, {}, {"subject": " ", "description": "\n"},
+        {"subject": false, "description": {"text": "must not stringify"}}
+    ]);
+    malformed["toolCalls"] = json!([
+        null, false, {}, {"name": " "}, {"name": 17},
+        {"id": "missing-name", "result": "must not invent a call"}
+    ]);
+    let mut wrong_containers = message("wrong-containers", "gemini", "");
+    wrong_containers["thoughts"] = json!({"description": "not a thoughts array"});
+    wrong_containers["toolCalls"] = json!("not a calls array");
+    let mut user = message("empty-user", "user", "");
+    user["thoughts"] = json!([{"description": "not assistant thoughts"}]);
+    user["toolCalls"] = json!([{"name": "not_an_assistant_call"}]);
+    let mut binary = message("binary-call", "gemini", "");
+    binary["toolCalls"] = json!([
+        {"id": "binary", "name": "read_file", "args": {"path": "image.png"}, "result": [
+            {"inlineData": {"mimeType": "image/png", "data": "BINARY_MARKER"}},
+            {"fileData": {"fileUri": "gs://bucket/private-image", "mimeType": "image/png"}},
+            {"functionResponse": {"response": {"__binary_injection__": [
+                {"inlineData": {"mimeType": "audio/wav", "data": "BINARY_MARKER"}}
+            ]}, "parts": [{"inlineData": {"data": "BINARY_MARKER"}}]}}
+        ]}
+    ]);
+    let mut results = message("results", "gemini", "");
+    results["toolCalls"] = json!([
+        {"id": "textual", "name": "run_shell_command", "args": {}, "result": [
+            "Plain result", {"text": "Text part"}, [{"text": "Nested text part"}],
+            {"functionResponse": {"response": {
+                "output": "Partial output", "error": "Cancelled by the user",
+                "__binary_injection__": [{"inlineData": {"data": "BINARY_MARKER"}}]
+            }}},
+            {"text": null}, {"unknown": {"output": "must not stringify"}},
+            {"functionResponse": {"response": {"output": {"text": "must not guess"}}}}
+        ]},
+        {"id": "failed", "name": "fail_tool", "args": {},
+         "result": {"functionResponse": {"response": {"error": "Tool failed"}}}}
+    ]);
+    let fixture = Fixture::new(&[
+        header(),
+        message("control", "user", "Valid question"),
+        message("empty", "gemini", " \n"),
+        malformed,
+        wrong_containers,
+        user,
+        binary,
+        results,
+    ]);
+    let conversation = fixture.scan_all_routes();
+    assert_eq!(ids(&conversation), ["control", "binary-call", "results"]);
+    assert_eq!(conversation.messages[1].content, "[Tool: read_file]");
+    assert_eq!(conversation.messages[1].invocations.len(), 1);
+    assert_eq!(
+        conversation.messages[2].content,
+        "[Tool: run_shell_command]\n[Tool result: run_shell_command] Plain result\nText part\nNested text part\nPartial output\n[Error] Cancelled by the user\n[Tool: fail_tool]\n[Tool result: fail_tool] [Error] Tool failed",
+    );
+    assert_eq!(conversation.messages[2].invocations.len(), 2);
+    for message in &conversation.messages {
+        assert!(!message.content.contains("BINARY_MARKER"));
+        assert!(!message.content.contains("private-image"));
+        assert!(!message.content.contains("must not"));
+    }
+}
+
+#[test]
+fn tool_only_message_replacement_and_patch_render_the_final_result_once() {
+    let mut draft = message("reply", "gemini", "");
+    draft["toolCalls"] = json!([
+        {"id": "call", "name": "run_shell_command", "args": {"command": "old command"},
+         "result": "obsolete result"}
+    ]);
+    let mut final_reply = draft.clone();
+    final_reply["toolCalls"][0]["args"] = json!({"command": "final command"});
+    final_reply["toolCalls"][0]["result"] = json!("intermediate result");
+    let fixture = Fixture::new(&[
+        header(),
+        draft,
+        final_reply,
+        json!({"$patch": {"id": "reply", "toolCalls": [
+            {"id": "call", "name": "must_not_replace_name", "args": {"command": "ignored"},
+             "result": {"functionResponse": {"id": "call", "name": "run_shell_command",
+                        "response": {"output": "Final masked output", "error": "User cancelled"}}}}
+        ]}}),
+    ]);
+    let conversation = fixture.scan_all_routes();
+    assert_eq!(ids(&conversation), ["reply"]);
+    let reply = &conversation.messages[0];
+    assert_eq!(reply.extra["content"], "");
+    assert_eq!(
+        reply.content,
+        "[Tool: run_shell_command]\n[Tool result: run_shell_command] Final masked output\n[Error] User cancelled",
+    );
+    assert_eq!(reply.invocations.len(), 1);
+    assert_eq!(reply.invocations[0].call_id.as_deref(), Some("call"));
+    assert_eq!(reply.invocations[0].name, "run_shell_command");
+    assert_eq!(
+        reply.invocations[0].arguments,
+        Some(json!({"command": "final command"}))
+    );
+}
+
+#[test]
+fn thought_and_tool_normalization_preserve_compaction_memory_contract() {
+    let description = "Detailed thought summary. ".repeat(512);
+    let output = "Readable tool output. ".repeat(512);
+    let arguments = json!({"command": "argument-text ".repeat(512)});
+    let plain_text = "Plain content remains intact. ".repeat(1024);
+    let mut thoughts = message("thoughts", "gemini", "");
+    thoughts["thoughts"] = json!([{"subject": "Plan", "description": description}]);
+    let mut tools = message("tools", "gemini", "");
+    tools["toolCalls"] = json!([
+        {"id": "call", "name": "run_shell_command", "args": arguments,
+         "result": [{"functionResponse": {"response": {"output": output,
+             "__binary_injection__": [{"inlineData": {"data": "BINARY_MARKER"}}]}}}]}
+    ]);
+    tools["bulky_provider_payload"] = json!("z".repeat(64 * 1024));
+    let mut plain = message("plain", "gemini", &plain_text);
+    for record in [&mut thoughts, &mut tools, &mut plain] {
+        record["model"] = json!("gemini-2.5-pro");
+    }
+    let records = [header(), thoughts, tools, plain];
+    let expected_thoughts = format!("[Thinking] Plan\n{description}");
+    let expected_tool =
+        format!("[Tool: run_shell_command]\n[Tool result: run_shell_command] {output}");
+    for size in [
+        COMPACT_THRESHOLD - 1,
+        COMPACT_THRESHOLD,
+        COMPACT_THRESHOLD + 1,
+    ] {
+        let fixture = Fixture::from_bytes(encode(&records), Some(size));
+        let conversation = fixture.scan_all_routes();
+        assert_eq!(conversation.messages.len(), 3);
+        assert_eq!(conversation.messages[0].content, expected_thoughts);
+        assert_eq!(conversation.messages[1].content, expected_tool);
+        assert_eq!(conversation.messages[2].content, plain_text);
+        let calls = &conversation.messages[1].invocations;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_shell_command");
+        assert_eq!(calls[0].call_id.as_deref(), Some("call"));
+        assert_eq!(calls[0].arguments.as_ref(), Some(&arguments));
+        for message in &conversation.messages {
+            assert_eq!(message.role, "assistant");
+            assert_eq!(message.extra["model"], "gemini-2.5-pro");
+            assert!(!message.content.contains("BINARY_MARKER"));
+            if size >= COMPACT_THRESHOLD {
+                assert_eq!(message.extra, json!({"model": "gemini-2.5-pro"}));
+                assert!(serde_json::to_vec(&message.extra).unwrap().len() < 1024);
+            }
+        }
+        if size < COMPACT_THRESHOLD {
+            assert_eq!(ids(&conversation), ["thoughts", "tools", "plain"]);
+            assert_eq!(conversation.messages[0].extra, records[1]);
+            assert_eq!(conversation.messages[1].extra, records[2]);
+            assert_eq!(conversation.messages[2].extra, records[3]);
+        }
     }
 }
