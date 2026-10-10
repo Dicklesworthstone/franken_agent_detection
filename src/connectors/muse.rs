@@ -71,13 +71,14 @@
 //!    `output_tokens` (not additive), so it is carried as-is without adding.
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 use super::flatten_content;
+use super::jsonl::JsonlLines;
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
@@ -280,30 +281,29 @@ fn parse_record(line: &str, lineno: usize) -> Option<MuseRecord> {
 }
 
 /// Read and sequence-sort every well-formed record in a transcript.
-fn read_records(session_file: &Path) -> Vec<MuseRecord> {
-    let Ok(file) = fs::File::open(session_file) else {
-        return Vec::new();
-    };
+/// Any I/O error discards the accumulated records rather than returning a
+/// truncated transcript as a complete session.
+fn read_records(session_file: &Path) -> Result<Vec<MuseRecord>> {
+    let file = fs::File::open(session_file)
+        .with_context(|| format!("open muse transcript {}", session_file.display()))?;
+    read_records_from(BufReader::new(file), session_file)
+}
+
+fn read_records_from<R: BufRead>(reader: R, session_file: &Path) -> Result<Vec<MuseRecord>> {
     let mut records: Vec<MuseRecord> = Vec::new();
-    for (lineno, line) in BufReader::new(file).lines().enumerate() {
-        let Ok(line) = line else {
-            tracing::warn!(
-                transcript = %session_file.display(),
-                line = lineno + 1,
-                "muse: stopping at unreadable transcript line"
-            );
-            break;
-        };
+    for (record_index, line) in JsonlLines::new(reader).enumerate() {
+        let line =
+            line.with_context(|| format!("read muse transcript {}", session_file.display()))?;
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(record) = parse_record(line, lineno) {
+        if let Some(record) = parse_record(line, record_index) {
             records.push(record);
         } else {
             tracing::warn!(
                 transcript = %session_file.display(),
-                line = lineno + 1,
+                record = record_index + 1,
                 "muse: skipping malformed transcript line"
             );
         }
@@ -312,24 +312,42 @@ fn read_records(session_file: &Path) -> Vec<MuseRecord> {
     // without one sort after all sequenced records, in file order (the
     // two-band key in `MuseRecord::sort_key`).
     records.sort_by_key(|r| r.sort_key);
-    records
+    Ok(records)
 }
 
 /// Scan a transcript for its `runtime.session.metadata` record and return
 /// `payload.record.workspace_root`, if any. Used both for the session's own
 /// workspace and for subagent inheritance (gotcha 1).
 fn workspace_root_of(session_file: &Path) -> Option<PathBuf> {
-    let Ok(file) = fs::File::open(session_file) else {
-        tracing::debug!(transcript = %session_file.display(), "muse: cannot open transcript for workspace lookup");
-        return None;
+    let file = match fs::File::open(session_file) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(
+                transcript = %session_file.display(),
+                error = %error,
+                "muse: cannot open transcript for workspace lookup"
+            );
+            return None;
+        }
     };
-    for (lineno, line) in BufReader::new(file).lines().enumerate() {
-        // A single unreadable line must not abort workspace extraction for
-        // the whole transcript — skip and keep scanning.
-        let Ok(line) = line else {
-            tracing::debug!(transcript = %session_file.display(), line = lineno + 1, "muse: skipping unreadable line during workspace lookup");
-            continue;
-        };
+    match workspace_root_from(BufReader::new(file)) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            tracing::debug!(
+                transcript = %session_file.display(),
+                error = %error,
+                "muse: stopping workspace lookup after read error"
+            );
+            None
+        }
+    }
+}
+
+fn workspace_root_from<R: BufRead>(reader: R) -> io::Result<Option<PathBuf>> {
+    for line in JsonlLines::new(reader) {
+        // Invalid UTF-8 is record-local; an actual I/O failure stops this
+        // optional lookup without invalidating a complete child transcript.
+        let line = line?;
         let line = line.trim();
         if line.is_empty() || !line.contains("runtime.session.metadata") {
             continue;
@@ -345,10 +363,10 @@ fn workspace_root_of(session_file: &Path) -> Option<PathBuf> {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
         {
-            return Some(PathBuf::from(root));
+            return Ok(Some(PathBuf::from(root)));
         }
     }
-    None
+    Ok(None)
 }
 
 /// If `session_file` is a subagent transcript
@@ -500,10 +518,10 @@ fn push_message(
 }
 
 #[allow(clippy::too_many_lines)]
-fn parse_session(session_file: &Path) -> Option<NormalizedConversation> {
-    let records = read_records(session_file);
+fn parse_session(session_file: &Path) -> Result<Option<NormalizedConversation>> {
+    let records = read_records(session_file)?;
     if records.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let external_id = records
@@ -664,7 +682,7 @@ fn parse_session(session_file: &Path) -> Option<NormalizedConversation> {
 
     if messages.is_empty() {
         // Un-run or telemetry-only transcript; nothing to index.
-        return None;
+        return Ok(None);
     }
     reindex_messages(&mut messages);
 
@@ -708,7 +726,7 @@ fn parse_session(session_file: &Path) -> Option<NormalizedConversation> {
         .and_then(|m| m.content.lines().find(|l| !l.trim().is_empty()))
         .map(|line| line.chars().take(100).collect::<String>());
 
-    Some(NormalizedConversation {
+    Ok(Some(NormalizedConversation {
         agent_slug: AGENT_SLUG.to_string(),
         external_id,
         title,
@@ -718,7 +736,7 @@ fn parse_session(session_file: &Path) -> Option<NormalizedConversation> {
         ended_at,
         metadata: Value::Object(metadata),
         messages,
-    })
+    }))
 }
 
 fn scan_muse_with_callback(
@@ -759,7 +777,18 @@ fn scan_muse_with_hooks(
             if !hooks.should_scan(&discovered) {
                 continue;
             }
-            if let Some(conversation) = parse_session(&session_file) {
+            let conversation = match parse_session(&session_file) {
+                Ok(conversation) => conversation,
+                Err(error) => {
+                    tracing::warn!(
+                        transcript = %session_file.display(),
+                        error = %format_args!("{error:#}"),
+                        "muse: skipping failed transcript"
+                    );
+                    continue;
+                }
+            };
+            if let Some(conversation) = conversation {
                 on_conversation(conversation).with_context(|| {
                     format!("emit muse conversation {}", session_file.display())
                 })?;
@@ -865,6 +894,9 @@ mod tests {
     use super::*;
     use crate::connectors::assert_discovery_covers_scan_sources;
     use serde_json::json;
+    use std::cell::Cell;
+    use std::io::{Cursor, ErrorKind, Read};
+    use std::rc::Rc;
     use tempfile::TempDir;
 
     const SESSION_ID: &str = "216854bc-9df1-4a01-93b5-000000000001";
@@ -1023,6 +1055,153 @@ mod tests {
         )
     }
 
+    struct FailingReader {
+        kind: ErrorKind,
+        attempts: Rc<Cell<usize>>,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            self.attempts.set(self.attempts.get() + 1);
+            Err(io::Error::new(self.kind, "persistent transcript failure"))
+        }
+    }
+
+    #[test]
+    fn record_read_failure_discards_prefix_and_preserves_original_error() {
+        let mut prefix = run_event(1, json!({"kind": "started", "prompt": "incomplete"}));
+        prefix.push_str("\n{\"payload_type\":");
+
+        for kind in [ErrorKind::Other, ErrorKind::InvalidData] {
+            let attempts = Rc::new(Cell::new(0));
+            let reader = Cursor::new(prefix.as_bytes()).chain(FailingReader {
+                kind,
+                attempts: attempts.clone(),
+            });
+            let error =
+                read_records_from(BufReader::new(reader), Path::new("failed/session.jsonl"))
+                    .err()
+                    .expect("I/O failure must not return the valid record prefix");
+
+            let original = error
+                .downcast_ref::<io::Error>()
+                .expect("original I/O error");
+            assert_eq!(original.kind(), kind);
+            assert_eq!(original.to_string(), "persistent transcript failure");
+            assert!(error.to_string().contains("failed/session.jsonl"));
+            assert_eq!(attempts.get(), 1, "failed read must not be retried");
+        }
+    }
+
+    #[test]
+    fn workspace_lookup_stops_on_underlying_read_error() {
+        let prefix = run_event(1, json!({"kind": "started", "prompt": "question"})) + "\n";
+        let attempts = Rc::new(Cell::new(0));
+        let reader = Cursor::new(prefix.as_bytes()).chain(FailingReader {
+            kind: ErrorKind::InvalidData,
+            attempts: attempts.clone(),
+        });
+
+        let error = workspace_root_from(BufReader::new(reader))
+            .expect_err("an underlying InvalidData is not an invalid UTF-8 record");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "persistent transcript failure");
+        assert_eq!(
+            attempts.get(),
+            1,
+            "failed lookup must not retry indefinitely"
+        );
+    }
+
+    #[test]
+    fn source_boundaries_skip_failed_source_and_reach_healthy_session() {
+        let temp = TempDir::new().expect("tempdir");
+        let failed = temp.path().join("sessions/a-failed/session.jsonl");
+        let healthy = temp.path().join("sessions/z-healthy/session.jsonl");
+        write_lines(
+            &failed,
+            &[run_event(
+                1,
+                json!({"kind": "started", "prompt": "unreadable"}),
+            )],
+        );
+        write_lines(
+            &healthy,
+            &[run_event(
+                1,
+                json!({"kind": "started", "prompt": "healthy"}),
+            )],
+        );
+
+        let mut visited = Vec::new();
+        let mut completed = Vec::new();
+        let mut conversations = Vec::new();
+        let mut should_scan = |source: &DiscoveredSourceFile| {
+            visited.push(source.source_path.clone());
+            if source.source_path == failed {
+                fs::rename(&failed, failed.with_extension("moved")).expect("remove listed source");
+            }
+            true
+        };
+        let mut on_complete = |completion: &SourceCompletion| {
+            completed.push(completion.clone());
+            Ok(())
+        };
+        let mut hooks = SourceScanHooks {
+            should_scan_source: Some(&mut should_scan),
+            on_source_complete: Some(&mut on_complete),
+        };
+
+        MuseConnector::new()
+            .scan_with_source_boundaries(&ctx_for(temp.path()), &mut hooks, &mut |conversation| {
+                conversations.push(conversation);
+                Ok(())
+            })
+            .expect("healthy sources remain reachable after one source fails");
+
+        assert_eq!(visited, [failed.clone(), healthy.clone()]);
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].source_path, healthy);
+        assert_eq!(conversations[0].messages[0].content, "healthy");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].source.source_path, healthy);
+        assert_eq!(completed[0].conversations_emitted, 1);
+        let error = parse_session(&failed).expect_err("a missing transcript is an error");
+        assert_eq!(
+            error
+                .downcast_ref::<io::Error>()
+                .expect("original I/O error")
+                .kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_records_do_not_hide_later_messages() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join(SESSION_FILE);
+        let mut bytes = run_event(1, json!({"kind": "started", "prompt": "before"})).into_bytes();
+        bytes.extend_from_slice(b"\n\xff\xfe\n");
+        bytes.extend_from_slice(
+            run_event(
+                2,
+                json!({"kind": "assistant_message_committed", "text": "after"}),
+            )
+            .as_bytes(),
+        );
+        fs::write(&log, bytes).expect("write transcript");
+
+        let conversation = parse_session(&log)
+            .expect("read transcript")
+            .expect("complete conversation");
+
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(conversation.messages[0].content, "before");
+        assert_eq!(conversation.messages[1].content, "after");
+        assert_eq!(conversation.messages[1].idx, 1);
+    }
+
     #[test]
     fn default_detection_scopes_to_muse_base_data_dir() {
         // build_fixture lays out the real store shape under the temp base;
@@ -1070,7 +1249,9 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let (root_log, _) = build_fixture(temp.path());
 
-        let conv = parse_session(&root_log).expect("root conversation");
+        let conv = parse_session(&root_log)
+            .expect("read root transcript")
+            .expect("root conversation");
         assert_eq!(conv.agent_slug, "muse");
         assert_eq!(conv.external_id.as_deref(), Some(SESSION_ID));
         assert_eq!(conv.workspace, Some(PathBuf::from("/data/projects/demo")));
@@ -1121,7 +1302,9 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let (_, sub_log) = build_fixture(temp.path());
 
-        let conv = parse_session(&sub_log).expect("subagent conversation");
+        let conv = parse_session(&sub_log)
+            .expect("read subagent transcript")
+            .expect("subagent conversation");
         // Gotcha 1: no metadata record of its own, workspace inherited from
         // ../../session.jsonl.
         assert_eq!(conv.workspace, Some(PathBuf::from("/data/projects/demo")));
@@ -1162,7 +1345,9 @@ mod tests {
                 run_event(2, json!({"kind": "started", "prompt": "question"})),
             ],
         );
-        let conv = parse_session(&log).expect("conversation");
+        let conv = parse_session(&log)
+            .expect("read transcript")
+            .expect("conversation");
         let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant"]);
         assert_eq!(conv.messages[0].content, "question");
@@ -1211,7 +1396,9 @@ mod tests {
                 ),
             ],
         );
-        let conv = parse_session(&log).expect("conversation");
+        let conv = parse_session(&log)
+            .expect("read transcript")
+            .expect("conversation");
         let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
         // Sequenced records sort by sequence; the unsequenced tail keeps
@@ -1256,7 +1443,9 @@ mod tests {
             &[run_event(1, json!({"kind": "started", "prompt": "search"}))],
         );
 
-        let conv = parse_session(&sub_log).expect("subagent conversation");
+        let conv = parse_session(&sub_log)
+            .expect("read subagent transcript")
+            .expect("subagent conversation");
         assert_eq!(conv.workspace, Some(PathBuf::from("/data/projects/demo")));
     }
 
@@ -1280,7 +1469,9 @@ mod tests {
                 ),
             ],
         );
-        let conv = parse_session(&log).expect("conversation despite noise");
+        let conv = parse_session(&log)
+            .expect("read transcript")
+            .expect("conversation despite noise");
         assert_eq!(conv.messages.len(), 2);
     }
 
@@ -1303,7 +1494,7 @@ mod tests {
                 envelope(3, "session.end", &json!({"reason": "completed"})),
             ],
         );
-        assert!(parse_session(&log).is_none());
+        assert!(parse_session(&log).expect("read transcript").is_none());
     }
 
     #[test]

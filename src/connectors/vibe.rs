@@ -7,7 +7,6 @@
 //! {"role":"user|assistant|system","content":"...","timestamp":"..."}
 
 use std::fs;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -16,6 +15,7 @@ use walkdir::WalkDir;
 
 use std::collections::HashSet;
 
+use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::dedupe_path_key;
 use super::{
@@ -246,7 +246,7 @@ impl Connector for VibeConnector {
             }
 
             let files = Self::session_files(&root);
-            for file in files {
+            'sources: for file in files {
                 if !seen_files.insert(dedupe_path_key(&file)) {
                     continue;
                 }
@@ -283,9 +283,17 @@ impl Connector for VibeConnector {
                 let mut started_at: Option<i64> = None;
                 let mut ended_at: Option<i64> = None;
 
-                for line_res in reader.lines() {
-                    let Ok(line) = line_res else {
-                        continue;
+                for line_res in JsonlLines::new(reader) {
+                    let line = match line_res {
+                        Ok(line) => line,
+                        Err(error) => {
+                            tracing::debug!(
+                                path = %source_path.display(),
+                                error = %error,
+                                "vibe: discarding incomplete session after read error"
+                            );
+                            continue 'sources;
+                        }
                     };
                     if line.trim().is_empty() {
                         continue;
@@ -451,6 +459,29 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].role, "user");
+    }
+
+    #[test]
+    fn scan_skips_invalid_utf8_records_and_keeps_later_messages() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".vibe/logs/session");
+        let session = sessions.join("sess-utf8");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("messages.jsonl"),
+            b"{\"role\":\"user\",\"content\":\"Before\"}\n\xff\xfe\n{\"role\":\"assistant\",\"content\":\"After\"}\n",
+        )
+        .unwrap();
+
+        let convs = VibeConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        assert_eq!(convs[0].messages[0].content, "Before");
+        assert_eq!(convs[0].messages[1].content, "After");
+        assert_eq!(convs[0].messages[1].idx, 1);
     }
 
     #[test]

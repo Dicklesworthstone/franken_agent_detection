@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
@@ -215,7 +216,7 @@ impl Connector for FactoryConnector {
                     Ok(Some(conv)) => convs.push(conv),
                     Ok(None) => {}
                     Err(e) => {
-                        tracing::debug!(path = %path.display(), error = %e, "factory parse error");
+                        tracing::debug!(path = %path.display(), error = %format_args!("{e:#}"), "factory parse error");
                     }
                 }
             }
@@ -261,12 +262,17 @@ fn update_time_bounds(started_at: &mut Option<i64>, ended_at: &mut Option<i64>, 
 }
 
 /// Parse a Factory session JSONL file into a `NormalizedConversation`.
-#[allow(clippy::too_many_lines)]
 fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> {
     let file =
         fs::File::open(path).with_context(|| format!("open session file {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
+    parse_factory_session_reader(path, std::io::BufReader::new(file))
+}
 
+#[allow(clippy::too_many_lines)]
+fn parse_factory_session_reader(
+    path: &Path,
+    reader: impl BufRead,
+) -> Result<Option<NormalizedConversation>> {
     let mut messages = Vec::new();
     let mut session_id: Option<String> = None;
     let mut title: Option<String> = None;
@@ -281,10 +287,8 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str());
 
-    for line_res in reader.lines() {
-        let Ok(line) = line_res else {
-            continue;
-        };
+    for line_res in JsonlLines::new(reader) {
+        let line = line_res.with_context(|| format!("read session file {}", path.display()))?;
 
         if line.trim().is_empty() {
             continue;
@@ -434,8 +438,39 @@ mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
     use std::fs;
+    use std::io::{self, BufReader, Cursor, Read};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    struct FailingReader(io::ErrorKind);
+
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "simulated source read failure"))
+        }
+    }
+
+    #[test]
+    fn parser_discards_complete_message_prefix_on_source_read_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("read-error.jsonl");
+        let prefix = concat!(
+            r#"{"type":"message","message":{"role":"user","content":"Complete prefix"}}"#,
+            "\n",
+        );
+        let complete = parse_factory_session_reader(&path, Cursor::new(prefix))
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.messages.len(), 1);
+        assert_eq!(complete.messages[0].content, "Complete prefix");
+
+        for kind in [io::ErrorKind::Other, io::ErrorKind::InvalidData] {
+            let reader = BufReader::new(prefix.as_bytes().chain(FailingReader(kind)));
+            let error = parse_factory_session_reader(&path, reader).unwrap_err();
+            assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+            assert!(error.to_string().contains("read-error.jsonl"));
+        }
+    }
 
     // =========================================================================
     // Constructor tests

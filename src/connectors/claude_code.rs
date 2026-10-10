@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
+use super::jsonl::JsonlLines;
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
@@ -19,6 +21,14 @@ use super::{
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
+#[cfg(test)]
+mod read_failures;
+
+/// Claude Code session ingestion.
+///
+/// Streaming scans recover healthy sources
+/// after source I/O failures, then return the first failure with a count.
+/// Collecting scans remain all-or-error; callback errors stop immediately.
 pub struct ClaudeCodeConnector;
 
 const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
@@ -532,12 +542,59 @@ fn scan_claude_with_callback(
     )
 }
 
-#[allow(clippy::too_many_lines)]
 fn scan_claude_with_callback_with_exclusions(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     excluded_paths: &[PathBuf],
     hooks: &mut SourceScanHooks<'_>,
+) -> Result<()> {
+    scan_claude_with_readers(
+        ctx,
+        on_conversation,
+        excluded_paths,
+        hooks,
+        &mut |path| fs::File::open(path).map(BufReader::new),
+        &mut |path| fs::read_to_string(path),
+    )
+}
+
+/// Retain one original error and a count, rather than buffering failures for
+/// an entire corpus. Callback failures bypass this source-only recovery.
+#[derive(Default)]
+struct SourceReadFailures {
+    first: Option<anyhow::Error>,
+    count: usize,
+}
+
+impl SourceReadFailures {
+    fn record(&mut self, path: &Path, operation: &str, error: io::Error) {
+        tracing::warn!(path = %path.display(), %error, operation, "claude_code skipping unreadable source");
+        self.count += 1;
+        if self.first.is_none() {
+            self.first =
+                Some(anyhow::Error::new(error).context(format!("{operation} {}", path.display())));
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        match self.first {
+            Some(error) => Err(error.context(format!(
+                "Claude Code scan could not read {} source(s)",
+                self.count
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_claude_with_readers<R: BufRead>(
+    ctx: &ScanContext,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    excluded_paths: &[PathBuf],
+    hooks: &mut SourceScanHooks<'_>,
+    open_jsonl: &mut impl FnMut(&Path) -> io::Result<R>,
+    read_json: &mut impl FnMut(&Path) -> io::Result<String>,
 ) -> Result<()> {
     let roots: Vec<ScanRoot> = ClaudeCodeConnector::source_roots(ctx);
     // Overlapping explicit roots (or a symlinked CLAUDE_CONFIG_DIR aliasing
@@ -546,6 +603,7 @@ fn scan_claude_with_callback_with_exclusions(
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
     let mut file_count = 0;
+    let mut read_failures = SourceReadFailures::default();
 
     for root in roots {
         let explicit_file_root = root.path.is_file();
@@ -567,7 +625,7 @@ fn scan_claude_with_callback_with_exclusions(
             ClaudeCodeConnector::session_files(&scan_target)
         };
 
-        for path in session_paths {
+        'sources: for path in session_paths {
             if path_is_excluded(&path, excluded_paths) {
                 tracing::debug!(
                     path = %path.display(),
@@ -646,13 +704,22 @@ fn scan_claude_with_callback_with_exclusions(
             }
 
             if ext == Some("jsonl") {
-                let file = std::fs::File::open(&path)
-                    .with_context(|| format!("open {}", path.display()))?;
-                let reader = std::io::BufReader::new(file);
-
-                for line_res in std::io::BufRead::lines(reader) {
-                    let Ok(line) = line_res else {
+                let reader = match open_jsonl(&path) {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        read_failures.record(&path, "open", error);
                         continue;
+                    }
+                };
+
+                for line_res in JsonlLines::new(reader) {
+                    let line = match line_res {
+                        Ok(line) => line,
+                        Err(error) => {
+                            read_failures.record(&path, "read", error);
+                            // Never emit or certify an incompletely read source.
+                            continue 'sources;
+                        }
                     };
                     if line.trim().is_empty() {
                         continue;
@@ -830,8 +897,13 @@ fn scan_claude_with_callback_with_exclusions(
                     continue;
                 }
 
-                let content_string = fs::read_to_string(&path)
-                    .with_context(|| format!("read {}", path.display()))?;
+                let content_string = match read_json(&path) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        read_failures.record(&path, "read", error);
+                        continue;
+                    }
+                };
                 let val: Value = match serde_json::from_str(&content_string) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1004,7 +1076,7 @@ fn scan_claude_with_callback_with_exclusions(
         }
     }
 
-    Ok(())
+    read_failures.finish()
 }
 
 impl Connector for ClaudeCodeConnector {
@@ -2709,9 +2781,8 @@ mod tests {
 
         assert!(result.is_ok(), "invalid UTF-8 should not cause a panic");
         let convs = result.unwrap();
-        // BufRead::lines() returns Err for invalid UTF-8 lines; the connector
-        // continues on Err (line 114: Err(_) => continue). So we should get
-        // the valid lines on either side.
+        // A successfully read physical line with invalid UTF-8 is skipped;
+        // the valid records on either side remain available.
         assert_eq!(convs.len(), 1);
         assert_eq!(
             convs[0].messages.len(),

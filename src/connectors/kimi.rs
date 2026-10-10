@@ -29,6 +29,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
@@ -342,7 +343,7 @@ impl Connector for KimiConnector {
                     Err(e) => {
                         tracing::debug!(
                             path = %wire_path.display(),
-                            error = %e,
+                            error = %format_args!("{e:#}"),
                             "kimi parse error"
                         );
                     }
@@ -458,22 +459,24 @@ fn extract_tool_call_text(payload: &Value) -> String {
 }
 
 /// Parse a Kimi wire.jsonl session file into a `NormalizedConversation`.
-#[allow(clippy::too_many_lines)]
 fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
     let file =
         fs::File::open(path).with_context(|| format!("open kimi wire file {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
+    parse_kimi_session_reader(path, std::io::BufReader::new(file))
+}
 
+#[allow(clippy::too_many_lines)]
+fn parse_kimi_session_reader(
+    path: &Path,
+    reader: impl BufRead,
+) -> Result<Option<NormalizedConversation>> {
     let mut messages = Vec::new();
     let mut started_at: Option<i64> = None;
     let mut ended_at: Option<i64> = None;
     let mut current_role = String::from("assistant");
 
-    for line_res in reader.lines() {
-        let Ok(line) = line_res else {
-            tracing::debug!("skipping unreadable JSONL line");
-            continue;
-        };
+    for line_res in JsonlLines::new(reader) {
+        let line = line_res.with_context(|| format!("read kimi wire file {}", path.display()))?;
 
         if line.trim().is_empty() {
             continue;
@@ -822,18 +825,24 @@ fn flush_pending_prompt(
 /// Parse a modern Kimi Code wire.jsonl (one JSON event per line, RFC3339
 /// timestamps in top-level `time`) into a `NormalizedConversation`.
 ///
-/// Tolerance matches the legacy parser: unreadable, blank, and malformed
-/// lines are skipped silently; a file with no renderable messages yields
-/// `Ok(None)`.
-#[allow(clippy::too_many_lines)]
+/// Tolerance matches the legacy parser: invalid UTF-8, blank, and malformed
+/// lines are skipped; an I/O error fails the entire source rather than
+/// returning an incomplete prefix. No renderable messages yields `Ok(None)`.
 fn parse_kimi_code_session(
     path: &Path,
     layout: &ModernWireLayout,
 ) -> Result<Option<NormalizedConversation>> {
     let file =
         fs::File::open(path).with_context(|| format!("open kimi wire file {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
+    parse_kimi_code_session_reader(path, layout, std::io::BufReader::new(file))
+}
 
+#[allow(clippy::too_many_lines)]
+fn parse_kimi_code_session_reader(
+    path: &Path,
+    layout: &ModernWireLayout,
+    reader: impl BufRead,
+) -> Result<Option<NormalizedConversation>> {
     let mut messages: Vec<NormalizedMessage> = Vec::new();
     let mut started_at: Option<i64> = None;
     let mut ended_at: Option<i64> = None;
@@ -844,11 +853,8 @@ fn parse_kimi_code_session(
     // toolCallId -> index of the message carrying that tool.call invocation.
     let mut call_index_by_id: HashMap<String, usize> = HashMap::new();
 
-    for line_res in reader.lines() {
-        let Ok(line) = line_res else {
-            tracing::debug!("skipping unreadable JSONL line");
-            continue;
-        };
+    for line_res in JsonlLines::new(reader) {
+        let line = line_res.with_context(|| format!("read kimi wire file {}", path.display()))?;
 
         if line.trim().is_empty() {
             continue;
@@ -1140,8 +1146,65 @@ mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
     use std::fs;
+    use std::io::{self, BufReader, Cursor, Read};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    struct FailingReader(io::ErrorKind);
+
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "simulated source read failure"))
+        }
+    }
+
+    #[test]
+    fn legacy_parser_discards_complete_message_prefix_on_source_read_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session").join("wire.jsonl");
+        let prefix = concat!(
+            r#"{"message":{"type":"TurnBegin","payload":{"role":"human","content":"Complete prefix"}}}"#,
+            "\n",
+        );
+        let complete = parse_kimi_session_reader(&path, Cursor::new(prefix))
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.messages.len(), 1);
+        assert_eq!(complete.messages[0].content, "Complete prefix");
+
+        for kind in [io::ErrorKind::Other, io::ErrorKind::InvalidData] {
+            let reader = BufReader::new(prefix.as_bytes().chain(FailingReader(kind)));
+            let error = parse_kimi_session_reader(&path, reader).unwrap_err();
+            assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+            assert!(error.to_string().contains("wire.jsonl"));
+        }
+    }
+
+    #[test]
+    fn modern_parser_discards_messages_and_pending_prompt_on_source_read_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session/agents/main/wire.jsonl");
+        let layout = modern_wire_layout(&path).unwrap();
+        let prefix = concat!(
+            r#"{"type":"context.append_message","message":{"role":"user","content":"Complete prefix"}}"#,
+            "\n",
+            r#"{"type":"turn.prompt","input":"Pending prompt"}"#,
+            "\n",
+        );
+        let complete = parse_kimi_code_session_reader(&path, &layout, Cursor::new(prefix))
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.messages.len(), 2);
+        assert_eq!(complete.messages[0].content, "Complete prefix");
+        assert_eq!(complete.messages[1].content, "Pending prompt");
+
+        for kind in [io::ErrorKind::Other, io::ErrorKind::InvalidData] {
+            let reader = BufReader::new(prefix.as_bytes().chain(FailingReader(kind)));
+            let error = parse_kimi_code_session_reader(&path, &layout, reader).unwrap_err();
+            assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+            assert!(error.to_string().contains("wire.jsonl"));
+        }
+    }
 
     // =========================================================================
     // Constructor tests

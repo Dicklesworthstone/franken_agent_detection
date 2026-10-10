@@ -145,6 +145,19 @@ directory. The existing infallible Pi `discover_sources` and durable
 `store_diagnostics` helpers log invalid-policy errors and return no sources;
 `pi_wire::try_discover_sources` exposes the discovery error to direct callers.
 
+Claude Code, Factory, Kimi, Clawdbot, Vibe, OpenClaw and Muse stop reading a
+transcript after an underlying I/O error and discard its incomplete contents.
+Their JSONL readers still skip individual malformed JSON or invalid UTF-8
+records and retain later valid records. The shared line reader buffers only
+the current line and adds no full-transcript copy.
+
+Claude Code streaming scans continue to deliver healthy sources after a source
+open/read failure, then return an error with the failure count and the first
+original I/O error. Failed sources emit no conversation or completion event.
+The collecting `scan()` API remains all-or-error, so its caller receives no
+partial vector. Conversation-callback and completion-callback errors stop
+traversal immediately, including when a source error was already deferred.
+
 ### Feature flags
 
 | Feature | Enables |

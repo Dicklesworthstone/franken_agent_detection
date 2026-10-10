@@ -18,7 +18,6 @@
 //! Copilot Chat JSON files) so that CLI-specific event logs are discovered and
 //! indexed independently.
 
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -287,17 +286,13 @@ impl CopilotCliConnector {
         }
 
         // JSONL: each line is a separate JSON event.
-        let reader = std::io::BufReader::new(content.as_bytes());
         let mut messages = Vec::new();
         let mut started_at: Option<i64> = None;
         let mut ended_at: Option<i64> = None;
         let mut session_id: Option<String> = None;
         let mut workspace: Option<PathBuf> = None;
 
-        for line in reader.lines() {
-            let Ok(line) = line else {
-                continue;
-            };
+        for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;

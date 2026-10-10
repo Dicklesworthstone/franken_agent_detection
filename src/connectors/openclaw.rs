@@ -31,13 +31,13 @@
 //! partially migrated trees may briefly hold both).
 
 use std::fs;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
@@ -1046,7 +1046,7 @@ impl Connector for OpenClawConnector {
                 file_count = files.len(),
                 "openclaw: scanning agent directory"
             );
-            for file in files {
+            'sources: for file in files {
                 agent_file_count += 1;
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
@@ -1100,9 +1100,18 @@ impl Connector for OpenClawConnector {
                 let reader = std::io::BufReader::new(file_handle);
 
                 let mut acc = SessionEventAccumulator::default();
-                for line_res in reader.lines() {
-                    let Ok(line) = line_res else {
-                        continue;
+                for line_res in JsonlLines::new(reader) {
+                    let line = match line_res {
+                        Ok(line) => line,
+                        Err(error) => {
+                            tracing::debug!(
+                                path = %file.display(),
+                                error = %error,
+                                "openclaw: discarding incomplete session after read error"
+                            );
+                            agent_error_count += 1;
+                            continue 'sources;
+                        }
                     };
                     if line.trim().is_empty() {
                         continue;
@@ -1295,6 +1304,28 @@ mod tests {
         // Only the valid non-empty message should appear
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].content, "Valid");
+    }
+
+    #[test]
+    fn scan_skips_invalid_utf8_records_and_keeps_later_messages() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("session.jsonl"),
+            b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"Before\"}}\n\xff\xfe\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"After\"}}\n",
+        )
+        .unwrap();
+
+        let convs = OpenClawConnector::new()
+            .scan(&ScanContext::local_default(sessions, None))
+            .unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        assert_eq!(convs[0].messages[0].content, "Before");
+        assert_eq!(convs[0].messages[1].content, "After");
+        assert_eq!(convs[0].messages[1].idx, 1);
     }
 
     #[test]
