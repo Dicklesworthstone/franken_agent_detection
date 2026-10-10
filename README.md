@@ -69,6 +69,11 @@ unknown slugs are an explicit error. Probe roots honor the agents' own
 environment overrides (`CODEX_HOME`, `PI_CODING_AGENT_DIR`, `CLAUDE_CONFIG_DIR`,
 …) and `root_overrides` makes tests deterministic.
 
+`PI_SESSIONS_DIR` adds a sessions location alongside `~/.pi/agent/sessions`.
+Setting `PI_CODING_AGENT_DIR` replaces that default agent home while keeping
+the separate sessions override. A missing additive sessions directory does
+not hide an existing default history.
+
 ## Connectors
 
 ```rust

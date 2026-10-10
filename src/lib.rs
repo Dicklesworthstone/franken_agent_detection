@@ -395,15 +395,17 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             Some(vec![PathBuf::from(root)])
         }
         "pi_agent" => {
-            // Same precedence as the connector: `PI_SESSIONS_DIR` names a
-            // sessions directory directly and is honored independently of
-            // the `PI_CODING_AGENT_DIR` agent home.
+            // A sessions-only override is additive: the connector still
+            // scans ~/.pi/agent unless PI_CODING_AGENT_DIR pins its home.
+            // Keep that fallback even when PI_SESSIONS_DIR does not exist.
             let mut roots = Vec::new();
             if let Some(sessions) = read("PI_SESSIONS_DIR").filter(|v| !v.is_empty()) {
                 roots.push(PathBuf::from(sessions));
             }
             if let Some(agent) = read("PI_CODING_AGENT_DIR").filter(|v| !v.is_empty()) {
                 roots.push(PathBuf::from(agent).join("sessions"));
+            } else if !roots.is_empty() {
+                roots.extend(default_probe_roots(slug));
             }
             (!roots.is_empty()).then_some(roots)
         }
