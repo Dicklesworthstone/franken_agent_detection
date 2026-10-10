@@ -439,6 +439,25 @@ impl GeminiConnector {
             out.insert("model".to_string(), Value::String(model.to_string()));
         }
 
+        if let Some(tokens) = raw.get("tokens") {
+            // Gemini's native TokensSummary has six numeric fields. Preserve
+            // those scalars for usage extraction without copying extensions,
+            // raw message content, or other potentially large nested values.
+            let mut compact_tokens = Map::new();
+            for key in ["input", "output", "cached", "thoughts", "tool", "total"] {
+                if let Some(count) = tokens
+                    .get(key)
+                    .and_then(Value::as_i64)
+                    .filter(|count| *count >= 0)
+                {
+                    compact_tokens.insert(key.to_owned(), Value::from(count));
+                }
+            }
+            if !compact_tokens.is_empty() {
+                out.insert("tokens".to_owned(), Value::Object(compact_tokens));
+            }
+        }
+
         if let Some(attachments) = raw
             .get("attachment_refs")
             .or_else(|| raw.get("attachments"))
@@ -1360,16 +1379,25 @@ mod tests {
     }
 
     #[test]
-    fn compact_message_extra_keeps_only_model_and_attachments() {
+    fn compact_message_extra_keeps_model_attachments_and_numeric_tokens() {
         let raw = serde_json::json!({
             "modelConfig": {"modelName": "gemini-2.5-pro"},
             "attachments": [{"uri": "gs://bucket/image.png"}],
+            "tokens": {
+                "input": 0, "output": 4, "total": 4,
+                "cached": -7, "thoughts": "12", "tool": null,
+                "extension": {"data": "large unknown payload"}
+            },
             "parts": [{"text": "very large duplicated content"}]
         });
 
         let compact = GeminiConnector::compact_message_extra(&raw);
         assert_eq!(compact["model"], "gemini-2.5-pro");
         assert_eq!(compact["attachments"][0]["uri"], "gs://bucket/image.png");
+        assert_eq!(
+            compact["tokens"],
+            serde_json::json!({"input": 0, "output": 4, "total": 4})
+        );
         assert!(compact.get("parts").is_none());
     }
 

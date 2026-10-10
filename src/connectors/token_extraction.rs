@@ -299,6 +299,67 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
     }
 }
 
+/// Normalize Gemini CLI's per-message `TokensSummary` into disjoint totals.
+/// The prompt includes cached input; generated thoughts are additional output.
+/// Tool-use prompt tokens are additional input. These semantics are documented
+/// at <https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/GenerateContentResponse#UsageMetadata>.
+fn extract_gemini_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
+    let model_name = extra
+        .get("model")
+        .or_else(|| extra.pointer("/cass/model"))
+        .or_else(|| extra.pointer("/message/model"))
+        .or_else(|| extra.pointer("/modelConfig/modelName"))
+        .or_else(|| extra.get("modelType"))
+        .or_else(|| extra.get("modelID"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let provider = model_name
+        .as_deref()
+        .map(|name| normalize_model(name).provider);
+    let mut extracted = ExtractedTokenUsage {
+        model_name,
+        provider,
+        ..Default::default()
+    };
+    if role != "assistant" {
+        return extracted;
+    }
+
+    // Compaction preserves this same native shape, with numeric scalars only.
+    let usage = extra.get("tokens");
+    let read = |key| {
+        usage
+            .and_then(|usage| usage.get(key))
+            .and_then(Value::as_i64)
+            .filter(|count| *count >= 0)
+    };
+    let prompt = read("input");
+    // An impossible cache subset must not inflate the known prompt or produce
+    // negative input. Keep the prompt intact and decline that invalid split.
+    let cached = read("cached").filter(|cached| prompt.is_none_or(|prompt| *cached <= prompt));
+    let uncached = match (prompt, cached) {
+        (Some(prompt), Some(cached)) => prompt.checked_sub(cached),
+        (prompt, _) => prompt,
+    };
+    // Missing components remain missing unless another recorded component is
+    // available. Never wrap/saturate an overflowing category into an API count.
+    let add = |left: Option<i64>, right: Option<i64>| match (left, right) {
+        (Some(left), Some(right)) => left.checked_add(right),
+        (left, right) => left.or(right),
+    };
+    extracted.input_tokens = add(uncached, read("tool"));
+    extracted.output_tokens = add(read("output"), read("thoughts"));
+    extracted.cache_read_tokens = cached;
+    // Informational subset of output_tokens; total_tokens() does not add it.
+    extracted.thinking_tokens = read("thoughts");
+    if extracted.has_token_data() {
+        extracted.data_source = TokenDataSource::Api;
+    }
+    // `total` alone cannot identify input/output categories. Preserve it in
+    // metadata, but do not use it to invent a missing split or residual count.
+    extracted
+}
+
 /// Estimate tokens from content length for agents that do not provide token data.
 #[must_use]
 pub fn estimate_tokens_from_content(content: &str, role: &str) -> ExtractedTokenUsage {
@@ -331,6 +392,7 @@ pub fn extract_tokens_for_agent(
     let extracted = match agent_slug {
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
+        "gemini" => extract_gemini_tokens(extra, role),
         // The modern Kimi parser attaches recognized usage.record input and
         // output counts to the preceding assistant message. Read only that
         // attachment: raw bookkeeping events and cumulative/session totals
@@ -524,7 +586,7 @@ pub fn extract_tokens_for_agent(
                 }
             }
         }
-        "cursor" | "factory" | "opencode" | "gemini" | "antigravity" => {
+        "cursor" | "factory" | "opencode" | "antigravity" => {
             let model_name = extra
                 .get("model")
                 .or_else(|| extra.pointer("/cass/model"))

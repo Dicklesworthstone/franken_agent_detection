@@ -199,6 +199,14 @@ Readable tool results are included in searchable content, while binary
 result parts are omitted. Compact metadata does not duplicate the raw
 thought, tool-call or result payloads.
 
+Gemini token extraction reads the native per-message `tokens` fields in both
+JSON and JSONL histories. The same six numeric fields survive metadata
+compaction at 32 MiB. Cached tokens are separated from the prompt, tool-use
+prompt tokens count as input, and generated thoughts count as output.
+`thinking_tokens` describes the reasoning subset already included in output;
+the aggregate counts it once. Invalid token fields are ignored, and messages
+without usable API counts retain the existing estimation fallback.
+
 Claude Code streaming scans continue to deliver healthy sources after a source
 open/read failure, then return an error with the failure count and the first
 original I/O error. Failed sources emit no conversation or completion event.
