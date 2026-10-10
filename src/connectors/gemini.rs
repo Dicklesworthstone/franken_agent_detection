@@ -1,11 +1,13 @@
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::BufRead;
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
+use super::jsonl::JsonlLines;
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
@@ -16,6 +18,143 @@ use super::{
     parse_timestamp,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+
+/// Final JSONL history in insertion order, with one retained value per native ID.
+/// Replacing a streamed message drops its previous payload immediately. The
+/// separate order index also lets rewind and reorder move values without
+/// cloning transcript bodies or keeping a slot for every historical update.
+#[derive(Default)]
+struct ReplayedMessages {
+    ordered: BTreeMap<usize, Value>,
+    by_id: HashMap<String, usize>,
+    next_order: usize,
+}
+
+impl ReplayedMessages {
+    fn upsert(&mut self, message: Value) {
+        // Snapshot arrays contain message records, not patch events. In
+        // particular, an ID on a patch must never replace the target body.
+        if message.get("$patch").is_some() {
+            return;
+        }
+        if let Some(id) = message.get("id").and_then(Value::as_str) {
+            if let Some(&order) = self.by_id.get(id) {
+                self.ordered.insert(order, message);
+                return;
+            }
+            self.by_id.insert(id.to_owned(), self.next_order);
+        }
+        // Historical exports can contain messages without IDs. Keep those
+        // separate; neither their text nor their token counts identify a reply.
+        self.ordered.insert(self.next_order, message);
+        self.next_order += 1;
+    }
+
+    fn clear(&mut self) {
+        self.ordered.clear();
+        self.by_id.clear();
+        self.next_order = 0;
+    }
+
+    fn remove(&mut self, id: &str) -> Option<Value> {
+        self.by_id
+            .remove(id)
+            .and_then(|order| self.ordered.remove(&order))
+    }
+
+    fn rewind(&mut self, id: &str) {
+        let Some(&order) = self.by_id.get(id) else {
+            self.clear();
+            return;
+        };
+        // Gemini removes the target itself as well as every later message.
+        for message in self.ordered.split_off(&order).into_values() {
+            if let Some(id) = message.get("id").and_then(Value::as_str) {
+                self.by_id.remove(id);
+            }
+        }
+    }
+
+    fn patch_message(&mut self, mut patch: Map<String, Value>) {
+        let Some(message) = patch
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| self.by_id.get(id))
+            .and_then(|order| self.ordered.get_mut(order))
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+        if let Some(content) = patch.remove("content") {
+            message.insert("content".to_owned(), content);
+        }
+        if message.get("type").and_then(Value::as_str) != Some("gemini") {
+            return;
+        }
+        let (Some(Value::Array(updates)), Some(Value::Array(calls))) =
+            (patch.remove("toolCalls"), message.get_mut("toolCalls"))
+        else {
+            return;
+        };
+        for update in updates {
+            let Value::Object(mut update) = update else {
+                continue;
+            };
+            let Some(id) = update.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(call) = calls
+                .iter_mut()
+                .find(|call| call.get("id").and_then(Value::as_str) == Some(id))
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            // Native patches only replace existing tool results. Names,
+            // arguments, status and unrelated message fields stay intact.
+            if let Some(result) = update.remove("result") {
+                call.insert("result".to_owned(), result);
+            }
+        }
+    }
+
+    fn apply_patch(&mut self, mut patch: Map<String, Value>) {
+        // A batch can also contain a single-message patch. Apply controls in
+        // the same order as Gemini's loader: single, updates, remove, reorder.
+        let updates = patch.remove("updates");
+        let removals = patch.remove("removeIds");
+        let ordering = patch.remove("orderIds");
+        self.patch_message(patch);
+        if let Some(Value::Array(updates)) = updates {
+            for update in updates {
+                if let Value::Object(update) = update {
+                    self.patch_message(update);
+                }
+            }
+        }
+        if let Some(Value::Array(ids)) = removals {
+            for id in ids.iter().filter_map(Value::as_str) {
+                self.remove(id);
+            }
+        }
+        if let Some(Value::Array(ids)) = ordering {
+            // Listed surviving IDs move to the end; unlisted messages retain
+            // their order. Removing first naturally ignores duplicate IDs.
+            let moved: Vec<Value> = ids
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|id| self.remove(id))
+                .collect();
+            for message in moved {
+                self.upsert(message);
+            }
+        }
+    }
+
+    fn into_values(self) -> Vec<Value> {
+        self.ordered.into_values().collect()
+    }
+}
 
 /// Extract actual workspace path from message content.
 /// Gemini stores sessions by hash, but messages often contain the actual project path
@@ -309,22 +448,26 @@ impl GeminiConnector {
         Value::Object(out)
     }
 
-    /// Apply session-level fields from a header or `$set` patch.
-    ///
-    /// `messages` is special: Gemini uses `$set.messages` to compact/reseed the
-    /// event stream, so the newest array is the authoritative snapshot. Bare
-    /// message records encountered after that snapshot are appended normally.
+    /// `$set.messages` replaces history; embedded header messages only upsert.
     fn apply_session_fields(
         session: &mut Map<String, Value>,
-        messages: &mut Vec<Value>,
+        messages: &mut ReplayedMessages,
         fields: Map<String, Value>,
+        replace_messages: bool,
         file: &Path,
         line_number: usize,
     ) {
         for (key, value) in fields {
             if key == "messages" {
                 match value {
-                    Value::Array(snapshot) => *messages = snapshot,
+                    Value::Array(snapshot) => {
+                        if replace_messages {
+                            messages.clear();
+                        }
+                        for message in snapshot {
+                            messages.upsert(message);
+                        }
+                    }
                     _ => {
                         tracing::warn!(
                             path = %file.display(),
@@ -339,29 +482,17 @@ impl GeminiConnector {
         }
     }
 
-    /// Replay Gemini CLI's event-sourced JSONL into the legacy session shape.
-    ///
-    /// The stream consists of one `kind: main` header, `$set` patches, and bare
-    /// message records. Individual malformed lines are skipped so an interrupted
-    /// final write cannot hide the valid prefix of an otherwise usable session.
-    fn replay_jsonl_session(reader: impl BufRead, file: &Path) -> Value {
+    /// Replay the final Gemini CLI history, including replacements, patches
+    /// and rewinds. See chatRecordingService.ts at gemini-cli 9b6e0265d16b.
+    /// Malformed physical records are skipped; a real reader failure discards
+    /// the whole source so an incomplete history cannot be marked complete.
+    fn replay_jsonl_session(reader: impl BufRead, file: &Path) -> io::Result<Value> {
         let mut session = Map::new();
-        let mut messages = Vec::new();
+        let mut messages = ReplayedMessages::default();
 
-        for (line_index, line_result) in reader.lines().enumerate() {
+        for (line_index, line_result) in JsonlLines::new(reader).enumerate() {
             let line_number = line_index + 1;
-            let line = match line_result {
-                Ok(line) => line,
-                Err(error) => {
-                    tracing::warn!(
-                        path = %file.display(),
-                        line = line_number,
-                        %error,
-                        "gemini: stopping after an unreadable JSONL line"
-                    );
-                    break;
-                }
-            };
+            let line = line_result?;
             let trimmed = line.trim().trim_start_matches('\u{feff}');
             if trimmed.is_empty() {
                 continue;
@@ -388,39 +519,50 @@ impl GeminiConnector {
                 continue;
             };
 
-            if let Some(patch) = object.remove("$set") {
-                if let Value::Object(fields) = patch {
+            // Event precedence follows Gemini's loader. A native message ID
+            // identifies a whole replacement, not an additional content block.
+            if let Some(id) = object.get("$rewindTo").and_then(Value::as_str) {
+                messages.rewind(id);
+            } else if object.get("$patch").is_some_and(Value::is_object) {
+                if let Some(Value::Object(patch)) = object.remove("$patch") {
+                    messages.apply_patch(patch);
+                }
+            } else if object.get("id").and_then(Value::as_str).is_some()
+                && !object.contains_key("$patch")
+            {
+                messages.upsert(Value::Object(object));
+            } else if object.get("$set").is_some_and(Value::is_object) {
+                if let Some(Value::Object(fields)) = object.remove("$set") {
                     Self::apply_session_fields(
                         &mut session,
                         &mut messages,
                         fields,
+                        true,
                         file,
                         line_number,
                     );
-                } else {
-                    tracing::warn!(
-                        path = %file.display(),
-                        line = line_number,
-                        "gemini: ignoring non-object $set patch"
-                    );
                 }
-                continue;
-            }
-
-            if object.get("kind").and_then(Value::as_str) == Some("main") {
-                Self::apply_session_fields(&mut session, &mut messages, object, file, line_number);
-                continue;
-            }
-
-            // Current Gemini CLI writes messages as bare records. Requiring a
-            // string type avoids treating unknown metadata events as messages.
-            if object.get("type").and_then(Value::as_str).is_some() {
-                messages.push(Value::Object(object));
+            } else if (object.get("sessionId").and_then(Value::as_str).is_some()
+                && object.get("projectHash").and_then(Value::as_str).is_some())
+                || object.get("kind").and_then(Value::as_str) == Some("main")
+            {
+                Self::apply_session_fields(
+                    &mut session,
+                    &mut messages,
+                    object,
+                    false,
+                    file,
+                    line_number,
+                );
+            } else if object.get("type").and_then(Value::as_str).is_some()
+                && !object.contains_key("$patch")
+            {
+                messages.upsert(Value::Object(object));
             }
         }
 
-        session.insert("messages".to_string(), Value::Array(messages));
-        Value::Object(session)
+        session.insert("messages".to_string(), Value::Array(messages.into_values()));
+        Ok(Value::Object(session))
     }
 
     fn parse_session_file(file: &Path) -> Option<Value> {
@@ -449,7 +591,13 @@ impl GeminiConnector {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"));
 
         if is_jsonl {
-            return Some(Self::replay_jsonl_session(reader, file));
+            return match Self::replay_jsonl_session(reader, file) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::warn!(path = %file.display(), %error, "failed to read Gemini session");
+                    None
+                }
+            };
         }
 
         match serde_json::from_reader(reader) {
@@ -721,6 +869,68 @@ mod tests {
     use crate::types::NormalizedMessage;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    struct FailingReader(io::ErrorKind);
+
+    impl io::Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "simulated Gemini source failure"))
+        }
+    }
+
+    #[test]
+    fn jsonl_reader_failure_discards_an_otherwise_complete_history() {
+        use std::io::{BufReader, Cursor, Read};
+
+        let path = Path::new("session-read-failure.jsonl");
+        let prefix = concat!(
+            r#"{"sessionId":"session","projectHash":"project"}"#,
+            "\n",
+            r#"{"id":"reply","type":"gemini","content":"valid prefix"}"#,
+            "\n",
+        );
+        let complete = GeminiConnector::replay_jsonl_session(Cursor::new(prefix), path).unwrap();
+        assert_eq!(complete["messages"].as_array().unwrap().len(), 1);
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Interrupted,
+        ] {
+            let reader = BufReader::new(prefix.as_bytes().chain(FailingReader(kind)));
+            let error = GeminiConnector::replay_jsonl_session(reader, path).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "simulated Gemini source failure");
+        }
+    }
+
+    #[test]
+    fn jsonl_preserves_distinct_idless_historical_messages() {
+        let input = concat!(
+            r#"{"kind":"main","sessionId":"session","projectHash":"project"}"#,
+            "\n",
+            r#"{"type":"user","content":"same text"}"#,
+            "\n",
+            r#"{"$set":{"messages":[{"type":"user","content":"same text"},{"type":"user","content":"same text"}]}}"#,
+            "\n",
+            r#"{"id":"reply","type":"gemini","content":"draft"}"#,
+            "\n",
+            r#"{"type":"user","content":"same text"}"#,
+            "\n",
+            r#"{"id":"reply","type":"gemini","content":"final"}"#,
+        );
+        let replay = GeminiConnector::replay_jsonl_session(
+            std::io::Cursor::new(input),
+            Path::new("session-legacy.jsonl"),
+        )
+        .unwrap();
+        let messages = replay["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["content"], "same text");
+        assert_eq!(messages[1]["content"], "same text");
+        assert_eq!(messages[2]["id"], "reply");
+        assert_eq!(messages[2]["content"], "final");
+        assert_eq!(messages[3]["content"], "same text");
+    }
 
     // ==================== Constructor Tests ====================
 

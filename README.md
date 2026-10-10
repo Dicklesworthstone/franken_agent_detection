@@ -169,12 +169,21 @@ directory. The existing infallible Pi `discover_sources` and durable
 `store_diagnostics` helpers log invalid-policy errors and return no sources;
 `pi_wire::try_discover_sources` exposes the discovery error to direct callers.
 
-Claude Code, Factory, Kimi, Clawdbot, Vibe, OpenClaw, Muse, Grok and Prime
-stop reading a transcript after an underlying I/O error and discard its
+Claude Code, Factory, Kimi, Clawdbot, Vibe, OpenClaw, Muse, Grok, Prime and
+Gemini stop reading a transcript after an underlying I/O error and discard its
 incomplete contents.
 Their JSONL readers still skip individual malformed JSON or invalid UTF-8
 records and retain later valid records. The shared line reader buffers only
 the current line and adds no full-transcript copy.
+
+Gemini CLI JSONL sessions are replayed into their final message history.
+Repeated native message IDs replace earlier versions in place; `$patch`
+updates content and tool results, removes messages, or reorders surviving
+IDs. `$rewindTo` removes its target and later messages, while `$set.messages`
+replaces history with an authoritative checkpoint. Optional-kind metadata
+headers and legacy messages without IDs remain supported. Replay keeps one
+payload per surviving ID, and the existing 32 MiB metadata compaction
+threshold is unchanged.
 
 Claude Code streaming scans continue to deliver healthy sources after a source
 open/read failure, then return an error with the failure count and the first
@@ -221,7 +230,7 @@ coherent snapshot and nothing is recovered or checkpointed.
 | `cursor` | Cursor | `state.vscdb` and agent transcripts |
 | `devin` | Devin CLI | `sessions.db` (detection-only without `devin`) |
 | `factory` | Factory Droid | session JSONL |
-| `gemini` | Gemini CLI | session JSON |
+| `gemini` | Gemini CLI | session JSON and event-sourced JSONL |
 | `goose` | Goose | `sessions.db` and legacy JSONL |
 | `grok` / `grok_bot` | Grok Build CLI / Grok Bot desktop | session logs / rolling replicas |
 | `hermes` | Hermes Agent | `state.db` |
