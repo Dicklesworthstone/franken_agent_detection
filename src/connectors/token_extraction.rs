@@ -12,7 +12,8 @@ pub enum TokenDataSource {
     Estimated,
     /// Deliberately no usage and no estimate (e.g. Shelley fork-copied rows
     /// whose original usage is already counted once, or a Cline request-finish
-    /// row whose counts belong to its start row). Consumers must exclude
+    /// row whose counts belong to its start row, or an SDK display-only
+    /// message). Consumers must exclude
     /// these from both API totals and estimated totals.
     Suppressed,
 }
@@ -132,7 +133,10 @@ pub(super) fn cline_legacy_usage_attachments(
 /// Cline's `getApiMetrics` sums these four independent buckets from usage-
 /// carrying UI rows. Ordinary transcript text and context-window estimates
 /// are not API usage, nor is a second copy on an `api_req_finished` row.
-fn extract_cline_tokens(extra: &Value) -> ExtractedTokenUsage {
+fn extract_cline_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
+    if extra.pointer("/cass/cline_sdk").and_then(Value::as_bool) == Some(true) {
+        return extract_cline_sdk_tokens(extra, role);
+    }
     let model_name = extra
         .pointer("/modelInfo/modelId")
         .or_else(|| extra.get("model"))
@@ -182,6 +186,132 @@ fn extract_cline_tokens(extra: &Value) -> ExtractedTokenUsage {
         if usage.has_token_data() {
             usage.data_source = TokenDataSource::Api;
         }
+    }
+    usage
+}
+
+/// SDK input counts include both cache buckets, unlike classic Cline UI
+/// counters. Preserve the known full input if an impossible cache split would
+/// otherwise inflate it. Metrics are stamped on native assistant turns only;
+/// manifests and display-only bookkeeping never supply additional usage.
+fn extract_cline_sdk_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
+    let model_name = extra
+        .pointer("/cass/model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(String::from);
+    let provider = extra
+        .pointer("/cass/provider")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(String::from)
+        .or_else(|| {
+            model_name
+                .as_deref()
+                .map(|name| normalize_model(name).provider)
+        });
+    let tool_call_count = u32::try_from(
+        extra
+            .pointer("/cass/tool_call_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    )
+    .unwrap_or(u32::MAX);
+    let mut usage = ExtractedTokenUsage {
+        model_name,
+        provider,
+        tool_call_count,
+        has_tool_calls: tool_call_count > 0,
+        ..Default::default()
+    };
+    if extra.pointer("/cass/display_only").and_then(Value::as_bool) == Some(true) {
+        usage.data_source = TokenDataSource::Suppressed;
+        return usage;
+    }
+    if role != "assistant"
+        || extra.pointer("/cass/role").and_then(Value::as_str) != Some("assistant")
+    {
+        return usage;
+    }
+    let metrics = extra.pointer("/cass/sdk_metrics");
+    let read = |key| {
+        metrics
+            .and_then(|metrics| metrics.get(key))
+            .and_then(Value::as_i64)
+            .filter(|count| *count >= 0)
+    };
+    let input = read("inputTokens");
+    let cache_read = read("cacheReadTokens");
+    let cache_write = read("cacheWriteTokens");
+    let cached = cache_read
+        .unwrap_or(0)
+        .checked_add(cache_write.unwrap_or(0));
+    if let Some(cached) = cached.filter(|cached| input.is_none_or(|input| *cached <= input)) {
+        usage.input_tokens = input.and_then(|input| input.checked_sub(cached));
+        usage.cache_read_tokens = cache_read;
+        usage.cache_creation_tokens = cache_write;
+    } else {
+        // Invalid/overflowing subsets remain available in compact metadata.
+        // Do not add them to a full input total that already includes them.
+        usage.input_tokens = input;
+    }
+    usage.output_tokens = read("outputTokens");
+    if usage.has_token_data() {
+        usage.data_source = TokenDataSource::Api;
+    }
+    usage
+}
+
+/// Native VS Code response summaries describe a whole turn. Only their output
+/// total has consistent semantics across the recorded backends: `inputTokens`
+/// can include or exclude the separately reported cache count. The connector
+/// retains those source scalars under `cass.model_totals` for richer consumers.
+fn extract_copilot_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
+    if role != "assistant" {
+        return ExtractedTokenUsage::default();
+    }
+    let tool_call_count = u32::try_from(
+        extra
+            .pointer("/cass/tool_call_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    )
+    .unwrap_or(u32::MAX);
+    let mut usage = ExtractedTokenUsage {
+        tool_call_count,
+        has_tool_calls: tool_call_count > 0,
+        ..Default::default()
+    };
+    if extra
+        .pointer("/cass/token_usage_scope")
+        .and_then(Value::as_str)
+        != Some("turn")
+    {
+        return usage;
+    }
+    let model_name = extra
+        .pointer("/cass/model_totals")
+        .and_then(Value::as_array)
+        .and_then(|totals| {
+            let first = totals.first()?.get("model")?.as_str()?;
+            (!first.trim().is_empty()
+                && totals
+                    .iter()
+                    .all(|total| total.get("model").and_then(Value::as_str) == Some(first)))
+            .then(|| first.to_owned())
+        });
+    let provider = model_name
+        .as_deref()
+        .map(|name| normalize_model(name).provider);
+    let output_tokens = extra
+        .pointer("/cass/token_usage/output_tokens")
+        .and_then(Value::as_i64)
+        .filter(|count| *count >= 0);
+    usage.model_name = model_name;
+    usage.provider = provider;
+    usage.output_tokens = output_tokens;
+    if output_tokens.is_some() {
+        usage.data_source = TokenDataSource::Api;
     }
     usage
 }
@@ -683,7 +813,8 @@ pub fn extract_tokens_for_agent(
         "codex" => extract_codex_tokens(extra),
         "gemini" => extract_gemini_tokens(extra, role),
         "qwen" => extract_qwen_tokens(extra, role),
-        "cline" => extract_cline_tokens(extra),
+        "cline" => extract_cline_tokens(extra, role),
+        "copilot" | "github-copilot" => extract_copilot_tokens(extra, role),
         // The modern Kimi parser attaches recognized usage.record input and
         // output counts to the preceding assistant message. Read only that
         // attachment: raw bookkeeping events and cumulative/session totals

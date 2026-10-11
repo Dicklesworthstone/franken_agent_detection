@@ -318,6 +318,65 @@ fn amp_xdg_probe_root_from_env() -> Option<PathBuf> {
         .and_then(|value| amp_xdg_probe_root_from_env_value(&value))
 }
 
+/// Cline SDK histories are independent of the legacy extension task stores.
+/// Match `resolveSessionDataDir` in Cline's shared storage paths: trim blank
+/// overrides, keep literal tildes, and normalize joined paths without following
+/// symlinks. Explicit scan/detection roots still take precedence over this.
+pub(crate) fn cline_sdk_sessions_root() -> Option<PathBuf> {
+    let read = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let path = read("CLINE_SESSION_DATA_DIR")
+        .or_else(|| read("CLINE_DATA_DIR").map(|root| root.join("sessions")))
+        .or_else(|| read("CLINE_DIR").map(|root| root.join("data/sessions")))
+        .or_else(|| {
+            // The SDK deliberately uses HOME first on every platform, then
+            // USERPROFILE and the Windows drive/path pair before OS lookup.
+            let home = read("HOME")
+                .filter(|home| home != Path::new("~"))
+                .or_else(|| read("USERPROFILE"))
+                .or_else(|| {
+                    let mut home = read("HOMEDRIVE")?.into_os_string();
+                    home.push(read("HOMEPATH")?.as_os_str());
+                    Some(PathBuf::from(home))
+                })
+                .or_else(|| {
+                    dirs::home_dir().and_then(|home| {
+                        home.to_str()
+                            .map(str::trim)
+                            .filter(|home| !home.is_empty() && *home != "~")
+                            .map(PathBuf::from)
+                    })
+                })?;
+            Some(home.join(".cline/data/sessions"))
+        })?;
+
+    // Node's path.join removes `..` lexically. Canonicalization would resolve
+    // symlinks first and would require missing intermediate paths to exist.
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if normalized.file_name().is_some_and(|name| name != "..") {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    Some(normalized)
+}
+
 fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for ext in ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"] {
@@ -395,6 +454,14 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             Some(vec![PathBuf::from(root)])
         }
         "claude" => claude_env_override_roots(read("CLAUDE_CONFIG_DIR").as_deref()),
+        "cline" => {
+            ["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]
+                .into_iter()
+                .find_map(read_path)?;
+            // Only the SDK store moves. Existing extension UI/API task
+            // histories remain independently discoverable after migration.
+            Some(default_probe_roots(slug))
+        }
         "devin" => {
             // Mirrors DevinConnector's CASS_DEVIN_DATA_ROOT resolution (the
             // sessions.db file, its `cli` dir, or the `devin` data root) so a
@@ -823,6 +890,9 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".clawdbot", "sessions"]);
         }
         "cline" => {
+            if let Some(sessions) = cline_sdk_sessions_root().filter(|path| path.is_dir()) {
+                out.push(sessions);
+            }
             if let Some(home) = dirs::home_dir() {
                 out.extend(cline_storage_probe_roots_from_home(&home));
             }
@@ -1398,7 +1468,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 ],
                 "clawdbot" => vec![tilde(&[".clawdbot", "sessions"]), tilde(&[".clawdbot"])],
                 "cline" => {
-                    let mut paths = Vec::new();
+                    let mut paths = vec![tilde(&[".cline", "data", "sessions"])];
                     for ext in ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"] {
                         paths.push(tilde(&[".config", "Code", "User", "globalStorage", ext]));
                         paths.push(tilde(&[

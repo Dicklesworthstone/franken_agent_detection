@@ -839,6 +839,82 @@ fn response_content(response: &Value) -> (String, Vec<NormalizedInvocation>) {
     (texts.join("\n"), invocations)
 }
 
+/// Preserve response accounting after append-log replay, without retaining the
+/// request, response parts, context diagnostics, or per-call usage a second time.
+///
+/// VS Code's `IChatUsageModelTotal` describes the whole turn, including subagents.
+/// Its saved `promptTokens` describes only the latest call, whereas the saved
+/// `completionTokens` is accumulated across the turn. Never combine those two
+/// scopes. See microsoft/vscode@cc3fec8846d0e678357e476fa611774da26d7e24,
+/// `chatModel.ts` (`_setUsage`, `toJSON`) and `chatService.ts`.
+///
+/// The input/cache convention is not uniform across agent-host providers:
+/// `claudeMapSessionEvents.ts` copies Anthropic's separate input/cache counts;
+/// `codexMapAppServerEvents.ts` copies Codex's cache-inclusive input. The saved
+/// model label may be a display name and does not identify that convention.
+/// Preserve those reported scalars as metadata, but normalize only output usage.
+fn compact_response_usage(request: &Value) -> Option<Map<String, Value>> {
+    let count = |value: &Value| value.as_i64().filter(|count| *count >= 0);
+    let mut cass = Map::new();
+    let output_tokens = if let Some(raw_totals) = request.get("modelTotals") {
+        let totals = raw_totals.as_array().map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    let mut compact = Map::new();
+                    if let Some(model) = entry
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .filter(|model| !model.trim().is_empty())
+                    {
+                        compact.insert("model".to_string(), Value::String(model.to_string()));
+                    }
+                    for (raw, normalized) in [
+                        ("inputTokens", "input_tokens"),
+                        ("cachedTokens", "cached_tokens"),
+                        ("outputTokens", "output_tokens"),
+                    ] {
+                        if let Some(value) = entry.get(raw).and_then(count) {
+                            compact.insert(normalized.to_string(), Value::from(value));
+                        }
+                    }
+                    // Keep even an empty entry: dropping an invalid output row
+                    // would turn an incomplete sum into an apparent turn total.
+                    Value::Object(compact)
+                })
+                .collect::<Vec<_>>()
+        });
+        let output = totals.as_ref().and_then(|totals| {
+            totals.iter().try_fold(0_i64, |sum, entry| {
+                sum.checked_add(entry.get("output_tokens")?.as_i64()?)
+            })
+        });
+        // Presence is authoritative even when the array is empty or malformed:
+        // do not resurrect an older saved completion total after a log update.
+        // An explicit empty array sums to zero, as it does in VS Code; a
+        // non-array retains a null sentinel and is never a zero-token report.
+        cass.insert(
+            "model_totals".to_string(),
+            totals.map_or(Value::Null, Value::Array),
+        );
+        output
+    } else {
+        Some(count(request.get("completionTokens")?)?)
+    };
+
+    cass.insert(
+        "token_usage_scope".to_string(),
+        Value::String("turn".to_string()),
+    );
+    if let Some(output) = output_tokens {
+        cass.insert(
+            "token_usage".to_string(),
+            serde_json::json!({"output_tokens": output, "data_source": "api"}),
+        );
+    }
+    Some(cass)
+}
+
 /// Convert one serialized native session into a normalized conversation.
 ///
 /// Returns `None` for sessions that are not Copilot's (shared store) or that
@@ -940,13 +1016,26 @@ pub fn session_to_conversation(
 
         let (assistant_text, invocations) =
             response_content(request.get("response").unwrap_or(&Value::Null));
-        if !assistant_text.trim().is_empty() || !invocations.is_empty() {
+        let mut usage = compact_response_usage(request);
+        let has_usage = usage
+            .as_ref()
+            .is_some_and(|cass| cass.contains_key("token_usage"));
+        if !assistant_text.trim().is_empty() || !invocations.is_empty() || has_usage {
             let mut extra = Map::new();
             if let Some(id) = request.get("requestId").and_then(Value::as_str) {
                 extra.insert("request_id".to_string(), Value::String(id.to_string()));
             }
             if let Some(model) = request.get("modelId").and_then(Value::as_str) {
                 extra.insert("model_id".to_string(), Value::String(model.to_string()));
+            }
+            if !invocations.is_empty() {
+                usage.get_or_insert_with(Map::new).insert(
+                    "tool_call_count".to_string(),
+                    Value::from(invocations.len()),
+                );
+            }
+            if let Some(cass) = usage {
+                extra.insert("cass".to_string(), Value::Object(cass));
             }
             messages.push(NormalizedMessage {
                 idx: 0,

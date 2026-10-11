@@ -80,6 +80,7 @@ Custom history stores use the same environment settings as their connectors:
 |---|---|---|
 | Gemini | `GEMINI_HOME` | Replaces the default session root; accepts a directory or an admitted `chats/session-*.json` / `.jsonl` file |
 | Qwen Code | `QWEN_RUNTIME_DIR`, `QWEN_HOME` | Runtime directory takes precedence over the home override; detects current `projects` and legacy `tmp` stores without falling back from a missing configured root |
+| Cline SDK | `CLINE_SESSION_DATA_DIR`, `CLINE_DATA_DIR`, `CLINE_DIR` | Resolves the SDK session directory in that order while keeping legacy extension histories independently available |
 | OpenCode | `OPENCODE_STORAGE_ROOT`, `OPENCODE_SQLITE_DB` | Keeps legacy storage and SQLite independent, with default database candidates still available |
 | Hermes | `HERMES_SQLITE_DB`, `HERMES_HOME` | Prefers an existing explicit database, then `$HERMES_HOME/state.db`, then the default store |
 | Crush | `CRUSH_SQLITE_DB` | Prefers an existing explicit global database, with the default as fallback |
@@ -175,14 +176,40 @@ discovery use the same ownership split. Supplied VS Code session files and
 native store containers remain scoped to that location, including empty or
 missing stores; they do not fall back to unrelated live histories.
 
+Native Copilot responses retain whole-turn output usage after append-log replay,
+once per assistant response. Valid `modelTotals` take precedence over saved
+`completionTokens`, including explicit zero totals. Per-model input, cache and
+output counters are retained in `extra.cass.model_totals`; only output is
+normalized as API usage because the saved input/cache relationship differs
+between backends. Latest-call prompt counts and session-wide credits are not
+added. Mixed-model turns retain their individual model labels without being
+attributed to the selected model alone. Invalid or overflowing totals do not
+fall back to an older saved count.
+
 Cline reads extension task stores at `tasks/<taskId>/ui_messages.json`, with
 `api_conversation_history.json` as the fallback when UI history is absent.
 Legacy direct `<store>/<taskId>` layouts remain supported. Exact transcript
 files, task directories, `tasks` directories and extension roots keep their
 scope, and overlapping roots share one task selection. Native `ask` / `say`
 records expose user, assistant and tool roles while preserving their raw
-subtypes. This covers Cline's UI/API task files; the separate SDK session
-store using manifests and message files is not supported.
+subtypes.
+
+Cline also reads version-1 SDK lead-session snapshots at
+`~/.cline/data/sessions/<id>/<id>.messages.json`, together with their neighboring
+`<id>.json` manifests. `CLINE_SESSION_DATA_DIR` selects the sessions directory;
+otherwise `CLINE_DATA_DIR/sessions`, `CLINE_DIR/data/sessions`, and the default
+location apply in order. Overrides are trimmed literal paths without tilde
+expansion. Explicit roots stay scoped. Source discovery includes the required
+manifest, and a change to either file re-reads the complete session. Snapshot
+order, message IDs, model identity, thought text and readable tool activity are
+preserved in compact normalized messages without duplicating binary payloads.
+
+When an SDK migration and its original Cline UI history are both in the supplied
+scope, the connector uses the original history followed by the resumed SDK
+turns. The copied cumulative usage before the native resume marker is counted
+once. Matching respects source origin; standalone SDK copies keep their saved
+history. SDK teammate/child artifacts and model-context compaction files are
+not imported as separate conversations.
 
 Cline token extraction reads recorded `tokensIn`, `tokensOut`, `cacheWrites`
 and `cacheReads` from request, deleted-request and subagent usage rows. These
@@ -193,6 +220,12 @@ and contributes neither API usage nor an estimate. Only the four counters
 are attached, without copying request payloads. Explicit zero and partial
 counts remain API data; invalid fields and ordinary transcript text retain
 the estimation fallback. The existing 100 MB task-file cap is unchanged.
+
+SDK metrics use a different convention: `inputTokens` includes cache reads and
+writes. Extraction separates the valid cache buckets while preserving the full
+input total. Only assistant metrics count as API usage; SDK display-only
+messages contribute neither usage nor estimates. Manifest-wide counters are
+not added to per-message metrics.
 
 Exclusion entries are literal paths, without shell or tilde expansion. An unset
 or empty `CASS_EXCLUDE_PATHS` leaves scans unrestricted. Invalid Unicode,

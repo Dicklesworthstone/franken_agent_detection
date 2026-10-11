@@ -22,6 +22,43 @@ impl Default for ClineConnector {
 
 const CLINE_EXTENSIONS: [&str; 2] = ["saoudrizwan.claude-dev", "rooveterinaryinc.roo-cline"];
 
+const LEGACY_RESUME_WARNING: &str = "Warning: this is a legacy conversation, which means tool names may have changed. Please use the most up-to-date tools you are aware of.";
+
+struct ClineSource {
+    primary: DiscoveredSourceFile,
+    metadata: Option<DiscoveredSourceFile>,
+    legacy: Option<Box<Self>>,
+    sdk: bool,
+    migrated: bool,
+}
+
+impl ClineSource {
+    fn changed_since(&self, since: Option<i64>) -> bool {
+        file_modified_since(&self.primary.source_path, since)
+            || (self.sdk
+                && self
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| file_modified_since(&metadata.source_path, since)))
+            || self
+                .legacy
+                .as_ref()
+                .is_some_and(|legacy| legacy.changed_since(since))
+    }
+
+    fn into_discovered(self, out: &mut Vec<DiscoveredSourceFile>) {
+        out.push(self.primary);
+        out.extend(self.metadata);
+        if let Some(mut legacy) = self.legacy {
+            // A migrated SDK history uses the original UI transcript before
+            // its resume boundary. It must be mirrored even when unchanged.
+            legacy.primary.role = DiscoveredSourceRole::MetadataSidecar;
+            legacy.primary.required_for_reconstruction = true;
+            legacy.into_discovered(out);
+        }
+    }
+}
+
 impl ClineConnector {
     #[must_use]
     pub const fn new() -> Self {
@@ -30,6 +67,9 @@ impl ClineConnector {
 
     fn candidate_roots() -> Vec<PathBuf> {
         let mut roots = Vec::new();
+        if let Some(sdk_root) = crate::cline_sdk_sessions_root() {
+            roots.push(sdk_root);
+        }
         let Some(base) = dirs::home_dir() else {
             return roots;
         };
@@ -79,11 +119,27 @@ impl ClineConnector {
 
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
         let base = Self::normalize_root_path(base);
-        if Self::looks_like_storage(&base) {
+        if Self::is_sdk_scope(&base) || Self::looks_like_storage(&base) {
             // A provider store, tasks directory, task or exact transcript is
             // already a complete scope. Do not widen it to adjacent stores.
             roots.push(base);
             return;
+        }
+        // SDK stores are independent of the VS Code extension stores. A
+        // supplied home can contain both generations; discover both without
+        // consulting environment overrides outside the supplied scope.
+        for candidate in [
+            base.clone(),
+            base.join("sessions"),
+            base.join("data/sessions"),
+            base.join(".cline/data/sessions"),
+        ] {
+            if Self::contains_sdk_sessions(&candidate) {
+                roots.push(candidate);
+            }
+        }
+        if base.join(".cline").is_dir() {
+            roots.push(base.join(".cline/data/sessions"));
         }
         let file_name = base.file_name().and_then(|n| n.to_str());
         let is_config = file_name.is_some_and(|n| n == ".config");
@@ -169,6 +225,93 @@ impl ClineConnector {
         path.file_name().is_some_and(|name| {
             name == "ui_messages.json" || name == "api_conversation_history.json"
         })
+    }
+
+    fn sdk_message_id(path: &Path) -> Option<&str> {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".messages.json"))
+            .filter(|id| !id.is_empty())
+    }
+
+    fn sdk_manifest_path(path: &Path) -> Option<PathBuf> {
+        Self::sdk_message_id(path).map(|id| path.with_file_name(format!("{id}.json")))
+    }
+
+    fn sdk_task_source(directory: &Path) -> Option<PathBuf> {
+        let id = directory.file_name()?.to_str()?;
+        let file = directory.join(format!("{id}.messages.json"));
+        (file.is_file() && directory.join(format!("{id}.json")).is_file()).then_some(file)
+    }
+
+    fn contains_sdk_sessions(path: &Path) -> bool {
+        Self::sdk_task_source(path).is_some()
+            || fs::read_dir(path).is_ok_and(|mut entries| {
+                entries.any(|entry| {
+                    entry.is_ok_and(|entry| Self::sdk_task_source(&entry.path()).is_some())
+                })
+            })
+    }
+
+    fn sdk_manifest_source(path: &Path) -> Option<PathBuf> {
+        let id = path.file_name()?.to_str()?.strip_suffix(".json")?;
+        let source = path.with_file_name(format!("{id}.messages.json"));
+        (path.is_file() && source.is_file()).then_some(source)
+    }
+
+    fn is_sdk_scope(path: &Path) -> bool {
+        let name = path.file_name().and_then(|name| name.to_str());
+        let parent = path.parent().and_then(|parent| parent.file_name());
+        Self::sdk_message_id(path).is_some()
+            || Self::sdk_manifest_source(path).is_some()
+            || Self::sdk_task_source(path).is_some()
+            || name == Some(".cline")
+            || (name == Some("data") && parent.is_some_and(|name| name == ".cline"))
+            || (name == Some("sessions")
+                && parent.is_some_and(|name| name == "data" || name == ".cline"))
+            || parent.is_some_and(|name| name == "sessions")
+            || path
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+            || (path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+                && path.file_stem().is_some_and(|stem| Some(stem) == parent))
+    }
+
+    fn sdk_source_files(root: &Path) -> Vec<PathBuf> {
+        if Self::sdk_message_id(root).is_some() {
+            return (root.is_file()
+                && Self::sdk_manifest_path(root).is_some_and(|path| path.is_file()))
+            .then(|| root.to_path_buf())
+            .into_iter()
+            .collect();
+        }
+        if let Some(source) = Self::sdk_manifest_source(root) {
+            return vec![source];
+        }
+        if let Some(source) = Self::sdk_task_source(root) {
+            return vec![source];
+        }
+        let mut files = Vec::new();
+        for directory in [
+            root.to_path_buf(),
+            root.join("sessions"),
+            root.join("data/sessions"),
+        ] {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if let Some(source) = Self::sdk_task_source(&entry.path()) {
+                    files.push(source);
+                }
+            }
+        }
+        files.sort();
+        files.dedup();
+        files
     }
 
     fn task_source(task_dir: &Path) -> Option<PathBuf> {
@@ -273,15 +416,25 @@ impl ClineConnector {
     }
 
     fn source_files(root: &Path) -> Vec<PathBuf> {
-        if Self::is_message_path(root) {
+        // A copied task directory can itself have a transcript-like name.
+        // Only a non-directory spelling selects an exact transcript file;
+        // existing task directories still resolve their contained history.
+        if Self::is_message_path(root) && !root.is_dir() {
             return root
                 .is_file()
                 .then(|| root.to_path_buf())
                 .into_iter()
                 .collect();
         }
+        let mut files = Self::sdk_source_files(root);
+        if Self::sdk_task_source(root).is_some() {
+            return files;
+        }
         if let Some(source) = Self::task_source(root) {
             return vec![source];
+        }
+        if Self::is_sdk_scope(root) {
+            return files;
         }
         if root
             .parent()
@@ -292,7 +445,6 @@ impl ClineConnector {
             return Vec::new();
         }
 
-        let mut files = Vec::new();
         // Native Cline writes <globalStorage>/tasks/<id> (disk.ts,
         // ensureTaskDirectoryExists). Preserve direct <store>/<id> histories
         // too, without recursively reading arbitrary extension directories.
@@ -321,7 +473,7 @@ impl ClineConnector {
         files
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn source_groups(ctx: &ScanContext) -> Vec<ClineSource> {
         let mut out = Vec::new();
         let mut seen_task_dirs = HashSet::new();
         for root in Self::source_roots(ctx) {
@@ -329,43 +481,123 @@ impl ClineConnector {
                 let Some(task_dir) = file.parent() else {
                     continue;
                 };
+                let sdk = Self::sdk_message_id(&file).is_some();
                 // An ancestor of the selected store may be a symlink too.
                 // Keep the original path/provenance in the source record,
-                // but compare actual task directories across overlapping roots.
+                // but compare physical sources across overlapping roots. SDK
+                // archives may hold several explicitly selected snapshots in
+                // one directory; legacy UI/API files still represent one task.
+                let identity = if sdk { file.as_path() } else { task_dir };
                 let task_key =
-                    fs::canonicalize(task_dir).unwrap_or_else(|_| dedupe_path_key(task_dir));
+                    fs::canonicalize(identity).unwrap_or_else(|_| dedupe_path_key(identity));
                 if !seen_task_dirs.insert(task_key) {
                     continue;
                 }
-                if !file_modified_since(&file, ctx.since_ts) {
-                    continue;
-                }
-
-                out.push(
+                let primary = DiscoveredSourceFile::new(
+                    "cline",
+                    &root,
+                    file.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata();
+                let meta_path = Self::sdk_manifest_path(&file)
+                    .unwrap_or_else(|| task_dir.join("task_metadata.json"));
+                let migrated = sdk
+                    && read_json(&meta_path).is_some_and(|manifest| {
+                        manifest.get("version").and_then(Value::as_u64) == Some(1)
+                            && manifest.get("session_id").and_then(Value::as_str)
+                                == Self::sdk_message_id(&file)
+                            && is_migrated_sdk(&manifest)
+                    });
+                let metadata = meta_path.is_file().then(|| {
                     DiscoveredSourceFile::new(
                         "cline",
                         &root,
-                        file.clone(),
-                        DiscoveredSourceRole::PrimarySessionLog,
-                        true,
+                        meta_path,
+                        DiscoveredSourceRole::MetadataSidecar,
+                        sdk,
                     )
-                    .with_fs_metadata(),
-                );
+                    .with_fs_metadata()
+                });
+                out.push(ClineSource {
+                    primary,
+                    metadata,
+                    legacy: None,
+                    sdk,
+                    migrated,
+                });
+            }
+        }
+        Self::pair_migrated_sources(out)
+            .into_iter()
+            .filter(|source| source.changed_since(ctx.since_ts))
+            .collect()
+    }
 
-                let meta_path = task_dir.join("task_metadata.json");
-                if meta_path.is_file() {
-                    out.push(
-                        DiscoveredSourceFile::new(
-                            "cline",
-                            &root,
-                            meta_path,
-                            DiscoveredSourceRole::MetadataSidecar,
-                            false,
-                        )
-                        .with_fs_metadata(),
-                    );
+    fn pair_migrated_sources(out: Vec<ClineSource>) -> Vec<ClineSource> {
+        // Pair the two generations before applying incremental filtering.
+        // Migration retains old cumulative usage in the SDK prefix and the
+        // full historical UI in the old store; those are one conversation.
+        let mut sources: Vec<Option<ClineSource>> = out.into_iter().map(Some).collect();
+        for index in 0..sources.len() {
+            let Some(sdk) = sources[index]
+                .as_ref()
+                .filter(|source| source.sdk && source.migrated)
+            else {
+                continue;
+            };
+            let id = Self::sdk_message_id(&sdk.primary.source_path);
+            if sources
+                .iter()
+                .flatten()
+                .filter(|candidate| {
+                    candidate.sdk
+                        && candidate.primary.origin == sdk.primary.origin
+                        && Self::sdk_message_id(&candidate.primary.source_path) == id
+                })
+                .count()
+                != 1
+            {
+                tracing::debug!(path = %sdk.primary.source_path.display(), "cline: ambiguous SDK migration roots; keeping independent sources");
+                continue;
+            }
+            let matching: Vec<usize> = sources
+                .iter()
+                .enumerate()
+                .filter_map(|(candidate_index, candidate)| {
+                    let candidate = candidate.as_ref()?;
+                    (!candidate.sdk
+                        && candidate.primary.origin == sdk.primary.origin
+                        && !candidate.primary.source_path.ancestors().any(|path| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| name.contains("roo-cline"))
+                        })
+                        && candidate
+                            .primary
+                            .source_path
+                            .parent()
+                            .and_then(|path| path.file_name())
+                            .and_then(|name| name.to_str())
+                            == id)
+                        .then_some(candidate_index)
+                })
+                .collect();
+            if let [legacy_index] = matching.as_slice() {
+                let legacy = sources[*legacy_index].take().map(Box::new);
+                if let Some(sdk) = sources[index].as_mut() {
+                    sdk.legacy = legacy;
                 }
             }
+        }
+        sources.into_iter().flatten().collect()
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        for source in Self::source_groups(ctx) {
+            source.into_discovered(&mut out);
         }
         out
     }
@@ -376,172 +608,500 @@ impl Connector for ClineConnector {
         franken_detection_for_connector("cline").unwrap_or_else(DetectionResult::not_found)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut convs = Vec::new();
-        // Use exactly the discovery selection, including its UI/API preference,
-        // incremental filter and cross-root task deduplication.
-        for source in Self::discover_sources(ctx) {
-            if source.role != DiscoveredSourceRole::PrimarySessionLog {
-                continue;
-            }
-            let file = source.source_path;
-            let Some(path) = file.parent() else {
-                continue;
-            };
-            let task_id = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(std::string::ToString::to_string);
-            let meta_path = path.join("task_metadata.json");
-
-            // Task logs embed base64 screenshots and routinely reach
-            // tens of MB; enforce the project's 100MB scan cap.
-            let data = match read_capped(&file) {
-                Ok(Some(d)) => d.trim_start_matches('\u{feff}').to_string(),
-                Ok(None) => {
-                    tracing::debug!(path = %file.display(), "cline: file exceeds the scan size cap; skipping");
-                    continue;
-                }
-                Err(e) => {
-                    tracing::debug!(path = %file.display(), error = %e, "cline: skipping unreadable file");
-                    continue;
-                }
-            };
-            let val: Value = match serde_json::from_str(&data) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::debug!(path = %file.display(), error = %e, "cline skipping malformed JSON");
-                    continue;
-                }
-            };
-
-            let mut messages = Vec::new();
-            if let Some(arr) = val.as_array() {
-                let mut legacy_usage = if file
-                    .file_name()
-                    .is_some_and(|name| name == "ui_messages.json")
-                {
-                    super::token_extraction::cline_legacy_usage_attachments(arr)
-                } else {
-                    std::collections::BTreeMap::new()
-                };
-                for (index, item) in arr.iter().enumerate() {
-                    // Use parse_timestamp to handle both i64 milliseconds and ISO-8601 strings
-                    let created = item
-                        .get("timestamp")
-                        .or_else(|| item.get("created_at"))
-                        .or_else(|| item.get("ts"))
-                        .and_then(parse_timestamp);
-
-                    // NOTE: Do NOT filter individual messages by timestamp here!
-                    // The file-level check in file_modified_since() is sufficient.
-                    // Filtering messages would cause older messages to be lost when
-                    // the file is re-indexed after new messages are added.
-
-                    let role = normalized_role(item);
-
-                    let content_val = item
-                        .get("content")
-                        .or_else(|| item.get("text"))
-                        .or_else(|| item.get("message"));
-                    let content = content_val.map(flatten_content).unwrap_or_default();
-
-                    let attached_usage = legacy_usage.remove(&index);
-                    let has_attached_usage = attached_usage
-                        .as_ref()
-                        .and_then(Value::as_object)
-                        .is_some_and(|usage| !usage.is_empty());
-                    if content.trim().is_empty() && !has_attached_usage {
-                        continue;
-                    }
-                    let mut extra = item.clone();
-                    if let Some(usage) = attached_usage {
-                        // The original start/finish rows and their content stay
-                        // intact; only selected counters are copied to cass.
-                        if !extra.get("cass").is_some_and(Value::is_object) {
-                            extra["cass"] = serde_json::json!({});
-                        }
-                        extra["cass"]["token_usage"] = usage;
-                    }
-
-                    messages.push(NormalizedMessage {
-                        idx: i64::try_from(messages.len()).unwrap_or(i64::MAX), // preserve original order for stable sorting
-                        role: role.to_string(),
-                        author: None,
-                        created_at: created,
-                        content,
-                        extra,
-                        invocations: content_val
-                            .map_or_else(Vec::new, extract_invocations_from_content_blocks),
-                        snippets: Vec::new(),
-                    });
-                }
-            }
-
-            if messages.is_empty() {
-                continue;
-            }
-
-            // Sort by timestamp (missing timestamps go last), preserving original order
-            messages.sort_by(|a, b| {
-                let a_ts = a.created_at.unwrap_or(i64::MAX);
-                let b_ts = b.created_at.unwrap_or(i64::MAX);
-                a_ts.cmp(&b_ts).then_with(|| a.idx.cmp(&b.idx))
-            });
-
-            // Re-index
-            crate::types::reindex_messages(&mut messages);
-
-            let (mut title, workspace) = if meta_path.exists()
-                && let Ok(s) = fs::read_to_string(&meta_path)
-                && let Ok(v) = serde_json::from_str::<Value>(&s)
-            {
-                let title = v
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .map(std::string::ToString::to_string);
-                // Try to find workspace path
-                // Cline doesn't standardize this in metadata, but sometimes it's there or in state.
-                // We check common keys.
-                let workspace = v
-                    .get("rootPath")
-                    .or_else(|| v.get("cwd"))
-                    .or_else(|| v.get("workspace"))
-                    .and_then(|s| s.as_str())
-                    .map(PathBuf::from);
-                (title, workspace)
-            } else {
-                (None, None)
-            };
-
-            // Fallback title from first message
-            if title.is_none() {
-                title = messages
-                    .first()
-                    .and_then(|m| m.content.lines().next())
-                    .map(|s| s.chars().take(100).collect());
-            }
-
-            convs.push(NormalizedConversation {
-                agent_slug: "cline".to_string(),
-                external_id: task_id,
-                title,
-                workspace,
-                source_path: file.clone(),
-                started_at: messages.iter().filter_map(|m| m.created_at).min(),
-                ended_at: messages.iter().filter_map(|m| m.created_at).max(),
-                metadata: serde_json::json!({"source": "cline"}),
-                messages,
-            });
-        }
-
-        Ok(convs)
+        Ok(Self::source_groups(ctx)
+            .iter()
+            .filter_map(parse_source_group)
+            .collect())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         Ok(Self::discover_sources(ctx))
     }
+}
+
+fn read_json(path: &Path) -> Option<Value> {
+    let text = match read_capped(path) {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            tracing::debug!(path = %path.display(), "cline: file exceeds the scan size cap; skipping");
+            return None;
+        }
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "cline: skipping unreadable file");
+            return None;
+        }
+    };
+    match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "cline: skipping malformed JSON");
+            None
+        }
+    }
+}
+
+fn is_migrated_sdk(manifest: &Value) -> bool {
+    manifest
+        .pointer("/metadata/legacyTask")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || manifest
+            .pointer("/metadata/migratedFromLegacyTask")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+fn parse_source_group(source: &ClineSource) -> Option<NormalizedConversation> {
+    if !source.sdk {
+        return parse_legacy_session(&source.primary.source_path);
+    }
+    let Some(mut sdk) = parse_sdk_session(&source.primary.source_path) else {
+        // A partial/invalid SDK write must not hide the readable original.
+        return source
+            .legacy
+            .as_ref()
+            .and_then(|legacy| parse_legacy_session(&legacy.primary.source_path));
+    };
+    let Some(legacy_source) = source.legacy.as_ref() else {
+        return Some(sdk);
+    };
+    if legacy_source
+        .primary
+        .source_path
+        .file_name()
+        .is_none_or(|name| name != "ui_messages.json")
+    {
+        // The SDK's migrated prefix already contains the API-history context
+        // and cumulative legacy usage. Only the UI history supplies the full
+        // transcript needed for Cline's own resume-boundary replacement.
+        return Some(sdk);
+    }
+    let Some(legacy) = parse_legacy_session(&legacy_source.primary.source_path) else {
+        return Some(sdk);
+    };
+    let Some(boundary) = sdk.messages.iter().position(|message| {
+        message
+            .extra
+            .pointer("/cass/legacy_resume_marker")
+            .and_then(Value::as_bool)
+            == Some(true)
+    }) else {
+        tracing::debug!(path = %sdk.source_path.display(), "cline: migrated SDK snapshot lacks an unambiguous legacy resume boundary; keeping its saved snapshot");
+        sdk.metadata["legacy_merge"] = Value::from("missing_resume_boundary");
+        return Some(sdk);
+    };
+    let resumed = sdk.messages.split_off(boundary + 1);
+    sdk.messages = legacy.messages;
+    sdk.messages.extend(resumed);
+    crate::types::reindex_messages(&mut sdk.messages);
+    sdk.started_at = sdk
+        .messages
+        .iter()
+        .filter_map(|message| message.created_at)
+        .min();
+    sdk.ended_at = sdk
+        .messages
+        .iter()
+        .filter_map(|message| message.created_at)
+        .max();
+    sdk.metadata["legacy_merge"] = Value::from("ui_history");
+    sdk.metadata["legacy_source_path"] =
+        Value::from(legacy_source.primary.source_path.to_string_lossy().as_ref());
+    Some(sdk)
+}
+
+fn nonblank_string(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// Read the canonical persisted SDK transcript, not its compacted model
+/// context, database index, teammate output or runtime-generated projections.
+/// Format: cline/cline c3a4057, core/services/session-{artifacts,data}.ts.
+fn parse_sdk_session(file: &Path) -> Option<NormalizedConversation> {
+    let session_id = ClineConnector::sdk_message_id(file)?;
+    let manifest = read_json(&ClineConnector::sdk_manifest_path(file)?)?;
+    let snapshot = read_json(file)?;
+    let valid = manifest.get("version").and_then(Value::as_u64) == Some(1)
+        && manifest.get("session_id").and_then(Value::as_str) == Some(session_id)
+        && snapshot.get("version").and_then(Value::as_u64) == Some(1)
+        && snapshot.get("agent").and_then(Value::as_str) == Some("lead")
+        && snapshot.get("sessionId").and_then(Value::as_str) == Some(session_id)
+        && snapshot
+            .pointer("/origin/sessionId")
+            .and_then(Value::as_str)
+            == Some(session_id)
+        && nonblank_string(snapshot.pointer("/origin/source")).is_some()
+        && snapshot.pointer("/origin/source").and_then(Value::as_str)
+            == manifest.get("source").and_then(Value::as_str);
+    if !valid {
+        tracing::debug!(path = %file.display(), "cline: skipping unsupported SDK version, agent kind or mismatched session identity");
+        return None;
+    }
+    let records = snapshot.get("messages")?.as_array()?;
+    let mut messages = Vec::new();
+    for record in records {
+        if let Some(message) = sdk_message(record, &manifest, session_id, messages.len()) {
+            messages.push(message);
+        }
+    }
+    if messages.is_empty() {
+        return None;
+    }
+    // This is an ordered snapshot, not a stream of timestamped UI events.
+    // Preserve its order even when missing/clock-skewed timestamps occur.
+    let title = nonblank_string(manifest.pointer("/metadata/title"))
+        .or_else(|| nonblank_string(manifest.get("prompt")))
+        .map(String::from)
+        .or_else(|| {
+            messages
+                .first()
+                .and_then(|message| message.content.lines().next())
+                .map(|line| line.chars().take(100).collect())
+        });
+    let workspace = nonblank_string(manifest.get("cwd"))
+        .or_else(|| nonblank_string(manifest.get("workspace_root")))
+        .map(PathBuf::from);
+    Some(NormalizedConversation {
+        agent_slug: "cline".into(),
+        external_id: Some(session_id.into()),
+        title,
+        workspace,
+        source_path: file.to_path_buf(),
+        started_at: messages
+            .iter()
+            .filter_map(|message| message.created_at)
+            .min()
+            .or_else(|| manifest.get("started_at").and_then(parse_timestamp)),
+        ended_at: messages
+            .iter()
+            .filter_map(|message| message.created_at)
+            .max()
+            .or_else(|| manifest.get("ended_at").and_then(parse_timestamp)),
+        metadata: serde_json::json!({
+            "source": "cline", "format": "cline_sdk_v1", "sdk_source": manifest["source"],
+            "migrated_from_legacy": is_migrated_sdk(&manifest),
+        }),
+        messages,
+    })
+}
+
+fn sdk_message(
+    record: &Value,
+    manifest: &Value,
+    session_id: &str,
+    index: usize,
+) -> Option<NormalizedMessage> {
+    let raw_role = record.get("role")?.as_str()?;
+    if !matches!(raw_role, "user" | "assistant") {
+        return None;
+    }
+    let blocks = record.get("content")?;
+    if !(blocks.is_string() || blocks.is_array()) {
+        return None;
+    }
+    let content = sdk_content(blocks);
+    let has_metrics = record
+        .get("metrics")
+        .and_then(Value::as_object)
+        .is_some_and(|metrics| {
+            [
+                "inputTokens",
+                "outputTokens",
+                "cacheReadTokens",
+                "cacheWriteTokens",
+            ]
+            .iter()
+            .any(|key| {
+                metrics
+                    .get(*key)
+                    .and_then(Value::as_i64)
+                    .is_some_and(|value| value >= 0)
+            })
+        });
+    if content.trim().is_empty() && !(raw_role == "assistant" && has_metrics) {
+        return None;
+    }
+    let role = if raw_role == "user"
+        && blocks.as_array().is_some_and(|blocks| {
+            !blocks.is_empty()
+                && blocks
+                    .iter()
+                    .all(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        }) {
+        "tool"
+    } else {
+        raw_role
+    };
+    let invocations = extract_invocations_from_content_blocks(blocks);
+    let mut extra = compact_sdk_extra(record, manifest, session_id, role, invocations.len());
+    if raw_role == "user" && has_legacy_resume_warning(blocks) {
+        extra["cass"]["legacy_resume_marker"] = Value::Bool(true);
+    }
+    Some(NormalizedMessage {
+        idx: i64::try_from(index).unwrap_or(i64::MAX),
+        role: role.into(),
+        author: None,
+        created_at: record.get("ts").and_then(parse_timestamp),
+        content,
+        extra,
+        invocations,
+        snippets: Vec::new(),
+    })
+}
+
+fn has_legacy_resume_warning(content: &Value) -> bool {
+    content
+        .as_str()
+        .is_some_and(|text| text.contains(LEGACY_RESUME_WARNING))
+        || content.as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains(LEGACY_RESUME_WARNING))
+            })
+        })
+}
+
+fn compact_sdk_extra(
+    record: &Value,
+    manifest: &Value,
+    session_id: &str,
+    role: &str,
+    tool_call_count: usize,
+) -> Value {
+    let mut cass = serde_json::json!({
+        "cline_sdk": true, "role": role, "session_id": session_id,
+        "tool_call_count": tool_call_count,
+    });
+    for (key, value) in [
+        ("message_id", nonblank_string(record.get("id"))),
+        ("session_id", nonblank_string(record.get("sessionId"))),
+        ("agent", nonblank_string(record.get("agent"))),
+        (
+            "model",
+            nonblank_string(record.pointer("/modelInfo/id"))
+                .or_else(|| nonblank_string(manifest.get("model"))),
+        ),
+        (
+            "provider",
+            nonblank_string(record.pointer("/modelInfo/provider"))
+                .or_else(|| nonblank_string(manifest.get("provider"))),
+        ),
+    ] {
+        if let Some(value) = value {
+            cass[key] = Value::from(value);
+        }
+    }
+    if record
+        .pointer("/metadata/displayOnly")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        cass["display_only"] = Value::Bool(true);
+    }
+    if let Some(metrics) = record.get("metrics") {
+        let mut compact = serde_json::Map::new();
+        for key in [
+            "inputTokens",
+            "outputTokens",
+            "cacheReadTokens",
+            "cacheWriteTokens",
+        ] {
+            if let Some(value) = metrics.get(key) {
+                // Preserve invalid-present versus absent counters without
+                // copying arbitrary strings, objects or provider payloads.
+                compact.insert(
+                    key.into(),
+                    if value.is_number() {
+                        value.clone()
+                    } else {
+                        Value::Null
+                    },
+                );
+            }
+        }
+        cass["sdk_metrics"] = Value::Object(compact);
+    }
+    serde_json::json!({"cass": cass})
+}
+
+fn sdk_content(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_owned();
+    }
+    let Some(blocks) = value.as_array() else {
+        return String::new();
+    };
+    let mut content = String::new();
+    for block in blocks {
+        let text = match block.get("type").and_then(Value::as_str) {
+            Some("text") => block
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            Some("thinking") => block
+                .get("thinking")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            Some("file") => block
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            Some("tool_use") => block
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| format!("[Tool: {name}]"))
+                .unwrap_or_default(),
+            Some("tool_result") => block.get("content").map(sdk_content).unwrap_or_default(),
+            // Image/media/redacted-thinking bytes are not searchable text.
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&text);
+        }
+    }
+    content
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_legacy_session(file: &Path) -> Option<NormalizedConversation> {
+    let path = file.parent()?;
+    let task_id = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(std::string::ToString::to_string);
+    let meta_path = path.join("task_metadata.json");
+
+    let val = read_json(file)?;
+
+    let mut messages = Vec::new();
+    if let Some(arr) = val.as_array() {
+        let mut legacy_usage = if file
+            .file_name()
+            .is_some_and(|name| name == "ui_messages.json")
+        {
+            super::token_extraction::cline_legacy_usage_attachments(arr)
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        for (index, item) in arr.iter().enumerate() {
+            // Use parse_timestamp to handle both i64 milliseconds and ISO-8601 strings
+            let created = item
+                .get("timestamp")
+                .or_else(|| item.get("created_at"))
+                .or_else(|| item.get("ts"))
+                .and_then(parse_timestamp);
+
+            // NOTE: Do NOT filter individual messages by timestamp here!
+            // The file-level check in file_modified_since() is sufficient.
+            // Filtering messages would cause older messages to be lost when
+            // the file is re-indexed after new messages are added.
+
+            let role = normalized_role(item);
+
+            let content_val = item
+                .get("content")
+                .or_else(|| item.get("text"))
+                .or_else(|| item.get("message"));
+            let content = content_val.map(flatten_content).unwrap_or_default();
+
+            let attached_usage = legacy_usage.remove(&index);
+            let has_attached_usage = attached_usage
+                .as_ref()
+                .and_then(Value::as_object)
+                .is_some_and(|usage| !usage.is_empty());
+            if content.trim().is_empty() && !has_attached_usage {
+                continue;
+            }
+            let mut extra = item.clone();
+            if let Some(usage) = attached_usage {
+                // The original start/finish rows and their content stay
+                // intact; only selected counters are copied to cass.
+                if !extra.get("cass").is_some_and(Value::is_object) {
+                    extra["cass"] = serde_json::json!({});
+                }
+                extra["cass"]["token_usage"] = usage;
+            }
+
+            messages.push(NormalizedMessage {
+                idx: i64::try_from(messages.len()).unwrap_or(i64::MAX), // preserve original order for stable sorting
+                role: role.to_string(),
+                author: None,
+                created_at: created,
+                content,
+                extra,
+                invocations: content_val
+                    .map_or_else(Vec::new, extract_invocations_from_content_blocks),
+                snippets: Vec::new(),
+            });
+        }
+    }
+
+    if messages.is_empty() {
+        return None;
+    }
+
+    // Sort by timestamp (missing timestamps go last), preserving original order
+    messages.sort_by(|a, b| {
+        let a_ts = a.created_at.unwrap_or(i64::MAX);
+        let b_ts = b.created_at.unwrap_or(i64::MAX);
+        a_ts.cmp(&b_ts).then_with(|| a.idx.cmp(&b.idx))
+    });
+
+    // Re-index
+    crate::types::reindex_messages(&mut messages);
+
+    let (mut title, workspace) = if meta_path.exists()
+        && let Some(v) = read_json(&meta_path)
+    {
+        let title = v
+            .get("title")
+            .and_then(|t| t.as_str())
+            .map(std::string::ToString::to_string);
+        // Try to find workspace path
+        // Cline doesn't standardize this in metadata, but sometimes it's there or in state.
+        // We check common keys.
+        let workspace = v
+            .get("rootPath")
+            .or_else(|| v.get("cwd"))
+            .or_else(|| v.get("workspace"))
+            .and_then(|s| s.as_str())
+            .map(PathBuf::from);
+        (title, workspace)
+    } else {
+        (None, None)
+    };
+
+    // Fallback title from first message
+    if title.is_none() {
+        title = messages
+            .first()
+            .and_then(|m| m.content.lines().next())
+            .map(|s| s.chars().take(100).collect());
+    }
+
+    Some(NormalizedConversation {
+        agent_slug: "cline".to_string(),
+        external_id: task_id,
+        title,
+        workspace,
+        source_path: file.to_path_buf(),
+        started_at: messages.iter().filter_map(|m| m.created_at).min(),
+        ended_at: messages.iter().filter_map(|m| m.created_at).max(),
+        metadata: serde_json::json!({"source": "cline"}),
+        messages,
+    })
 }
 
 fn normalized_role(item: &Value) -> &str {
