@@ -11,9 +11,179 @@ pub enum TokenDataSource {
     #[default]
     Estimated,
     /// Deliberately no usage and no estimate (e.g. Shelley fork-copied rows
-    /// whose original usage is already counted once). Consumers must exclude
+    /// whose original usage is already counted once, or a Cline request-finish
+    /// row whose counts belong to its start row). Consumers must exclude
     /// these from both API totals and estimated totals.
     Suppressed,
+}
+
+/// A present invalid count must replace an earlier count when legacy Cline
+/// request start/finish payloads are combined. Missing fields leave it intact.
+#[derive(Clone, Copy, Default)]
+enum ClineCount {
+    #[default]
+    Missing,
+    Invalid,
+    Count(i64),
+}
+
+impl ClineCount {
+    const fn value(self) -> Option<i64> {
+        match self {
+            Self::Count(value) => Some(value),
+            Self::Missing | Self::Invalid => None,
+        }
+    }
+
+    const fn overlay(self, finish: Self) -> Self {
+        match finish {
+            Self::Missing => self,
+            present => present,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClineTokenCounts {
+    #[serde(default, deserialize_with = "cline_count")]
+    tokens_in: ClineCount,
+    #[serde(default, deserialize_with = "cline_count")]
+    tokens_out: ClineCount,
+    #[serde(default, deserialize_with = "cline_count")]
+    cache_writes: ClineCount,
+    #[serde(default, deserialize_with = "cline_count")]
+    cache_reads: ClineCount,
+}
+
+fn cline_count<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<ClineCount, D::Error> {
+    let value = <Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value
+        .as_i64()
+        .filter(|count| *count >= 0)
+        .map_or(ClineCount::Invalid, ClineCount::Count))
+}
+
+impl ClineTokenCounts {
+    fn from_message(extra: &Value) -> Option<Self> {
+        let text = extra.get("text").and_then(Value::as_str).unwrap_or("");
+        let text = if text.is_empty() { "{}" } else { text };
+        if !text.trim_start().starts_with('{') {
+            return None;
+        }
+        // Deserialize only the counters. serde skips the often-large request
+        // text and other incidental fields without copying their payloads.
+        serde_json::from_str(text).ok()
+    }
+
+    const fn overlay(&mut self, finish: Self) {
+        self.tokens_in = self.tokens_in.overlay(finish.tokens_in);
+        self.tokens_out = self.tokens_out.overlay(finish.tokens_out);
+        self.cache_writes = self.cache_writes.overlay(finish.cache_writes);
+        self.cache_reads = self.cache_reads.overlay(finish.cache_reads);
+    }
+
+    fn compact(self) -> Value {
+        let mut counts = serde_json::Map::new();
+        for (key, value) in [
+            ("tokensIn", self.tokens_in),
+            ("tokensOut", self.tokens_out),
+            ("cacheWrites", self.cache_writes),
+            ("cacheReads", self.cache_reads),
+        ] {
+            if let Some(value) = value.value() {
+                counts.insert(key.into(), Value::from(value));
+            }
+        }
+        Value::Object(counts)
+    }
+}
+
+/// Match Cline's legacy `combineApiRequests` pass in physical message order.
+/// Keep every transcript row and attach only the final four scalar counters
+/// to each paired start row; finish rows are suppressed by token extraction.
+pub(super) fn cline_legacy_usage_attachments(
+    messages: &[Value],
+) -> std::collections::BTreeMap<usize, Value> {
+    let mut attachments = std::collections::BTreeMap::new();
+    let mut pending: Option<(usize, ClineTokenCounts)> = None;
+    for (index, message) in messages.iter().enumerate() {
+        if message.get("type").and_then(Value::as_str) != Some("say") {
+            continue;
+        }
+        match message.get("say").and_then(Value::as_str) {
+            Some("api_req_started") if pending.is_none() => {
+                pending = ClineTokenCounts::from_message(message).map(|counts| (index, counts));
+            }
+            Some("api_req_finished") => {
+                if let Some((start, mut counts)) = pending.take() {
+                    if let Some(finish) = ClineTokenCounts::from_message(message) {
+                        counts.overlay(finish);
+                    }
+                    attachments.insert(start, counts.compact());
+                }
+            }
+            _ => {}
+        }
+    }
+    attachments
+}
+
+/// Cline's `getApiMetrics` sums these four independent buckets from usage-
+/// carrying UI rows. Ordinary transcript text and context-window estimates
+/// are not API usage, nor is a second copy on an `api_req_finished` row.
+fn extract_cline_tokens(extra: &Value) -> ExtractedTokenUsage {
+    let model_name = extra
+        .pointer("/modelInfo/modelId")
+        .or_else(|| extra.get("model"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let provider = extra
+        .pointer("/modelInfo/providerId")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| {
+            model_name
+                .as_deref()
+                .map(|name| normalize_model(name).provider)
+        });
+    let mut usage = ExtractedTokenUsage {
+        model_name,
+        provider,
+        ..Default::default()
+    };
+    if extra.get("type").and_then(Value::as_str) != Some("say") {
+        return usage;
+    }
+    match extra.get("say").and_then(Value::as_str) {
+        Some("api_req_finished") => {
+            usage.data_source = TokenDataSource::Suppressed;
+            return usage;
+        }
+        Some("api_req_started" | "deleted_api_reqs" | "subagent_usage") => {}
+        _ => return usage,
+    }
+
+    // An empty attachment is authoritative too: invalid finish fields
+    // must not resurrect stale values from the original start payload.
+    let counts = extra.pointer("/cass/token_usage").map_or_else(
+        || ClineTokenCounts::from_message(extra),
+        |compact| {
+            compact
+                .as_object()
+                .and_then(|_| <ClineTokenCounts as serde::Deserialize>::deserialize(compact).ok())
+        },
+    );
+    if let Some(counts) = counts {
+        usage.input_tokens = counts.tokens_in.value();
+        usage.output_tokens = counts.tokens_out.value();
+        usage.cache_read_tokens = counts.cache_reads.value();
+        usage.cache_creation_tokens = counts.cache_writes.value();
+        if usage.has_token_data() {
+            usage.data_source = TokenDataSource::Api;
+        }
+    }
+    usage
 }
 
 impl TokenDataSource {
@@ -513,6 +683,7 @@ pub fn extract_tokens_for_agent(
         "codex" => extract_codex_tokens(extra),
         "gemini" => extract_gemini_tokens(extra, role),
         "qwen" => extract_qwen_tokens(extra, role),
+        "cline" => extract_cline_tokens(extra),
         // The modern Kimi parser attaches recognized usage.record input and
         // output counts to the preceding assistant message. Read only that
         // attachment: raw bookkeeping events and cumulative/session totals

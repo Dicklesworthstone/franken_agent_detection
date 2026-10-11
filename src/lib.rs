@@ -884,8 +884,6 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         "github-copilot" => {
             maybe_push(&mut out, &[".github-copilot"]);
             maybe_push(&mut out, &[".config", "github-copilot"]);
-            maybe_push(&mut out, &[".copilot", "session-state"]);
-            maybe_push(&mut out, &[".copilot", "history-session-state"]);
             maybe_push(
                 &mut out,
                 &[
@@ -1598,11 +1596,6 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                         "globalStorage",
                         "github.copilot-chat",
                     ]),
-                    tilde(&[".config", "gh-copilot"]),
-                    // Copilot CLI session-state (v2, since 0.0.342)
-                    tilde(&[".copilot", "session-state"]),
-                    // Copilot CLI legacy session-state (v1)
-                    tilde(&[".copilot", "history-session-state"]),
                 ],
                 "goose" => vec![
                     tilde(&[".local", "share", "goose", "sessions"]),

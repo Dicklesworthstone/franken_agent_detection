@@ -23,20 +23,8 @@
 //! Each file typically represents a conversation panel session with an array
 //! of conversation threads.
 //!
-//! Additionally, the `gh copilot` CLI may store history at:
-//! - ~/.config/gh-copilot/
-//!
-//! ## Copilot CLI event logs
-//!
-//! GitHub Copilot CLI (the `gh copilot` or standalone `copilot` binary) stores
-//! session history as JSONL event logs:
-//! - ~/.copilot/session-state/{session-id}/events.jsonl  (v2, since 0.0.342)
-//! - ~/.copilot/history-session-state/{session-id}.json  (v1, legacy)
-//! - ~/.copilot/command-history-state.json
-//!
-//! Each line in `events.jsonl` is a JSON object with a `type` field identifying
-//! the event kind. Conversation events use `user.message` and `assistant.message`
-//! types with `content`, `role`, and `timestamp` fields.
+//! Copilot CLI history is handled exclusively by [`super::copilot_cli`],
+//! including when a scan root contains both CLI and VS Code stores.
 //!
 //! ## VS Code Copilot Chat JSON format
 //!
@@ -66,6 +54,7 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use super::copilot_cli::CopilotCliConnector;
 use super::copilot_vscode;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::read_capped;
@@ -139,7 +128,7 @@ impl CopilotConnector {
         paths
     }
 
-    /// Check if a path looks like Copilot Chat or Copilot CLI storage.
+    /// Check if a path looks like extension-produced Copilot Chat storage.
     fn looks_like_copilot_storage(path: &Path) -> bool {
         let segments: Vec<String> = path
             .components()
@@ -149,6 +138,18 @@ impl CopilotConnector {
         segments
             .iter()
             .any(|segment| segment == "github.copilot-chat" || segment == "copilot-chat")
+    }
+
+    /// Exclude CLI stores without mistaking the name of an archive parent
+    /// for the provider of a clearly identified VS Code source below it.
+    fn is_cli_only_scope(path: &Path) -> bool {
+        !Self::looks_like_copilot_storage(path)
+            && !copilot_vscode::looks_like_native_store(path)
+            && (CopilotCliConnector::looks_like_cli_storage(path)
+                || matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(".copilot" | "gh")
+                ))
     }
 
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
@@ -168,28 +169,10 @@ impl CopilotConnector {
             roots.push(base.to_path_buf());
         }
 
-        if file_name.is_some_and(|n| n == ".copilot") {
-            let session_state = base.join("session-state");
-            if session_state.exists() {
-                roots.push(session_state);
-            }
-            let history_state = base.join("history-session-state");
-            if history_state.exists() {
-                roots.push(history_state);
-            }
-        }
-
         if is_global_storage {
             let copilot_chat = base.join("github.copilot-chat");
             if copilot_chat.exists() {
                 roots.push(copilot_chat);
-            }
-        }
-
-        if file_name.is_some_and(|n| n == "gh") {
-            let gh_copilot = base.join("copilot");
-            if gh_copilot.exists() {
-                roots.push(gh_copilot);
             }
         }
 
@@ -199,8 +182,6 @@ impl CopilotConnector {
             candidates.push(base.join("Code/User/globalStorage/github.copilot-chat"));
             candidates.push(base.join("Code - Insiders/User/globalStorage/github.copilot-chat"));
             candidates.push(base.join("VSCodium/User/globalStorage/github.copilot-chat"));
-            candidates.push(base.join("gh-copilot"));
-            candidates.push(base.join("gh/copilot"));
         }
 
         if is_app_support {
@@ -250,10 +231,6 @@ impl CopilotConnector {
             );
             candidates
                 .push(base.join("AppData/Roaming/VSCodium/User/globalStorage/github.copilot-chat"));
-            candidates.push(base.join(".config/gh-copilot"));
-            candidates.push(base.join(".config/gh/copilot"));
-            candidates.push(base.join(".copilot/session-state"));
-            candidates.push(base.join(".copilot/history-session-state"));
         }
 
         for candidate in candidates {
@@ -307,14 +284,23 @@ impl CopilotConnector {
     /// either store family.
     fn native_scan_bases(ctx: &ScanContext) -> Vec<ScanRoot> {
         if !ctx.use_default_detection() {
-            return ctx.scan_roots.clone();
+            return ctx
+                .scan_roots
+                .iter()
+                // Directory expansion already selects native containers.
+                // Only an exact CLI file could otherwise be admitted by
+                // the native scanner's generic JSON-file entry point.
+                .filter(|root| !(root.path.is_file() && Self::is_cli_only_scope(&root.path)))
+                .cloned()
+                .collect();
         }
-        if ctx.data_dir.exists() && copilot_vscode::looks_like_native_store(&ctx.data_dir) {
-            return vec![ScanRoot::local(ctx.data_dir.clone())];
-        }
-        if ctx.data_dir.exists() && Self::looks_like_copilot_storage(&ctx.data_dir) {
-            // data_dir pins the scan to the extension/CLI store only.
+        if Self::looks_like_copilot_storage(&ctx.data_dir) || Self::is_cli_only_scope(&ctx.data_dir)
+        {
+            // A supplied extension or CLI store stays scoped even if absent.
             return Vec::new();
+        }
+        if copilot_vscode::looks_like_native_store(&ctx.data_dir) {
+            return vec![ScanRoot::local(ctx.data_dir.clone())];
         }
         copilot_vscode::default_user_roots()
             .into_iter()
@@ -327,8 +313,18 @@ impl CopilotConnector {
         let mut roots: Vec<ScanRoot> = Vec::new();
 
         if ctx.use_default_detection() {
-            if Self::looks_like_copilot_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+            if Self::is_cli_only_scope(&ctx.data_dir) {
+                return roots;
+            }
+            if Self::looks_like_copilot_storage(&ctx.data_dir) {
                 roots.push(ScanRoot::local(ctx.data_dir.clone()));
+            } else if copilot_vscode::looks_like_native_store(&ctx.data_dir) {
+                // Shared User/globalStorage bases can contain extension
+                // exports too. Expand only the supplied base; never append
+                // unrelated default stores when it is missing or empty.
+                let mut candidates = Vec::new();
+                Self::append_explicit_roots(&mut candidates, &ctx.data_dir);
+                roots.extend(candidates.into_iter().map(ScanRoot::local));
             } else {
                 roots.extend(
                     Self::all_candidate_paths()
@@ -352,10 +348,13 @@ impl CopilotConnector {
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         let mut out = Vec::new();
+        let mut seen_files = HashSet::new();
         for root in Self::source_roots(ctx) {
             let files = Self::find_conversation_files(&root.path);
             for file in files {
-                if !file_modified_since(&file, ctx.since_ts) {
+                if !seen_files.insert(copilot_vscode::source_path_key(&file))
+                    || !file_modified_since(&file, ctx.since_ts)
+                {
                     continue;
                 }
                 out.push(
@@ -371,10 +370,13 @@ impl CopilotConnector {
             }
         }
         // Native VS Code chat-session stores (issue #16).
-        out.extend(copilot_vscode::discover_native(
-            &Self::native_scan_bases(ctx),
-            ctx.since_ts,
-        ));
+        out.extend(
+            copilot_vscode::discover_native(&Self::native_scan_bases(ctx), ctx.since_ts)
+                .into_iter()
+                .filter(|source| {
+                    seen_files.insert(copilot_vscode::source_path_key(&source.source_path))
+                }),
+        );
         out
     }
 
@@ -684,6 +686,7 @@ impl Connector for CopilotConnector {
             .collect();
 
         let mut all_conversations = Vec::new();
+        let mut seen_files = HashSet::new();
 
         for root in roots {
             let files = Self::find_conversation_files(&root);
@@ -694,7 +697,9 @@ impl Connector for CopilotConnector {
             );
 
             for file in files {
-                if !file_modified_since(&file, ctx.since_ts) {
+                if !seen_files.insert(copilot_vscode::source_path_key(&file))
+                    || !file_modified_since(&file, ctx.since_ts)
+                {
                     continue;
                 }
 

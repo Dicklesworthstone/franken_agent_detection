@@ -79,6 +79,12 @@ impl ClineConnector {
 
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
         let base = Self::normalize_root_path(base);
+        if Self::looks_like_storage(&base) {
+            // A provider store, tasks directory, task or exact transcript is
+            // already a complete scope. Do not widen it to adjacent stores.
+            roots.push(base);
+            return;
+        }
         let file_name = base.file_name().and_then(|n| n.to_str());
         let is_config = file_name.is_some_and(|n| n == ".config");
         let is_app_support = file_name.is_some_and(|n| n == "Application Support");
@@ -86,14 +92,10 @@ impl ClineConnector {
             && base
                 .parent()
                 .is_some_and(|p| p.file_name().is_some_and(|n| n == "AppData"));
-        let is_code_variant =
-            file_name.is_some_and(|n| n == "Code" || n == "Code - Insiders" || n == "VSCodium");
+        let is_code_variant = file_name
+            .is_some_and(|n| matches!(n, "Code" | "Code - Insiders" | "VSCodium" | "Cursor"));
         let is_user = file_name.is_some_and(|n| n == "User");
         let is_global_storage = file_name.is_some_and(|n| n == "globalStorage");
-
-        if Self::looks_like_storage(&base) {
-            roots.push(base.clone());
-        }
 
         let mut storage_roots: Vec<PathBuf> = Vec::new();
 
@@ -105,18 +107,21 @@ impl ClineConnector {
             storage_roots.push(base.join("Code/User/globalStorage"));
             storage_roots.push(base.join("Code - Insiders/User/globalStorage"));
             storage_roots.push(base.join("VSCodium/User/globalStorage"));
+            storage_roots.push(base.join("Cursor/User/globalStorage"));
         }
 
         if is_app_support {
             storage_roots.push(base.join("Code/User/globalStorage"));
             storage_roots.push(base.join("Code - Insiders/User/globalStorage"));
             storage_roots.push(base.join("VSCodium/User/globalStorage"));
+            storage_roots.push(base.join("Cursor/User/globalStorage"));
         }
 
         if is_appdata_roaming {
             storage_roots.push(base.join("Code/User/globalStorage"));
             storage_roots.push(base.join("Code - Insiders/User/globalStorage"));
             storage_roots.push(base.join("VSCodium/User/globalStorage"));
+            storage_roots.push(base.join("Cursor/User/globalStorage"));
         }
 
         if is_code_variant {
@@ -137,14 +142,17 @@ impl ClineConnector {
             storage_roots.push(base.join(".config/Code/User/globalStorage"));
             storage_roots.push(base.join(".config/Code - Insiders/User/globalStorage"));
             storage_roots.push(base.join(".config/VSCodium/User/globalStorage"));
+            storage_roots.push(base.join(".config/Cursor/User/globalStorage"));
             storage_roots.push(base.join("Library/Application Support/Code/User/globalStorage"));
             storage_roots
                 .push(base.join("Library/Application Support/Code - Insiders/User/globalStorage"));
             storage_roots
                 .push(base.join("Library/Application Support/VSCodium/User/globalStorage"));
+            storage_roots.push(base.join("Library/Application Support/Cursor/User/globalStorage"));
             storage_roots.push(base.join("AppData/Roaming/Code/User/globalStorage"));
             storage_roots.push(base.join("AppData/Roaming/Code - Insiders/User/globalStorage"));
             storage_roots.push(base.join("AppData/Roaming/VSCodium/User/globalStorage"));
+            storage_roots.push(base.join("AppData/Roaming/Cursor/User/globalStorage"));
         }
 
         for root in storage_roots {
@@ -157,29 +165,74 @@ impl ClineConnector {
         }
     }
 
-    fn looks_like_storage(path: &std::path::Path) -> bool {
-        if path
+    fn is_message_path(path: &Path) -> bool {
+        path.file_name().is_some_and(|name| {
+            name == "ui_messages.json" || name == "api_conversation_history.json"
+        })
+    }
+
+    fn task_source(task_dir: &Path) -> Option<PathBuf> {
+        if task_dir
             .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.contains("claude-dev") || n.contains("roo-cline"))
+            .is_some_and(|name| name == "taskHistory.json")
+        {
+            return None;
+        }
+        // UI history is the user-facing transcript. Keep API history as the
+        // fallback only when that file is absent, as in the original adapter.
+        ["ui_messages.json", "api_conversation_history.json"]
+            .into_iter()
+            .map(|name| task_dir.join(name))
+            .find(|path| path.is_file())
+    }
+
+    fn looks_like_storage(path: &Path) -> bool {
+        if Self::is_message_path(path)
+            || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.contains("claude-dev") || n.contains("roo-cline") || n == "tasks"
+            })
+            || path
+                .parent()
+                .is_some_and(|p| p.file_name().is_some_and(|n| n == "tasks"))
+            || Self::task_source(path).is_some()
+            || Self::contains_task_sources(&path.join("tasks"))
         {
             return true;
         }
 
-        if path.is_dir() {
-            return fs::read_dir(path).is_ok_and(|mut d| {
-                d.any(|e| {
-                    e.is_ok_and(|e| {
-                        let p = e.path();
-                        p.is_dir()
-                            && (p.join("ui_messages.json").exists()
-                                || p.join("api_conversation_history.json").exists())
-                    })
-                })
-            });
-        }
+        Self::contains_task_sources(path)
+    }
 
-        false
+    fn contains_task_sources(path: &Path) -> bool {
+        fs::read_dir(path).is_ok_and(|mut entries| {
+            entries.any(|entry| {
+                entry.is_ok_and(|entry| {
+                    let path = entry.path();
+                    path.is_dir() && Self::task_source(&path).is_some()
+                })
+            })
+        })
+    }
+
+    fn is_storage_container(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    ".config"
+                        | "Application Support"
+                        | "Code"
+                        | "Code - Insiders"
+                        | "VSCodium"
+                        | "Cursor"
+                        | "User"
+                        | "globalStorage"
+                ) || (name == "Roaming"
+                    && path
+                        .parent()
+                        .is_some_and(|parent| parent.file_name().is_some_and(|n| n == "AppData")))
+            })
     }
 
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
@@ -194,8 +247,10 @@ impl ClineConnector {
             Self::append_explicit_roots(&mut derived, &override_root);
             if !derived.is_empty() {
                 derived.into_iter().map(ScanRoot::local).collect()
-            } else if Self::looks_like_storage(&override_root) {
-                vec![ScanRoot::local(override_root)]
+            } else if Self::is_storage_container(&override_root) {
+                // A missing or empty selected VS Code store must not read
+                // unrelated live histories from the current machine.
+                Vec::new()
             } else {
                 Self::storage_roots()
                     .into_iter()
@@ -217,41 +272,71 @@ impl ClineConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
-        let mut out = Vec::new();
-        for root in Self::source_roots(ctx) {
-            if !root.path.exists() {
+    fn source_files(root: &Path) -> Vec<PathBuf> {
+        if Self::is_message_path(root) {
+            return root
+                .is_file()
+                .then(|| root.to_path_buf())
+                .into_iter()
+                .collect();
+        }
+        if let Some(source) = Self::task_source(root) {
+            return vec![source];
+        }
+        if root
+            .parent()
+            .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "tasks"))
+        {
+            // A selected native task is terminal even if its transcript is
+            // absent. Never replace it with a nested task or artifact.
+            return Vec::new();
+        }
+
+        let mut files = Vec::new();
+        // Native Cline writes <globalStorage>/tasks/<id> (disk.ts,
+        // ensureTaskDirectoryExists). Preserve direct <store>/<id> histories
+        // too, without recursively reading arbitrary extension directories.
+        for directory in [root.to_path_buf(), root.join("tasks")] {
+            if !directory.is_dir() {
                 continue;
             }
-            let entries = match fs::read_dir(&root.path) {
+            let entries = match fs::read_dir(&directory) {
                 Ok(entries) => entries,
                 Err(err) => {
-                    tracing::debug!(path = %root.path.display(), error = %err, "cline: skipping unreadable source-discovery directory");
+                    tracing::debug!(path = %directory.display(), error = %err, "cline: skipping unreadable task directory");
                     continue;
                 }
             };
             for entry in entries.flatten() {
                 let task_dir = entry.path();
-                if !task_dir.is_dir() {
+                if task_dir.is_dir()
+                    && let Some(source) = Self::task_source(&task_dir)
+                {
+                    files.push(source);
+                }
+            }
+        }
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+        let mut out = Vec::new();
+        let mut seen_task_dirs = HashSet::new();
+        for root in Self::source_roots(ctx) {
+            for file in Self::source_files(&root.path) {
+                let Some(task_dir) = file.parent() else {
+                    continue;
+                };
+                // An ancestor of the selected store may be a symlink too.
+                // Keep the original path/provenance in the source record,
+                // but compare actual task directories across overlapping roots.
+                let task_key =
+                    fs::canonicalize(task_dir).unwrap_or_else(|_| dedupe_path_key(task_dir));
+                if !seen_task_dirs.insert(task_key) {
                     continue;
                 }
-                if task_dir.file_name().and_then(|s| s.to_str()) == Some("taskHistory.json") {
-                    continue;
-                }
-
-                let ui_messages_path = task_dir.join("ui_messages.json");
-                let api_messages_path = task_dir.join("api_conversation_history.json");
-                let source_file = if ui_messages_path.exists() {
-                    Some(ui_messages_path)
-                } else if api_messages_path.exists() {
-                    Some(api_messages_path)
-                } else {
-                    None
-                };
-
-                let Some(file) = source_file else {
-                    continue;
-                };
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }
@@ -260,7 +345,7 @@ impl ClineConnector {
                     DiscoveredSourceFile::new(
                         "cline",
                         &root,
-                        file,
+                        file.clone(),
                         DiscoveredSourceRole::PrimarySessionLog,
                         true,
                     )
@@ -268,7 +353,7 @@ impl ClineConnector {
                 );
 
                 let meta_path = task_dir.join("task_metadata.json");
-                if meta_path.exists() {
+                if meta_path.is_file() {
                     out.push(
                         DiscoveredSourceFile::new(
                             "cline",
@@ -293,193 +378,162 @@ impl Connector for ClineConnector {
 
     #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
-
-        if roots.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut convs = Vec::new();
-        // Overlapping roots (Code + Cursor sync, ancestor symlinks) reach
-        // the same task directory twice; dedupe across ALL roots on the
-        // lossless path key so the same task is never parsed twice.
-        let mut seen_task_dirs: HashSet<PathBuf> = HashSet::new();
-        for root in roots {
-            if !root.exists() {
+        // Use exactly the discovery selection, including its UI/API preference,
+        // incremental filter and cross-root task deduplication.
+        for source in Self::discover_sources(ctx) {
+            if source.role != DiscoveredSourceRole::PrimarySessionLog {
                 continue;
             }
+            let file = source.source_path;
+            let Some(path) = file.parent() else {
+                continue;
+            };
+            let task_id = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(std::string::ToString::to_string);
+            let meta_path = path.join("task_metadata.json");
 
-            let entries = match fs::read_dir(&root) {
-                Ok(e) => e,
+            // Task logs embed base64 screenshots and routinely reach
+            // tens of MB; enforce the project's 100MB scan cap.
+            let data = match read_capped(&file) {
+                Ok(Some(d)) => d.trim_start_matches('\u{feff}').to_string(),
+                Ok(None) => {
+                    tracing::debug!(path = %file.display(), "cline: file exceeds the scan size cap; skipping");
+                    continue;
+                }
                 Err(e) => {
-                    tracing::debug!(path = %root.display(), error = %e, "cline: skipping unreadable directory");
+                    tracing::debug!(path = %file.display(), error = %e, "cline: skipping unreadable file");
                     continue;
                 }
             };
-            for entry in entries {
-                let Ok(entry) = entry else { continue };
-                let path = entry.path();
-                if !path.is_dir() {
+            let val: Value = match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(path = %file.display(), error = %e, "cline skipping malformed JSON");
                     continue;
                 }
-                if !seen_task_dirs.insert(dedupe_path_key(&path)) {
-                    continue;
-                }
-                let task_id = path
+            };
+
+            let mut messages = Vec::new();
+            if let Some(arr) = val.as_array() {
+                let mut legacy_usage = if file
                     .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(std::string::ToString::to_string);
-                if task_id.as_deref() == Some("taskHistory.json") {
-                    continue;
-                }
-
-                let meta_path = path.join("task_metadata.json");
-                let ui_messages_path = path.join("ui_messages.json");
-                let api_messages_path = path.join("api_conversation_history.json");
-
-                // Prefer UI messages as they are user-facing. Fallback to API history.
-                let source_file = if ui_messages_path.exists() {
-                    Some(ui_messages_path)
-                } else if api_messages_path.exists() {
-                    Some(api_messages_path)
-                } else {
-                    None
-                };
-
-                let Some(file) = source_file else {
-                    continue;
-                };
-
-                // Skip files not modified since last scan (incremental indexing)
-                if !file_modified_since(&file, ctx.since_ts) {
-                    continue;
-                }
-
-                // Task logs embed base64 screenshots and routinely reach
-                // tens of MB; enforce the project's 100MB scan cap.
-                let data = match read_capped(&file) {
-                    Ok(Some(d)) => d.trim_start_matches('\u{feff}').to_string(),
-                    Ok(None) => {
-                        tracing::debug!(path = %file.display(), "cline: file exceeds the scan size cap; skipping");
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::debug!(path = %file.display(), error = %e, "cline: skipping unreadable file");
-                        continue;
-                    }
-                };
-                let val: Value = match serde_json::from_str(&data) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::debug!(path = %file.display(), error = %e, "cline skipping malformed JSON");
-                        continue;
-                    }
-                };
-
-                let mut messages = Vec::new();
-                if let Some(arr) = val.as_array() {
-                    for item in arr {
-                        // Use parse_timestamp to handle both i64 milliseconds and ISO-8601 strings
-                        let created = item
-                            .get("timestamp")
-                            .or_else(|| item.get("created_at"))
-                            .or_else(|| item.get("ts"))
-                            .and_then(parse_timestamp);
-
-                        // NOTE: Do NOT filter individual messages by timestamp here!
-                        // The file-level check in file_modified_since() is sufficient.
-                        // Filtering messages would cause older messages to be lost when
-                        // the file is re-indexed after new messages are added.
-
-                        let role = item
-                            .get("role")
-                            .or_else(|| item.get("type"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("agent");
-
-                        let content_val = item
-                            .get("content")
-                            .or_else(|| item.get("text"))
-                            .or_else(|| item.get("message"));
-                        let content = content_val.map(flatten_content).unwrap_or_default();
-
-                        if content.trim().is_empty() {
-                            continue;
-                        }
-
-                        messages.push(NormalizedMessage {
-                            idx: i64::try_from(messages.len()).unwrap_or(i64::MAX), // preserve original order for stable sorting
-                            role: role.to_string(),
-                            author: None,
-                            created_at: created,
-                            content,
-                            extra: item.clone(),
-                            invocations: content_val
-                                .map_or_else(Vec::new, extract_invocations_from_content_blocks),
-                            snippets: Vec::new(),
-                        });
-                    }
-                }
-
-                if messages.is_empty() {
-                    continue;
-                }
-
-                // Sort by timestamp (missing timestamps go last), preserving original order
-                messages.sort_by(|a, b| {
-                    let a_ts = a.created_at.unwrap_or(i64::MAX);
-                    let b_ts = b.created_at.unwrap_or(i64::MAX);
-                    a_ts.cmp(&b_ts).then_with(|| a.idx.cmp(&b.idx))
-                });
-
-                // Re-index
-                crate::types::reindex_messages(&mut messages);
-
-                let (mut title, workspace) = if meta_path.exists()
-                    && let Ok(s) = fs::read_to_string(&meta_path)
-                    && let Ok(v) = serde_json::from_str::<Value>(&s)
+                    .is_some_and(|name| name == "ui_messages.json")
                 {
-                    let title = v
-                        .get("title")
-                        .and_then(|t| t.as_str())
-                        .map(std::string::ToString::to_string);
-                    // Try to find workspace path
-                    // Cline doesn't standardize this in metadata, but sometimes it's there or in state.
-                    // We check common keys.
-                    let workspace = v
-                        .get("rootPath")
-                        .or_else(|| v.get("cwd"))
-                        .or_else(|| v.get("workspace"))
-                        .and_then(|s| s.as_str())
-                        .map(PathBuf::from);
-                    (title, workspace)
+                    super::token_extraction::cline_legacy_usage_attachments(arr)
                 } else {
-                    (None, None)
+                    std::collections::BTreeMap::new()
                 };
+                for (index, item) in arr.iter().enumerate() {
+                    // Use parse_timestamp to handle both i64 milliseconds and ISO-8601 strings
+                    let created = item
+                        .get("timestamp")
+                        .or_else(|| item.get("created_at"))
+                        .or_else(|| item.get("ts"))
+                        .and_then(parse_timestamp);
 
-                // Fallback title from first message
-                if title.is_none() {
-                    title = messages
-                        .first()
-                        .and_then(|m| m.content.lines().next())
-                        .map(|s| s.chars().take(100).collect());
+                    // NOTE: Do NOT filter individual messages by timestamp here!
+                    // The file-level check in file_modified_since() is sufficient.
+                    // Filtering messages would cause older messages to be lost when
+                    // the file is re-indexed after new messages are added.
+
+                    let role = normalized_role(item);
+
+                    let content_val = item
+                        .get("content")
+                        .or_else(|| item.get("text"))
+                        .or_else(|| item.get("message"));
+                    let content = content_val.map(flatten_content).unwrap_or_default();
+
+                    let attached_usage = legacy_usage.remove(&index);
+                    let has_attached_usage = attached_usage
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .is_some_and(|usage| !usage.is_empty());
+                    if content.trim().is_empty() && !has_attached_usage {
+                        continue;
+                    }
+                    let mut extra = item.clone();
+                    if let Some(usage) = attached_usage {
+                        // The original start/finish rows and their content stay
+                        // intact; only selected counters are copied to cass.
+                        if !extra.get("cass").is_some_and(Value::is_object) {
+                            extra["cass"] = serde_json::json!({});
+                        }
+                        extra["cass"]["token_usage"] = usage;
+                    }
+
+                    messages.push(NormalizedMessage {
+                        idx: i64::try_from(messages.len()).unwrap_or(i64::MAX), // preserve original order for stable sorting
+                        role: role.to_string(),
+                        author: None,
+                        created_at: created,
+                        content,
+                        extra,
+                        invocations: content_val
+                            .map_or_else(Vec::new, extract_invocations_from_content_blocks),
+                        snippets: Vec::new(),
+                    });
                 }
-
-                convs.push(NormalizedConversation {
-                    agent_slug: "cline".to_string(),
-                    external_id: task_id,
-                    title,
-                    workspace,
-                    source_path: file.clone(),
-                    started_at: messages.iter().filter_map(|m| m.created_at).min(),
-                    ended_at: messages.iter().filter_map(|m| m.created_at).max(),
-                    metadata: serde_json::json!({"source": "cline"}),
-                    messages,
-                });
             }
+
+            if messages.is_empty() {
+                continue;
+            }
+
+            // Sort by timestamp (missing timestamps go last), preserving original order
+            messages.sort_by(|a, b| {
+                let a_ts = a.created_at.unwrap_or(i64::MAX);
+                let b_ts = b.created_at.unwrap_or(i64::MAX);
+                a_ts.cmp(&b_ts).then_with(|| a.idx.cmp(&b.idx))
+            });
+
+            // Re-index
+            crate::types::reindex_messages(&mut messages);
+
+            let (mut title, workspace) = if meta_path.exists()
+                && let Ok(s) = fs::read_to_string(&meta_path)
+                && let Ok(v) = serde_json::from_str::<Value>(&s)
+            {
+                let title = v
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .map(std::string::ToString::to_string);
+                // Try to find workspace path
+                // Cline doesn't standardize this in metadata, but sometimes it's there or in state.
+                // We check common keys.
+                let workspace = v
+                    .get("rootPath")
+                    .or_else(|| v.get("cwd"))
+                    .or_else(|| v.get("workspace"))
+                    .and_then(|s| s.as_str())
+                    .map(PathBuf::from);
+                (title, workspace)
+            } else {
+                (None, None)
+            };
+
+            // Fallback title from first message
+            if title.is_none() {
+                title = messages
+                    .first()
+                    .and_then(|m| m.content.lines().next())
+                    .map(|s| s.chars().take(100).collect());
+            }
+
+            convs.push(NormalizedConversation {
+                agent_slug: "cline".to_string(),
+                external_id: task_id,
+                title,
+                workspace,
+                source_path: file.clone(),
+                started_at: messages.iter().filter_map(|m| m.created_at).min(),
+                ended_at: messages.iter().filter_map(|m| m.created_at).max(),
+                metadata: serde_json::json!({"source": "cline"}),
+                messages,
+            });
         }
 
         Ok(convs)
@@ -487,6 +541,25 @@ impl Connector for ClineConnector {
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         Ok(Self::discover_sources(ctx))
+    }
+}
+
+fn normalized_role(item: &Value) -> &str {
+    if let Some(role) = item.get("role").and_then(Value::as_str) {
+        return role;
+    }
+    // Native Cline UI records use ask/say for their display type, not their
+    // speaker. Keep the subtype in raw extra while exposing useful roles.
+    // See cline/cline's ExtensionMessage.ts and sdk/message-translator.ts.
+    match item.get("type").and_then(Value::as_str) {
+        Some("say") => match item.get("say").and_then(Value::as_str) {
+            Some("task" | "user_feedback" | "user_feedback_diff") => "user",
+            Some("command_output" | "mcp_server_response" | "browser_action_result") => "tool",
+            _ => "assistant",
+        },
+        Some("ask") => "assistant",
+        Some(legacy_type) => legacy_type,
+        None => "agent",
     }
 }
 

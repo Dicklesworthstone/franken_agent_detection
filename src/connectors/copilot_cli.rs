@@ -62,7 +62,7 @@ impl CopilotCliConnector {
     }
 
     /// Check whether a path looks like Copilot CLI storage.
-    fn looks_like_cli_storage(path: &Path) -> bool {
+    pub(crate) fn looks_like_cli_storage(path: &Path) -> bool {
         let segments: Vec<String> = path
             .components()
             .map(|c| c.as_os_str().to_string_lossy().to_lowercase())

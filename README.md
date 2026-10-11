@@ -168,6 +168,32 @@ but names such as `cassie` and `cassette-player` remain scoped to that
 directory. `CASS_AIDER_DATA_ROOT` takes precedence over the context directory;
 explicit `ScanRoot`s take precedence over both.
 
+The `copilot` / `github-copilot` connector reads VS Code chat stores and
+extension exports. Copilot CLI histories belong to `copilot_cli`, including
+when both connectors scan one supplied home directory. Detection and source
+discovery use the same ownership split. Supplied VS Code session files and
+native store containers remain scoped to that location, including empty or
+missing stores; they do not fall back to unrelated live histories.
+
+Cline reads extension task stores at `tasks/<taskId>/ui_messages.json`, with
+`api_conversation_history.json` as the fallback when UI history is absent.
+Legacy direct `<store>/<taskId>` layouts remain supported. Exact transcript
+files, task directories, `tasks` directories and extension roots keep their
+scope, and overlapping roots share one task selection. Native `ask` / `say`
+records expose user, assistant and tool roles while preserving their raw
+subtypes. This covers Cline's UI/API task files; the separate SDK session
+store using manifests and message files is not supported.
+
+Cline token extraction reads recorded `tokensIn`, `tokensOut`, `cacheWrites`
+and `cacheReads` from request, deleted-request and subagent usage rows. These
+are four independent buckets. Legacy request start/finish pairs retain all
+transcript rows, with final counters attached to the start row under
+`extra.cass.token_usage`; the finish row returns `TokenDataSource::Suppressed`
+and contributes neither API usage nor an estimate. Only the four counters
+are attached, without copying request payloads. Explicit zero and partial
+counts remain API data; invalid fields and ordinary transcript text retain
+the estimation fallback. The existing 100 MB task-file cap is unchanged.
+
 Exclusion entries are literal paths, without shell or tilde expansion. An unset
 or empty `CASS_EXCLUDE_PATHS` leaves scans unrestricted. Invalid Unicode,
 unresolvable entries, or relative entries without a usable working directory

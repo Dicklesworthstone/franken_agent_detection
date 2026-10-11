@@ -72,7 +72,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanRoot};
-use super::utils::{dedupe_path_key, read_capped};
+use super::utils::read_capped;
 use super::{file_modified_since, parse_timestamp};
 use crate::types::{
     NormalizedConversation, NormalizedInvocation, NormalizedMessage, reindex_messages,
@@ -147,20 +147,42 @@ pub fn default_user_roots() -> Vec<PathBuf> {
 pub fn looks_like_native_store(path: &Path) -> bool {
     let named = |name: &str| {
         path.components().any(|component| {
-            let segment = component.as_os_str().to_string_lossy().to_lowercase();
-            segment == name
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(name)
         })
     };
     named("workspaceStorage")
+        || named("globalStorage")
         || named("chatSessions")
         || named("emptyWindowChatSessions")
         || named("transferredChatSessions")
+        || matches!(
+            dir_name(path),
+            Some(
+                "User"
+                    | "Code"
+                    | "Code - Insiders"
+                    | "VSCodium"
+                    | ".config"
+                    | "Application Support"
+            )
+        )
+        || (dir_name(path) == Some("Roaming")
+            && path.parent().and_then(dir_name) == Some("AppData"))
         || path.join("workspaceStorage").is_dir()
         || path.join("globalStorage").is_dir()
 }
 
 fn dir_name(path: &Path) -> Option<&str> {
     path.file_name().and_then(|name| name.to_str())
+}
+
+/// Deduplicate overlapping roots and ancestor symlink aliases while keeping
+/// the caller's original source paths and provenance in emitted records.
+pub(super) fn source_path_key(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn is_session_file(path: &Path) -> Option<NativeFormat> {
@@ -329,6 +351,13 @@ pub fn native_sources_under(base: &Path) -> Vec<NativeSource> {
             collect_session_container(&mut out, base, store, workspace_dir.as_deref());
         }
         Some("workspaceStorage") => collect_workspace_storage(&mut out, base),
+        Some(_) if base.parent().and_then(dir_name) == Some("workspaceStorage") => {
+            let container = base.join("chatSessions");
+            if container.is_dir() {
+                collect_session_container(&mut out, &container, STORE_WORKSPACE, Some(base));
+            }
+            push_state_db(&mut out, base.join("state.vscdb"), Some(base));
+        }
         Some("globalStorage") => collect_global_storage(&mut out, base),
         Some("User") => collect_user_root(&mut out, base),
         Some(name) if PRODUCT_DIRS.contains(&name) => {
@@ -1202,7 +1231,7 @@ pub fn scan_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<NormalizedC
     let mut seen_sessions: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for (_root, source) in collect_sources(bases) {
-        if !seen_files.insert(dedupe_path_key(&source.path)) {
+        if !seen_files.insert(source_path_key(&source.path)) {
             continue;
         }
         if !file_modified_since(&source.path, since_ts) {
@@ -1220,7 +1249,7 @@ pub fn discover_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<Discove
     let mut seen_sidecars: HashSet<PathBuf> = HashSet::new();
     let mut out = Vec::new();
     for (root, source) in collect_sources(bases) {
-        if !seen_files.insert(dedupe_path_key(&source.path)) {
+        if !seen_files.insert(source_path_key(&source.path)) {
             continue;
         }
         if !file_modified_since(&source.path, since_ts) {
@@ -1238,7 +1267,7 @@ pub fn discover_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<Discove
         );
         if let Some(workspace_dir) = &source.workspace_dir {
             let sidecar = workspace_dir.join("workspace.json");
-            if sidecar.is_file() && seen_sidecars.insert(dedupe_path_key(&sidecar)) {
+            if sidecar.is_file() && seen_sidecars.insert(source_path_key(&sidecar)) {
                 out.push(
                     DiscoveredSourceFile::new(
                         "copilot",
