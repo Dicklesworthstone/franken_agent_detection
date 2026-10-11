@@ -9,8 +9,10 @@ Repository: <https://github.com/Dicklesworthstone/franken_agent_detection>
 Crate: <https://crates.io/crates/franken-agent-detection>
 
 > **Release vs. tag:** The latest published GitHub Release is
-> [`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0)
-> (2026-09-16).
+> [`v0.3.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.9)
+> (2026-10-11). `v0.3.4` through `v0.3.7` are git tags and crates.io versions
+> without GitHub Release pages; `v0.3.8` got its tag and Release page on
+> 2026-10-11, after its crates.io publish.
 > Earlier GitHub Releases exist for
 > [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4),
 > [`v0.1.5`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.5),
@@ -49,6 +51,93 @@ window is since GitHub Release
 ---
 
 ## [Unreleased]
+
+## [0.3.9] -- 2026-10-11
+
+Published from `main` (16 commits since 0.3.8, plus the `dirs` 7 update).
+
+### Added
+
+- **Qwen Code native JSONL sessions:** UUID-named
+  `projects/<project>/chats/<uuid>.jsonl` sessions (and `chats/archive/`) are
+  discovered alongside the legacy `session-*.json` files. The active parent
+  chain is rebuilt, same-UUID content fragments are merged and keep their
+  latest usage, and user text, thoughts, tool calls and results, custom titles
+  and usage-only assistant turns are kept. Detection and scanning both follow
+  `QWEN_RUNTIME_DIR`, then `QWEN_HOME`, then `~/.qwen`. The connector now
+  streams, and token extraction reads Qwen's recorded usage.
+- **Cline native task directories:** `tasks/<taskId>` UI and API histories are
+  read as well as the legacy layouts. Native `ask`/`say` rows get
+  `user`/`assistant`/`tool` roles (the raw subtype is kept). Recorded input,
+  output, cache-write and cache-read counts are extracted; finish rows no
+  longer repeat a request's usage.
+- **Recorded token usage for Gemini and Kimi:** `extract_tokens_for_agent`
+  returns the counts these tools record (Gemini's native token components,
+  Kimi's `usage.record`) instead of estimating from text.
+- `connectors::pi_wire::try_discover_sources`: like `discover_sources`, but
+  returns an invalid exclusion policy as an error.
+
+### Fixed
+
+- **Claude Code: compacted messages keep reply identity
+  ([#35](https://github.com/Dicklesworthstone/franken_agent_detection/issues/35)):**
+  in sessions of 32 MiB or more, `message.id` and `requestId` are kept as
+  `extra.cass.message_id` and `extra.cass.request_id`, so hosts can count a
+  reply's repeated per-block usage once. Based on LPFchan's patch.
+- **Exclusions
+  ([#29](https://github.com/Dicklesworthstone/franken_agent_detection/issues/29),
+  [#30](https://github.com/Dicklesworthstone/franken_agent_detection/issues/30)):**
+  an exact Codex `CASS_EXCLUDE_PATHS` entry now covers both the plain
+  `.jsonl` and the compressed `.jsonl.zst` form of a rollout. An invalid
+  policy (non-Unicode, an entry that cannot be resolved, or a relative entry
+  with no usable working directory) is now an error from Claude Code, Codex
+  and Pi-family discovery and scans, raised before any source is read; it
+  used to mean "no exclusions". `pi_wire::discover_sources` and
+  `PiDurableConnector::store_diagnostics` fail closed (they log and return
+  nothing). Pi Durable no longer opens an excluded explicit store to detect
+  its format.
+- **Read failures
+  ([#33](https://github.com/Dicklesworthstone/franken_agent_detection/issues/33)):**
+  a shared line reader skips invalid UTF-8 one record at a time and returns an
+  I/O error once instead of retrying the read. Claude Code, Factory, Kimi,
+  Muse, Clawdbot, Vibe, OpenClaw, Grok, Prime and Gemini drop a transcript
+  that fails mid-read instead of emitting its prefix as a complete session.
+  Claude Code streaming carries on with healthy sources and returns the first
+  error, with a failure count, at the end; the collecting `scan()` stays
+  all-or-error.
+- **Detection follows each scanner's precedence
+  ([#31](https://github.com/Dicklesworthstone/franken_agent_detection/issues/31),
+  [#32](https://github.com/Dicklesworthstone/franken_agent_detection/issues/32)):**
+  `PI_SESSIONS_DIR` alone now adds to the default Pi history instead of
+  hiding it. Detection honors `GEMINI_HOME`, `OPENCODE_STORAGE_ROOT` /
+  `OPENCODE_SQLITE_DB`, `HERMES_HOME` / `HERMES_SQLITE_DB`, `CRUSH_SQLITE_DB`,
+  `GOOSE_SQLITE_DB` (even when `GOOSE_PATH_ROOT` names a missing directory)
+  and `CASS_CURSOR_PROJECTS_ROOT`.
+- **Gemini:** JSONL histories are replayed the way Gemini CLI writes them. A
+  re-appended message ID replaces the earlier version in place, so replies and
+  their usage are no longer duplicated; patches, removals, rewinds and
+  checkpoints are applied. Assistant turns that hold only thoughts or tool
+  calls are kept: their text includes `[Thinking]`, `[Tool: ...]` and
+  `[Tool result: ...]`, and their tool calls are invocations.
+- **Aider:** a supplied `.aider.chat.history.md` stays scoped to its own
+  source. cass state directories are recognized by whole name, so paths such
+  as `cassette` are no longer redirected.
+- **Copilot:** `copilot` / `github-copilot` own the VS Code histories and
+  `copilot_cli` owns the CLI histories, the same way in detection, discovery
+  and scans. CLI sessions are no longer also emitted under `copilot`, and the
+  `github-copilot` probe list no longer includes `~/.config/gh-copilot` or the
+  `~/.copilot/*session-state` directories.
+
+### Changed
+
+- **Re-indexing:** hosts that already indexed Gemini, Cline or Copilot CLI
+  sessions get different output for the same files (collapsed Gemini message
+  versions and the new thought and tool text, Cline roles, Copilot CLI
+  sessions only under `copilot_cli`).
+- **Dependencies:** `dirs` 6 to 7. Its only upstream change is Windows
+  `preference_dir`, which FAD does not call; the home, config and data
+  directories it uses are unchanged. `zstd` stays on 0.13, the version cass
+  uses.
 
 ## [0.3.8] -- 2026-10-08
 
