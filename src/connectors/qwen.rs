@@ -2,6 +2,8 @@
 //!
 //! Qwen Code stores current sessions as UUID-named JSONL files under
 //! `~/.qwen/projects/<project>/chats/` (including `chats/archive/`).
+//! Canonical subagent histories live alongside chats at
+//! `projects/<project>/subagents/<parent-session>/agent-<agent-id>.jsonl`.
 //! Legacy JSON sessions live at
 //! `~/.qwen/tmp/<project-hash>/chats/session-<timestamp>-<id>.json`.
 //!
@@ -14,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -33,6 +35,7 @@ use crate::types::{
 };
 
 const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_SUBAGENT_METADATA_BYTES: u64 = 1024 * 1024;
 const QWEN_USAGE_KEYS: [&str; 6] = [
     "promptTokenCount",
     "candidatesTokenCount",
@@ -120,19 +123,47 @@ impl QwenConnector {
             && id.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-')
     }
 
+    fn is_subagent_session_file(path: &Path) -> bool {
+        let Some(id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("agent-"))
+            .and_then(|name| name.strip_suffix(".jsonl"))
+        else {
+            return false;
+        };
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            && path
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "subagents"))
+    }
+
     fn looks_like_native_root(path: &Path) -> bool {
         Self::is_native_session_file(path)
-            || path.file_name().is_some_and(|name| name == "chats")
+            || Self::is_subagent_session_file(path)
+            || path
+                .file_name()
+                .is_some_and(|name| name == "chats" || name == "subagents")
+            || path
+                .parent()
+                .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "subagents"))
             || (path.file_name().is_some_and(|name| name == "archive")
                 && path
                     .parent()
                     .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "chats")))
             || path.join("projects").is_dir()
             || path.join("chats").is_dir()
+            || path.join("subagents").is_dir()
             || fs::read_dir(path).is_ok_and(|entries| {
                 entries.flatten().any(|entry| {
                     Self::is_native_session_file(&entry.path())
+                        || Self::is_subagent_session_file(&entry.path())
                         || entry.path().join("chats").is_dir()
+                        || entry.path().join("subagents").is_dir()
                 })
             })
     }
@@ -151,6 +182,7 @@ impl QwenConnector {
 
             let name = entry.file_name().to_str().unwrap_or("");
             if Self::is_native_session_file(entry.path())
+                || Self::is_subagent_session_file(entry.path())
                 || (include_legacy
                     && name.starts_with("session-")
                     && entry
@@ -207,10 +239,10 @@ impl QwenConnector {
                 continue;
             }
             for session_path in Self::session_files(&root.path, source_root.include_legacy) {
-                if !seen_files.insert(dedupe_path_key(&session_path)) {
+                if !seen_files.insert(qwen_source_key(&session_path)) {
                     continue;
                 }
-                if !file_modified_since(&session_path, ctx.since_ts) {
+                if !qwen_source_modified_since(&session_path, ctx.since_ts) {
                     continue;
                 }
                 out.push(
@@ -223,6 +255,20 @@ impl QwenConnector {
                     )
                     .with_fs_metadata(),
                 );
+                if let Some(metadata) = subagent_metadata_path(&session_path)
+                    && metadata.is_file()
+                {
+                    out.push(
+                        DiscoveredSourceFile::new(
+                            "qwen",
+                            &root,
+                            metadata,
+                            DiscoveredSourceRole::MetadataSidecar,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
                 if session_path
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -280,11 +326,11 @@ impl Connector for QwenConnector {
             }
 
             for session_path in Self::session_files(&root.path, source_root.include_legacy) {
-                if !seen_files.insert(dedupe_path_key(&session_path)) {
+                if !seen_files.insert(qwen_source_key(&session_path)) {
                     continue;
                 }
 
-                if !file_modified_since(&session_path, ctx.since_ts) {
+                if !qwen_source_modified_since(&session_path, ctx.since_ts) {
                     continue;
                 }
 
@@ -307,6 +353,25 @@ impl Connector for QwenConnector {
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         Ok(Self::discover_sources(ctx))
+    }
+}
+
+fn subagent_metadata_path(path: &Path) -> Option<PathBuf> {
+    QwenConnector::is_subagent_session_file(path).then(|| path.with_extension("meta.json"))
+}
+
+fn qwen_source_modified_since(path: &Path, since_ts: Option<i64>) -> bool {
+    file_modified_since(path, since_ts)
+        || subagent_metadata_path(path)
+            .is_some_and(|metadata| metadata.is_file() && file_modified_since(&metadata, since_ts))
+}
+
+fn qwen_source_key(path: &Path) -> PathBuf {
+    if QwenConnector::is_subagent_session_file(path) {
+        // Exact, parent and ancestor-symlink selections still name one agent log.
+        fs::canonicalize(path).unwrap_or_else(|_| dedupe_path_key(path))
+    } else {
+        dedupe_path_key(path)
     }
 }
 
@@ -384,9 +449,42 @@ struct QwenHistory {
     started_at: Option<i64>,
     ended_at: Option<i64>,
     native_signature: bool,
+    agent_id: Option<String>,
 }
 
-fn read_qwen_jsonl(reader: impl BufRead) -> Result<QwenHistory> {
+impl QwenHistory {
+    fn check_subagent(&mut self, record: &Value, path: &Path) -> Result<()> {
+        let Some(agent_id) = record["agentId"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+        else {
+            anyhow::bail!("qwen: subagent transcript has no agent identity");
+        };
+        let session_id = record["sessionId"].as_str().expect("validated session ID");
+        let expected_file = format!("agent-{}.jsonl", sanitize_subagent_component(agent_id));
+        let expected_parent = sanitize_subagent_component(session_id);
+        if record["isSidechain"] != true
+            || self
+                .agent_id
+                .as_deref()
+                .is_some_and(|expected| expected != agent_id)
+            || path.file_name().and_then(|name| name.to_str()) != Some(expected_file.as_str())
+            || path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                != Some(expected_parent.as_str())
+        {
+            anyhow::bail!("qwen: subagent transcript identity does not match its source");
+        }
+        if self.agent_id.is_none() {
+            self.agent_id = Some(agent_id.to_string());
+        }
+        Ok(())
+    }
+}
+
+fn read_qwen_jsonl(reader: impl BufRead, subagent_path: Option<&Path>) -> Result<QwenHistory> {
     let mut history = QwenHistory::default();
     for line in JsonlLines::new(reader) {
         let line = line?;
@@ -407,6 +505,9 @@ fn read_qwen_jsonl(reader: impl BufRead) -> Result<QwenHistory> {
         }
         if !is_qwen_record(&record) {
             continue;
+        }
+        if let Some(path) = subagent_path {
+            history.check_subagent(&record, path)?;
         }
         history.native_signature |= record
             .pointer("/message/parts")
@@ -489,41 +590,23 @@ fn parse_qwen_jsonl(
     compact: bool,
 ) -> Result<Option<NormalizedConversation>> {
     let QwenHistory {
-        mut records,
+        records,
         leaf,
         session_id,
         workspace,
         started_at,
         ended_at,
         native_signature,
-    } = read_qwen_jsonl(reader)?;
+        agent_id,
+    } = read_qwen_jsonl(
+        reader,
+        QwenConnector::is_subagent_session_file(path).then_some(path),
+    )?;
     if !native_signature {
         return Ok(None);
     }
 
-    // Remove each payload while walking backwards. This both bounds cycle
-    // handling and avoids a second full collection of raw record clones.
-    let mut chain = Vec::<Value>::new();
-    let mut cursor = leaf.clone();
-    let mut missing_parent = None;
-    let mut cycle_uuid = None;
-    while let Some(uuid) = cursor {
-        let Some(record) = records.remove(&uuid) else {
-            if chain.iter().any(|record| record["uuid"] == uuid) {
-                cycle_uuid = Some(uuid);
-            } else {
-                missing_parent = Some(uuid);
-            }
-            break;
-        };
-        cursor = record["parentUuid"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(String::from);
-        chain.push(record);
-    }
-    drop(records);
-    chain.reverse();
+    let (chain, missing_parent, cycle_uuid) = qwen_active_chain(records, leaf.clone());
     let title = chain.iter().rev().find_map(|record| {
         (record["type"] == "system" && record["subtype"] == "custom_title")
             .then(|| {
@@ -568,7 +651,7 @@ fn parse_qwen_jsonl(
     if let Some(uuid) = cycle_uuid {
         metadata["history_cycle_uuid"] = Value::String(uuid);
     }
-    Ok(Some(NormalizedConversation {
+    let mut conversation = NormalizedConversation {
         agent_slug: "qwen".into(),
         external_id: session_id,
         title,
@@ -578,7 +661,136 @@ fn parse_qwen_jsonl(
         ended_at,
         metadata,
         messages,
-    }))
+    };
+    if let Some(agent_id) = agent_id {
+        annotate_qwen_subagent(&mut conversation, &agent_id)?;
+    }
+    Ok(Some(conversation))
+}
+
+fn qwen_active_chain(
+    mut records: HashMap<String, Value>,
+    mut cursor: Option<String>,
+) -> (Vec<Value>, Option<String>, Option<String>) {
+    // Move each payload while walking backwards. Both parent chats and agents
+    // keep the same branch selection without cloning the raw record collection.
+    let mut chain = Vec::<Value>::new();
+    let mut missing_parent = None;
+    let mut cycle_uuid = None;
+    while let Some(uuid) = cursor {
+        let Some(record) = records.remove(&uuid) else {
+            if chain.iter().any(|record| record["uuid"] == uuid) {
+                cycle_uuid = Some(uuid);
+            } else {
+                missing_parent = Some(uuid);
+            }
+            break;
+        };
+        cursor = record["parentUuid"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        chain.push(record);
+    }
+    chain.reverse();
+    (chain, missing_parent, cycle_uuid)
+}
+
+// Producer contract: QwenLM/qwen-code@a8990042e648a7807e251d99b3d37c0ee8c16100,
+// packages/core/src/agents/agent-transcript.ts. Every row names the parent
+// session and the agent separately; copied bootstrap context is a system row,
+// while completed model rounds carry their own usageMetadata once.
+fn sanitize_subagent_component(value: &str) -> String {
+    // The producer's JavaScript regexp has no Unicode flag: supplementary
+    // characters occupy two UTF-16 code units and therefore become two '_'.
+    value
+        .encode_utf16()
+        .map(|unit| {
+            let byte = u8::try_from(unit).unwrap_or(b'_');
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+                char::from(byte)
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn read_subagent_metadata(path: &Path) -> Result<Option<Value>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if file.metadata()?.len() > MAX_SUBAGENT_METADATA_BYTES {
+        anyhow::bail!("qwen: subagent metadata exceeds the 1 MiB cap");
+    }
+    let mut text = String::new();
+    file.take(MAX_SUBAGENT_METADATA_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_SUBAGENT_METADATA_BYTES {
+        anyhow::bail!("qwen: subagent metadata exceeds the 1 MiB cap");
+    }
+    Ok(Some(serde_json::from_str(&text)?))
+}
+
+fn subagent_metadata_text<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
+    metadata[key]
+        .as_str()
+        .filter(|text| !text.trim().is_empty() && text.len() <= 4096)
+}
+
+fn annotate_qwen_subagent(conversation: &mut NormalizedConversation, agent_id: &str) -> Result<()> {
+    let parent_id = conversation
+        .external_id
+        .as_deref()
+        .expect("validated session ID");
+    // A JSON tuple is injective even when upstream IDs contain delimiters or
+    // characters that its filename sanitizer maps to the same spelling.
+    let external_id = format!(
+        "subagent:{}",
+        serde_json::to_string(&(parent_id, agent_id))?
+    );
+    conversation.metadata["format"] = "subagent-jsonl".into();
+    conversation.metadata["parent_session_id"] = parent_id.into();
+    conversation.metadata["agent_id"] = agent_id.into();
+    conversation.metadata["is_sidechain"] = true.into();
+
+    let metadata_path = conversation.source_path.with_extension("meta.json");
+    match read_subagent_metadata(&metadata_path) {
+        Ok(Some(metadata))
+            if metadata["agentId"] == agent_id && metadata["parentSessionId"] == parent_id =>
+        {
+            for (native, normalized) in [
+                ("agentType", "agent_type"),
+                ("description", "description"),
+                ("parentAgentId", "parent_agent_id"),
+                ("toolUseId", "tool_use_id"),
+                ("model", "model"),
+                ("status", "status"),
+                ("createdAt", "created_at"),
+                ("lastUpdatedAt", "last_updated_at"),
+            ] {
+                if let Some(text) = subagent_metadata_text(&metadata, native) {
+                    conversation.metadata[normalized] = text.into();
+                }
+            }
+            if let Some(description) = subagent_metadata_text(&metadata, "description") {
+                conversation.title = Some(description.chars().take(100).collect());
+            }
+            // The sidecar's model and stats describe the agent as a whole.
+            // They cannot replace per-reply model identity or usage.
+        }
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            tracing::debug!(path = %metadata_path.display(), "qwen: ignoring mismatched subagent metadata");
+        }
+        Err(error) => {
+            tracing::debug!(path = %metadata_path.display(), %error, "qwen: ignoring unreadable subagent metadata");
+        }
+    }
+    conversation.external_id = Some(external_id);
+    Ok(())
 }
 
 fn push_qwen_text(content: &mut String, text: &str) {
@@ -715,6 +927,7 @@ fn compact_qwen_record(record: &Value, tool_call_count: usize) -> Value {
         ("subtype", "subtype"),
         ("agentId", "agent_id"),
         ("agentName", "agent_name"),
+        ("agentRunId", "agent_run_id"),
     ] {
         if let Some(value) = record.get(native).filter(|value| value.is_string()) {
             cass.insert(compact.into(), value.clone());
@@ -722,6 +935,12 @@ fn compact_qwen_record(record: &Value, tool_call_count: usize) -> Value {
     }
     if let Some(value) = record.get("isSidechain").filter(|value| value.is_boolean()) {
         cass.insert("is_sidechain".into(), value.clone());
+    }
+    if let Some(value) = record
+        .get("agentRound")
+        .filter(|value| value.as_u64().is_some())
+    {
+        cass.insert("agent_round".into(), value.clone());
     }
     let mut usage = serde_json::Map::new();
     for key in QWEN_USAGE_KEYS {

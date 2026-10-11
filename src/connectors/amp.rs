@@ -5,6 +5,7 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::token_extraction::extract_amp_tokens;
 use super::utils::{dedupe_path_key, read_capped};
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
@@ -312,10 +313,14 @@ impl Connector for AmpConnector {
                         .and_then(|v| v.as_str())
                         .map(std::string::ToString::to_string)
                         .or_else(|| {
-                            messages
-                                .first()
-                                .and_then(|m| m.content.lines().next())
-                                .map(std::string::ToString::to_string)
+                            messages.iter().find_map(|message| {
+                                message
+                                    .content
+                                    .lines()
+                                    .next()
+                                    .filter(|line| !line.trim().is_empty())
+                                    .map(std::string::ToString::to_string)
+                            })
                         });
 
                     let workspace = infer_workspace(&val).or_else(|| {
@@ -404,14 +409,11 @@ impl Connector for AmpConnector {
 }
 
 fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<NormalizedMessage>> {
-    let msgs = val
-        .get("messages")
-        .and_then(|m| m.as_array().cloned())
-        .or_else(|| {
-            val.get("thread")
-                .and_then(|t| t.get("messages"))
-                .and_then(|m| m.as_array().cloned())
-        })?;
+    let msgs = val.get("messages").and_then(Value::as_array).or_else(|| {
+        val.get("thread")
+            .and_then(|t| t.get("messages"))
+            .and_then(Value::as_array)
+    })?;
 
     let mut out = Vec::new();
     for m in msgs {
@@ -432,7 +434,10 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
             .or_else(|| extract_content_value(m.get("body")))
             .unwrap_or_default();
 
-        if content.trim().is_empty() {
+        // An interrupted or reasoning-only native assistant can have API
+        // usage without searchable text. Keep that single saved snapshot,
+        // including explicit zero counts, so its request is still counted.
+        if content.trim().is_empty() && !extract_amp_tokens(m, role).has_token_data() {
             continue;
         }
 
@@ -445,6 +450,8 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
             .or_else(|| m.get("timestamp"))
             .or_else(|| m.get("ts"))
             .or_else(|| m.get("created"))
+            .or_else(|| m.pointer("/meta/sentAt"))
+            .or_else(|| m.pointer("/usage/timestamp"))
             .and_then(parse_timestamp);
         let author = m
             .get("author")

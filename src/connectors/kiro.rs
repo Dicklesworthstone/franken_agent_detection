@@ -13,6 +13,10 @@
 //!   `updated_at`, `session_state.model_info.model_id`).
 //! - `<session_uuid>.lock` / `sess_<uuid>.history` — ignored (not logs).
 //!
+//! Since Kiro 2.3, `KIRO_HOME` replaces `~/.kiro`, including this v2 store.
+//! See <https://kiro.dev/changelog/cli/2-3/> and
+//! <https://kiro.dev/docs/cli/acp/>. The v3 session format is not parsed here.
+//!
 //! Record `kind` → normalized role:
 //! - `Prompt` → `user` (carries `data.meta.timestamp` as **epoch seconds**).
 //! - `AssistantMessage` → `assistant` (no timestamp of its own).
@@ -24,11 +28,11 @@
 //! - `toolUse` → `[Tool: <name>]\n<input-json>` plus a `NormalizedInvocation`.
 //! - `toolResult` → `[Tool output: <id>]\n<text>`.
 //!
-//! Unknown record kinds and malformed lines are tolerated (skip-and-continue)
-//! rather than failing the whole session. Detection restricts itself to exact
-//! `kiro`/`.kiro` path components so lookalikes such as `/Users/kiroshi` are
-//! never claimed. IDE-specific Kiro storage is out of scope (no stable
-//! contract observed).
+//! Unknown record kinds, malformed JSON and corrupt UTF-8 lines are skipped.
+//! An underlying I/O error discards the incomplete session. Explicit roots
+//! admit `kiro`/`.kiro` path components and native `sessions/cli` layouts, so
+//! renamed profiles work without claiming lookalikes such as `/Users/kiroshi`.
+//! IDE-specific Kiro storage is out of scope (no stable contract observed).
 
 use std::collections::HashSet;
 use std::fs;
@@ -40,6 +44,7 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use super::jsonl::JsonlLines;
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
@@ -64,9 +69,9 @@ impl KiroConnector {
         Self
     }
 
-    /// The default Kiro CLI session store: `~/.kiro/sessions/cli`.
+    /// The configured v2 store, or `~/.kiro/sessions/cli` when unset.
     fn default_sessions_root() -> Option<PathBuf> {
-        dirs::home_dir().map(|home| home.join(".kiro").join("sessions").join("cli"))
+        crate::kiro_home().map(|home| home.join("sessions/cli"))
     }
 
     /// Structural check: an exact `kiro` or `.kiro` path component is the
@@ -79,23 +84,49 @@ impl KiroConnector {
         })
     }
 
+    fn is_cli_sessions_dir(path: &Path) -> bool {
+        path.file_name().is_some_and(|name| name == "cli")
+            && path
+                .parent()
+                .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+    }
+
+    /// Resolve only the supplied scope, including renamed `KIRO_HOME` copies.
+    /// Recognizable missing paths stay scoped instead of selecting live data.
+    fn scoped_root(path: &Path) -> Option<PathBuf> {
+        if Self::looks_like_kiro_storage(path)
+            || Self::is_cli_sessions_dir(path)
+            || (path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+                && path.parent().is_some_and(Self::is_cli_sessions_dir))
+        {
+            return Some(path.to_path_buf());
+        }
+        for candidate in [path.join(".kiro/sessions/cli"), path.join("sessions/cli")] {
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+        if path.file_name().is_some_and(|name| name == "sessions") {
+            return Some(path.join("cli"));
+        }
+        None
+    }
+
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots: Vec<ScanRoot> = Vec::new();
         if ctx.use_default_detection() {
-            if Self::looks_like_kiro_storage(&ctx.data_dir) && ctx.data_dir.exists() {
-                roots.push(ScanRoot::local(ctx.data_dir.clone()));
-            } else if let Some(default_root) = Self::default_sessions_root()
-                && default_root.exists()
-            {
+            if let Some(root) = Self::scoped_root(&ctx.data_dir) {
+                roots.push(ScanRoot::local(root));
+            } else if let Some(default_root) = Self::default_sessions_root() {
                 roots.push(ScanRoot::local(default_root));
             }
         } else {
             for root in &ctx.scan_roots {
-                let candidate = root.path.join(".kiro").join("sessions").join("cli");
-                if candidate.exists() {
+                if let Some(candidate) = Self::scoped_root(&root.path) {
                     roots.push(root.with_path(candidate));
-                } else if Self::looks_like_kiro_storage(&root.path) && root.path.exists() {
-                    roots.push(root.with_path(root.path.clone()));
                 }
             }
         }
@@ -131,14 +162,34 @@ impl KiroConnector {
     /// Parse one Kiro CLI `<uuid>.jsonl` log (with its optional `<uuid>.json`
     /// metadata sidecar) into a normalized conversation. `None` for
     /// unreadable files or logs that yield no messages.
-    #[allow(clippy::too_many_lines)]
     fn parse_session_file(root: &ScanRoot, file: &Path) -> Option<NormalizedConversation> {
+        let handle = match fs::File::open(file) {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::debug!(
+                    path = %file.display(),
+                    %error,
+                    "kiro: skipping unreadable session log"
+                );
+                return None;
+            }
+        };
+        Self::parse_session_reader(root, file, BufReader::new(handle))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn parse_session_reader(
+        root: &ScanRoot,
+        file: &Path,
+        reader: impl BufRead,
+    ) -> Option<NormalizedConversation> {
         let source_path = file.to_path_buf();
 
         // Root-relative external id (fall back to the bare file stem/uuid).
         let external_id = source_path
             .strip_prefix(&root.path)
             .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
             .and_then(|rel| rel.with_extension("").to_str().map(ToString::to_string))
             .or_else(|| {
                 source_path
@@ -196,24 +247,23 @@ impl KiroConnector {
         // rather than fabricating the Unix epoch and mis-ranking the session.
         let base_ts = conv_created_ms.or_else(|| file_mtime_ms(file));
 
-        let file_handle = match fs::File::open(file) {
-            Ok(handle) => handle,
-            Err(err) => {
-                tracing::debug!(
-                    path = %file.display(),
-                    error = %err,
-                    "kiro: skipping unreadable session log"
-                );
-                return None;
-            }
-        };
-
         let mut messages: Vec<NormalizedMessage> = Vec::new();
         // Timestamp of the previously emitted message. Kept separate from
         // `base_ts` so a Prompt's own `meta.timestamp` is honored verbatim
         // rather than being clamped up to `created_at`/file mtime.
         let mut last_ts: Option<i64> = None;
-        for line in BufReader::new(file_handle).lines().map_while(Result::ok) {
+        for line in JsonlLines::new(reader) {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %file.display(),
+                        %error,
+                        "kiro: discarding incomplete session after read error"
+                    );
+                    return None;
+                }
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -316,7 +366,7 @@ impl Connector for KiroConnector {
         let mut detection =
             franken_detection_for_connector("kiro").unwrap_or_else(DetectionResult::not_found);
         if let Some(root) = Self::default_sessions_root()
-            && root.exists()
+            && root.is_dir()
         {
             let count = Self::session_files(&root).len();
             detection.evidence.push(format!(
@@ -625,6 +675,10 @@ fn flatten_kiro_content(content: &Value) -> (String, Vec<NormalizedInvocation>) 
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::io::{self, Cursor, Read};
+    use std::rc::Rc;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -828,5 +882,232 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.contains("via root"));
+    }
+
+    #[test]
+    fn renamed_profile_scopes_keep_source_identity_and_remote_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join("profile-copy");
+        let cli = profile.join("sessions/cli");
+        fs::create_dir_all(&cli).unwrap();
+        let file = cli.join("native-session.jsonl");
+        let contents = r#"{"version":"v1","kind":"Prompt","data":{"content":[{"kind":"text","data":"copied profile"}],"meta":{"timestamp":1785939877}}}"#;
+        write(&file, contents);
+        let metadata =
+            r#"{"session_id":"native-session","cwd":"/work/repo","title":"Native session"}"#;
+        write(&file.with_extension("json"), metadata);
+        let connector = KiroConnector::new();
+        for scope in [&profile, &profile.join("sessions"), &cli, &file] {
+            for remote in [false, true] {
+                let root = if remote {
+                    ScanRoot::remote(
+                        scope.clone(),
+                        crate::types::Origin::remote("remote-host"),
+                        None,
+                    )
+                } else {
+                    ScanRoot::local(scope.clone())
+                };
+                let origin = root.origin.clone();
+                let ctx = ScanContext::with_roots(PathBuf::new(), vec![root], None);
+                let sources = connector.discover_source_files(&ctx).unwrap();
+                assert_eq!(sources.len(), 2);
+                assert!(sources.iter().all(|source| source.origin == origin));
+                let conversations = connector.scan(&ctx).unwrap();
+                assert_eq!(conversations.len(), 1);
+                let conversation = &conversations[0];
+                assert_eq!(conversation.source_path, file);
+                assert_eq!(conversation.external_id.as_deref(), Some("native-session"));
+                assert_eq!(conversation.title.as_deref(), Some("Native session"));
+                assert_eq!(conversation.messages[0].content, "copied profile");
+            }
+            let local = connector
+                .scan(&ScanContext::local_default(scope.clone(), None))
+                .unwrap();
+            assert_eq!(local.len(), 1);
+            assert_eq!(local[0].source_path, file);
+            assert_eq!(local[0].external_id.as_deref(), Some("native-session"));
+        }
+        assert_eq!(fs::read_to_string(&file).unwrap(), contents);
+        assert_eq!(
+            fs::read_to_string(file.with_extension("json")).unwrap(),
+            metadata
+        );
+    }
+
+    #[test]
+    fn unrelated_roots_and_non_cli_siblings_are_not_admitted() {
+        let tmp = TempDir::new().unwrap();
+        let lookalike = tmp.path().join("kiroshi");
+        fs::create_dir_all(&lookalike).unwrap();
+        write(
+            &lookalike.join("unrelated.jsonl"),
+            r#"{"kind":"Prompt","data":{"content":"not a Kiro store"}}"#,
+        );
+        let profile = tmp.path().join("profile-copy");
+        let cli = profile.join("sessions/cli");
+        fs::create_dir_all(&cli).unwrap();
+        write(
+            &profile.join("unrelated.jsonl"),
+            r#"{"kind":"Prompt","data":{"content":"outside the CLI store"}}"#,
+        );
+        for root in [lookalike, profile] {
+            let ctx = ScanContext::with_roots(PathBuf::new(), vec![ScanRoot::local(root)], None);
+            let connector = KiroConnector::new();
+            assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
+            assert!(connector.scan(&ctx).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn corrupt_utf8_line_preserves_later_messages_and_source_completion() {
+        let tmp = TempDir::new().unwrap();
+        let cli = kiro_cli_dir(&tmp);
+        let file = cli.join("recoverable.jsonl");
+        let mut bytes = br#"{"version":"v1","kind":"Prompt","data":{"content":"before","meta":{"timestamp":1785939877}}}"#.to_vec();
+        bytes.extend_from_slice(b"\r\n\xff\xfe broken UTF-8\nmalformed JSON\n");
+        bytes.extend_from_slice(
+            br#"{"version":"v1","kind":"AssistantMessage","data":{"content":"after"}}"#,
+        );
+        fs::write(&file, &bytes).unwrap();
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        let ctx = ScanContext::local_default(cli, None);
+        let connector = KiroConnector::new();
+        let mut conversations = Vec::new();
+        let mut completed = Vec::new();
+        connector
+            .scan_with_source_boundaries(
+                &ctx,
+                &mut SourceScanHooks {
+                    on_source_complete: Some(&mut |completion| {
+                        completed.push(completion.source.source_path.clone());
+                        Ok(())
+                    }),
+                    ..SourceScanHooks::default()
+                },
+                &mut |conversation| {
+                    conversations.push(conversation);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(completed, std::slice::from_ref(&file));
+        let messages = &conversations[0].messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "before");
+        assert_eq!(messages[1].content, "after");
+        assert_eq!(messages[0].idx, 0);
+        assert_eq!(messages[1].idx, 1);
+        assert_eq!(fs::read(&file).unwrap(), bytes);
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+    }
+
+    struct FailingReader {
+        prefix: Cursor<Vec<u8>>,
+        kind: io::ErrorKind,
+        attempts: Rc<Cell<usize>>,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            unreachable!("the transcript reader uses BufRead directly")
+        }
+    }
+
+    impl BufRead for FailingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if usize::try_from(self.prefix.position()).unwrap() < self.prefix.get_ref().len() {
+                return self.prefix.fill_buf();
+            }
+            self.attempts.set(self.attempts.get() + 1);
+            Err(io::Error::new(
+                self.kind,
+                "injected transcript read failure",
+            ))
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.prefix.consume(amount);
+        }
+    }
+
+    #[test]
+    fn reader_failure_discards_the_complete_prefix_without_retrying() {
+        let tmp = TempDir::new().unwrap();
+        let cli = kiro_cli_dir(&tmp);
+        let file = cli.join("failing.jsonl");
+        let root = ScanRoot::local(cli);
+        let prefix = concat!(
+            "{\"version\":\"v1\",\"kind\":\"Prompt\",\"data\":{\"content\":\"complete prefix\"}}\n",
+            "{\"version\":\"v1\",\"kind\":\"AssistantMessage\",\"data\":{\"content\":\"partial",
+        );
+        let healthy = KiroConnector::parse_session_reader(&root, &file, Cursor::new(prefix))
+            .expect("a clean EOF retains the complete record and ignores malformed JSON");
+        assert_eq!(healthy.messages[0].content, "complete prefix");
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Interrupted,
+        ] {
+            let attempts = Rc::new(Cell::new(0));
+            let conversation = KiroConnector::parse_session_reader(
+                &root,
+                &file,
+                FailingReader {
+                    prefix: Cursor::new(prefix.as_bytes().to_vec()),
+                    kind,
+                    attempts: Rc::clone(&attempts),
+                },
+            );
+            assert!(
+                conversation.is_none(),
+                "{kind:?} must discard accumulated messages"
+            );
+            assert_eq!(attempts.get(), 1, "the failed read must not be retried");
+        }
+    }
+
+    #[test]
+    fn unreadable_source_emits_no_conversation_or_completion_and_scan_continues() {
+        let tmp = TempDir::new().unwrap();
+        let cli = kiro_cli_dir(&tmp);
+        let failed = cli.join("a-failed.jsonl");
+        let healthy = cli.join("b-healthy.jsonl");
+        let bytes = r#"{"version":"v1","kind":"Prompt","data":{"content":"healthy source"}}"#;
+        write(&failed, bytes);
+        write(&healthy, bytes);
+        let saved = cli.join("saved-original");
+        let ctx = ScanContext::local_default(cli, None);
+        let mut emitted = Vec::new();
+        let mut completed = Vec::new();
+        KiroConnector::new()
+            .scan_with_source_boundaries(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |source| {
+                        if source.source_path == failed {
+                            // Make the admitted source unreadable immediately
+                            // before parsing, without permission assumptions.
+                            fs::rename(&failed, &saved).unwrap();
+                            fs::create_dir(&failed).unwrap();
+                        }
+                        true
+                    }),
+                    on_source_complete: Some(&mut |completion| {
+                        completed.push(completion.source.source_path.clone());
+                        Ok(())
+                    }),
+                },
+                &mut |conversation| {
+                    emitted.push(conversation.source_path);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(emitted, std::slice::from_ref(&healthy));
+        assert_eq!(completed, std::slice::from_ref(&healthy));
+        assert_eq!(fs::read_to_string(saved).unwrap(), bytes);
+        assert_eq!(fs::read_to_string(healthy).unwrap(), bytes);
     }
 }

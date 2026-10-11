@@ -13,6 +13,7 @@ pub mod cline;
 #[cfg(feature = "codebuff")]
 pub mod codebuff;
 pub mod codex;
+pub mod continue_dev;
 pub mod copilot;
 pub mod copilot_cli;
 pub(crate) mod copilot_vscode;
@@ -278,6 +279,9 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
     let mut v: Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> = vec![
         ("codex", || Box::new(codex::CodexConnector::new())),
         ("cline", || Box::new(cline::ClineConnector::new())),
+        ("continue", || {
+            Box::new(continue_dev::ContinueConnector::new())
+        }),
         ("gemini", || Box::new(gemini::GeminiConnector::new())),
         ("claude", || {
             Box::new(claude_code::ClaudeCodeConnector::new())

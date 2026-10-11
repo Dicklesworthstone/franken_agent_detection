@@ -81,6 +81,8 @@ Custom history stores use the same environment settings as their connectors:
 | Gemini | `GEMINI_HOME` | Replaces the default session root; accepts a directory or an admitted `chats/session-*.json` / `.jsonl` file |
 | Qwen Code | `QWEN_RUNTIME_DIR`, `QWEN_HOME` | Runtime directory takes precedence over the home override; detects current `projects` and legacy `tmp` stores without falling back from a missing configured root |
 | Cline SDK | `CLINE_SESSION_DATA_DIR`, `CLINE_DATA_DIR`, `CLINE_DIR` | Resolves the SDK session directory in that order while keeping legacy extension histories independently available |
+| Continue | `CONTINUE_GLOBAL_DIR` | Replaces the default `~/.continue` home; relative paths resolve against the process working directory, and `~` remains literal |
+| Kiro CLI v2 | `KIRO_HOME` | Replaces `~/.kiro`, including `sessions/cli`; a missing configured home does not select another profile |
 | OpenCode | `OPENCODE_STORAGE_ROOT`, `OPENCODE_SQLITE_DB` | Keeps legacy storage and SQLite independent, with default database candidates still available |
 | Hermes | `HERMES_SQLITE_DB`, `HERMES_HOME` | Prefers an existing explicit database, then `$HERMES_HOME/state.db`, then the default store |
 | Crush | `CRUSH_SQLITE_DB` | Prefers an existing explicit global database, with the default as fallback |
@@ -236,7 +238,7 @@ directory. The existing infallible Pi `discover_sources` and durable
 `store_diagnostics` helpers log invalid-policy errors and return no sources;
 `pi_wire::try_discover_sources` exposes the discovery error to direct callers.
 
-Claude Code, Factory, Kimi, Clawdbot, Vibe, OpenClaw, Muse, Grok, Prime and
+Claude Code, Factory, Kimi, Kiro, Clawdbot, Vibe, OpenClaw, Muse, Grok, Prime and
 Gemini stop reading a transcript after an underlying I/O error and discard its
 incomplete contents.
 Their JSONL readers still skip individual malformed JSON or invalid UTF-8
@@ -250,6 +252,54 @@ Larger arguments remain in the original `extra` record, and opaque reasoning
 and image payloads do not enter searchable content. Each source row remains
 one normalized message. Per-message token usage remains estimated because
 Vibe stores its API counters separately as cumulative session statistics.
+
+Continue reads IDE and CLI snapshots from
+`~/.continue/sessions/<sessionId>.json`, or `CONTINUE_GLOBAL_DIR/sessions`.
+Explicit home, global-home, session-directory and exact-file scopes stay
+isolated; overlapping and symlinked paths yield each source once. The native
+session ID must match the filename. The connector supports callback streaming,
+source discovery and per-source completion hooks. Invalid or interrupted
+snapshots never authorize a resume skip. The shared `sessions.json` list is
+not a transcript and is not required to reconstruct a session.
+
+Continue preserves ordered text, reasoning, tool calls, tool results and message
+IDs. IDE tool-result rows take precedence over their duplicate copies in
+`toolCallStates.output`; CLI inline results are emitted as tool messages. Typed
+reading skips duplicated editor state, prompt/completion logs, retrieved context
+and image payloads. Tool arguments up to 64 KiB become structured values;
+larger arguments are omitted from normalized metadata. The original source
+file remains available through source discovery. Native snapshots do not
+record message timestamps, so those fields remain unset.
+
+Continue usage is attached once to its assistant message, including replies
+with multiple text blocks or no text. Recorded completion tokens and input
+without cache activity are exposed as API counts. Cache-bearing prompt totals
+remain in compact metadata because the IDE's legacy Anthropic adapter and the
+CLI's provider adapters use different input/cache conventions. Display model
+aliases are kept separate from actual model IDs. Session-wide usage stays in
+conversation metadata and is never added to per-reply counts. These contracts
+follow the pinned [Continue session writer](https://github.com/continuedev/continue/blob/5522c6f44ca0ac3528b37244818fbfa39b5af470/core/util/history.ts)
+and [CLI history service](https://github.com/continuedev/continue/blob/5522c6f44ca0ac3528b37244818fbfa39b5af470/extensions/cli/src/services/ChatHistoryService.ts).
+
+Amp exposes its native per-assistant `inputTokens`, `outputTokens`,
+`cacheCreationInputTokens` and `cacheReadInputTokens` as four disjoint API
+buckets. Combined `totalInputTokens`, context limits, debug calls and thread
+ledgers are not additional usage. Native streaming updates replace the saved
+assistant snapshot, so multiple content blocks still contribute one observation.
+Usage-only replies and explicit zero counts survive ingestion, and native
+message IDs and timestamps remain available. The mapping is verified against
+the vendor's [published CLI artifact](https://registry.npmjs.org/@sourcegraph/amp/-/amp-0.0.1768996903-g592a3a.tgz)
+and [documented stream schema](https://ampcode.com/docs/cli/streaming-json).
+Cross-conversation fork reconciliation remains the consumer's responsibility:
+Amp can retain a stale fork index after edits and reuse descendant message IDs,
+so those fields alone cannot safely suppress copied usage.
+
+Kiro's supported v2 JSONL store follows `KIRO_HOME/sessions/cli`, including
+renamed profile copies, their session directories and exact transcript files.
+The native override was introduced in [Kiro 2.3](https://kiro.dev/changelog/cli/2-3/).
+JSON metadata sidecars, source provenance and existing message projection are
+preserved. This support covers the [v2 JSONL/JSON layout](https://kiro.dev/docs/cli/acp/);
+it does not infer a schema for Kiro v3 stores.
 
 Gemini CLI JSONL sessions are replayed into their final message history.
 Repeated native message IDs replace earlier versions in place; `$patch`
@@ -284,6 +334,18 @@ user display text, and custom titles are preserved. Exact discovered files
 and recognizable copied stores remain scoped to their supplied roots;
 explicit scan roots exclude unrelated local stores. Configured Qwen paths
 support the agent's tilde expansion and relative-path resolution.
+
+Qwen also reads native subagent transcripts at
+`projects/<project>/subagents/<parentSessionId>/agent-<agentId>.jsonl`.
+Every record must agree on the parent session, agent and sidechain identity.
+The external ID is an escaped JSON tuple of the original parent and agent IDs,
+so filename sanitization cannot merge different agents. Completed rounds keep
+their own usage once; separate tool-call records, bootstrap copies,
+`.jsonl.stream` files and cumulative sidecar statistics add no API usage.
+Optional `.meta.json` sidecars supply bounded descriptions, lineage and status
+and participate in incremental selection. Reads are capped at 1 MiB, and a
+missing or malformed optional sidecar does not discard the transcript.
+The format follows the pinned [Qwen subagent writer](https://github.com/QwenLM/qwen-code/blob/a8990042e648a7807e251d99b3d37c0ee8c16100/packages/core/src/agents/agent-transcript.ts).
 
 At 32 MiB, Qwen JSONL metadata retains reply identity, model, selected scalar
 usage fields and tool-call counts without duplicating the raw content or
@@ -335,6 +397,7 @@ coherent snapshot and nothing is recovered or checkpointed.
 | `cline` | Cline | task JSON |
 | `codebuff` | Codebuff / Freebuff (one shared store) | `~/.config/manicode` chats |
 | `codex` | Codex CLI | rollout JSONL (`.jsonl.zst` with `codex-zstd`) |
+| `continue` | Continue IDE / CLI | native session JSON snapshots |
 | `copilot` / `github-copilot` | VS Code Copilot Chat | chat-session JSON and append logs; legacy `state.vscdb` |
 | `copilot_cli` | Copilot CLI | session event logs |
 | `crush` | Charm Crush | SQLite |
@@ -354,7 +417,7 @@ coherent snapshot and nothing is recovered or checkpointed.
 | `pi_durable` | Pi durable harness | `main.jsonl` commit logs; `session.sqlite` with `pi-durable` |
 | `prime_agent` | Prime Agent | session JSONL |
 | `shelley` | Shelley | `shelley.db` |
-| `continue`, `windsurf` | Continue, Windsurf | detection only |
+| `windsurf` | Windsurf | detection only |
 
 Pi-family transcripts keep every branch of a session (abandoned branches stay
 searchable), and each message records whether it is on the active branch and

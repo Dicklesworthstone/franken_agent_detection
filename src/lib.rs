@@ -69,14 +69,15 @@ pub use connectors::{
     SourceCompletion, SourceScanHooks, WorkspaceCache, aider::AiderConnector, amp::AmpConnector,
     antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
     clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
-    copilot::CopilotConnector, copilot_cli::CopilotCliConnector, devin::DevinConnector,
-    estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,
-    extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
-    file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
-    get_connector_factories, grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector,
-    normalize_model, omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
-    parse_timestamp, pi_agent::PiAgentConnector, pi_durable::PiDurableConnector,
-    prime_agent::PrimeAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,
+    continue_dev::ContinueConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
+    devin::DevinConnector, estimate_tokens_from_content, extract_claude_code_tokens,
+    extract_codex_tokens, extract_invocations_from_content_blocks, extract_tokens_for_agent,
+    factory::FactoryConnector, file_modified_since, flatten_content,
+    franken_detection_for_connector, gemini::GeminiConnector, get_connector_factories,
+    grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector, normalize_model,
+    omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
+    pi_agent::PiAgentConnector, pi_durable::PiDurableConnector, prime_agent::PrimeAgentConnector,
+    qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -318,6 +319,20 @@ fn amp_xdg_probe_root_from_env() -> Option<PathBuf> {
         .and_then(|value| amp_xdg_probe_root_from_env_value(&value))
 }
 
+fn kiro_env_home() -> Option<PathBuf> {
+    std::env::var_os("KIRO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Kiro 2.3 introduced `KIRO_HOME` for relocating its global state, including
+/// the v2 CLI session store. A configured path replaces the default even when
+/// missing; explicit scan and detection roots are handled separately.
+#[cfg(feature = "connectors")]
+pub(crate) fn kiro_home() -> Option<PathBuf> {
+    kiro_env_home().or_else(|| home_join(&[".kiro"]))
+}
+
 /// Cline SDK histories are independent of the legacy extension task stores.
 /// Match `resolveSessionDataDir` in Cline's shared storage paths: trim blank
 /// overrides, keep literal tildes, and normalize joined paths without following
@@ -423,6 +438,19 @@ fn cline_storage_probe_roots_from_home(home: &std::path::Path) -> Vec<PathBuf> {
     roots
 }
 
+/// Continue's native global-home override, shared by detection and ingestion.
+/// `core/util/paths.ts` resolves relative paths against CWD and treats `~`
+/// literally. An empty value selects the ordinary home-directory default.
+pub(crate) fn continue_env_global_dir() -> Option<PathBuf> {
+    let raw = std::env::var_os("CONTINUE_GLOBAL_DIR").filter(|value| !value.is_empty())?;
+    let root = PathBuf::from(raw);
+    Some(if root.is_absolute() {
+        root
+    } else {
+        std::env::current_dir().unwrap_or_default().join(root)
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
     let read = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string());
@@ -453,6 +481,17 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             }
             Some(vec![PathBuf::from(root)])
         }
+        "kiro" => {
+            let home = kiro_env_home()?;
+            // A configured but missing or invalid home remains an explicit
+            // override, so detection cannot fall back to another profile.
+            Some(
+                [home.join("sessions/cli"), home]
+                    .into_iter()
+                    .filter(|path| path.is_dir())
+                    .collect(),
+            )
+        }
         "claude" => claude_env_override_roots(read("CLAUDE_CONFIG_DIR").as_deref()),
         "cline" => {
             ["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]
@@ -461,6 +500,18 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
             // Only the SDK store moves. Existing extension UI/API task
             // histories remain independently discoverable after migration.
             Some(default_probe_roots(slug))
+        }
+        "continue" => {
+            // Continue resolves this global home relative to the process CWD,
+            // without shell-style tilde expansion. It replaces the default
+            // store even when the configured directory has not been created.
+            let root = continue_env_global_dir()?;
+            Some(
+                [root.join("sessions"), root]
+                    .into_iter()
+                    .filter(|path| path.is_dir())
+                    .collect(),
+            )
         }
         "devin" => {
             // Mirrors DevinConnector's CASS_DEVIN_DATA_ROOT resolution (the
@@ -2333,6 +2384,7 @@ mod tests {
             ("claude_code", "claude"),
             ("copilot", "github-copilot"),
             ("copilot_cli", "copilot_cli"),
+            ("continue", "continue"),
             ("pi_agent", "pi_agent"),
             ("pi_durable", "pi_durable"),
             ("omp", "omp"),
@@ -2419,7 +2471,7 @@ mod tests {
         {
             // Slugs with no scan implementation at all (no module under
             // `connectors/`). Everything else must register a factory.
-            let detection_only: HashSet<&str> = HashSet::from(["continue", "windsurf"]);
+            let detection_only: HashSet<&str> = HashSet::from(["windsurf"]);
             let feature_gated: HashMap<&str, bool> = HashMap::from([
                 ("chatgpt", cfg!(feature = "chatgpt")),
                 ("codebuff", cfg!(feature = "codebuff")),

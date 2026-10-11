@@ -316,6 +316,59 @@ fn extract_copilot_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
     usage
 }
 
+/// Amp's native assistant snapshot has four disjoint usage buckets. Its
+/// `totalInputTokens` already includes both cache buckets; context limits,
+/// debug calls, and thread-wide totals are not additional message usage.
+/// The vendor CLI maps these same native counters to its documented streaming
+/// usage schema: <https://ampcode.com/docs/cli/streaming-json>.
+pub(super) fn extract_amp_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
+    if role != "assistant" {
+        return ExtractedTokenUsage::default();
+    }
+    let source = extra.get("usage");
+    let read = |key: &str| {
+        source
+            .and_then(|usage| usage.get(key))
+            .and_then(Value::as_i64)
+            .filter(|count| *count >= 0)
+    };
+    let model_name = source
+        .and_then(|usage| usage.get("model"))
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .map(String::from);
+    let provider = model_name
+        .as_deref()
+        .map(|model| normalize_model(model).provider);
+    let tool_call_count = extra
+        .get("content")
+        .and_then(Value::as_array)
+        .map_or(0, |blocks| {
+            u32::try_from(
+                blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .count(),
+            )
+            .unwrap_or(u32::MAX)
+        });
+    let mut usage = ExtractedTokenUsage {
+        model_name,
+        provider,
+        input_tokens: read("inputTokens"),
+        output_tokens: read("outputTokens"),
+        cache_read_tokens: read("cacheReadInputTokens"),
+        cache_creation_tokens: read("cacheCreationInputTokens"),
+        tool_call_count,
+        has_tool_calls: tool_call_count > 0,
+        ..Default::default()
+    };
+    if usage.has_token_data() {
+        usage.data_source = TokenDataSource::Api;
+    }
+    usage
+}
+
 impl TokenDataSource {
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -814,7 +867,9 @@ pub fn extract_tokens_for_agent(
         "gemini" => extract_gemini_tokens(extra, role),
         "qwen" => extract_qwen_tokens(extra, role),
         "cline" => extract_cline_tokens(extra, role),
+        "continue" => super::continue_dev::extract_tokens(extra, role),
         "copilot" | "github-copilot" => extract_copilot_tokens(extra, role),
+        "amp" => extract_amp_tokens(extra, role),
         // The modern Kimi parser attaches recognized usage.record input and
         // output counts to the preceding assistant message. Read only that
         // attachment: raw bookkeeping events and cumulative/session totals
