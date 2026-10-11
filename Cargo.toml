@@ -27,7 +27,7 @@ include = [
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "6"
+dirs = "7"
 
 # --- Optional: connector infrastructure ---
 anyhow = { version = "1", optional = true }
