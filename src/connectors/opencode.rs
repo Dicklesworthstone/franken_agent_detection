@@ -1167,9 +1167,13 @@ impl Connector for OpenCodeConnector {
                     );
                 }
                 Err(e) => {
+                    // The whole chain: the outer context alone ("failed to
+                    // query OpenCode sessions from session") hid the engine
+                    // error behind exports failing under a live writer (cass
+                    // GH #519).
                     tracing::warn!(
                         db = %db.display(),
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "opencode sqlite: failed to read store; conversations from it may be missing"
                     );
                 }

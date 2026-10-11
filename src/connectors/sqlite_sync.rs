@@ -49,6 +49,24 @@ fn drive<T>(future: impl Future<Output = T>) -> Result<T, FrankenError> {
     Ok(output)
 }
 
+/// Shut down this thread's cached connector runtime, waiting up to 30 s for
+/// its worker threads. Returns `false` if they did not stop in time.
+///
+/// Call it on a thread that used a SQLite connector before that thread, or
+/// the process, ends. On Windows the main thread's thread-local destructors
+/// run during process exit, after the OS has already terminated every other
+/// thread. A runtime still cached then cannot join its blocking-pool threads,
+/// and the panic that follows aborts the process (exit 0xC0000409) after its
+/// work succeeded (cass GH #519). Drop the thread's connections first: one
+/// still open keeps the runtime busy, and shutdown then waits out the
+/// timeout. A later bridge call builds a new runtime.
+#[must_use]
+pub fn shutdown_driver() -> bool {
+    DRIVER
+        .with(|slot| slot.borrow_mut().take())
+        .is_none_or(|runtime| runtime.shutdown_timeout(std::time::Duration::from_secs(30)))
+}
+
 /// Synchronous wrapper over [`frankensqlite::Connection`].
 ///
 /// Exposes the subset of the engine surface the connectors use, with the
@@ -202,6 +220,49 @@ mod tests {
     use super::*;
     use asupersync::{Cx, cx::CapMask};
     use frankensqlite::compat::RowExt;
+
+    fn driver_cached() -> bool {
+        DRIVER.with(|slot| slot.borrow().is_some())
+    }
+
+    /// cass GH #519: a runtime left in the thread-local slot is dropped by
+    /// the process-exit destructors on Windows and aborts the process.
+    /// `shutdown_driver` must empty the slot, and the bridge must keep
+    /// working after it.
+    #[test]
+    fn shutdown_driver_releases_the_cached_runtime_and_the_bridge_still_works() {
+        std::thread::spawn(|| {
+            assert!(shutdown_driver(), "nothing cached yet");
+            assert!(!driver_cached());
+            let connection = Connection::open(":memory:").unwrap();
+            connection
+                .execute_batch("CREATE TABLE t (v INTEGER)")
+                .unwrap();
+            drop(connection);
+            assert!(driver_cached(), "a bridge call caches its runtime");
+            let started = std::time::Instant::now();
+            assert!(shutdown_driver());
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "an idle runtime shuts down promptly"
+            );
+            assert!(!driver_cached(), "shutdown must release the runtime");
+            let connection = Connection::open(":memory:").unwrap();
+            connection
+                .execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+            assert!(driver_cached(), "a later call builds a new runtime");
+            let count: i64 = connection
+                .query_row_map("SELECT count(*) FROM t", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(count, 1);
+            drop(connection);
+            assert!(shutdown_driver());
+            assert!(!driver_cached());
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn read_transaction_rolls_back_callback_and_row_mapper_panics() {
