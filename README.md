@@ -210,6 +210,14 @@ Their JSONL readers still skip individual malformed JSON or invalid UTF-8
 records and retain later valid records. The shared line reader buffers only
 the current line and adds no full-transcript copy.
 
+Vibe retains native assistant turns containing only reasoning or tool calls,
+as well as ordinary text. Tool names and call IDs are exposed through
+`invocations`; JSON-encoded arguments up to 64 KiB become structured values.
+Larger arguments remain in the original `extra` record, and opaque reasoning
+and image payloads do not enter searchable content. Each source row remains
+one normalized message. Per-message token usage remains estimated because
+Vibe stores its API counters separately as cumulative session statistics.
+
 Gemini CLI JSONL sessions are replayed into their final message history.
 Repeated native message IDs replace earlier versions in place; `$patch`
 updates content and tool results, removes messages, or reorders surviving

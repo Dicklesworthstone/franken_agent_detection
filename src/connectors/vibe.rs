@@ -22,7 +22,14 @@ use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
+
+// The complete native argument string remains in `extra`. Only copy small
+// arguments into the structured invocation; tool results and binary payloads
+// must not expand the searchable message or acquire another large copy.
+const MAX_INVOCATION_ARGUMENT_BYTES: usize = 64 * 1024;
 
 pub struct VibeConnector;
 
@@ -197,6 +204,93 @@ impl VibeConnector {
         String::new()
     }
 
+    fn normalize_content(val: &Value) -> (String, Vec<NormalizedInvocation>) {
+        let plain = Self::extract_content(val);
+        // SessionLogger persists flat LLMMessage rows. Limit the additional
+        // fields to that native assistant shape; legacy role/content aliases
+        // keep their existing projection.
+        if val.get("role").and_then(Value::as_str) != Some("assistant") {
+            return (plain, Vec::new());
+        }
+
+        let mut content = if let Some(reasoning) = val
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        {
+            let mut text = String::from("[Thinking] ");
+            text.push_str(reasoning);
+            Self::append_text(&mut text, &plain);
+            text
+        } else {
+            plain
+        };
+
+        let mut invocations = Vec::new();
+        if let Some(calls) = val.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                // Native calls default to type "function". Allow an omitted
+                // default without treating other block types
+                // or arbitrary objects as tool activity.
+                if call
+                    .get("type")
+                    .is_some_and(|kind| kind.as_str() != Some("function"))
+                {
+                    continue;
+                }
+                let Some(name) = call
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                else {
+                    continue;
+                };
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str("[Tool: ");
+                content.push_str(name);
+                content.push(']');
+                invocations.push(NormalizedInvocation {
+                    kind: "tool".to_owned(),
+                    name: name.to_owned(),
+                    raw_name: None,
+                    call_id: call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .map(str::to_owned),
+                    arguments: Self::invocation_arguments(call),
+                });
+            }
+        }
+        (content, invocations)
+    }
+
+    fn append_text(content: &mut String, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(text);
+    }
+
+    fn invocation_arguments(call: &Value) -> Option<Value> {
+        // Vibe's FunctionCall.arguments is a JSON-encoded string, not an
+        // object. Malformed argument text is still useful to consumers;
+        // preserve it as text instead of guessing a structure. Oversize and
+        // non-string values remain available only in the untouched raw row.
+        let arguments = call.pointer("/function/arguments")?.as_str()?;
+        if arguments.len() > MAX_INVOCATION_ARGUMENT_BYTES {
+            return None;
+        }
+        Some(
+            serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_owned())),
+        )
+    }
+
     fn extract_timestamp(val: &Value) -> Option<i64> {
         let candidates = ["timestamp", "created_at", "createdAt", "time", "ts"];
 
@@ -306,7 +400,7 @@ impl Connector for VibeConnector {
                     };
 
                     let role = Self::extract_role(&val);
-                    let content = Self::extract_content(&val);
+                    let (content, invocations) = Self::normalize_content(&val);
 
                     if content.trim().is_empty() {
                         continue;
@@ -331,7 +425,7 @@ impl Connector for VibeConnector {
                         created_at: created,
                         content,
                         extra: val,
-                        invocations: Vec::new(),
+                        invocations,
                         snippets: Vec::new(),
                     });
                 }
