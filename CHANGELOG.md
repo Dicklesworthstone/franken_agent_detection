@@ -52,6 +52,30 @@ window is since GitHub Release
 
 ## [Unreleased]
 
+## [0.3.10] -- 2026-10-11
+
+Published from `main` (0.3.9 plus this change).
+
+### Added
+
+- **`connectors::sqlite_sync::shutdown_driver()`.** The SQLite connectors
+  drive the engine on a runtime cached per thread. On Windows the main
+  thread's thread-local destructors run during process exit, after the OS has
+  terminated every other thread, so a runtime still cached then cannot join
+  its blocking-pool threads: the process panicked ("threads should not
+  terminate unexpectedly") and aborted with 0xC0000409 after its work had
+  succeeded. cass `export` of an OpenCode SQLite session hit this every time
+  (cass GH #519). Call `shutdown_driver()` on a thread that used a SQLite
+  connector, after its connections are dropped, before the thread or the
+  process ends. A later call builds a new runtime.
+
+### Fixed
+
+- **OpenCode:** when a SQLite store cannot be read, the warning now carries
+  the whole error chain. Only the outer context ("failed to query OpenCode
+  sessions from session") was logged, which hid the cause of exports failing
+  while OpenCode was writing (cass GH #519).
+
 ## [0.3.9] -- 2026-10-11
 
 Published from `main` (16 commits since 0.3.8, plus the `dirs` 7 update).
