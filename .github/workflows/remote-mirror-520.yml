@@ -1,0 +1,47 @@
+name: Validate remote mirror layouts
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/patches/remote_mirror*'
+      - '.github/scripts/remote-mirror-520.py'
+      - '.github/workflows/remote-mirror-520.yml'
+permissions:
+  contents: write
+concurrency:
+  group: remote-mirror-520
+  cancel-in-progress: false
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Apply candidate with exact source anchors
+        run: python3 .github/scripts/remote-mirror-520.py
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format candidate
+        run: cargo fmt --all
+      - name: Non-SQLite regression and existing connector tests
+        run: |
+          cargo test --locked --no-default-features --features connectors --test remote_mirror_layouts
+          cargo test --locked --no-default-features --features connectors --lib
+      - name: Cursor end-to-end regression
+        run: cargo test --locked --no-default-features --features cursor --test remote_mirror_layouts
+      - name: Strict lint validation
+        run: cargo clippy --locked --no-default-features --features cursor --lib --test remote_mirror_layouts -- -D warnings
+      - name: Publish exact candidate blobs for reviewed direct-main commit
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/remote-mirror-520.py publish
