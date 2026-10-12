@@ -22,6 +22,10 @@ pub struct ScanRoot {
     /// Optional path rewrite rules.
     pub workspace_rewrites: Vec<PathMapping>,
 
+    /// Configured source path whose basename was copied inside this mirror
+    /// container. This is identity metadata, never a local filesystem path.
+    pub mirrored_source_path: Option<String>,
+
     /// Cached trie for fast workspace rewriting.
     rewrite_trie: OnceCell<Arc<PathTrie>>,
 }
@@ -33,6 +37,7 @@ impl Clone for ScanRoot {
             origin: self.origin.clone(),
             platform: self.platform,
             workspace_rewrites: self.workspace_rewrites.clone(),
+            mirrored_source_path: self.mirrored_source_path.clone(),
             rewrite_trie: OnceCell::new(),
         }
     }
@@ -47,6 +52,7 @@ impl ScanRoot {
             origin: Origin::local(),
             platform: None,
             workspace_rewrites: Vec::new(),
+            mirrored_source_path: None,
             rewrite_trie: OnceCell::new(),
         }
     }
@@ -59,6 +65,7 @@ impl ScanRoot {
             origin,
             platform,
             workspace_rewrites: Vec::new(),
+            mirrored_source_path: None,
             rewrite_trie: OnceCell::new(),
         }
     }
@@ -84,8 +91,56 @@ impl ScanRoot {
             origin: self.origin.clone(),
             platform: self.platform,
             workspace_rewrites: self.workspace_rewrites.clone(),
+            // A derived root is no longer the transport's container.
+            mirrored_source_path: None,
             rewrite_trie: OnceCell::new(),
         }
+    }
+
+    /// Mark an SSH transport container that holds `<source basename>/...`.
+    #[must_use]
+    pub fn with_mirrored_source_path(mut self, path: impl Into<String>) -> Self {
+        self.mirrored_source_path = Some(path.into());
+        self
+    }
+
+    /// Resolve a known provider store in a basename-preserving remote mirror.
+    /// For example, a mirror of `.factory` holds `.factory/sessions`, while
+    /// a mirror of `.factory/sessions` holds `sessions`. Match whole source
+    /// components so a generic `sessions` mirror cannot be claimed by Prime.
+    #[must_use]
+    pub fn mirrored_store(&self, store: &[&str]) -> Option<PathBuf> {
+        if !self.origin.is_remote() || store.is_empty() {
+            return None;
+        }
+        let source = self.mirrored_source_path.as_deref()?;
+        let components: Vec<_> = source
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty())
+            .collect();
+        if components.iter().any(|s| matches!(*s, "." | "..")) {
+            return None;
+        }
+        let matched = (1..=store.len())
+            .rev()
+            .find(|&len| components.ends_with(&store[..len]))?;
+        let leaf = self.path.join(components.last()?);
+        // rsync's trailing-slash form copies the directory's contents;
+        // scp/SFTP retain the basename even for that configured spelling.
+        let mut candidate = if leaf.is_dir() {
+            leaf
+        } else if source.ends_with('/') {
+            self.path.clone()
+        } else {
+            return None;
+        };
+        for component in &store[matched..] {
+            candidate.push(component);
+        }
+        // Never let a symlink at the transport boundary escape its container.
+        let container = std::fs::canonicalize(&self.path).ok()?;
+        let resolved = std::fs::canonicalize(&candidate).ok()?;
+        (resolved.starts_with(container) && candidate.is_dir()).then_some(candidate)
     }
 
     /// Get or build the cached rewrite trie.
@@ -382,6 +437,160 @@ impl std::fmt::Debug for SourceScanHooks<'_> {
 mod tests {
     use super::*;
     use crate::types::Origin;
+
+    #[test]
+    fn remote_mirrors_discover_and_scan_provider_stores() {
+        use crate::connectors::{
+            Connector, factory::FactoryConnector, gemini::GeminiConnector,
+            prime_agent::PrimeAgentConnector, vibe::VibeConnector,
+        };
+        let cases: Vec<(&str, &str, &str, &str, Box<dyn Connector>)> = vec![
+            (
+                "factory",
+                ".factory/sessions",
+                "project/session.jsonl",
+                concat!(
+                    r#"{"type":"session_start","id":"factory-test","cwd":"/work/project"}"#,
+                    "\n",
+                    r#"{"type":"message","timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"Hello"}}"#
+                ),
+                Box::new(FactoryConnector::new()),
+            ),
+            (
+                "gemini",
+                ".gemini/tmp",
+                "hash/chats/session-test.json",
+                r#"{"sessionId":"gemini-test","projectHash":"hash","messages":[{"type":"user","content":"Hello","timestamp":"2026-01-05T10:00:01Z"}]}"#,
+                Box::new(GeminiConnector::new()),
+            ),
+            (
+                "vibe",
+                ".vibe/logs/session",
+                "session-test/messages.jsonl",
+                r#"{"role":"user","content":"Hello","timestamp":"2026-01-05T10:00:01Z"}"#,
+                Box::new(VibeConnector::new()),
+            ),
+            (
+                "prime_agent",
+                ".prime/agent/sessions",
+                "session.jsonl",
+                concat!(
+                    r#"{"type":"session","version":3,"id":"prime-test","timestamp":"2026-01-05T10:00:00Z","cwd":"/work/project"}"#,
+                    "\n",
+                    r#"{"type":"message","id":"aaaa0001","parentId":null,"timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"Hello"}}"#
+                ),
+                Box::new(PrimeAgentConnector::new()),
+            ),
+        ];
+        for (slug, store, relative, content, connector) in cases {
+            let parts: Vec<_> = store.split('/').collect();
+            // Every configured ancestor: rsync, scp and SFTP retain its leaf
+            // inside an opaque safe_path_hash container.
+            for depth in 1..=parts.len() {
+                let tmp = tempfile::tempdir().unwrap();
+                let wrapper = tmp
+                    .path()
+                    .join(format!("{}_0123456789abcdef", parts[..depth].join("_")));
+                let target = wrapper.join(parts[depth - 1..].join("/")).join(relative);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::write(&target, content).unwrap();
+                let origin = Origin::remote_with_host("laptop", "user@laptop");
+                let root = ScanRoot::remote(wrapper, origin.clone(), Some(Platform::Linux))
+                    .with_mirrored_source_path(format!("~/{}", parts[..depth].join("/")))
+                    .with_rewrite("/work", "/local/work");
+                assert_eq!(
+                    root.with_path(target.clone())
+                        .rewrite_workspace("/work/project", Some(slug)),
+                    "/local/work/project"
+                );
+                let ctx = ScanContext::with_roots(
+                    tmp.path().join("state"),
+                    vec![root.clone(), root],
+                    None,
+                );
+                let discovered = connector.discover_source_files(&ctx).unwrap();
+                assert_eq!(discovered.len(), 1, "{slug} at depth {depth}");
+                assert_eq!(discovered[0].source_path, target);
+                assert_eq!(discovered[0].origin, origin);
+                assert_eq!(discovered[0].platform, Some(Platform::Linux));
+                let conversations = connector.scan(&ctx).unwrap();
+                assert_eq!(conversations.len(), 1, "{slug} at depth {depth}");
+                assert_eq!(conversations[0].agent_slug, slug);
+                assert_eq!(conversations[0].source_path, target);
+                if matches!(slug, "factory" | "prime_agent") {
+                    assert_eq!(
+                        conversations[0].workspace,
+                        Some(PathBuf::from("/work/project"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mirrored_store_requires_remote_provider_identity_and_safe_containment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join("opaque_hash");
+        let sessions = wrapper.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let store = [".prime", "agent", "sessions"];
+        for source in [
+            "~/sessions",
+            "~/.pi/agent/sessions",
+            "~/.prime/agent/../sessions",
+            "~/.prime/agent/sessions-extra",
+        ] {
+            let root = ScanRoot::remote(wrapper.clone(), Origin::remote("laptop"), None)
+                .with_mirrored_source_path(source);
+            assert!(root.mirrored_store(&store).is_none(), "{source}");
+        }
+        let root = ScanRoot::remote(wrapper.clone(), Origin::remote("laptop"), None)
+            .with_mirrored_source_path("/home/u/.prime/agent/sessions/");
+        assert_eq!(root.mirrored_store(&store), Some(sessions.clone()));
+        assert!(root.clone().mirrored_store(&store).is_some());
+        assert!(root.with_path(sessions).mirrored_store(&store).is_none());
+        assert!(
+            ScanRoot::local(wrapper)
+                .with_mirrored_source_path("~/.prime/agent/sessions")
+                .mirrored_store(&store)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mirrored_store_supports_rsync_contents_and_missing_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join(".vibe_logs_hash");
+        std::fs::create_dir_all(wrapper.join("session")).unwrap();
+        let root = ScanRoot::remote(wrapper.clone(), Origin::remote("laptop"), None)
+            .with_mirrored_source_path("~/.vibe/logs/");
+        assert_eq!(
+            root.mirrored_store(&[".vibe", "logs", "session"]),
+            Some(wrapper.join("session"))
+        );
+        assert!(root.mirrored_store(&[".factory", "sessions"]).is_none());
+        let missing = ScanRoot::remote(tmp.path().join("missing"), Origin::remote("laptop"), None)
+            .with_mirrored_source_path("~/.vibe/logs");
+        assert!(
+            missing
+                .mirrored_store(&[".vibe", "logs", "session"])
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mirrored_store_rejects_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join("mirror");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, wrapper.join("sessions")).unwrap();
+        let root = ScanRoot::remote(wrapper, Origin::remote("laptop"), None)
+            .with_mirrored_source_path("~/.factory/sessions");
+        assert!(root.mirrored_store(&[".factory", "sessions"]).is_none());
+    }
 
     #[test]
     fn scan_root_local_creates_with_defaults() {

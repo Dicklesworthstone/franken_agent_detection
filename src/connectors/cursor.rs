@@ -268,6 +268,9 @@ impl CursorConnector {
             for scan_root in &ctx.scan_roots {
                 let mut candidates = Vec::new();
                 Self::append_explicit_roots(&mut candidates, &scan_root.path);
+                if let Some(path) = scan_root.mirrored_store(&["Cursor", "User"]) {
+                    Self::append_explicit_roots(&mut candidates, &path);
+                }
                 roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
             }
         }
@@ -1429,6 +1432,48 @@ mod tests {
         conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)")
             .unwrap();
         conn
+    }
+
+    #[test]
+    fn remote_mirrors_discover_and_scan_cursor_databases() {
+        for (source, subtree) in [
+            ("~/.config/Cursor/User", "User"),
+            ("/Users/u/Library/Application Support/Cursor", "Cursor/User"),
+            ("C:\\Users\\u\\AppData\\Roaming\\Cursor\\User", "User"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let wrapper = tmp.path().join("Cursor_User_0123456789abcdef");
+            let db_path = wrapper.join(subtree).join("globalStorage/state.vscdb");
+            fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let conn = create_test_db(&db_path);
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "composerData:mirror-test",
+                    r#"{"text":"Remote conversation"}"#
+                ],
+            )
+            .unwrap();
+            drop(conn);
+            let origin = crate::types::Origin::remote_with_host("laptop", "u@laptop");
+            let root =
+                ScanRoot::remote(wrapper, origin.clone(), None).with_mirrored_source_path(source);
+            let ctx =
+                ScanContext::with_roots(tmp.path().join("state"), vec![root.clone(), root], None);
+            let connector = CursorConnector::new();
+            let discovered = connector.discover_source_files(&ctx).unwrap();
+            assert_eq!(discovered.len(), 1, "{source}");
+            assert_eq!(discovered[0].source_path, db_path);
+            assert_eq!(discovered[0].origin, origin);
+            let conversations = connector.scan(&ctx).unwrap();
+            assert_eq!(conversations.len(), 1, "{source}");
+            assert_eq!(conversations[0].source_path, db_path);
+            assert!(
+                conversations[0].messages[0]
+                    .content
+                    .contains("Remote conversation")
+            );
+        }
     }
 
     // =========================================================================

@@ -368,6 +368,11 @@ impl GeminiConnector {
         } else {
             let mut explicit = Vec::new();
             for scan_root in &ctx.scan_roots {
+                if let Some(path) = scan_root.mirrored_store(&[".gemini", "tmp"])
+                    && Self::looks_like_root(&path)
+                {
+                    explicit.push(scan_root.with_path(path));
+                }
                 let candidate = scan_root.path.join(".gemini/tmp");
                 if Self::looks_like_root(&candidate) {
                     explicit.push(scan_root.with_path(candidate));

@@ -243,6 +243,9 @@ impl PrimeAgentConnector {
             for scan_root in &ctx.scan_roots {
                 let mut expanded = Vec::new();
                 Self::append_explicit_roots(&mut expanded, &scan_root.path, &session_dirs);
+                if let Some(path) = scan_root.mirrored_store(&[".prime", "agent", "sessions"]) {
+                    expanded.push(path);
+                }
                 roots.extend(expanded.into_iter().map(|path| scan_root.with_path(path)));
             }
         }

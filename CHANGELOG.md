@@ -52,6 +52,15 @@ window is since GitHub Release
 
 ## [Unreleased]
 
+### Fixed
+
+- Discover Factory, Cursor, Gemini, Vibe and Prime Agent stores inside remote
+  mirrors that retain only the configured source basename (CASS #520).
+  Hosts attach the configured remote path with
+  `ScanRoot::with_mirrored_source_path`; provider matching uses whole path
+  components, preserves provenance and workspace rewrites, and refuses mirror
+  roots that resolve outside their container. Existing local roots are unchanged.
+
 ## [0.3.10] -- 2026-10-11
 
 Published from `main` (0.3.9 plus this change).
