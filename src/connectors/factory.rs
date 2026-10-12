@@ -101,6 +101,9 @@ impl FactoryConnector {
             for scan_root in &ctx.scan_roots {
                 let mut candidates = Vec::new();
                 Self::append_factory_roots(&mut candidates, &scan_root.path);
+                if let Some(path) = scan_root.mirrored_store(&[".factory", "sessions"]) {
+                    candidates.push(path);
+                }
                 roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
             }
 

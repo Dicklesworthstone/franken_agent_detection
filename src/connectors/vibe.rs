@@ -131,6 +131,9 @@ impl VibeConnector {
             }
         } else {
             for root in &ctx.scan_roots {
+                if let Some(path) = root.mirrored_store(&[".vibe", "logs", "session"]) {
+                    roots.push(root.with_path(path));
+                }
                 let candidate = root.path.join(".vibe/logs/session");
                 if candidate.exists() {
                     roots.push(root.with_path(candidate));
