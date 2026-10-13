@@ -10,6 +10,8 @@
 //! The workspace path slug encodes the original working directory path,
 //! e.g., `-Users-alice-Dev-myproject` for `/Users/alice/Dev/myproject`.
 
+mod mirror;
+
 use std::collections::HashSet;
 use std::fs;
 use std::io::BufRead;
@@ -99,11 +101,15 @@ impl FactoryConnector {
             }
         } else {
             for scan_root in &ctx.scan_roots {
+                // A qualified transport container is not also a local home or
+                // an arbitrary JSONL directory. Even a rejected/missing mirror
+                // must not fall through to those broader structural probes.
+                if let Some(selected) = mirror::roots(scan_root) {
+                    roots.extend(selected);
+                    continue;
+                }
                 let mut candidates = Vec::new();
                 Self::append_factory_roots(&mut candidates, &scan_root.path);
-                if let Some(path) = scan_root.mirrored_store(&[".factory", "sessions"]) {
-                    candidates.push(path);
-                }
                 roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
             }
 
@@ -126,7 +132,11 @@ impl FactoryConnector {
             if !root.path.exists() {
                 continue;
             }
-            for entry in WalkDir::new(&root.path).into_iter().flatten() {
+            for entry in WalkDir::new(&root.path)
+                .sort_by_file_name()
+                .into_iter()
+                .flatten()
+            {
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -175,19 +185,38 @@ impl Connector for FactoryConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let mut conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            conversations.push(conversation);
+            Ok(())
+        })?;
+        Ok(conversations)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    // Do not retain every transcript until discovery is exhausted. A large
+    // synced Factory store must yield each completed session before opening the
+    // next one; a consumer error stops parsing immediately.
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
         let mut roots: Vec<PathBuf> = Self::source_roots(ctx)
             .into_iter()
             .map(|root| root.path)
             .collect();
 
         if roots.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         roots.sort();
         roots.dedup();
 
-        let mut convs = Vec::new();
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
         for root in roots {
@@ -195,7 +224,11 @@ impl Connector for FactoryConnector {
                 continue;
             }
 
-            for entry in WalkDir::new(&root).into_iter().flatten() {
+            for entry in WalkDir::new(&root)
+                .sort_by_file_name()
+                .into_iter()
+                .flatten()
+            {
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -216,7 +249,7 @@ impl Connector for FactoryConnector {
                 }
 
                 match parse_factory_session(path) {
-                    Ok(Some(conv)) => convs.push(conv),
+                    Ok(Some(conv)) => on_conversation(conv)?,
                     Ok(None) => {}
                     Err(e) => {
                         tracing::debug!(path = %path.display(), error = %format_args!("{e:#}"), "factory parse error");
@@ -225,7 +258,7 @@ impl Connector for FactoryConnector {
             }
         }
 
-        Ok(convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
