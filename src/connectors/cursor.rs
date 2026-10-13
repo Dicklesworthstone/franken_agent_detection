@@ -25,6 +25,8 @@
     clippy::unreadable_literal
 )]
 
+mod storage_roots;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -232,27 +234,16 @@ impl CursorConnector {
         // 4. Check standard layout: workspaceStorage/{workspace-id}/state.vscdb
         // We only need this specific file pattern, so avoid recursive walking
         // over all workspace files (which can be large and noisy).
-        let workspace_storage = base.join("workspaceStorage");
-        if workspace_storage.exists() {
-            // Keep compatibility with odd setups that place state.vscdb directly
-            // under workspaceStorage.
-            let root_db = workspace_storage.join("state.vscdb");
-            if root_db.is_file() {
-                dbs.push(root_db);
-            }
-
-            if let Ok(entries) = std::fs::read_dir(&workspace_storage) {
-                for entry in entries.flatten() {
-                    let db = entry.path().join("state.vscdb");
-                    if db.is_file() {
-                        dbs.push(db);
-                    }
-                }
-            }
-        }
+        let workspace_storage = if base.file_name().is_some_and(|name| name == "workspaceStorage") {
+            base.to_path_buf()
+        } else {
+            base.join("workspaceStorage")
+        };
+        dbs.extend(storage_roots::workspace_db_files(&workspace_storage));
 
         // Keep connector traversal deterministic across filesystems/runs.
         dbs.sort();
+        dbs.dedup();
         dbs
     }
 
@@ -266,11 +257,13 @@ impl CursorConnector {
             }
         } else {
             for scan_root in &ctx.scan_roots {
-                let mut candidates = Vec::new();
-                Self::append_explicit_roots(&mut candidates, &scan_root.path);
-                if let Some(path) = scan_root.mirrored_store(&["Cursor", "User"]) {
-                    Self::append_explicit_roots(&mut candidates, &path);
-                }
+                // Some(empty) is a recognized but rejected/missing mirror.
+                // Do not retry its unsafe shape through local-layout probes.
+                let candidates = storage_roots::mirrored_db_files(scan_root).unwrap_or_else(|| {
+                    let mut candidates = Vec::new();
+                    Self::append_explicit_roots(&mut candidates, &scan_root.path);
+                    candidates
+                });
                 roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
             }
         }
@@ -282,8 +275,12 @@ impl CursorConnector {
 
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         let mut out = Vec::new();
+        let mut seen_files = HashSet::new();
         for root in Self::source_roots(ctx) {
             for db_path in Self::find_db_files(&root.path) {
+                if !seen_files.insert(dedupe_path_key(&db_path)) {
+                    continue;
+                }
                 if !file_modified_since(&db_path, ctx.since_ts) {
                     continue;
                 }
@@ -679,7 +676,7 @@ impl CursorConnector {
         let model_name = val
             .get("modelConfig")
             .and_then(|m| m.get("modelName"))
-            .and_then(|v| v.as_str());
+            .and_then(|m| m.as_str());
 
         // Use explicit name field if available (v0.40+), otherwise derive from first message
         let title = val
@@ -1467,7 +1464,7 @@ mod tests {
             assert_eq!(discovered[0].origin, origin);
             let conversations = connector.scan(&ctx).unwrap();
             assert_eq!(conversations.len(), 1, "{source}");
-            assert_eq!(conversations[0].source_path, db_path);
+            assert_eq!(conversations[0].source_path, db_path.join("mirror-test"));
             assert!(
                 conversations[0].messages[0]
                     .content
