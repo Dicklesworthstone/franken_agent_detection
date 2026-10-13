@@ -6,6 +6,8 @@
 //! Each line is a message object:
 //! {"role":"user|assistant|system","content":"...","timestamp":"..."}
 
+mod mirror;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -118,8 +120,9 @@ impl VibeConnector {
         out
     }
 
-    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+    fn source_roots(ctx: &ScanContext) -> Vec<mirror::SessionRoot> {
         let mut roots: Vec<ScanRoot> = Vec::new();
+        let mut subtrees = Vec::new();
         if ctx.use_default_detection() {
             if Self::looks_like_vibe_storage(&ctx.data_dir) && ctx.data_dir.exists() {
                 roots.push(ScanRoot::local(ctx.data_dir.clone()));
@@ -131,6 +134,10 @@ impl VibeConnector {
             }
         } else {
             for root in &ctx.scan_roots {
+                if let Some(selected) = mirror::subtree(root) {
+                    subtrees.extend(selected);
+                    continue;
+                }
                 if let Some(path) = root.mirrored_store(&[".vibe", "logs", "session"]) {
                     roots.push(root.with_path(path));
                 }
@@ -144,8 +151,13 @@ impl VibeConnector {
                 roots.extend(explicit.into_iter().map(|path| root.with_path(path)));
             }
         }
-        roots.sort_by(|a, b| a.path.cmp(&b.path));
-        roots.dedup_by(|a, b| a.path == b.path);
+        let mut roots: Vec<_> = roots
+            .into_iter()
+            .map(mirror::SessionRoot::native)
+            .chain(subtrees)
+            .collect();
+        roots.sort_by(|a, b| a.root.path.cmp(&b.root.path));
+        roots.dedup_by(|a, b| a.root.path == b.root.path);
         roots
     }
 
@@ -154,7 +166,8 @@ impl VibeConnector {
         // Same cross-root dedupe as scan(): overlapping or symlink-aliased
         // roots must not produce duplicate discovered sources.
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
-        for mut root in Self::source_roots(ctx) {
+        for source in Self::source_roots(ctx) {
+            let mut root = source.root;
             if root.path.is_file() {
                 let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
                 root = root.with_path(parent);
@@ -322,10 +335,7 @@ impl Connector for VibeConnector {
 
     #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
+        let roots = Self::source_roots(ctx);
 
         if roots.is_empty() {
             return Ok(Vec::new());
@@ -337,12 +347,13 @@ impl Connector for VibeConnector {
 
         let mut convs = Vec::new();
 
-        for mut root in roots {
-            if root.is_file() {
-                root = root.parent().unwrap_or(&root).to_path_buf();
+        for mut source in roots {
+            if source.root.path.is_file() {
+                let parent = source.root.path.parent().unwrap_or(&source.root.path).to_path_buf();
+                source.root = source.root.with_path(parent);
             }
 
-            let files = Self::session_files(&root);
+            let files = Self::session_files(&source.root.path);
             'sources: for file in files {
                 if !seen_files.insert(dedupe_path_key(&file)) {
                     continue;
@@ -351,16 +362,7 @@ impl Connector for VibeConnector {
                     continue;
                 }
 
-                let external_id = file
-                    .parent()
-                    .and_then(|parent| parent.strip_prefix(&root).ok())
-                    .and_then(|rel| rel.to_str().map(str::to_string))
-                    .or_else(|| {
-                        file.parent()
-                            .and_then(|p| p.file_name())
-                            .and_then(|s| s.to_str())
-                            .map(str::to_string)
-                    });
+                let external_id = source.external_id(&file);
 
                 let source_path = file;
                 let file_handle = match fs::File::open(&source_path) {
