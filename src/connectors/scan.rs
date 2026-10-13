@@ -1,5 +1,7 @@
 //! Scan root and context types for multi-root connector scanning.
 
+mod mirror;
+
 use crate::connectors::path_trie::PathTrie;
 use crate::types::{Origin, PathMapping, Platform};
 use once_cell::sync::OnceCell;
@@ -104,43 +106,17 @@ impl ScanRoot {
         self
     }
 
-    /// Resolve a known provider store in a basename-preserving remote mirror.
-    /// For example, a mirror of `.factory` holds `.factory/sessions`, while
-    /// a mirror of `.factory/sessions` holds `sessions`. Match whole source
-    /// components so a generic `sessions` mirror cannot be claimed by Prime.
+    /// Resolve a provider store or a configured subtree inside an SSH mirror.
+    /// Ancestor sources expand to the store; sources inside the complete store
+    /// stay narrow. Ownership uses whole source components, never a generic
+    /// basename or a substring of the hashed container name. Inferred paths
+    /// must be directories without symlinks at or below the container boundary.
     #[must_use]
     pub fn mirrored_store(&self, store: &[&str]) -> Option<PathBuf> {
-        if !self.origin.is_remote() || store.is_empty() {
+        if !self.origin.is_remote() {
             return None;
         }
-        let source = self.mirrored_source_path.as_deref()?;
-        let components: Vec<_> = source
-            .split(['/', '\\'])
-            .filter(|s| !s.is_empty())
-            .collect();
-        if components.iter().any(|s| matches!(*s, "." | "..")) {
-            return None;
-        }
-        let matched = (1..=store.len())
-            .rev()
-            .find(|&len| components.ends_with(&store[..len]))?;
-        let leaf = self.path.join(components.last()?);
-        // rsync's trailing-slash form copies the directory's contents;
-        // scp/SFTP retain the basename even for that configured spelling.
-        let mut candidate = if leaf.is_dir() {
-            leaf
-        } else if source.ends_with('/') {
-            self.path.clone()
-        } else {
-            return None;
-        };
-        for component in &store[matched..] {
-            candidate.push(component);
-        }
-        // Never let a symlink at the transport boundary escape its container.
-        let container = std::fs::canonicalize(&self.path).ok()?;
-        let resolved = std::fs::canonicalize(&candidate).ok()?;
-        (resolved.starts_with(container) && candidate.is_dir()).then_some(candidate)
+        mirror::resolve(&self.path, self.mirrored_source_path.as_deref()?, store)
     }
 
     /// Get or build the cached rewrite trie.
