@@ -63,6 +63,29 @@ window is since `v0.3.11` (2026-10-14).
 
 ## [Unreleased]
 
+### Added
+
+- **100% 34-connector `CASS_EXCLUDE_PATHS` enforcement (`franken_agent_detection-uji`):**
+  wired `excluded_scan_paths_from_env()` pre-parse validation and `path_is_excluded()`
+  filtering across all remaining connectors (`aider`, `amp`, `chatgpt`, `cline`, `copilot`,
+  `copilot_vscode`, `copilot_cli`, `crush`, `cursor`, `devin`, `gemini`, `goose`, `grok_bot`,
+  `hermes`, `opencode`, `openhands`, and `shelley`), achieving 100% 34-connector coverage
+  across `discover_source_files()`, `scan()`, `scan_with_callback()`, and
+  `scan_with_source_boundaries()`.
+- **100% 34-connector streaming scan and 28-connector per-source boundary hooks (`franken_agent_detection-xzo`):**
+  implemented `supports_streaming_scan() -> true` and `scan_with_callback()` across all
+  remaining connectors (`aider`, `amp`, `chatgpt`, `cline`, `copilot`, `copilot_vscode`,
+  `copilot_cli`, `crush`, `cursor`, `devin`, `goose`, `hermes`, and `opencode`), and
+  implemented `supports_source_boundaries() -> true` and `scan_with_source_boundaries()`
+  with `SourceScanHooks` (`should_scan_source` and `on_source_complete`) for `aider`, `amp`,
+  `chatgpt`, `copilot_cli`, `crush`, `devin`, `goose`, and `hermes`.
+
+### Fixed
+
+- **Shelley 0-based `sequence_id` conformance and `--all-features` Clippy cleanliness (`franken_agent_detection-da4`):**
+  aligned Shelley's conformance test fixture with real Shelley 0-based `sequence_id`
+  ordering and resolved all `--all-features --all-targets` Clippy `-D warnings` lints.
+
 ## [0.3.11] -- 2026-10-14
 
 ### Added

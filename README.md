@@ -232,14 +232,14 @@ not added to per-message metrics.
 Exclusion entries are literal paths, without shell or tilde expansion. An unset
 or empty `CASS_EXCLUDE_PATHS` leaves scans unrestricted. Invalid Unicode,
 unresolvable entries, or relative entries without a usable working directory
-return an error from affected connectors' scan and discovery methods before
-source hooks or parsing (including Claude Code, Codex, Pi Agent, Oh My Pi, Pi
-Durable, Continue, Kiro, Grok, Muse, Factory, Qwen, Prime Agent, Vibe, Kimi,
-Clawdbot, Antigravity, Codebuff, and OpenClaw). Absolute entries remain usable
-without a working directory. The existing infallible Pi `discover_sources` and
-durable `store_diagnostics` helpers log invalid-policy errors and return no
-sources; `pi_wire::try_discover_sources` exposes the discovery error to direct
-callers.
+return an error from all 34 connectors' scan and discovery methods before
+source hooks or parsing. All 34 connectors support streaming callback scans
+(`supports_streaming_scan() == true`), and 28 connectors also expose per-source
+lifecycle boundary hooks (`supports_source_boundaries() == true` via
+`scan_with_source_boundaries()`). Absolute entries remain usable without a
+working directory. The existing infallible Pi `discover_sources` and durable
+`store_diagnostics` helpers log invalid-policy errors and return no sources;
+`pi_wire::try_discover_sources` exposes the discovery error to direct callers.
 
 Claude Code, Factory, Kimi, Kiro, Clawdbot, Vibe, OpenClaw, Muse, Grok, Prime and
 Gemini stop reading a transcript after an underlying I/O error and discard its
