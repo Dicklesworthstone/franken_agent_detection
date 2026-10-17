@@ -1681,11 +1681,6 @@ fn parse_session_file(path: &Path) -> Result<SessionInfo> {
 }
 
 /// Load all messages for a session
-#[cfg(test)]
-fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<NormalizedMessage>> {
-    load_messages_with_exclusions(session_msg_dir, part_dir, &[])
-}
-
 fn load_messages_with_exclusions(
     session_msg_dir: &Path,
     part_dir: &Path,
