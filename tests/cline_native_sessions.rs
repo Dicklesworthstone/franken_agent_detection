@@ -95,7 +95,7 @@ fn scan_routes(ctx: &ScanContext) -> Vec<NormalizedConversation> {
         serde_json::to_value(&direct).unwrap(),
         serde_json::to_value(boundaries).unwrap()
     );
-    assert!(!connector.supports_streaming_scan());
+    assert!(connector.supports_streaming_scan());
     assert!(!connector.supports_source_boundaries());
     assert_eq!(should_scan_calls, 0);
     assert_eq!(complete_calls, 0);

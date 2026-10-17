@@ -281,7 +281,7 @@ fn sdk_callback_routes_match_collecting_and_preserve_cancellation() {
         serde_json::to_value(expected).unwrap(),
         serde_json::to_value(bounded).unwrap()
     );
-    assert!(!connector.supports_streaming_scan());
+    assert!(connector.supports_streaming_scan());
     assert!(!connector.supports_source_boundaries());
     let error = connector
         .scan_with_callback(&ctx, &mut |_| anyhow::bail!("stop after first SDK session"))

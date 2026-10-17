@@ -442,8 +442,11 @@ fn copilot_scope_child() {
             serde_json::to_value(&callback).unwrap(),
             serde_json::to_value(&conversations).unwrap()
         );
-        assert!(!connector.supports_streaming_scan());
-        assert!(!connector.supports_source_boundaries());
+        assert!(connector.supports_streaming_scan());
+        assert_eq!(
+            connector.supports_source_boundaries(),
+            slug == "copilot_cli"
+        );
         let mut boundary = Vec::new();
         connector
             .scan_with_source_boundaries(

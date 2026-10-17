@@ -203,7 +203,8 @@ fn aider_scope_child() {
         serde_json::to_value(&callback).unwrap(),
         serde_json::to_value(&conversations).unwrap(),
     );
-    assert!(!connector.supports_source_boundaries());
+    assert!(connector.supports_streaming_scan());
+    assert!(connector.supports_source_boundaries());
     let mut boundary_fallback = Vec::new();
     connector
         .scan_with_source_boundaries(&ctx, &mut SourceScanHooks::default(), &mut |conversation| {

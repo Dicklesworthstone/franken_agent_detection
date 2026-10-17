@@ -253,14 +253,20 @@ fn case(root: &Path, provider: &'static str) -> Case {
         .map(|visibility| root.join(visibility).join(directory))
         .into_iter()
         .collect();
-    let sources = if provider == "goose" {
-        visibilities
+    let sources = match provider {
+        "goose" => visibilities
             .into_iter()
             .zip(&roots)
             .map(|(visibility, path)| path.join(format!("sess-{visibility}.jsonl")))
-            .collect()
-    } else {
-        roots.iter().map(|path| path.join(&filename)).collect()
+            .collect(),
+        "copilot" => visibilities
+            .into_iter()
+            .zip(&roots)
+            .map(|(visibility, path)| {
+                path.join(format!("ws-1/chatSessions/sess-{visibility}.json"))
+            })
+            .collect(),
+        _ => roots.iter().map(|path| path.join(&filename)).collect(),
     };
     Case {
         provider,
@@ -394,7 +400,8 @@ impl Fixture {
                         }
                     }),
                     "copilot" => json!({
-                        "sessionId": "sess-1",
+                        "sessionId": format!("sess-{visibility}"),
+                        "responderUsername": "GitHub Copilot",
                         "requests": [{
                             "requestId": "req-1",
                             "timestamp": 1_700_000_000_000_i64,
