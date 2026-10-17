@@ -108,6 +108,7 @@ fn context(root: &Path, paths: impl IntoIterator<Item = PathBuf>) -> ScanContext
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn case(root: &Path, provider: &'static str) -> Case {
     let (connector, directory, filename): (Box<dyn Connector>, &str, String) = match provider {
         "claude" => (
