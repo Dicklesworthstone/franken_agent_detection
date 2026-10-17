@@ -744,7 +744,7 @@ impl Connector for GooseConnector {
                         })?;
                     }
                 }
-                _ => {}
+                DiscoveredSourceRole::MetadataSidecar => {}
             }
         }
 

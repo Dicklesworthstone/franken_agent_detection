@@ -1372,6 +1372,7 @@ impl CursorConnector {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn scan_cursor_with_callback(
         &self,
         ctx: &ScanContext,
