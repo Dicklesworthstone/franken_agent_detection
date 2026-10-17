@@ -15,8 +15,11 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::jsonl::JsonlLines;
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::dedupe_path_key;
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -119,18 +122,25 @@ impl ClawdbotConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         // Same cross-root dedupe scan() applies: overlapping or
         // symlink-aliased roots must not produce duplicate discovered
         // sources (double mirroring downstream).
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
         let mut out = Vec::new();
         for mut root in Self::source_roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             if root.path.is_file() {
                 let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
                 root = root.with_path(parent);
             }
             for file in Self::session_files(&root.path) {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&file)) {
                     continue;
                 }
@@ -149,7 +159,128 @@ impl ClawdbotConnector {
                 );
             }
         }
-        out
+        Ok(out)
+    }
+    #[allow(clippy::too_many_lines)]
+    fn parse_session_reader(
+        root: &Path,
+        file: &Path,
+        reader: impl std::io::BufRead,
+    ) -> Option<NormalizedConversation> {
+        let source_path = file.to_path_buf();
+        let external_id = source_path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|rel| {
+                rel.with_extension("")
+                    .to_str()
+                    .map(std::string::ToString::to_string)
+            })
+            .or_else(|| {
+                source_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(std::string::ToString::to_string)
+            });
+
+        let mut messages = Vec::new();
+        let mut started_at: Option<i64> = None;
+        let mut ended_at: Option<i64> = None;
+
+        for line_res in JsonlLines::new(reader) {
+            let line = match line_res {
+                Ok(line) => line,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %file.display(),
+                        error = %error,
+                        "clawdbot: discarding incomplete session after read error"
+                    );
+                    return None;
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let line = line.trim_start_matches('\u{feff}');
+            let val: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let role = val
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("assistant");
+            let content = val.get("content").map(flatten_content).unwrap_or_default();
+
+            if content.trim().is_empty() {
+                continue;
+            }
+
+            let created = val.get("timestamp").and_then(parse_timestamp);
+            started_at = match (started_at, created) {
+                (Some(curr), Some(ts)) => Some(curr.min(ts)),
+                (None, Some(ts)) => Some(ts),
+                (other, None) => other,
+            };
+            ended_at = match (ended_at, created) {
+                (Some(curr), Some(ts)) => Some(curr.max(ts)),
+                (None, Some(ts)) => Some(ts),
+                (other, None) => other,
+            };
+
+            messages.push(NormalizedMessage {
+                idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
+                role: role.to_string(),
+                author: None,
+                created_at: created,
+                content,
+                extra: val,
+                invocations: Vec::new(),
+                snippets: Vec::new(),
+            });
+        }
+
+        if messages.is_empty() {
+            return None;
+        }
+
+        let title = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .map(|m| {
+                m.content
+                    .lines()
+                    .next()
+                    .unwrap_or(&m.content)
+                    .chars()
+                    .take(100)
+                    .collect::<String>()
+            })
+            .or_else(|| {
+                messages
+                    .first()
+                    .and_then(|m| m.content.lines().next())
+                    .map(|s| s.chars().take(100).collect())
+            });
+
+        let metadata = serde_json::json!({
+            "source": "clawdbot",
+        });
+
+        Some(NormalizedConversation {
+            agent_slug: "clawdbot".to_string(),
+            external_id,
+            title,
+            workspace: None,
+            source_path,
+            started_at,
+            ended_at,
+            metadata,
+            messages,
+        })
     }
 }
 
@@ -158,30 +289,63 @@ impl Connector for ClawdbotConnector {
         franken_detection_for_connector("clawdbot").unwrap_or_else(DetectionResult::not_found)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
+        let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            convs.push(conversation);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
+        let roots = Self::source_roots(ctx);
 
         if roots.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        let mut convs = Vec::new();
         // Cross-root guard: overlapping explicit roots (two machine mirrors,
         // nested roots) would otherwise parse and emit the same session
         // file once per covering root.
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
         for mut root in roots {
-            if root.is_file() {
-                root = root.parent().unwrap_or(&root).to_path_buf();
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
+            if root.path.is_file() {
+                let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
+                root = root.with_path(parent);
             }
 
-            let files = Self::session_files(&root);
-            'sources: for file in files {
+            let files = Self::session_files(&root.path);
+            for file in files {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&file)) {
                     continue;
                 }
@@ -189,21 +353,17 @@ impl Connector for ClawdbotConnector {
                     continue;
                 }
 
-                let source_path = file.clone();
-                let external_id = source_path
-                    .strip_prefix(&root)
-                    .ok()
-                    .and_then(|rel| {
-                        rel.with_extension("")
-                            .to_str()
-                            .map(std::string::ToString::to_string)
-                    })
-                    .or_else(|| {
-                        source_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .map(std::string::ToString::to_string)
-                    });
+                let discovered = DiscoveredSourceFile::new(
+                    "clawdbot",
+                    &root,
+                    file.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata();
+                if !hooks.should_scan(&discovered) {
+                    continue;
+                }
 
                 let file_handle = match fs::File::open(&file) {
                     Ok(f) => f,
@@ -213,113 +373,24 @@ impl Connector for ClawdbotConnector {
                     }
                 };
                 let reader = std::io::BufReader::new(file_handle);
-
-                let mut messages = Vec::new();
-                let mut started_at: Option<i64> = None;
-                let mut ended_at: Option<i64> = None;
-
-                for line_res in JsonlLines::new(reader) {
-                    let line = match line_res {
-                        Ok(line) => line,
-                        Err(error) => {
-                            tracing::debug!(
-                                path = %file.display(),
-                                error = %error,
-                                "clawdbot: discarding incomplete session after read error"
-                            );
-                            continue 'sources;
-                        }
-                    };
-                    if line.trim().is_empty() {
-                        continue;
+                if let Some(conv) = Self::parse_session_reader(&root.path, &file, reader) {
+                    on_conversation(conv)?;
+                    if !discovered.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source: discovered,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted: 1,
+                        })?;
                     }
-
-                    let line = line.trim_start_matches('\u{feff}');
-                    let val: Value = match serde_json::from_str(line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    let role = val
-                        .get("role")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("assistant");
-                    let content = val.get("content").map(flatten_content).unwrap_or_default();
-
-                    if content.trim().is_empty() {
-                        continue;
-                    }
-
-                    let created = val.get("timestamp").and_then(parse_timestamp);
-                    started_at = match (started_at, created) {
-                        (Some(curr), Some(ts)) => Some(curr.min(ts)),
-                        (None, Some(ts)) => Some(ts),
-                        (other, None) => other,
-                    };
-                    ended_at = match (ended_at, created) {
-                        (Some(curr), Some(ts)) => Some(curr.max(ts)),
-                        (None, Some(ts)) => Some(ts),
-                        (other, None) => other,
-                    };
-
-                    messages.push(NormalizedMessage {
-                        idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
-                        role: role.to_string(),
-                        author: None,
-                        created_at: created,
-                        content,
-                        extra: val,
-                        invocations: Vec::new(),
-                        snippets: Vec::new(),
-                    });
                 }
-
-                if messages.is_empty() {
-                    continue;
-                }
-
-                let title = messages
-                    .iter()
-                    .find(|m| m.role == "user")
-                    .map(|m| {
-                        m.content
-                            .lines()
-                            .next()
-                            .unwrap_or(&m.content)
-                            .chars()
-                            .take(100)
-                            .collect::<String>()
-                    })
-                    .or_else(|| {
-                        messages
-                            .first()
-                            .and_then(|m| m.content.lines().next())
-                            .map(|s| s.chars().take(100).collect())
-                    });
-
-                let metadata = serde_json::json!({
-                    "source": "clawdbot",
-                });
-
-                convs.push(NormalizedConversation {
-                    agent_slug: "clawdbot".to_string(),
-                    external_id,
-                    title,
-                    workspace: None,
-                    source_path,
-                    started_at,
-                    ended_at,
-                    metadata,
-                    messages,
-                });
             }
         }
 
-        Ok(convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 
@@ -461,5 +532,71 @@ mod tests {
         let mut sorted = files.clone();
         sorted.sort();
         assert_eq!(files, sorted);
+    }
+
+    struct FailingReader {
+        prefix: std::io::Cursor<Vec<u8>>,
+        kind: std::io::ErrorKind,
+        attempts: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            unreachable!("the transcript reader uses BufRead directly")
+        }
+    }
+
+    impl std::io::BufRead for FailingReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if usize::try_from(self.prefix.position()).unwrap() < self.prefix.get_ref().len() {
+                return self.prefix.fill_buf();
+            }
+            self.attempts.set(self.attempts.get() + 1);
+            Err(std::io::Error::new(
+                self.kind,
+                "injected transcript read failure",
+            ))
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.prefix.consume(amount);
+        }
+    }
+
+    #[test]
+    fn reader_failure_discards_complete_prefix_without_retrying() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".clawdbot/sessions");
+        let file = sessions.join("failing.jsonl");
+        let prefix = concat!(
+            "{\"role\":\"user\",\"content\":\"complete prefix\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"partial",
+        );
+        let healthy =
+            ClawdbotConnector::parse_session_reader(&sessions, &file, std::io::Cursor::new(prefix))
+                .expect("a clean EOF retains the complete record and ignores malformed JSON");
+        assert_eq!(healthy.messages[0].content, "complete prefix");
+
+        for kind in [
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+            let conversation = ClawdbotConnector::parse_session_reader(
+                &sessions,
+                &file,
+                FailingReader {
+                    prefix: std::io::Cursor::new(prefix.as_bytes().to_vec()),
+                    kind,
+                    attempts: std::rc::Rc::clone(&attempts),
+                },
+            );
+            assert!(
+                conversation.is_none(),
+                "{kind:?} must discard accumulated messages"
+            );
+            assert_eq!(attempts.get(), 1, "the failed read must not be retried");
+        }
     }
 }

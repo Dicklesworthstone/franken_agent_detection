@@ -14,7 +14,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
-use super::utils::{env_var_nonempty, read_capped};
+use super::scan::{SourceCompletion, SourceScanHooks};
+use super::utils::{env_var_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot,
     file_modified_since, franken_detection_for_connector, parse_timestamp,
@@ -49,9 +50,13 @@ impl CodebuffConnector {
     }
 
     fn discover(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut sources = Vec::new();
         let mut seen = HashSet::new();
         for root in Self::roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             // Only the shared projects tree or an explicitly named transcript
             // is eligible. Do not walk arbitrary sibling-product directories.
             let candidates = if root.path.is_file() {
@@ -64,7 +69,7 @@ impl CodebuffConnector {
                 } else {
                     root.path.join(".config/manicode/projects")
                 };
-                if !projects.exists() {
+                if !projects.exists() || path_is_excluded(&projects, &excluded_paths) {
                     continue;
                 }
                 let mut candidates = Vec::new();
@@ -77,6 +82,9 @@ impl CodebuffConnector {
                 candidates
             };
             for path in candidates {
+                if path_is_excluded(&path, &excluded_paths) {
+                    continue;
+                }
                 let Some(key) = session_key(&path) else {
                     continue;
                 };
@@ -85,7 +93,8 @@ impl CodebuffConnector {
                 }
                 let state_path = path.with_file_name(RUN_STATE);
                 let changed = file_modified_since(&path, ctx.since_ts)
-                    || (state_path.is_file() && file_modified_since(&state_path, ctx.since_ts));
+                    || (state_path.is_file()
+                        && file_modified_since(&state_path, since_ts_opt(ctx.since_ts)));
                 if !changed {
                     continue;
                 }
@@ -99,7 +108,7 @@ impl CodebuffConnector {
                     )
                     .with_fs_metadata(),
                 );
-                if state_path.is_file() {
+                if state_path.is_file() && !path_is_excluded(&state_path, &excluded_paths) {
                     sources.push(
                         DiscoveredSourceFile::new(
                             SLUG,
@@ -116,6 +125,10 @@ impl CodebuffConnector {
         sources.sort_by(|a, b| a.source_path.cmp(&b.source_path));
         Ok(sources)
     }
+}
+
+const fn since_ts_opt(since_ts: Option<i64>) -> Option<i64> {
+    since_ts
 }
 
 // The directory ID is native, not synthesized from a message timestamp.
@@ -408,6 +421,19 @@ impl Connector for CodebuffConnector {
         ctx: &ScanContext,
         emit: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), emit)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        emit: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
         // One transcript that does not parse (upstream's /history lists chats
         // truncated by a crash mid-write as unreadable) must not hide every
         // other chat (cass GH #511): emit each chat that parses, then fail the
@@ -419,8 +445,20 @@ impl Connector for CodebuffConnector {
         let mut failures = 0_usize;
         for source in Self::discover(ctx)? {
             if source.role == DiscoveredSourceRole::PrimarySessionLog {
+                if !hooks.should_scan(&source) {
+                    continue;
+                }
                 match parse_session(&source) {
-                    Ok(Some(conversation)) => emit(conversation)?,
+                    Ok(Some(conversation)) => {
+                        emit(conversation)?;
+                        if !source.fs_metadata_changed() {
+                            hooks.complete(&SourceCompletion {
+                                source,
+                                required_sidecars: Vec::new(),
+                                conversations_emitted: 1,
+                            })?;
+                        }
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         failures += 1;

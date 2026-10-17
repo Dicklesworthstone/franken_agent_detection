@@ -30,10 +30,14 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::jsonl::JsonlLines;
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
-    parse_timestamp, utils::dedupe_path_key,
+    parse_timestamp,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -219,12 +223,19 @@ impl KimiConnector {
             }
         } else {
             for scan_root in &ctx.scan_roots {
+                if let Some(mirrored) = scan_root
+                    .mirrored_store(&[".kimi-code", "sessions"])
+                    .or_else(|| scan_root.mirrored_store(&[".kimi", "sessions"]))
+                {
+                    roots.push(scan_root.with_path(mirrored));
+                    continue;
+                }
                 let mut candidates = Vec::new();
                 Self::append_kimi_roots(&mut candidates, &scan_root.path);
                 roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
             }
 
-            if ctx.data_dir.exists() {
+            if ctx.data_dir.exists() && !ctx.scan_roots.iter().any(|r| r.path == ctx.data_dir) {
                 let mut candidates = Vec::new();
                 Self::append_kimi_roots(&mut candidates, &ctx.data_dir);
                 roots.extend(candidates.into_iter().map(ScanRoot::local));
@@ -246,14 +257,18 @@ impl KimiConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
         for root in Self::source_roots(ctx) {
-            if !root.path.exists() {
+            if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
             for wire_path in Self::wire_files(&root.path) {
+                if path_is_excluded(&wire_path, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&wire_path)) {
                     continue;
                 }
@@ -278,7 +293,10 @@ impl KimiConnector {
                     |layout| Some(layout.session_root.join("state.json")),
                 );
                 if let Some(state) = state {
-                    if state.exists() && seen_files.insert(dedupe_path_key(&state)) {
+                    if state.exists()
+                        && !path_is_excluded(&state, &excluded_paths)
+                        && seen_files.insert(dedupe_path_key(&state))
+                    {
                         out.push(
                             DiscoveredSourceFile::new(
                                 "kimi",
@@ -293,7 +311,7 @@ impl KimiConnector {
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -303,32 +321,71 @@ impl Connector for KimiConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
+        let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            convs.push(conversation);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
+        let roots = Self::source_roots(ctx);
 
         if roots.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        roots.sort();
-        roots.dedup();
-
-        let mut convs = Vec::new();
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
         for root in roots {
-            if !root.exists() {
+            if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
 
-            for wire_path in Self::wire_files(&root) {
+            for wire_path in Self::wire_files(&root.path) {
+                if path_is_excluded(&wire_path, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&wire_path)) {
                     continue;
                 }
 
                 if !file_modified_since(&wire_path, ctx.since_ts) {
+                    continue;
+                }
+
+                let discovered = DiscoveredSourceFile::new(
+                    "kimi",
+                    &root,
+                    wire_path.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata();
+                if !hooks.should_scan(&discovered) {
                     continue;
                 }
 
@@ -338,7 +395,16 @@ impl Connector for KimiConnector {
                 );
 
                 match parsed {
-                    Ok(Some(conv)) => convs.push(conv),
+                    Ok(Some(conv)) => {
+                        on_conversation(conv)?;
+                        if !discovered.fs_metadata_changed() {
+                            hooks.complete(&SourceCompletion {
+                                source: discovered,
+                                required_sidecars: Vec::new(),
+                                conversations_emitted: 1,
+                            })?;
+                        }
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         tracing::debug!(
@@ -351,11 +417,11 @@ impl Connector for KimiConnector {
             }
         }
 
-        Ok(convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

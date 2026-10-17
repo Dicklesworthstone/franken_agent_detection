@@ -39,7 +39,9 @@ use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, env_path_nonempty, read_capped};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -234,7 +236,10 @@ impl CursorConnector {
         // 4. Check standard layout: workspaceStorage/{workspace-id}/state.vscdb
         // We only need this specific file pattern, so avoid recursive walking
         // over all workspace files (which can be large and noisy).
-        let workspace_storage = if base.file_name().is_some_and(|name| name == "workspaceStorage") {
+        let workspace_storage = if base
+            .file_name()
+            .is_some_and(|name| name == "workspaceStorage")
+        {
             base.to_path_buf()
         } else {
             base.join("workspaceStorage")
@@ -273,11 +278,18 @@ impl CursorConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         let mut seen_files = HashSet::new();
         for root in Self::source_roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             for db_path in Self::find_db_files(&root.path) {
+                if path_is_excluded(&db_path, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&db_path)) {
                     continue;
                 }
@@ -298,8 +310,8 @@ impl CursorConnector {
         }
         // Cursor Agent transcripts (gh #306) — mirror scan_agent_transcripts so
         // discovery covers every scanned source (conformance contract).
-        Self::discover_agent_sources(ctx, &mut out);
-        out
+        Self::discover_agent_sources(ctx, &excluded_paths, &mut out);
+        Ok(out)
     }
 
     /// Fast existence probe for detect(): return true on the first matching
@@ -1030,16 +1042,26 @@ impl CursorConnector {
     /// The `(root, transcript)` pairs that BOTH `scan()` and
     /// `discover_source_files()` consume, so discovery always covers every
     /// scanned source (the connector conformance contract).
-    fn agent_transcript_sources(ctx: &ScanContext) -> Vec<(ScanRoot, PathBuf)> {
+    fn agent_transcript_sources(
+        ctx: &ScanContext,
+        excluded_paths: &[PathBuf],
+    ) -> Vec<(ScanRoot, PathBuf)> {
         let mut out = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
         for root in Self::agent_scan_roots(ctx) {
-            if !root.path.exists() {
+            if !root.path.exists() || path_is_excluded(&root.path, excluded_paths) {
                 continue;
             }
             for transcript in Self::agent_transcript_files(&root.path) {
+                if path_is_excluded(&transcript, excluded_paths) {
+                    continue;
+                }
                 let workspace_metadata_changed = Self::agent_workspace_metadata_path(&transcript)
-                    .is_some_and(|path| path.is_file() && file_modified_since(&path, ctx.since_ts));
+                    .is_some_and(|path| {
+                        path.is_file()
+                            && !path_is_excluded(&path, excluded_paths)
+                            && file_modified_since(&path, ctx.since_ts)
+                    });
                 if !file_modified_since(&transcript, ctx.since_ts) && !workspace_metadata_changed {
                     continue;
                 }
@@ -1078,8 +1100,14 @@ impl CursorConnector {
     /// hyphens. Only the explicit workspacePath can establish attribution.
     /// Accept foreign absolute paths too: exported sources need not exist on
     /// the scanning host, and ScanRoot applies source mappings afterward.
-    fn agent_workspace_from_metadata(transcript: &Path) -> Option<PathBuf> {
+    fn agent_workspace_from_metadata(
+        transcript: &Path,
+        excluded_paths: &[PathBuf],
+    ) -> Option<PathBuf> {
         let path = Self::agent_workspace_metadata_path(transcript)?;
+        if path_is_excluded(&path, excluded_paths) {
+            return None;
+        }
         let text = read_capped(&path).ok()??;
         let metadata: Value = serde_json::from_str(&text).ok()?;
         let workspace = metadata.get("workspacePath")?.as_str()?;
@@ -1194,6 +1222,7 @@ impl CursorConnector {
     fn parse_agent_transcript(
         transcript: &Path,
         root: &ScanRoot,
+        excluded_paths: &[PathBuf],
     ) -> Option<NormalizedConversation> {
         let records = Self::read_agent_transcript_records(transcript);
         if records.is_empty() {
@@ -1244,7 +1273,7 @@ impl CursorConnector {
             .and_then(|s| s.to_str())
             .map(String::from);
         let project = Self::agent_project_dir_name(transcript);
-        let explicit_workspace = Self::agent_workspace_from_metadata(transcript);
+        let explicit_workspace = Self::agent_workspace_from_metadata(transcript, excluded_paths);
         let attribution = if explicit_workspace.is_some() {
             "workspace_trusted"
         } else {
@@ -1292,21 +1321,31 @@ impl CursorConnector {
         })
     }
 
-    /// Append Agent-transcript conversations to `out` (additive to Composer).
-    fn scan_agent_transcripts(ctx: &ScanContext, out: &mut Vec<NormalizedConversation>) {
-        for (root, transcript) in Self::agent_transcript_sources(ctx) {
-            if let Some(conv) = Self::parse_agent_transcript(&transcript, &root) {
-                out.push(conv);
+    /// Emit Agent-transcript conversations (additive to Composer).
+    fn scan_agent_transcripts_with_callback(
+        ctx: &ScanContext,
+        excluded_paths: &[PathBuf],
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        for (root, transcript) in Self::agent_transcript_sources(ctx, excluded_paths) {
+            if let Some(conv) = Self::parse_agent_transcript(&transcript, &root, excluded_paths) {
+                on_conversation(conv)?;
             }
         }
+        Ok(())
     }
 
-    /// Agent-transcript files as discovered sources (mirrors `scan_agent_transcripts`).
-    fn discover_agent_sources(ctx: &ScanContext, out: &mut Vec<DiscoveredSourceFile>) {
+    /// Agent-transcript files as discovered sources (mirrors `scan_agent_transcripts_with_callback`).
+    fn discover_agent_sources(
+        ctx: &ScanContext,
+        excluded_paths: &[PathBuf],
+        out: &mut Vec<DiscoveredSourceFile>,
+    ) {
         let mut seen_metadata = HashSet::new();
-        for (root, transcript) in Self::agent_transcript_sources(ctx) {
+        for (root, transcript) in Self::agent_transcript_sources(ctx, excluded_paths) {
             if let Some(path) = Self::agent_workspace_metadata_path(&transcript)
                 && path.is_file()
+                && !path_is_excluded(&path, excluded_paths)
                 && seen_metadata.insert(dedupe_path_key(&path))
             {
                 out.push(
@@ -1332,15 +1371,13 @@ impl CursorConnector {
             );
         }
     }
-}
 
-impl Connector for CursorConnector {
-    fn detect(&self) -> DetectionResult {
-        franken_detection_for_connector("cursor").unwrap_or_else(DetectionResult::not_found)
-    }
-
-    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut all_convs = Vec::new();
+    fn scan_cursor_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         // The same composer id can be mirrored across DBs (globalStorage vs
         // workspaceStorage, explicit overlapping roots, backups). extract_from_db
         // only dedupes within one store, so span a session-id set across ALL
@@ -1357,13 +1394,16 @@ impl Connector for CursorConnector {
             .collect();
 
         for root in roots {
-            if !root.exists() {
+            if !root.exists() || path_is_excluded(&root, &excluded_paths) {
                 continue;
             }
 
             let db_files = Self::find_db_files(&root);
 
             for db_path in db_files {
+                if path_is_excluded(&db_path, &excluded_paths) {
+                    continue;
+                }
                 // Skip files not modified since last scan
                 if !file_modified_since(&db_path, ctx.since_ts) {
                     continue;
@@ -1380,7 +1420,7 @@ impl Connector for CursorConnector {
                                 _ => {}
                             }
                             kept += 1;
-                            all_convs.push(conv);
+                            on_conversation(conv)?;
                         }
                         tracing::debug!(
                             path = %db_path.display(),
@@ -1400,13 +1440,40 @@ impl Connector for CursorConnector {
         }
 
         // Cursor Agent transcripts (gh #306) — additive second source.
-        Self::scan_agent_transcripts(ctx, &mut all_convs);
+        Self::scan_agent_transcripts_with_callback(ctx, &excluded_paths, on_conversation)?;
 
+        Ok(())
+    }
+}
+
+impl Connector for CursorConnector {
+    fn detect(&self) -> DetectionResult {
+        franken_detection_for_connector("cursor").unwrap_or_else(DetectionResult::not_found)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_cursor_with_callback(ctx, on_conversation)
+    }
+
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let mut all_convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conv| {
+            all_convs.push(conv);
+            Ok(())
+        })?;
         Ok(all_convs)
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

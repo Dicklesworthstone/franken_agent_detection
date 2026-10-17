@@ -320,8 +320,8 @@ fn nontext_sessions_survive_all_scan_routes_and_readonly_discovery() {
         serde_json::to_value(&direct).unwrap(),
         serde_json::to_value(bounded).unwrap()
     );
-    assert!(!connector.supports_streaming_scan());
-    assert!(!connector.supports_source_boundaries());
+    assert!(connector.supports_streaming_scan());
+    assert!(connector.supports_source_boundaries());
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
 }

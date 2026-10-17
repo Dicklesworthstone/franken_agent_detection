@@ -83,7 +83,9 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -151,7 +153,14 @@ impl MuseConnector {
                 vec![ScanRoot::local(Self::base_root())]
             }
         } else {
-            ctx.scan_roots.clone()
+            ctx.scan_roots
+                .iter()
+                .map(|scan_root| {
+                    scan_root
+                        .mirrored_store(&[".local", "share", "muse", "sessions"])
+                        .map_or_else(|| scan_root.clone(), |path| scan_root.with_path(path))
+                })
+                .collect()
         };
         roots.sort_by(|a, b| a.path.cmp(&b.path));
         roots.dedup_by(|a, b| a.path == b.path);
@@ -751,6 +760,7 @@ fn scan_muse_with_hooks(
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = MuseConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
@@ -760,6 +770,9 @@ fn scan_muse_with_hooks(
         }
         for session_file in MuseConnector::session_files(&root.path) {
             if !seen.insert(dedupe_path_key(&session_file)) {
+                continue;
+            }
+            if path_is_excluded(&session_file, &excluded_paths) {
                 continue;
             }
             if !file_modified_since(&session_file, ctx.since_ts) {
@@ -807,7 +820,8 @@ fn scan_muse_with_hooks(
     Ok(())
 }
 
-fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+    let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = MuseConnector::source_roots(ctx);
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -817,6 +831,9 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
             continue;
         }
         for session_file in MuseConnector::session_files(&root.path) {
+            if path_is_excluded(&session_file, &excluded_paths) {
+                continue;
+            }
             if !file_modified_since(&session_file, ctx.since_ts) {
                 continue;
             }
@@ -835,7 +852,7 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 impl Connector for MuseConnector {
@@ -857,7 +874,7 @@ impl Connector for MuseConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(discover_sources(ctx))
+        discover_sources(ctx)
     }
 
     fn scan_with_callback(

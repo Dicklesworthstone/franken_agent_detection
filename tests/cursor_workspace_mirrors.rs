@@ -69,11 +69,8 @@ fn workspace_and_global_mirrors_parse_across_all_copy_layouts() {
             let origin = Origin::remote_with_host("laptop", "alice@laptop");
             let root = ScanRoot::remote(wrapper, origin.clone(), Some(Platform::Linux))
                 .with_mirrored_source_path(&configured);
-            let mut ctx = ScanContext::with_roots(
-                temp.path().join("state"),
-                vec![root.clone(), root],
-                None,
-            );
+            let mut ctx =
+                ScanContext::with_roots(temp.path().join("state"), vec![root.clone(), root], None);
             let connector = CursorConnector::new();
             let label = format!("{configured}, retained={retained}");
             let discovered = connector.discover_source_files(&ctx).unwrap();

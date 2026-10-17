@@ -413,17 +413,31 @@ mod conformance {
         use super::*;
 
         fn validate_conversation(conv: &NormalizedConversation, connector_slug: &str) {
-            // agent_slug must not be empty
+            // agent_slug must match canonical provider identity (OpenClaw qualifies per-agent stores as `openclaw/<agent>`)
+            let slug_matches = match connector_slug {
+                "claude" => conv.agent_slug == "claude_code",
+                "openclaw" => {
+                    conv.agent_slug == "openclaw" || conv.agent_slug.starts_with("openclaw/")
+                }
+                _ => conv.agent_slug == connector_slug,
+            };
             assert!(
-                !conv.agent_slug.is_empty(),
-                "connector {} produced conversation with empty agent_slug",
-                connector_slug
+                slug_matches,
+                "connector {} produced conversation with unexpected agent_slug {}",
+                connector_slug, conv.agent_slug
             );
 
             // source_path must be set (even if synthetic)
             assert!(
                 !conv.source_path.as_os_str().is_empty(),
                 "connector {} produced conversation with empty source_path",
+                connector_slug
+            );
+
+            // Conversation must contain at least one message
+            assert!(
+                !conv.messages.is_empty(),
+                "connector {} produced conversation with empty messages",
                 connector_slug
             );
 
@@ -460,7 +474,7 @@ mod conformance {
 
         fn validate_message(msg: &NormalizedMessage, connector_slug: &str) {
             // Role must be one of the standard roles
-            let valid_roles = ["user", "assistant", "system", "tool", "function"];
+            let valid_roles = ["user", "assistant", "system", "tool", "function", "other"];
             assert!(
                 valid_roles.contains(&msg.role.as_str()),
                 "connector {} produced message with non-standard role: {}",
@@ -542,6 +556,7 @@ mod conformance {
                 "NormalizedConversation should deserialize from JSON"
             );
         }
+
         #[test]
         fn checked_in_fixture_stores_produce_schema_conformant_conversations() {
             // Contract 3 made real: every conversation produced from a
@@ -581,6 +596,393 @@ mod conformance {
                     "{slug}: checked-in fixture store yielded no conversations"
                 );
 
+                for conv in &convs {
+                    validate_conversation(conv, slug);
+                    for msg in &conv.messages {
+                        validate_message(msg, slug);
+                    }
+                }
+            }
+        }
+
+        fn write_fixture_file(path: &std::path::Path, content: &str) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create fixture parent dir");
+            }
+            fs::write(path, content).expect("write fixture file");
+        }
+
+        #[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+        fn build_connector_fixture_context(
+            slug: &str,
+            base: &std::path::Path,
+        ) -> Option<ScanContext> {
+            let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let root = match slug {
+                "antigravity" => manifest.join("fixtures/antigravity"),
+                "codex" => manifest.join("fixtures/codex"),
+                "openhands" => manifest.join("fixtures/openhands"),
+                "claude" => {
+                    let r = base.join(".claude/projects");
+                    write_fixture_file(
+                        &r.join("proj/sess1.jsonl"),
+                        "{\"type\":\"user\",\"sessionId\":\"s1\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Hello Claude\"}}\n",
+                    );
+                    r
+                }
+                "cline" => {
+                    let r = base.join("claude-dev");
+                    write_fixture_file(
+                        &r.join("task-001/ui_messages.json"),
+                        "[{\"role\":\"user\",\"content\":\"Hello Cline\",\"timestamp\":1733000000}]",
+                    );
+                    r
+                }
+                "continue" => {
+                    let r = base.join(".continue/sessions");
+                    write_fixture_file(
+                        &r.join("session-1.json"),
+                        "{\"sessionId\":\"session-1\",\"title\":\"Test\",\"workspaceDirectory\":\"/work\",\"history\":[{\"message\":{\"role\":\"user\",\"content\":\"Hello Continue\"}}]}",
+                    );
+                    r
+                }
+                "gemini" => {
+                    let r = base.join("gemini");
+                    write_fixture_file(
+                        &r.join("gemini_project/chats/session-1.json"),
+                        "{\"sessionId\":\"s1\",\"projectHash\":\"p1\",\"messages\":[{\"type\":\"user\",\"content\":\"Hello Gemini\",\"timestamp\":\"2025-01-15T10:00:00Z\"}]}",
+                    );
+                    r
+                }
+                "clawdbot" => {
+                    let r = base.join(".clawdbot/sessions");
+                    write_fixture_file(
+                        &r.join("sess-1.jsonl"),
+                        "{\"role\":\"user\",\"content\":\"Hello Clawdbot\",\"timestamp\":\"2026-03-01T00:00:00Z\"}\n",
+                    );
+                    r
+                }
+                "vibe" => {
+                    let r = base.join(".vibe/logs/session");
+                    write_fixture_file(
+                        &r.join("sess-1/messages.jsonl"),
+                        "{\"role\":\"user\",\"content\":\"Hello Vibe\",\"timestamp\":\"2026-03-01T00:00:00Z\"}\n",
+                    );
+                    r
+                }
+                "amp" => {
+                    let r = base.join("sourcegraph.amp");
+                    write_fixture_file(
+                        &r.join("conversation.json"),
+                        "{\"messages\":[{\"role\":\"user\",\"content\":\"Hello Amp\",\"created_at\":1700000000000}]}",
+                    );
+                    r
+                }
+                "aider" => {
+                    let r = base.join("aider-project");
+                    write_fixture_file(
+                        &r.join(".aider.chat.history.md"),
+                        "# aider chat started at 2026-03-01 10:00:00\n\n#### Hello Aider\n\nHi from Aider!\n",
+                    );
+                    r
+                }
+                "pi_agent" => {
+                    let r = base.join(".pi/agent");
+                    write_fixture_file(
+                        &r.join("sessions/2026-10-09T00-00-00_s1.jsonl"),
+                        "{\"type\":\"session\",\"id\":\"0192aa11-0000-7000-8000-000000000001\",\"cwd\":\"/work\",\"version\":3}\n{\"type\":\"message\",\"id\":\"m1\",\"message\":{\"role\":\"user\",\"content\":\"Hello Pi\"}}\n",
+                    );
+                    r
+                }
+                "omp" => {
+                    let r = base.join(".omp/agent");
+                    write_fixture_file(
+                        &r.join("sessions/2026-10-09T00-00-00_s1.jsonl"),
+                        "{\"type\":\"session\",\"id\":\"0192aa11-0000-7000-8000-000000000001\",\"cwd\":\"/work\",\"version\":3}\n{\"type\":\"message\",\"id\":\"m1\",\"message\":{\"role\":\"user\",\"content\":\"Hello OMP\"}}\n",
+                    );
+                    r
+                }
+                "pi_durable" => {
+                    let r = base.join("durable");
+                    write_fixture_file(
+                        &r.join("main.jsonl"),
+                        "{\"format\":1,\"type\":\"commit\",\"seq\":1,\"writes\":[{\"type\":\"conversation\",\"value\":{\"id\":1}},{\"type\":\"entry\",\"value\":{\"id\":2,\"conversationId\":1,\"kind\":\"pi.user\",\"model\":[{\"role\":\"user\",\"content\":\"Hello Pi Durable\"}]}}]}\n",
+                    );
+                    r
+                }
+                "prime_agent" => {
+                    let r = base.join(".prime/agent/sessions");
+                    write_fixture_file(
+                        &r.join("0192aa11-0000-7000-8000-000000000001.jsonl"),
+                        "{\"type\":\"session\",\"id\":\"0192aa11-0000-7000-8000-000000000001\",\"cwd\":\"/work\",\"version\":3}\n{\"type\":\"message\",\"id\":\"a1b2c3d4\",\"parentId\":null,\"timestamp\":\"2026-10-09T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"Hello Prime\"}}\n",
+                    );
+                    r
+                }
+                "factory" => {
+                    let r = base.join(".factory/sessions");
+                    write_fixture_file(
+                        &r.join("-work-demo/sess-1.jsonl"),
+                        "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-10-09T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Hello Factory\"}}\n",
+                    );
+                    r
+                }
+                "kimi" => {
+                    let r = base.join(".kimi-code/sessions");
+                    write_fixture_file(
+                        &r.join("workdir/sess-1/agents/main/wire.jsonl"),
+                        "{\"type\":\"turn.prompt\",\"time\":\"2026-10-09T00:00:00Z\",\"input\":\"Hello Kimi\"}\n",
+                    );
+                    r
+                }
+                "kiro" => {
+                    let r = base.join(".kiro/sessions/cli");
+                    write_fixture_file(
+                        &r.join("session.jsonl"),
+                        "{\"kind\":\"Prompt\",\"data\":{\"content\":\"Hello Kiro\"}}\n",
+                    );
+                    r
+                }
+                "muse" => {
+                    let r = base.join(".local/share/muse/sessions");
+                    write_fixture_file(
+                        &r.join("019cccd3-9f97-7351-824f-6b1eb5f199f2/session.jsonl"),
+                        "{\"schema_version\":\"v1\",\"stream_id\":\"019cccd3-9f97-7351-824f-6b1eb5f199f2\",\"seq\":1,\"recorded_at_ms\":1772962994000,\"payload_type\":\"runtime.session\",\"payload\":{\"kind\":\"run\",\"event\":{\"kind\":\"started\",\"prompt\":\"Hello Muse\"}}}\n",
+                    );
+                    r
+                }
+                "openclaw" => {
+                    let r = base.join(".openclaw/agents/main/sessions");
+                    write_fixture_file(
+                        &r.join("sess-1.jsonl"),
+                        "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-10-09T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Hello OpenClaw\"}}\n",
+                    );
+                    r
+                }
+                "copilot" => {
+                    let r = base.join(".config");
+                    write_fixture_file(
+                        &r.join("Code/User/globalStorage/github.copilot-chat/conversations.json"),
+                        "[{\"id\":\"conv-1\",\"workspaceFolder\":\"/work\",\"turns\":[{\"request\":{\"message\":\"Hello Copilot\",\"timestamp\":1700000000000},\"response\":{\"message\":\"Hi\",\"timestamp\":1700000001000}}]}]",
+                    );
+                    r
+                }
+                "copilot_cli" => {
+                    let r = base.join(".copilot/session-state");
+                    write_fixture_file(
+                        &r.join("abc-123/events.jsonl"),
+                        "{\"type\":\"sessionStart\",\"session_id\":\"abc-123\",\"timestamp\":1700000000000,\"cwd\":\"/work\"}\n{\"type\":\"user.message\",\"role\":\"user\",\"content\":\"Hello Copilot CLI\",\"timestamp\":1700000001000}\n",
+                    );
+                    r
+                }
+                "qwen" => {
+                    let r = base.join(".qwen");
+                    write_fixture_file(
+                        &r.join("projects/demo/chats/11111111-2222-3333-4444-555555555555.jsonl"),
+                        "{\"uuid\":\"u1\",\"parentUuid\":null,\"sessionId\":\"11111111-2222-3333-4444-555555555555\",\"timestamp\":\"2026-10-09T00:00:00Z\",\"cwd\":\"/work/demo\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"parts\":[{\"text\":\"Hello Qwen\"}]}}\n",
+                    );
+                    r
+                }
+                "grok" => {
+                    let r = base.join(".grok/sessions");
+                    write_fixture_file(
+                        &r.join("group-1/sess-1/updates.jsonl"),
+                        "{\"timestamp\":\"2026-10-09T00:00:00Z\",\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Hello Grok\"}}}\n",
+                    );
+                    r
+                }
+                "codebuff" => {
+                    let r = base.join(".config/manicode/projects");
+                    write_fixture_file(
+                        &r.join("demo/chats/2026-10-09T00-00-00.000Z/chat-messages.json"),
+                        "[{\"id\":\"user-1700000000000\",\"variant\":\"user\",\"content\":\"Hello Codebuff\",\"timestamp\":\"2026-10-09T00:00:00.000Z\"}]",
+                    );
+                    r
+                }
+                "chatgpt" => {
+                    let r = base.join("com.openai.chat");
+                    write_fixture_file(
+                        &r.join("conversations-v1/conv-1.json"),
+                        "{\"id\":\"conv-1\",\"title\":\"ChatGPT\",\"mapping\":{\"u1\":{\"parent\":null,\"message\":{\"author\":{\"role\":\"user\"},\"content\":{\"parts\":[\"Hello ChatGPT\"]},\"create_time\":1700000000.0}}}}",
+                    );
+                    r
+                }
+                "grok_bot" => {
+                    let r = base.join("grok_bot");
+                    let key = "sand.client.slice.account.auth0%7Cuser_00000000000000000000000000.transcript.replicas.81da155f-cc4c-58b3-aadf-770858d5e55c";
+                    let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
+                    let bits: Vec<bool> = key
+                        .bytes()
+                        .flat_map(|byte| (0..8).rev().map(move |bit| byte & (1 << bit) != 0))
+                        .collect();
+                    let encoded: String = bits
+                        .chunks(5)
+                        .map(|chunk| {
+                            let val = chunk
+                                .iter()
+                                .fold(0_usize, |v, bit| (v << 1) | usize::from(*bit))
+                                << (5 - chunk.len());
+                            char::from(alphabet[val])
+                        })
+                        .collect();
+                    write_fixture_file(
+                        &r.join(format!("{encoded}.blob")),
+                        include_str!("../../tests/fixtures/grok_bot_reporter_0440.json"),
+                    );
+                    r
+                }
+                "opencode" => {
+                    let r = base.join("opencode/storage");
+                    write_fixture_file(
+                        &r.join("session/proj-001/sess-001.json"),
+                        "{\"id\":\"sess-001\",\"title\":\"Test Session\",\"directory\":\"/work\",\"projectID\":\"proj-001\",\"time\":{\"created\":1733000000,\"updated\":1733000100}}",
+                    );
+                    write_fixture_file(
+                        &r.join("message/sess-001/msg-001.json"),
+                        "{\"id\":\"msg-001\",\"role\":\"user\",\"sessionID\":\"sess-001\",\"time\":{\"created\":1733000000,\"completed\":1733000001}}",
+                    );
+                    write_fixture_file(
+                        &r.join("part/msg-001/part-001.json"),
+                        "{\"id\":\"part-001\",\"messageID\":\"msg-001\",\"type\":\"text\",\"text\":\"Hello OpenCode\"}",
+                    );
+                    r
+                }
+                "goose" => {
+                    let r = base.join(".goose");
+                    write_fixture_file(
+                        &r.join("sessions/session1.jsonl"),
+                        "{\"role\":\"user\",\"content\":\"Hello Goose\",\"created_at\":1700000000}\n",
+                    );
+                    r
+                }
+                "devin" => {
+                    #[cfg(feature = "devin")]
+                    {
+                        let db_path = base.join("sessions.db");
+                        let conn = crate::connectors::sqlite_sync::Connection::open(
+                            db_path.to_string_lossy().as_ref(),
+                        )
+                        .expect("open Devin db");
+                        conn.execute_batch(
+                            "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, working_directory TEXT, model TEXT, agent_mode TEXT, created_at INTEGER, last_activity_at INTEGER, main_chain_id INTEGER, hidden INTEGER);
+                             CREATE TABLE message_nodes (node_id INTEGER PRIMARY KEY, session_id TEXT, parent_node_id INTEGER, chat_message TEXT, created_at INTEGER);
+                             INSERT INTO sessions VALUES ('s1', 'Devin', '/work', 'm', 'a', 1700000000, 1700000001, 1, 0);
+                             INSERT INTO message_nodes VALUES (1, 's1', NULL, '{\"role\":\"user\",\"content\":\"Hello Devin\"}', 1700000000);",
+                        )
+                        .expect("populate Devin db");
+                        return Some(ScanContext::with_roots(
+                            base.to_path_buf(),
+                            vec![ScanRoot::local(db_path)],
+                            None,
+                        ));
+                    }
+                    #[cfg(not(feature = "devin"))]
+                    {
+                        return None;
+                    }
+                }
+                #[cfg(feature = "cursor")]
+                "cursor" => {
+                    let db_path = base.join("Cursor/User/globalStorage/state.vscdb");
+                    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+                    let conn = crate::connectors::sqlite_sync::Connection::open(
+                        db_path.to_string_lossy().as_ref(),
+                    )
+                    .expect("open Cursor db");
+                    conn.execute_batch(
+                        "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);
+                         CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);
+                         INSERT INTO cursorDiskKV VALUES ('composerData:c1', '{\"text\":\"Hello Cursor\"}');",
+                    )
+                    .expect("populate Cursor db");
+                    db_path
+                }
+                #[cfg(feature = "crush")]
+                "crush" => {
+                    let db_path = base.join("crush.db");
+                    let conn = crate::connectors::sqlite_sync::Connection::open(
+                        db_path.to_string_lossy().as_ref(),
+                    )
+                    .expect("open Crush db");
+                    conn.execute_batch(
+                        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, cost REAL);
+                         CREATE TABLE messages (session_id TEXT, role TEXT, parts TEXT, created_at INTEGER, model TEXT, provider TEXT);
+                         INSERT INTO sessions VALUES ('s1', 'Crush', 1, 2, 0.01);
+                         INSERT INTO messages VALUES ('s1', 'user', '[{\"type\":\"text\",\"text\":\"Hello Crush\"}]', 1733000000000, 'm', 'p');",
+                    )
+                    .expect("populate Crush db");
+                    db_path
+                }
+                #[cfg(feature = "hermes")]
+                "hermes" => {
+                    let db_path = base.join("state.db");
+                    let conn = crate::connectors::sqlite_sync::Connection::open(
+                        db_path.to_string_lossy().as_ref(),
+                    )
+                    .expect("open Hermes db");
+                    conn.execute_batch(
+                        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, model TEXT, title TEXT, parent_session_id TEXT, started_at REAL, ended_at REAL, end_reason TEXT, message_count INTEGER, tool_call_count INTEGER, input_tokens INTEGER, output_tokens INTEGER);
+                         CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, tool_calls TEXT, tool_name TEXT, tool_call_id TEXT, reasoning TEXT, timestamp REAL);
+                         INSERT INTO sessions VALUES ('s1', 'cli', 'm', 'Hermes', NULL, 1700000000.0, 1700000010.0, 'completed', 1, 0, 10, 5);
+                         INSERT INTO messages VALUES ('s1', 'user', 'Hello Hermes', NULL, NULL, NULL, NULL, 1700000001.0);",
+                    )
+                    .expect("populate Hermes db");
+                    base.to_path_buf()
+                }
+                #[cfg(feature = "shelley")]
+                "shelley" => {
+                    let db_path = base.join("shelley.db");
+                    let conn = crate::connectors::sqlite_sync::Connection::open(
+                        db_path.to_string_lossy().as_ref(),
+                    )
+                    .expect("open Shelley db");
+                    conn.execute_batch(
+                        "CREATE TABLE migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, migration_number INTEGER NOT NULL, migration_name TEXT NOT NULL UNIQUE, executed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                         CREATE TABLE conversations (conversation_id TEXT PRIMARY KEY, slug TEXT, user_initiated BOOLEAN NOT NULL DEFAULT TRUE, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, cwd TEXT, archived BOOLEAN NOT NULL DEFAULT FALSE, parent_conversation_id TEXT, model TEXT, conversation_options TEXT NOT NULL DEFAULT '{}', current_generation INTEGER NOT NULL DEFAULT 0, tags TEXT NOT NULL DEFAULT '[]', is_draft BOOLEAN NOT NULL DEFAULT FALSE, draft TEXT NOT NULL DEFAULT '', queued_messages TEXT NOT NULL DEFAULT '[]');
+                         CREATE TABLE messages (message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL, type TEXT NOT NULL, llm_data TEXT, user_data TEXT, usage_data TEXT, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, display_data TEXT, excluded_from_context BOOLEAN NOT NULL DEFAULT FALSE, generation INTEGER NOT NULL DEFAULT 0, llm_api_url TEXT, model_name TEXT, forked_from_message_id TEXT, user_email TEXT, other_usage_data TEXT);
+                         INSERT INTO conversations (conversation_id, slug, user_initiated, created_at, updated_at, cwd) VALUES ('c1', 'shelley-test', 1, '2026-08-01 10:00:00', '2026-08-01 11:00:00', '/work');
+                         INSERT INTO messages (message_id, conversation_id, sequence_id, type, llm_data, created_at) VALUES ('m1', 'c1', 0, 'user', '{\"Role\":0,\"Content\":[{\"Type\":2,\"Text\":\"Hello Shelley\"}]}', '2026-08-01 10:30:00');",
+                    )
+                    .expect("populate Shelley db");
+                    db_path
+                }
+                other => panic!("no schema conformance fixture defined for connector {other}"), // ubs:ignore[rust.ownership.panic-macro] — Fail fast if a new connector factory is added without a schema conformance fixture.
+            };
+            Some(ScanContext::with_roots(
+                root.clone(),
+                vec![ScanRoot::local(root)],
+                None,
+            ))
+        }
+
+        #[test]
+        fn all_compiled_connectors_produce_schema_conformant_conversations() {
+            for (slug, factory) in get_connector_factories() {
+                let tmp = TempDir::new().expect("create temp dir for connector fixture");
+                let Some(ctx) = build_connector_fixture_context(slug, tmp.path()) else {
+                    // Detection-only build slice (e.g. `devin` without `feature = "devin"`).
+                    let empty_ctx = ScanContext::with_roots(
+                        tmp.path().to_path_buf(),
+                        vec![ScanRoot::local(tmp.path().to_path_buf())],
+                        None,
+                    );
+                    assert!(
+                        factory()
+                            .scan(&empty_ctx)
+                            .expect("detection-only scan")
+                            .is_empty(),
+                        "{slug}: detection-only connector should emit no conversations"
+                    );
+                    continue;
+                };
+
+                let convs = factory().scan(&ctx).unwrap_or_else(|err| {
+                    // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and scan error in conformance test.
+                    panic!("{slug}: schema conformance fixture scan failed: {err}")
+                });
+                assert!(
+                    !convs.is_empty(),
+                    "{slug}: schema conformance fixture yielded no conversations"
+                );
                 for conv in &convs {
                     validate_conversation(conv, slug);
                     for msg in &conv.messages {
@@ -942,6 +1344,368 @@ mod conformance {
                 let connector = factory();
                 // Should not panic, regardless of result
                 let _ = connector.scan(&ctx);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Contract 7: Metamorphic Conformance Laws (Bead franken_agent_detection-o9y)
+    // =========================================================================
+    //
+    // Law 1 (Detection-Discovery Monotonicity):
+    //   When a canonical session store is populated at root R, both
+    //   `detect_installed_agents` (with root override R) and the corresponding
+    //   connector's `discover_source_files` + `scan` agree that the store is
+    //   present and non-empty.
+    //
+    // Law 2 (Remote Mirror Equivalence):
+    //   Scanning a basename-preserving SSH mirror container `<hash>/<leaf>`
+    //   (and trailing-slash contents copy `<hash>/`) with `mirrored_source_path`
+    //   yields the same conversations and message content as scanning the local
+    //   store directly, while ignoring sibling directories inside `<hash>` and
+    //   preserving `Origin::remote(...)`.
+    //
+    // Law 3 (Atomic I/O Fault Discard):
+    //   `JsonlLines` halts immediately on mid-stream reader failure without
+    //   polling the broken reader a second time.
+
+    mod metamorphic_conformance_laws {
+        use super::*;
+        use crate::connectors::jsonl::JsonlLines;
+        use crate::types::Origin;
+        use std::io::{self, Read};
+
+        struct MirrorCase {
+            detect_slug: &'static str,
+            factory_slug: &'static str,
+            tilde_source: &'static str,
+            leaf_dir: &'static str,
+            rel_file: &'static str,
+            payload: &'static str,
+        }
+
+        fn mirror_cases() -> Vec<MirrorCase> {
+            vec![
+                MirrorCase {
+                    detect_slug: "kiro",
+                    factory_slug: "kiro",
+                    tilde_source: "~/.kiro/sessions/cli",
+                    leaf_dir: "cli",
+                    rel_file: "a1b2c3d4-0000-0000-0000-000000000001.jsonl",
+                    payload: "{\"kind\":\"Prompt\",\"data\":{\"content\":\"hello kiro\"},\"timestamp\":\"2026-03-01T00:00:00Z\"}\n",
+                },
+                MirrorCase {
+                    detect_slug: "pi_agent",
+                    factory_slug: "pi_agent",
+                    tilde_source: "~/.pi/agent/sessions",
+                    leaf_dir: "sessions",
+                    rel_file: "--work--/2026-03-01_s1.jsonl",
+                    payload: "{\"type\":\"session\",\"id\":\"pi-s1\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"cwd\":\"/work\"}\n{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-03-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hello pi\"}}\n",
+                },
+                MirrorCase {
+                    detect_slug: "omp",
+                    factory_slug: "omp",
+                    tilde_source: "~/.omp/agent/sessions",
+                    leaf_dir: "sessions",
+                    rel_file: "--work--/2026-03-01_s1.jsonl",
+                    payload: "{\"type\":\"session\",\"id\":\"omp-s1\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"cwd\":\"/work\"}\n{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-03-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hello omp\"}}\n",
+                },
+                MirrorCase {
+                    detect_slug: "kimi",
+                    factory_slug: "kimi",
+                    tilde_source: "~/.kimi/sessions",
+                    leaf_dir: "sessions",
+                    rel_file: "wkey/sess1/wire.jsonl",
+                    payload: "{\"type\":\"metadata\",\"protocol_version\":\"1.3\"}\n{\"timestamp\":1770000000.0,\"message\":{\"type\":\"TurnBegin\",\"payload\":{\"role\":\"human\",\"content\":\"hello kimi\"}}}\n",
+                },
+                MirrorCase {
+                    detect_slug: "qwen",
+                    factory_slug: "qwen",
+                    tilde_source: "~/.qwen/projects",
+                    leaf_dir: "projects",
+                    rel_file: "proj/chats/0123456789abcdef0123456789abcdef.jsonl",
+                    payload: "{\"uuid\":\"u1\",\"parentUuid\":null,\"sessionId\":\"0123456789abcdef0123456789abcdef\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"parts\":[{\"text\":\"hello qwen\"}]}}\n",
+                },
+                MirrorCase {
+                    detect_slug: "grok",
+                    factory_slug: "grok",
+                    tilde_source: "~/.grok/sessions",
+                    leaf_dir: "sessions",
+                    rel_file: "%2Fwork/sess1/updates.jsonl",
+                    payload: "{\"timestamp\":1784388059,\"method\":\"_x.ai/session/update\",\"params\":{\"sessionId\":\"sess1\",\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"hello grok\"}}}}\n",
+                },
+                MirrorCase {
+                    detect_slug: "muse",
+                    factory_slug: "muse",
+                    tilde_source: "~/.local/share/muse/sessions",
+                    leaf_dir: "sessions",
+                    rel_file: "2026/03/01/sess1/session.jsonl",
+                    payload: "{\"schema_version\":1,\"id\":\"705d0e90-0000-0000-0000-000000000001\",\"stream\":{\"kind\":\"session\",\"id\":\"sess1\"},\"sequence\":1,\"recorded_at\":1785972468194395,\"record_type\":\"event\",\"durability\":\"durable\",\"causation_id\":null,\"payload_type\":\"runtime.session\",\"payload\":{\"kind\":\"run\",\"event\":{\"kind\":\"started\",\"prompt\":\"hello muse\"}}}\n",
+                },
+                MirrorCase {
+                    detect_slug: "continue",
+                    factory_slug: "continue",
+                    tilde_source: "~/.continue/sessions",
+                    leaf_dir: "sessions",
+                    rel_file: "sess1.json",
+                    payload: "{\"sessionId\":\"sess1\",\"title\":\"Continue\",\"workspaceDirectory\":\"/work\",\"history\":[{\"message\":{\"role\":\"user\",\"content\":\"hello continue\"}}]}\n",
+                },
+                MirrorCase {
+                    detect_slug: "claude",
+                    factory_slug: "claude",
+                    tilde_source: "~/.claude/projects",
+                    leaf_dir: "projects",
+                    rel_file: "proj/sess1.jsonl",
+                    payload: "{\"type\":\"user\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"hello claude\"}}\n",
+                },
+                MirrorCase {
+                    detect_slug: "codex",
+                    factory_slug: "codex",
+                    tilde_source: "~/.codex/sessions",
+                    leaf_dir: "sessions",
+                    rel_file: "2026/03/01/rollout-2026-03-01T00-00-00-sess1.jsonl",
+                    payload: "{\"timestamp\":\"2026-03-01T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello codex\"}}\n",
+                },
+                MirrorCase {
+                    detect_slug: "prime_agent",
+                    factory_slug: "prime_agent",
+                    tilde_source: "~/.prime/agent/sessions",
+                    leaf_dir: "sessions",
+                    rel_file: "proj/sess1.jsonl",
+                    payload: "{\"type\":\"session\",\"id\":\"prime-s1\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"cwd\":\"/work\"}\n{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-03-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hello prime\"}}\n",
+                },
+                MirrorCase {
+                    detect_slug: "factory",
+                    factory_slug: "factory",
+                    tilde_source: "~/.factory/sessions",
+                    leaf_dir: "sessions",
+                    rel_file: "proj/sess1.jsonl",
+                    payload: "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-03-01T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello factory\"}]}}\n",
+                },
+            ]
+        }
+
+        fn connector_for(slug: &str) -> Box<dyn crate::connectors::Connector> {
+            let (_, factory) = get_connector_factories()
+                .into_iter()
+                .find(|(s, _)| *s == slug)
+                .unwrap_or_else(|| panic!("missing factory for {slug}"));
+            factory()
+        }
+
+        #[test]
+        fn law1_detection_discovery_scan_monotonicity() {
+            for case in mirror_cases() {
+                let tmp = TempDir::new().expect("tempdir");
+                let rel_store = case.tilde_source.trim_start_matches("~/");
+                let store_root = tmp.path().join(rel_store);
+                let target_file = store_root.join(case.rel_file);
+                if let Some(parent) = target_file.parent() {
+                    fs::create_dir_all(parent).expect("create parent");
+                }
+                fs::write(&target_file, case.payload).expect("write fixture");
+
+                let report = detect_installed_agents(&AgentDetectOptions {
+                    only_connectors: Some(vec![case.detect_slug.to_string()]),
+                    include_undetected: true,
+                    root_overrides: vec![AgentDetectRootOverride {
+                        slug: case.detect_slug.to_string(),
+                        root: store_root.clone(),
+                    }],
+                })
+                .expect("detect_installed_agents");
+                assert_eq!(
+                    report.summary.detected_count, 1,
+                    "Law 1: detect_installed_agents failed for {}",
+                    case.detect_slug
+                );
+
+                let connector = connector_for(case.factory_slug);
+                let ctx = ScanContext::with_roots(
+                    store_root.clone(),
+                    vec![ScanRoot::local(store_root)],
+                    None,
+                );
+                let discovered = connector
+                    .discover_source_files(&ctx)
+                    .expect("discover_source_files");
+                assert!(
+                    !discovered.is_empty(),
+                    "Law 1: discover_source_files returned empty for {}",
+                    case.factory_slug
+                );
+                let conversations = connector.scan(&ctx).expect("scan");
+                assert_eq!(
+                    conversations.len(),
+                    1,
+                    "Law 1: scan conversation count mismatch for {}",
+                    case.factory_slug
+                );
+                assert!(
+                    !conversations[0].messages.is_empty(),
+                    "Law 1: scan produced empty messages for {}",
+                    case.factory_slug
+                );
+            }
+        }
+
+        #[test]
+        fn law2_remote_mirror_equivalence_and_containment() {
+            for case in mirror_cases() {
+                // 1. Local baseline
+                let local_tmp = TempDir::new().expect("local tempdir");
+                let rel_store = case.tilde_source.trim_start_matches("~/");
+                let local_store = local_tmp.path().join(rel_store);
+                let local_file = local_store.join(case.rel_file);
+                if let Some(parent) = local_file.parent() {
+                    fs::create_dir_all(parent).expect("create local parent");
+                }
+                fs::write(&local_file, case.payload).expect("write local fixture");
+
+                let connector = connector_for(case.factory_slug);
+                let local_ctx = ScanContext::with_roots(
+                    local_store.clone(),
+                    vec![ScanRoot::local(local_store)],
+                    None,
+                );
+                let local_convs = connector.scan(&local_ctx).expect("local scan");
+                assert_eq!(
+                    local_convs.len(),
+                    1,
+                    "baseline scan for {}",
+                    case.factory_slug
+                );
+
+                // 2. Basename-preserving SSH mirror container `<hash>/<leaf>` + sibling noise
+                let mirror_tmp = TempDir::new().expect("mirror tempdir");
+                let container = mirror_tmp.path().join("opaque_hash_container");
+                let mirrored_leaf = container.join(case.leaf_dir);
+                let mirrored_file = mirrored_leaf.join(case.rel_file);
+                if let Some(parent) = mirrored_file.parent() {
+                    fs::create_dir_all(parent).expect("create mirror parent");
+                }
+                fs::write(&mirrored_file, case.payload).expect("write mirror fixture");
+
+                // Add unrelated sibling noise inside the container to verify narrow scoping
+                let sibling_noise = container.join("unrelated_sibling").join(case.rel_file);
+                if let Some(parent) = sibling_noise.parent() {
+                    fs::create_dir_all(parent).expect("create sibling parent");
+                }
+                fs::write(&sibling_noise, case.payload).expect("write sibling noise");
+
+                let remote_origin = Origin::remote("mirror-host");
+                let remote_root = ScanRoot::remote(container.clone(), remote_origin.clone(), None)
+                    .with_mirrored_source_path(case.tilde_source);
+                let remote_ctx = ScanContext::with_roots(container, vec![remote_root], None);
+
+                let remote_discovered = connector
+                    .discover_source_files(&remote_ctx)
+                    .expect("remote discover");
+                assert_eq!(
+                    remote_discovered.len(),
+                    1,
+                    "Law 2: remote mirror discovery count mismatch for {} (source={})",
+                    case.factory_slug,
+                    case.tilde_source
+                );
+                assert_eq!(
+                    remote_discovered[0].origin, remote_origin,
+                    "Law 2: remote mirror discovery lost origin for {}",
+                    case.factory_slug
+                );
+
+                let remote_convs = connector.scan(&remote_ctx).expect("remote scan");
+                assert_eq!(
+                    remote_convs.len(),
+                    local_convs.len(),
+                    "Law 2: remote mirror scan count mismatch for {}",
+                    case.factory_slug
+                );
+                assert_eq!(
+                    remote_convs[0].messages.len(),
+                    local_convs[0].messages.len(),
+                    "Law 2: remote mirror message count mismatch for {}",
+                    case.factory_slug
+                );
+                assert_eq!(
+                    remote_convs[0].messages[0].content, local_convs[0].messages[0].content,
+                    "Law 2: remote mirror message content mismatch for {}",
+                    case.factory_slug
+                );
+
+                // 3. Trailing-slash rsync contents copy (`<tilde_source>/` directly into `<hash>/`)
+                let contents_tmp = TempDir::new().expect("contents tempdir");
+                let contents_container = contents_tmp.path().join("contents_hash_container");
+                let contents_file = contents_container.join(case.rel_file);
+                if let Some(parent) = contents_file.parent() {
+                    fs::create_dir_all(parent).expect("create contents parent");
+                }
+                fs::write(&contents_file, case.payload).expect("write contents fixture");
+
+                let trailing_source = format!("{}/", case.tilde_source);
+                let contents_root =
+                    ScanRoot::remote(contents_container.clone(), remote_origin, None)
+                        .with_mirrored_source_path(trailing_source);
+                let contents_ctx =
+                    ScanContext::with_roots(contents_container, vec![contents_root], None);
+                let contents_convs = connector.scan(&contents_ctx).expect("contents scan");
+                assert_eq!(
+                    contents_convs.len(),
+                    1,
+                    "Law 2: trailing-slash contents copy scan mismatch for {}",
+                    case.factory_slug
+                );
+            }
+        }
+
+        struct FaultAfterPrefixReader {
+            prefix: io::Cursor<Vec<u8>>,
+            kind: io::ErrorKind,
+            faulted: bool,
+        }
+
+        impl Read for FaultAfterPrefixReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = self.prefix.read(buf)?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                assert!(
+                    !self.faulted,
+                    "Law 3 violation: reader polled again after returning an I/O error"
+                );
+                self.faulted = true;
+                Err(io::Error::new(self.kind, "injected mid-stream fault"))
+            }
+        }
+
+        #[test]
+        fn law3_jsonl_lines_halts_immediately_on_io_fault_across_error_kinds() {
+            for kind in [
+                io::ErrorKind::Other,
+                io::ErrorKind::UnexpectedEof,
+                io::ErrorKind::InvalidData,
+                io::ErrorKind::PermissionDenied,
+            ] {
+                let reader = io::BufReader::new(FaultAfterPrefixReader {
+                    prefix: io::Cursor::new(b"{\"line\":1}\n{\"partial\":".to_vec()),
+                    kind,
+                    faulted: false,
+                });
+                let mut lines = JsonlLines::new(reader);
+                assert_eq!(
+                    lines.next().transpose().expect("first line ok").as_deref(),
+                    Some("{\"line\":1}")
+                );
+                let err = lines
+                    .next()
+                    .expect("second item must be Err")
+                    .expect_err("mid-stream fault must surface as Err");
+                assert_eq!(err.kind(), kind);
+                assert!(
+                    lines.next().is_none(),
+                    "JsonlLines must fuse to None after an I/O error"
+                );
             }
         }
     }

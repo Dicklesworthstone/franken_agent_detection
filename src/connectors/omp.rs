@@ -157,34 +157,53 @@ impl OmpConnector {
         home: Option<&Path>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Vec<(PathBuf, Option<String>)> {
+        let trimmed = |key: &str| {
+            env(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
         let mut out: Vec<(PathBuf, Option<String>)> = Vec::new();
         let profile = Self::active_profile(env);
 
-        if let Some(session_dir) = env("PI_CODING_AGENT_SESSION_DIR").filter(|v| !v.is_empty()) {
+        if let Some(data_root) = trimmed("CASS_OMP_DATA_ROOT") {
+            let root = PathBuf::from(data_root);
+            for (name, dir) in Self::enumerate_profiles(&root.join("profiles")) {
+                out.push((dir.join("agent"), Some(name)));
+            }
+            let agent = root.join("agent");
+            if agent.is_dir() {
+                out.push((agent, None));
+            }
+            out.push((root, profile));
+            return out;
+        }
+
+        if let Some(session_dir) = trimmed("PI_CODING_AGENT_SESSION_DIR") {
             out.push((PathBuf::from(session_dir), profile.clone()));
         }
-        if profile.is_none() {
-            if let Some(agent_dir) = env("PI_CODING_AGENT_DIR").filter(|v| !v.is_empty()) {
-                out.push((PathBuf::from(agent_dir), None));
-            }
+        if profile.is_none()
+            && let Some(agent_dir) = trimmed("PI_CODING_AGENT_DIR")
+        {
+            out.push((PathBuf::from(agent_dir), None));
         }
 
         if let Some(home) = home {
-            let cfg_name = env("PI_CONFIG_DIR")
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| ".omp".to_string());
             // Upstream resolves the config root via Node `path.join(home,
             // name)`, which keeps even an absolute-looking override *under*
             // home; Rust `Path::join` would replace the whole path, so
             // strip leading separators to preserve upstream semantics.
-            let base = home.join(cfg_name.trim_start_matches(['/', '\\']));
+            let cfg_name = trimmed("PI_CONFIG_DIR")
+                .map(|v| v.trim_start_matches(['/', '\\']).to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| ".omp".to_string());
+            let base = home.join(cfg_name);
             out.push((base.join("agent"), None));
             for (name, dir) in Self::enumerate_profiles(&base.join("profiles")) {
                 out.push((dir.join("agent"), Some(name)));
             }
         }
 
-        if let Some(xdg_data) = env("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        if let Some(xdg_data) = trimmed("XDG_DATA_HOME") {
             let app_root = PathBuf::from(xdg_data).join("omp");
             if app_root.is_dir() {
                 for (name, dir) in Self::enumerate_profiles(&app_root.join("profiles")) {
@@ -256,11 +275,16 @@ impl OmpConnector {
                 );
             }
         } else {
-            if Self::looks_like_root(&ctx.data_dir) {
-                homes.push((ScanRoot::local(ctx.data_dir.clone()), None));
-            }
-
             for scan_root in &ctx.scan_roots {
+                if let Some(mirrored) = scan_root
+                    .mirrored_store(&[".omp", "agent", "sessions"])
+                    .or_else(|| scan_root.mirrored_store(&[".omp", "agent"]))
+                    .or_else(|| scan_root.mirrored_store(&[".local", "share", "omp", "sessions"]))
+                    .or_else(|| scan_root.mirrored_store(&[".local", "share", "omp"]))
+                {
+                    homes.push((scan_root.with_path(mirrored), None));
+                    continue;
+                }
                 for (candidate, profile) in Self::explicit_root_candidates(&scan_root.path) {
                     // Existence gate: string-marker acceptance must not
                     // fabricate phantom roots under unrelated scan roots.
@@ -273,6 +297,12 @@ impl OmpConnector {
                         homes.push((scan_root.with_path(candidate), profile));
                     }
                 }
+            }
+
+            if !ctx.scan_roots.iter().any(|r| r.path == ctx.data_dir)
+                && Self::looks_like_root(&ctx.data_dir)
+            {
+                homes.push((ScanRoot::local(ctx.data_dir.clone()), None));
             }
         }
 
@@ -589,6 +619,50 @@ mod tests {
         let missing = env_of(&missing_pairs);
         let roots = OmpConnector::v18_roots_from(Some(dir.path()), &missing);
         assert_eq!(roots, vec![(dir.path().join(".omp").join("agent"), None)]);
+    }
+
+    #[test]
+    fn v18_roots_honor_cass_omp_data_root_and_trim_whitespace_overrides() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let relocated = dir.path().join("relocated-omp");
+        fs::create_dir_all(relocated.join("agent").join("sessions")).unwrap();
+        fs::create_dir_all(
+            relocated
+                .join("profiles")
+                .join("work")
+                .join("agent")
+                .join("sessions"),
+        )
+        .unwrap();
+
+        let padded_root = format!("  {} \t", relocated.display());
+        let pairs = [("CASS_OMP_DATA_ROOT", padded_root.as_str())];
+        let roots = OmpConnector::v18_roots_from(Some(dir.path()), &env_of(&pairs));
+        assert_eq!(
+            roots,
+            vec![
+                (
+                    relocated.join("profiles").join("work").join("agent"),
+                    Some("work".to_string()),
+                ),
+                (relocated.join("agent"), None),
+                (relocated, None),
+            ],
+            "CASS_OMP_DATA_ROOT must replace ~/.omp/agent and preserve profile roots",
+        );
+
+        let blank_pairs = [
+            ("CASS_OMP_DATA_ROOT", " \t "),
+            ("PI_CODING_AGENT_SESSION_DIR", "   "),
+            ("PI_CODING_AGENT_DIR", "\t\n"),
+            ("PI_CONFIG_DIR", "  ///  "),
+            ("XDG_DATA_HOME", "   "),
+        ];
+        assert_eq!(
+            OmpConnector::v18_roots_from(Some(dir.path()), &env_of(&blank_pairs)),
+            vec![(dir.path().join(".omp").join("agent"), None)],
+            "whitespace-only overrides must fall back to canonical ~/.omp/agent",
+        );
     }
 
     // =====================================================

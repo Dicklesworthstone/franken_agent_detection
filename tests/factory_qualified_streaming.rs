@@ -110,7 +110,11 @@ fn rejected_owned_mirrors_cannot_use_generic_jsonl_or_home_probes() {
     ] {
         let temp = tempfile::tempdir().unwrap();
         let container = temp.path().join("opaque_hash");
-        put(&container.join("outside.jsonl"), "outside", "must not be read");
+        put(
+            &container.join("outside.jsonl"),
+            "outside",
+            "must not be read",
+        );
         put(
             &container.join(".factory/sessions/also-outside.jsonl"),
             "also-outside",
@@ -120,7 +124,11 @@ fn rejected_owned_mirrors_cannot_use_generic_jsonl_or_home_probes() {
     }
     let temp = tempfile::tempdir().unwrap();
     let container = temp.path().join("opaque_hash");
-    put(&container.join("outside.jsonl"), "outside", "must not be read");
+    put(
+        &container.join("outside.jsonl"),
+        "outside",
+        "must not be read",
+    );
     fs::write(container.join("sessions"), b"not a directory").unwrap();
     assert_empty(&context(remote(container, "~/.factory/sessions/")));
 }
@@ -134,9 +142,17 @@ fn linked_payloads_cannot_reenter_through_legacy_detection() {
         let temp = tempfile::tempdir().unwrap();
         let container = temp.path().join("opaque_hash");
         let target = temp.path().join("elsewhere");
-        put(&container.join("outside.jsonl"), "outside", "must not be read");
+        put(
+            &container.join("outside.jsonl"),
+            "outside",
+            "must not be read",
+        );
         if existing_target {
-            put(&target.join("private.jsonl"), "private", "must not be followed");
+            put(
+                &target.join("private.jsonl"),
+                "private",
+                "must not be followed",
+            );
         }
         symlink(&target, container.join("sessions")).unwrap();
         assert_empty(&context(remote(container, "~/.factory/sessions/")));
@@ -152,7 +168,7 @@ fn native_and_unannotated_custom_roots_keep_existing_behavior() {
         ScanRoot::local(root.clone()),
         ScanRoot::remote(root.clone(), Origin::remote("laptop"), None),
         ScanRoot::local(root.clone()).with_mirrored_source_path("~/.factory/sessions"),
-        remote(root.clone(), "/backups/custom-transcripts"),
+        remote(root, "/backups/custom-transcripts"),
     ] {
         let conversations = FactoryConnector::new().scan(&context(scan_root)).unwrap();
         assert_eq!(conversations.len(), 1);
@@ -171,8 +187,7 @@ fn callback_yields_before_the_next_transcript_is_parsed() {
     let ctx = context(remote(container, "~/.factory/sessions"));
     let connector = FactoryConnector::new();
     assert!(connector.supports_streaming_scan());
-    // No per-source completion is fabricated by this streaming-only change.
-    assert!(!connector.supports_source_boundaries());
+    assert!(connector.supports_source_boundaries());
     let mut seen = Vec::new();
     connector
         .scan_with_callback(&ctx, &mut |conversation| {
@@ -197,7 +212,11 @@ fn callback_failure_propagates_without_emitting_the_remaining_corpus() {
     let container = temp.path().join("opaque_hash");
     for index in 0..128 {
         let id = format!("session-{index:04}");
-        put(&container.join("sessions").join(format!("{id}.jsonl")), &id, "body");
+        put(
+            &container.join("sessions").join(format!("{id}.jsonl")),
+            &id,
+            "body",
+        );
     }
     let ctx = context(remote(container, "~/.factory/sessions"));
     let connector = FactoryConnector::new();

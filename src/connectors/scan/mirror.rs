@@ -7,9 +7,7 @@ use std::path::{Component, Path, PathBuf};
 pub(super) fn resolve(container: &Path, source: &str, store: &[&str]) -> Option<PathBuf> {
     if store.is_empty()
         || store.iter().any(|part| {
-            part.is_empty()
-                || matches!(*part, "." | ".." | "~")
-                || part.contains(['/', '\\', ':'])
+            part.is_empty() || matches!(*part, "." | ".." | "~") || part.contains(['/', '\\', ':'])
         })
         || source.chars().any(char::is_control)
     {
@@ -29,9 +27,20 @@ pub(super) fn resolve(container: &Path, source: &str, store: &[&str]) -> Option<
     // Structural connectors use their own subtree/identity handling.
     let strict_layout = matches!(
         store,
-        [".factory", "sessions"] | [".prime", "agent", "sessions"]
+        [
+            ".factory" | ".kimi-code" | ".kimi" | ".grok" | ".continue" | ".codex",
+            "sessions",
+        ] | [".prime" | ".pi" | ".omp", "agent", "sessions"]
+            | [".local", "share", "omp" | "muse", "sessions"]
+            | [".qwen" | ".claude", "projects"]
+            | [".qwen", "tmp"]
+            | [".kiro", "sessions", "cli"]
     );
-    let matched = if strict_layout && components.windows(store.len()).any(|window| window == store) {
+    let matched = if strict_layout
+        && components
+            .windows(store.len())
+            .any(|window| window == store)
+    {
         store.len()
     } else {
         (1..=store.len())
@@ -99,7 +108,10 @@ mod tests {
     #[test]
     fn qualified_subtrees_remain_narrow_for_strict_layout_providers() {
         for (source, store) in [
-            ("~/.factory/sessions/project-a", &[".factory", "sessions"][..]),
+            (
+                "~/.factory/sessions/project-a",
+                &[".factory", "sessions"][..],
+            ),
             (
                 "~/.prime/agent/sessions/project-a",
                 &[".prime", "agent", "sessions"][..],
@@ -225,7 +237,11 @@ mod tests {
                     leaf_name,
                     if slash { "/" } else { "" }
                 );
-                assert_eq!(resolve(&container, &source, store), Some(selected), "{source}");
+                assert_eq!(
+                    resolve(&container, &source, store),
+                    Some(selected),
+                    "{source}"
+                );
             }
         }
     }
@@ -280,5 +296,4 @@ mod tests {
             }
         }
     }
-
 }

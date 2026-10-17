@@ -1082,6 +1082,35 @@ pub fn extract_tokens_for_agent(
                 ..Default::default()
             }
         }
+        // Crush and Muse record API token counters only at the session level
+        // (`conversation.metadata.prompt_tokens`/`completion_tokens` for Crush;
+        // `conversation.metadata.usage` for Muse, because Muse's
+        // `model_completed` events have no message correlation ID). Per-message
+        // extraction therefore preserves Crush's recorded model/provider and
+        // falls back to content estimation rather than double-counting session
+        // totals across every assistant turn.
+        "crush" => {
+            let model_name = extra
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from);
+            let provider = extra
+                .get("provider")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from)
+                .or_else(|| {
+                    model_name
+                        .as_deref()
+                        .map(|name| normalize_model(name).provider)
+                });
+            ExtractedTokenUsage {
+                model_name,
+                provider,
+                ..Default::default()
+            }
+        }
         _ => ExtractedTokenUsage::default(),
     };
 
@@ -1409,6 +1438,22 @@ mod tests {
         let raw = Value::Null;
         let usage = extract_tokens_for_agent("aider", &raw, "Some content here", "assistant");
         assert_eq!(usage.data_source, TokenDataSource::Estimated);
+        assert!(usage.output_tokens.unwrap() > 0);
+    }
+
+    #[test]
+    fn extract_tokens_for_agent_crush_preserves_model_and_provider_with_estimated_tokens() {
+        let raw = serde_json::json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "provider": "anthropic"
+        });
+        let usage = extract_tokens_for_agent("crush", &raw, "Some content here", "assistant");
+        assert_eq!(usage.data_source, TokenDataSource::Estimated);
+        assert_eq!(
+            usage.model_name.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        assert_eq!(usage.provider.as_deref(), Some("anthropic"));
         assert!(usage.output_tokens.unwrap() > 0);
     }
 }

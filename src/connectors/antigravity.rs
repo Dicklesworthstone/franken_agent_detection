@@ -71,8 +71,13 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, env_path_nonempty, read_capped};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+};
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -707,18 +712,44 @@ fn scan_antigravity_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    scan_antigravity_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
+}
+
+fn scan_antigravity_with_hooks(
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<()> {
+    let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = AntigravityConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for root in roots {
-        if !root.path.exists() {
+        if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
             continue;
         }
         for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
+            let transcript = AntigravityConnector::transcript_path(&conversation_dir);
+            if path_is_excluded(&conversation_dir, &excluded_paths)
+                || path_is_excluded(&transcript, &excluded_paths)
+            {
+                continue;
+            }
             if !seen.insert(dedupe_path_key(&conversation_dir)) {
                 continue;
             }
             if !AntigravityConnector::conversation_modified_since(&conversation_dir, ctx.since_ts) {
+                continue;
+            }
+            let discovered = DiscoveredSourceFile::new(
+                AGENT_SLUG,
+                &root,
+                transcript,
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&discovered) {
                 continue;
             }
             if let Some(conversation) = parse_conversation(&conversation_dir, &root) {
@@ -728,6 +759,13 @@ fn scan_antigravity_with_callback(
                         conversation_dir.display()
                     )
                 })?;
+                if !discovered.fs_metadata_changed() {
+                    hooks.complete(&SourceCompletion {
+                        source: discovered,
+                        required_sidecars: Vec::new(),
+                        conversations_emitted: 1,
+                    })?;
+                }
             }
         }
     }
@@ -735,23 +773,30 @@ fn scan_antigravity_with_callback(
     Ok(())
 }
 
-fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+    let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = AntigravityConnector::source_roots(ctx);
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for root in roots {
-        if !root.path.exists() {
+        if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
             continue;
         }
         for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
+            if path_is_excluded(&conversation_dir, &excluded_paths) {
+                continue;
+            }
             if !AntigravityConnector::conversation_modified_since(&conversation_dir, ctx.since_ts) {
                 continue;
             }
 
             // The transcript we actually parse — required for reconstruction.
             let transcript = AntigravityConnector::transcript_path(&conversation_dir);
-            if transcript.is_file() && seen.insert(dedupe_path_key(&transcript)) {
+            if transcript.is_file()
+                && !path_is_excluded(&transcript, &excluded_paths)
+                && seen.insert(dedupe_path_key(&transcript))
+            {
                 out.push(
                     DiscoveredSourceFile::new(
                         AGENT_SLUG,
@@ -766,7 +811,10 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
 
             // The fuller transcript variant, if present (optional).
             let transcript_full = AntigravityConnector::transcript_full_path(&conversation_dir);
-            if transcript_full.is_file() && seen.insert(dedupe_path_key(&transcript_full)) {
+            if transcript_full.is_file()
+                && !path_is_excluded(&transcript_full, &excluded_paths)
+                && seen.insert(dedupe_path_key(&transcript_full))
+            {
                 out.push(
                     DiscoveredSourceFile::new(
                         AGENT_SLUG,
@@ -782,7 +830,7 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
             // The durable per-conversation SQLite database — the canonical source
             // of truth worth mirroring, though we read the transcript instead.
             if let Some(db) = AntigravityConnector::sibling_db_path(&conversation_dir) {
-                if seen.insert(dedupe_path_key(&db)) {
+                if !path_is_excluded(&db, &excluded_paths) && seen.insert(dedupe_path_key(&db)) {
                     out.push(
                         DiscoveredSourceFile::new(
                             AGENT_SLUG,
@@ -798,7 +846,7 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -889,7 +937,7 @@ impl Connector for AntigravityConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(discover_sources(ctx))
+        discover_sources(ctx)
     }
 
     fn scan_with_callback(
@@ -898,6 +946,19 @@ impl Connector for AntigravityConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         scan_antigravity_with_callback(ctx, on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_antigravity_with_hooks(ctx, hooks, on_conversation)
     }
 }
 

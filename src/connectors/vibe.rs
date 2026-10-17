@@ -18,8 +18,11 @@ use walkdir::WalkDir;
 use std::collections::HashSet;
 
 use super::jsonl::JsonlLines;
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::dedupe_path_key;
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -161,18 +164,25 @@ impl VibeConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         // Same cross-root dedupe as scan(): overlapping or symlink-aliased
         // roots must not produce duplicate discovered sources.
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
         for source in Self::source_roots(ctx) {
+            if path_is_excluded(&source.root.path, &excluded_paths) {
+                continue;
+            }
             let mut root = source.root;
             if root.path.is_file() {
                 let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
                 root = root.with_path(parent);
             }
             for file in Self::session_files(&root.path) {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&file)) {
                     continue;
                 }
@@ -191,7 +201,7 @@ impl VibeConnector {
                 );
             }
         }
-        out
+        Ok(out)
     }
 
     fn extract_role(val: &Value) -> String {
@@ -326,6 +336,109 @@ impl VibeConnector {
 
         None
     }
+    fn parse_session_reader(
+        source: &mirror::SessionRoot,
+        source_path: &Path,
+        reader: impl std::io::BufRead,
+    ) -> Option<NormalizedConversation> {
+        let external_id = source.external_id(source_path);
+
+        let mut messages = Vec::new();
+        let mut started_at: Option<i64> = None;
+        let mut ended_at: Option<i64> = None;
+
+        for line_res in JsonlLines::new(reader) {
+            let line = match line_res {
+                Ok(line) => line,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %source_path.display(),
+                        error = %error,
+                        "vibe: discarding incomplete session after read error"
+                    );
+                    return None;
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let line = line.trim_start_matches('\u{feff}');
+            let val: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let role = Self::extract_role(&val);
+            let (content, invocations) = Self::normalize_content(&val);
+
+            if content.trim().is_empty() {
+                continue;
+            }
+
+            let created = Self::extract_timestamp(&val);
+            started_at = match (started_at, created) {
+                (Some(curr), Some(ts)) => Some(curr.min(ts)),
+                (None, Some(ts)) => Some(ts),
+                (other, None) => other,
+            };
+            ended_at = match (ended_at, created) {
+                (Some(curr), Some(ts)) => Some(curr.max(ts)),
+                (None, Some(ts)) => Some(ts),
+                (other, None) => other,
+            };
+
+            messages.push(NormalizedMessage {
+                idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
+                role,
+                author: None,
+                created_at: created,
+                content,
+                extra: val,
+                invocations,
+                snippets: Vec::new(),
+            });
+        }
+
+        if messages.is_empty() {
+            return None;
+        }
+
+        let title = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .map(|m| {
+                m.content
+                    .lines()
+                    .next()
+                    .unwrap_or(&m.content)
+                    .chars()
+                    .take(100)
+                    .collect::<String>()
+            })
+            .or_else(|| {
+                messages
+                    .first()
+                    .and_then(|m| m.content.lines().next())
+                    .map(|s| s.chars().take(100).collect())
+            });
+
+        let metadata = serde_json::json!({
+            "source": "vibe",
+        });
+
+        Some(NormalizedConversation {
+            agent_slug: "vibe".to_string(),
+            external_id,
+            title,
+            workspace: None,
+            source_path: source_path.to_path_buf(),
+            started_at,
+            ended_at,
+            metadata,
+            messages,
+        })
+    }
 }
 
 impl Connector for VibeConnector {
@@ -333,28 +446,67 @@ impl Connector for VibeConnector {
         franken_detection_for_connector("vibe").unwrap_or_else(DetectionResult::not_found)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            convs.push(conversation);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let roots = Self::source_roots(ctx);
 
         if roots.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         // Overlapping or symlink-aliased roots reach the same session file
         // twice; dedupe across ALL roots on the lossless path key.
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
-        let mut convs = Vec::new();
-
         for mut source in roots {
+            if path_is_excluded(&source.root.path, &excluded_paths) {
+                continue;
+            }
             if source.root.path.is_file() {
-                let parent = source.root.path.parent().unwrap_or(&source.root.path).to_path_buf();
+                let parent = source
+                    .root
+                    .path
+                    .parent()
+                    .unwrap_or(&source.root.path)
+                    .to_path_buf();
                 source.root = source.root.with_path(parent);
             }
 
             let files = Self::session_files(&source.root.path);
-            'sources: for file in files {
+            for file in files {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&file)) {
                     continue;
                 }
@@ -362,14 +514,23 @@ impl Connector for VibeConnector {
                     continue;
                 }
 
-                let external_id = source.external_id(&file);
+                let discovered = DiscoveredSourceFile::new(
+                    "vibe",
+                    &source.root,
+                    file.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata();
+                if !hooks.should_scan(&discovered) {
+                    continue;
+                }
 
-                let source_path = file;
-                let file_handle = match fs::File::open(&source_path) {
+                let file_handle = match fs::File::open(&file) {
                     Ok(f) => f,
                     Err(e) => {
                         tracing::debug!(
-                            path = %source_path.display(),
+                            path = %file.display(),
                             error = %e,
                             "vibe: skipping unreadable session"
                         );
@@ -377,110 +538,24 @@ impl Connector for VibeConnector {
                     }
                 };
                 let reader = std::io::BufReader::new(file_handle);
-
-                let mut messages = Vec::new();
-                let mut started_at: Option<i64> = None;
-                let mut ended_at: Option<i64> = None;
-
-                for line_res in JsonlLines::new(reader) {
-                    let line = match line_res {
-                        Ok(line) => line,
-                        Err(error) => {
-                            tracing::debug!(
-                                path = %source_path.display(),
-                                error = %error,
-                                "vibe: discarding incomplete session after read error"
-                            );
-                            continue 'sources;
-                        }
-                    };
-                    if line.trim().is_empty() {
-                        continue;
+                if let Some(conv) = Self::parse_session_reader(&source, &file, reader) {
+                    on_conversation(conv)?;
+                    if !discovered.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source: discovered,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted: 1,
+                        })?;
                     }
-
-                    let line = line.trim_start_matches('\u{feff}');
-                    let val: Value = match serde_json::from_str(line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    let role = Self::extract_role(&val);
-                    let (content, invocations) = Self::normalize_content(&val);
-
-                    if content.trim().is_empty() {
-                        continue;
-                    }
-
-                    let created = Self::extract_timestamp(&val);
-                    started_at = match (started_at, created) {
-                        (Some(curr), Some(ts)) => Some(curr.min(ts)),
-                        (None, Some(ts)) => Some(ts),
-                        (other, None) => other,
-                    };
-                    ended_at = match (ended_at, created) {
-                        (Some(curr), Some(ts)) => Some(curr.max(ts)),
-                        (None, Some(ts)) => Some(ts),
-                        (other, None) => other,
-                    };
-
-                    messages.push(NormalizedMessage {
-                        idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
-                        role,
-                        author: None,
-                        created_at: created,
-                        content,
-                        extra: val,
-                        invocations,
-                        snippets: Vec::new(),
-                    });
                 }
-
-                if messages.is_empty() {
-                    continue;
-                }
-
-                let title = messages
-                    .iter()
-                    .find(|m| m.role == "user")
-                    .map(|m| {
-                        m.content
-                            .lines()
-                            .next()
-                            .unwrap_or(&m.content)
-                            .chars()
-                            .take(100)
-                            .collect::<String>()
-                    })
-                    .or_else(|| {
-                        messages
-                            .first()
-                            .and_then(|m| m.content.lines().next())
-                            .map(|s| s.chars().take(100).collect())
-                    });
-
-                let metadata = serde_json::json!({
-                    "source": "vibe",
-                });
-
-                convs.push(NormalizedConversation {
-                    agent_slug: "vibe".to_string(),
-                    external_id,
-                    title,
-                    workspace: None,
-                    source_path,
-                    started_at,
-                    ended_at,
-                    metadata,
-                    messages,
-                });
             }
         }
 
-        Ok(convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 
@@ -631,5 +706,72 @@ mod tests {
         let mut sorted = files.clone();
         sorted.sort();
         assert_eq!(files, sorted);
+    }
+
+    struct FailingReader {
+        prefix: std::io::Cursor<Vec<u8>>,
+        kind: std::io::ErrorKind,
+        attempts: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            unreachable!("the transcript reader uses BufRead directly")
+        }
+    }
+
+    impl std::io::BufRead for FailingReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if usize::try_from(self.prefix.position()).unwrap() < self.prefix.get_ref().len() {
+                return self.prefix.fill_buf();
+            }
+            self.attempts.set(self.attempts.get() + 1);
+            Err(std::io::Error::new(
+                self.kind,
+                "injected transcript read failure",
+            ))
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.prefix.consume(amount);
+        }
+    }
+
+    #[test]
+    fn reader_failure_discards_complete_prefix_without_retrying() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".vibe/logs/session");
+        let file = sessions.join("sess-fail/messages.jsonl");
+        let source = mirror::SessionRoot::native(ScanRoot::local(sessions));
+        let prefix = concat!(
+            "{\"role\":\"user\",\"content\":\"complete prefix\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"partial",
+        );
+        let healthy =
+            VibeConnector::parse_session_reader(&source, &file, std::io::Cursor::new(prefix))
+                .expect("a clean EOF retains the complete record and ignores malformed JSON");
+        assert_eq!(healthy.messages[0].content, "complete prefix");
+
+        for kind in [
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+            let conversation = VibeConnector::parse_session_reader(
+                &source,
+                &file,
+                FailingReader {
+                    prefix: std::io::Cursor::new(prefix.as_bytes().to_vec()),
+                    kind,
+                    attempts: std::rc::Rc::clone(&attempts),
+                },
+            );
+            assert!(
+                conversation.is_none(),
+                "{kind:?} must discard accumulated messages"
+            );
+            assert_eq!(attempts.get(), 1, "the failed read must not be retried");
+        }
     }
 }

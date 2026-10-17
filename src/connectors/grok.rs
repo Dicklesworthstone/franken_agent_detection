@@ -56,7 +56,9 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+};
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -117,7 +119,14 @@ impl GrokConnector {
                 vec![ScanRoot::local(Self::base_root())]
             }
         } else {
-            ctx.scan_roots.clone()
+            ctx.scan_roots
+                .iter()
+                .map(|scan_root| {
+                    scan_root
+                        .mirrored_store(&[".grok", "sessions"])
+                        .map_or_else(|| scan_root.clone(), |path| scan_root.with_path(path))
+                })
+                .collect()
         };
         roots.sort_by(|a, b| a.path.cmp(&b.path));
         roots.dedup_by(|a, b| a.path == b.path);
@@ -799,12 +808,14 @@ fn scan_grok_with_hooks(
     scan_grok_with_parser(ctx, hooks, on_conversation, &mut parse_session)
 }
 
+#[allow(clippy::too_many_lines)]
 fn scan_grok_with_parser(
     ctx: &ScanContext,
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     parse: &mut impl FnMut(&Path) -> Result<Option<NormalizedConversation>>,
 ) -> Result<()> {
+    let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = GrokConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
@@ -816,6 +827,16 @@ fn scan_grok_with_parser(
             if !seen.insert(dedupe_path_key(&session_dir)) {
                 continue;
             }
+            let updates = session_dir.join("updates.jsonl");
+            let chat_history = session_dir.join("chat_history.jsonl");
+            if path_is_excluded(&session_dir, &excluded_paths)
+                || (updates.is_file() && path_is_excluded(&updates, &excluded_paths))
+                || (!updates.is_file()
+                    && chat_history.is_file()
+                    && path_is_excluded(&chat_history, &excluded_paths))
+            {
+                continue;
+            }
             if !GrokConnector::session_modified_since(&session_dir, ctx.since_ts) {
                 continue;
             }
@@ -825,8 +846,6 @@ fn scan_grok_with_parser(
             // path) and summary.json ride as sidecar fingerprints because
             // parse_session() consults them. A session dir with NEITHER
             // stream present has no trustworthy boundary and never completes.
-            let updates = session_dir.join("updates.jsonl");
-            let chat_history = session_dir.join("chat_history.jsonl");
             let summary = session_dir.join("summary.json");
             let primary = if updates.is_file() {
                 Some((updates, true))
@@ -909,7 +928,8 @@ fn scan_grok_with_parser(
     Ok(())
 }
 
-fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+    let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = GrokConnector::source_roots(ctx);
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -919,13 +939,19 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
             continue;
         }
         for session_dir in GrokConnector::session_dirs(&root.path) {
+            if path_is_excluded(&session_dir, &excluded_paths) {
+                continue;
+            }
             if !GrokConnector::session_modified_since(&session_dir, ctx.since_ts) {
                 continue;
             }
 
             // The authoritative update stream we parse.
             let updates = session_dir.join("updates.jsonl");
-            if updates.is_file() && seen.insert(dedupe_path_key(&updates)) {
+            if updates.is_file()
+                && !path_is_excluded(&updates, &excluded_paths)
+                && seen.insert(dedupe_path_key(&updates))
+            {
                 out.push(
                     DiscoveredSourceFile::new(
                         AGENT_SLUG,
@@ -940,7 +966,10 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
 
             // The raw model-facing history (fallback read path).
             let chat_history = session_dir.join("chat_history.jsonl");
-            if chat_history.is_file() && seen.insert(dedupe_path_key(&chat_history)) {
+            if chat_history.is_file()
+                && !path_is_excluded(&chat_history, &excluded_paths)
+                && seen.insert(dedupe_path_key(&chat_history))
+            {
                 out.push(
                     DiscoveredSourceFile::new(
                         AGENT_SLUG,
@@ -955,7 +984,10 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
 
             // Session metadata sidecar.
             let summary = session_dir.join("summary.json");
-            if summary.is_file() && seen.insert(dedupe_path_key(&summary)) {
+            if summary.is_file()
+                && !path_is_excluded(&summary, &excluded_paths)
+                && seen.insert(dedupe_path_key(&summary))
+            {
                 out.push(
                     DiscoveredSourceFile::new(
                         AGENT_SLUG,
@@ -970,7 +1002,7 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 impl Connector for GrokConnector {
@@ -992,7 +1024,7 @@ impl Connector for GrokConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(discover_sources(ctx))
+        discover_sources(ctx)
     }
 
     fn scan_with_callback(

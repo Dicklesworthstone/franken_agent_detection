@@ -32,8 +32,11 @@ use serde_json::{Value, json};
 use walkdir::WalkDir;
 
 use super::jsonl::JsonlLines;
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::dedupe_path_key;
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
 use super::{Connector, franken_detection_for_connector, parse_timestamp};
 use crate::expand_leading_tilde;
 use crate::types::{
@@ -254,11 +257,18 @@ impl PrimeAgentConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
         for root in Self::source_roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             for file in Self::session_files(&root.path) {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&file)) {
                     continue;
                 }
@@ -277,7 +287,7 @@ impl PrimeAgentConnector {
                 );
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -997,17 +1007,73 @@ impl Connector for PrimeAgentConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            convs.push(conversation);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
         for root in Self::source_roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             for file in Self::session_files(&root.path) {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(dedupe_path_key(&file)) {
                     continue;
                 }
                 if !super::file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }
+                let discovered = DiscoveredSourceFile::new(
+                    "prime_agent",
+                    &root,
+                    file.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata();
+                if !hooks.should_scan(&discovered) {
+                    continue;
+                }
                 match parse_session_file(&file) {
-                    Ok(Some(conversation)) => convs.push(conversation),
+                    Ok(Some(conversation)) => {
+                        on_conversation(conversation)?;
+                        if !discovered.fs_metadata_changed() {
+                            hooks.complete(&SourceCompletion {
+                                source: discovered,
+                                required_sidecars: Vec::new(),
+                                conversations_emitted: 1,
+                            })?;
+                        }
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         tracing::debug!(
@@ -1020,11 +1086,11 @@ impl Connector for PrimeAgentConnector {
                 }
             }
         }
-        Ok(convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

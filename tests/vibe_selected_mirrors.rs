@@ -65,11 +65,8 @@ fn selected_vibe_mirrors_keep_full_store_identities_across_copy_layouts() {
             );
             let root = remote(container, &source);
             let origin = root.origin.clone();
-            let ctx = ScanContext::with_roots(
-                temp.path().join("state"),
-                vec![root.clone(), root],
-                None,
-            );
+            let ctx =
+                ScanContext::with_roots(temp.path().join("state"), vec![root.clone(), root], None);
             let label = format!("{source}, retained={retained}");
             let found = connector.discover_source_files(&ctx).unwrap();
             assert_eq!(found.len(), 1, "{label}");
@@ -80,7 +77,10 @@ fn selected_vibe_mirrors_keep_full_store_identities_across_copy_layouts() {
             assert_eq!(actual.len(), 1, "{label}");
             assert_eq!(actual[0].external_id, expected[0].external_id, "{label}");
             assert!(
-                actual[0].external_id.as_deref().is_some_and(|id| !id.is_empty())
+                actual[0]
+                    .external_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
             );
             assert_eq!(actual[0].source_path, file);
             assert_eq!(actual[0].started_at, expected[0].started_at);
@@ -103,7 +103,10 @@ fn selected_vibe_mirrors_keep_full_store_identities_across_copy_layouts() {
             let mut incremental = ctx;
             incremental.since_ts = Some(i64::MAX);
             assert!(
-                connector.discover_source_files(&incremental).unwrap().is_empty()
+                connector
+                    .discover_source_files(&incremental)
+                    .unwrap()
+                    .is_empty()
             );
             assert!(connector.scan(&incremental).unwrap().is_empty());
         }
@@ -144,7 +147,9 @@ fn independent_selected_subtrees_with_the_same_basename_do_not_collapse_ids() {
 #[test]
 fn invalid_owned_subtrees_do_not_fall_back_to_broader_home_layouts() {
     let temp = tempfile::tempdir().unwrap();
-    put(&temp.path().join(".vibe/logs/session/unselected/messages.jsonl"));
+    put(&temp
+        .path()
+        .join(".vibe/logs/session/unselected/messages.jsonl"));
     for source in [
         "~/.vibe/logs/session/../run",
         "~/.vibe/logs/session/./run",
@@ -158,10 +163,16 @@ fn invalid_owned_subtrees_do_not_fall_back_to_broader_home_layouts() {
             None,
         );
         assert!(
-            VibeConnector::new().discover_source_files(&ctx).unwrap().is_empty(),
+            VibeConnector::new()
+                .discover_source_files(&ctx)
+                .unwrap()
+                .is_empty(),
             "{source}"
         );
-        assert!(VibeConnector::new().scan(&ctx).unwrap().is_empty(), "{source}");
+        assert!(
+            VibeConnector::new().scan(&ctx).unwrap().is_empty(),
+            "{source}"
+        );
     }
 }
 
@@ -185,9 +196,15 @@ fn selected_vibe_mirrors_reject_linked_containers_and_payloads() {
             None,
         );
         assert!(
-            VibeConnector::new().discover_source_files(&ctx).unwrap().is_empty()
+            VibeConnector::new()
+                .discover_source_files(&ctx)
+                .unwrap()
+                .is_empty()
         );
         assert!(VibeConnector::new().scan(&ctx).unwrap().is_empty());
     }
-    assert_eq!(fs::read(outside.join("messages.jsonl")).unwrap(), TRANSCRIPT);
+    assert_eq!(
+        fs::read(outside.join("messages.jsonl")).unwrap(),
+        TRANSCRIPT
+    );
 }

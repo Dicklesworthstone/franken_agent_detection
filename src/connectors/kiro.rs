@@ -49,7 +49,7 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::dedupe_path_key;
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -125,7 +125,9 @@ impl KiroConnector {
             }
         } else {
             for root in &ctx.scan_roots {
-                if let Some(candidate) = Self::scoped_root(&root.path) {
+                if let Some(mirrored) = root.mirrored_store(&[".kiro", "sessions", "cli"]) {
+                    roots.push(root.with_path(mirrored));
+                } else if let Some(candidate) = Self::scoped_root(&root.path) {
                     roots.push(root.with_path(candidate));
                 }
             }
@@ -412,10 +414,14 @@ impl Connector for KiroConnector {
         hooks: &mut SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
         for root in Self::source_roots(ctx) {
             for file in Self::session_files(&root.path) {
                 if !seen_files.insert(dedupe_path_key(&file)) {
+                    continue;
+                }
+                if path_is_excluded(&file, &excluded_paths) {
                     continue;
                 }
                 if !file_modified_since(&file, ctx.since_ts) {
@@ -433,16 +439,17 @@ impl Connector for KiroConnector {
                 )
                 .with_fs_metadata();
                 let sidecar = file.with_extension("json");
-                let sidecar_discovered = sidecar.exists().then(|| {
-                    DiscoveredSourceFile::new(
-                        "kiro",
-                        &root,
-                        sidecar,
-                        DiscoveredSourceRole::MetadataSidecar,
-                        false,
-                    )
-                    .with_fs_metadata()
-                });
+                let sidecar_discovered =
+                    (sidecar.exists() && !path_is_excluded(&sidecar, &excluded_paths)).then(|| {
+                        DiscoveredSourceFile::new(
+                            "kiro",
+                            &root,
+                            sidecar,
+                            DiscoveredSourceRole::MetadataSidecar,
+                            false,
+                        )
+                        .with_fs_metadata()
+                    });
                 if !hooks.should_scan(&discovered) {
                     continue;
                 }
@@ -466,11 +473,15 @@ impl Connector for KiroConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
         for root in Self::source_roots(ctx) {
             for file in Self::session_files(&root.path) {
                 if !seen_files.insert(dedupe_path_key(&file)) {
+                    continue;
+                }
+                if path_is_excluded(&file, &excluded_paths) {
                     continue;
                 }
                 if !file_modified_since(&file, ctx.since_ts) {
@@ -487,7 +498,7 @@ impl Connector for KiroConnector {
                     )
                     .with_fs_metadata(),
                 );
-                if sidecar.exists() {
+                if sidecar.exists() && !path_is_excluded(&sidecar, &excluded_paths) {
                     out.push(
                         DiscoveredSourceFile::new(
                             "kiro",

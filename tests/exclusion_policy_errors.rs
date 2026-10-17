@@ -11,9 +11,15 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(feature = "codebuff")]
+use franken_agent_detection::connectors::codebuff::CodebuffConnector;
 use franken_agent_detection::connectors::{
-    claude_code::ClaudeCodeConnector, codex::CodexConnector, omp::OmpConnector,
+    antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
+    clawdbot::ClawdbotConnector, codex::CodexConnector, continue_dev::ContinueConnector,
+    factory::FactoryConnector, grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector,
+    muse::MuseConnector, omp::OmpConnector, openclaw::OpenClawConnector,
     pi_agent::PiAgentConnector, pi_durable::PiDurableConnector, pi_wire,
+    prime_agent::PrimeAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
 };
 use franken_agent_detection::{
     Connector, DiscoveredSourceFile, NormalizedConversation, ScanContext, ScanRoot,
@@ -25,7 +31,27 @@ use tempfile::TempDir;
 const CHILD_ROOT: &str = "FAD_INVALID_POLICY_TEST_ROOT";
 const CHILD_EXPECTED: &str = "FAD_INVALID_POLICY_TEST_EXPECTED";
 const CHILD_DROP_CWD: &str = "FAD_INVALID_POLICY_TEST_DROP_CWD";
-const PROVIDERS: [&str; 5] = ["claude", "codex", "pi_agent", "omp", "pi_durable"];
+const PROVIDERS: &[&str] = &[
+    "claude",
+    "codex",
+    "pi_agent",
+    "omp",
+    "pi_durable",
+    "continue",
+    "kiro",
+    "grok",
+    "muse",
+    "factory",
+    "qwen",
+    "prime_agent",
+    "vibe",
+    "kimi",
+    "clawdbot",
+    "antigravity",
+    #[cfg(feature = "codebuff")]
+    "codebuff",
+    "openclaw",
+];
 
 struct Case {
     provider: &'static str,
@@ -65,6 +91,72 @@ fn case(root: &Path, provider: &'static str) -> Case {
             "sessions/2026-10-09T00-00-00_policy.jsonl",
         ),
         "pi_durable" => (Box::new(PiDurableConnector::new()), "durable", "main.jsonl"),
+        "continue" => (
+            Box::new(ContinueConnector::new()),
+            ".continue/sessions",
+            "session-1.json",
+        ),
+        "kiro" => (
+            Box::new(KiroConnector::new()),
+            ".kiro/sessions/cli",
+            "session.jsonl",
+        ),
+        "grok" => (
+            Box::new(GrokConnector::new()),
+            ".grok/sessions",
+            "group-1/sess-1/updates.jsonl",
+        ),
+        "muse" => (
+            Box::new(MuseConnector::new()),
+            ".local/share/muse/sessions",
+            "019cccd3-9f97-7351-824f-6b1eb5f199f2/session.jsonl",
+        ),
+        "factory" => (
+            Box::new(FactoryConnector::new()),
+            ".factory/sessions",
+            "-work-demo/sess-1.jsonl",
+        ),
+        "qwen" => (
+            Box::new(QwenConnector::new()),
+            ".qwen",
+            "projects/demo/chats/11111111-2222-3333-4444-555555555555.jsonl",
+        ),
+        "prime_agent" => (
+            Box::new(PrimeAgentConnector::new()),
+            ".prime/agent/sessions",
+            "0192aa11-0000-7000-8000-000000000001.jsonl",
+        ),
+        "vibe" => (
+            Box::new(VibeConnector::new()),
+            ".vibe/logs/session",
+            "sess-1/messages.jsonl",
+        ),
+        "kimi" => (
+            Box::new(KimiConnector::new()),
+            ".kimi-code/sessions",
+            "workdir/sess-1/agents/main/wire.jsonl",
+        ),
+        "clawdbot" => (
+            Box::new(ClawdbotConnector::new()),
+            ".clawdbot/sessions",
+            "sess-1.jsonl",
+        ),
+        "antigravity" => (
+            Box::new(AntigravityConnector::new()),
+            ".gemini/antigravity-cli",
+            "brain/00000000-0000-0000-0000-000000000001/.system_generated/logs/transcript.jsonl",
+        ),
+        #[cfg(feature = "codebuff")]
+        "codebuff" => (
+            Box::new(CodebuffConnector::new()),
+            ".config/manicode/projects",
+            "demo/chats/2026-10-09T00-00-00.000Z/chat-messages.json",
+        ),
+        "openclaw" => (
+            Box::new(OpenClawConnector::new()),
+            ".openclaw/agents/main/sessions",
+            "sess-1.jsonl",
+        ),
         other => panic!("unknown provider: {other}"),
     };
     let roots: Vec<_> = ["private", "public"]
@@ -82,9 +174,10 @@ fn case(root: &Path, provider: &'static str) -> Case {
 struct Fixture(TempDir);
 
 impl Fixture {
+    #[allow(clippy::too_many_lines)]
     fn new() -> Self {
         let fixture = Self(TempDir::new().unwrap());
-        for provider in PROVIDERS {
+        for &provider in PROVIDERS {
             for (visibility, path) in ["private", "public"]
                 .into_iter()
                 .zip(case(fixture.0.path(), provider).sources)
@@ -104,15 +197,83 @@ impl Fixture {
                         {"type": "entry", "value": {"id": 2, "conversationId": 1,
                             "kind": "pi.user", "model": [{"role": "user", "content": text}]}}
                     ]}),
+                    "continue" => json!({
+                        "sessionId": "session-1",
+                        "title": "Policy",
+                        "workspaceDirectory": "/work",
+                        "history": [{"message": {"role": "user", "content": text}}]
+                    }),
+                    "kiro" => json!({"kind": "Prompt", "data": {"content": text}}),
+                    "grok" => json!({
+                        "timestamp": "2026-10-09T00:00:00Z",
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "content": {"type": "text", "text": text}
+                        }
+                    }),
+                    "muse" => json!({
+                        "schema_version": "v1",
+                        "stream_id": "019cccd3-9f97-7351-824f-6b1eb5f199f2",
+                        "seq": 1,
+                        "recorded_at_ms": 1_772_962_994_000_i64,
+                        "payload_type": "runtime.session",
+                        "payload": {"kind": "run", "event": {"kind": "started", "prompt": text}}
+                    }),
+                    "factory" | "openclaw" => json!({
+                        "type": "message",
+                        "id": "m1",
+                        "timestamp": "2026-10-09T00:00:00Z",
+                        "message": {"role": "user", "content": text}
+                    }),
+                    "qwen" => json!({
+                        "uuid": "u1",
+                        "parentUuid": null,
+                        "sessionId": "11111111-2222-3333-4444-555555555555",
+                        "timestamp": "2026-10-09T00:00:00Z",
+                        "cwd": "/work/demo",
+                        "type": "user",
+                        "message": {"role": "user", "parts": [{"text": text}]}
+                    }),
+                    "prime_agent" => json!({
+                        "type": "message",
+                        "id": "a1b2c3d4",
+                        "parentId": null,
+                        "timestamp": "2026-10-09T00:00:01Z",
+                        "message": {"role": "user", "content": text}
+                    }),
+                    "vibe" | "clawdbot" => json!({
+                        "role": "user",
+                        "content": text,
+                        "timestamp": "2026-10-09T00:00:00Z"
+                    }),
+                    "kimi" => json!({
+                        "type": "turn.prompt",
+                        "time": "2026-10-09T00:00:00Z",
+                        "input": text
+                    }),
+                    "antigravity" => json!({
+                        "step_index": 0,
+                        "source": "USER_EXPLICIT",
+                        "type": "USER_INPUT",
+                        "status": "DONE",
+                        "created_at": "2026-10-09T00:00:00Z",
+                        "content": text
+                    }),
+                    "codebuff" => json!([{
+                        "id": "user-1700000000000",
+                        "variant": "user",
+                        "content": text,
+                        "timestamp": "2026-10-09T00:00:00.000Z"
+                    }]),
                     _ => unreachable!(),
                 };
                 let mut content = String::new();
-                if matches!(provider, "pi_agent" | "omp") {
+                if matches!(provider, "pi_agent" | "omp" | "prime_agent") {
                     writeln!(
                         content,
                         "{}",
                         json!({"type": "session",
-                        "id": text, "cwd": fixture.0.path(), "version": 3})
+                        "id": "0192aa11-0000-7000-8000-000000000001", "cwd": fixture.0.path(), "version": 3})
                     )
                     .unwrap();
                 }
@@ -281,8 +442,13 @@ fn assert_valid_case(case: &Case, public_only: bool) {
             })
             .unwrap();
     }
-    assert_paths(visited, expected);
-    assert_paths(completed, expected);
+    if connector.supports_source_boundaries() {
+        assert_paths(visited, expected);
+        assert_paths(completed, expected);
+    } else {
+        assert!(visited.is_empty());
+        assert!(completed.is_empty());
+    }
     assert_conversations(&conversations, expected);
 }
 
@@ -307,7 +473,7 @@ fn exclusion_policy_child() {
         panic!("deleted working-directory fixture is only supported on Unix");
     }
     let invalid = expected == "error";
-    for provider in PROVIDERS {
+    for &provider in PROVIDERS {
         let case = case(&root, provider);
         let before: Vec<_> = case
             .sources

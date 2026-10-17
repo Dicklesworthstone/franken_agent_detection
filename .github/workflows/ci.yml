@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -32,11 +32,17 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Check detection-only (no default features)
+        run: cargo test --locked --all-targets --no-default-features
 
-      - name: Test
-        run: cargo test --all-targets --all-features
+      - name: Check non-SQLite connectors
+        run: cargo clippy --locked --all-targets --no-default-features --features connectors,codex-zstd,chatgpt -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test (all features)
+        run: cargo test --locked --all-targets --all-features
 
       - name: Package check
-        run: cargo package --allow-dirty
+        run: cargo package --locked --allow-dirty

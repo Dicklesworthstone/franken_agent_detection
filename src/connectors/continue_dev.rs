@@ -17,7 +17,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
 use super::token_extraction::{ExtractedTokenUsage, TokenDataSource, normalize_model};
-use super::utils::dedupe_path_key;
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
 use super::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks, file_modified_since, franken_detection_for_connector,
@@ -57,6 +57,9 @@ impl ContinueConnector {
     }
 
     fn expand_root(root: &ScanRoot) -> Vec<ScanRoot> {
+        if let Some(mirrored) = root.mirrored_store(&[".continue", "sessions"]) {
+            return vec![root.with_path(mirrored)];
+        }
         if root.path.is_file() {
             return vec![root.clone()];
         }
@@ -77,7 +80,8 @@ impl ContinueConnector {
         expanded
     }
 
-    fn sources(ctx: &ScanContext) -> Vec<Source> {
+    fn sources(ctx: &ScanContext) -> Result<Vec<Source>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let roots = if ctx.use_default_detection() {
             let root = if Self::native_data_dir(&ctx.data_dir) {
                 Some(ctx.data_dir.clone())
@@ -108,6 +112,7 @@ impl ContinueConnector {
             for file in files {
                 if file.extension().is_none_or(|extension| extension != "json")
                     || file.file_name().is_some_and(|name| name == "sessions.json")
+                    || path_is_excluded(&file, &excluded_paths)
                     || !file_modified_since(&file, ctx.since_ts)
                 {
                     continue;
@@ -133,7 +138,7 @@ impl ContinueConnector {
                 });
             }
         }
-        sources
+        Ok(sources)
     }
 
     fn scan_sources(
@@ -141,7 +146,7 @@ impl ContinueConnector {
         hooks: &mut SourceScanHooks<'_>,
         emit: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        for source in Self::sources(ctx) {
+        for source in Self::sources(ctx)? {
             if !hooks.should_scan(&source.file) {
                 continue;
             }
@@ -212,7 +217,7 @@ impl Connector for ContinueConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::sources(ctx)
+        Ok(Self::sources(ctx)?
             .into_iter()
             .map(|source| source.file)
             .collect())

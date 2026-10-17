@@ -40,12 +40,14 @@ pub(super) fn mirrored_db_files(root: &ScanRoot) -> Option<Vec<PathBuf>> {
         .split(['/', '\\'])
         .filter(|part| !part.is_empty())
         .collect();
-    let user_start = parts.windows(2).rposition(|part| part == ["Cursor", "User"]);
+    let user_start = parts
+        .windows(2)
+        .rposition(|part| part == ["Cursor", "User"]);
     let user_suffix = user_start.map(|start| &parts[start + 2..]);
     let is_home = parts.last() == Some(&"Cursor");
     let is_store = matches!(
         user_suffix,
-        Some([] | ["globalStorage"] | ["workspaceStorage"])
+        Some([] | ["globalStorage" | "workspaceStorage"])
     );
     let is_workspace = matches!(user_suffix, Some(["workspaceStorage", _]));
     if !is_home && !is_store && !is_workspace {
@@ -123,8 +125,7 @@ mod tests {
     }
 
     fn remote(path: PathBuf, source: &str) -> ScanRoot {
-        ScanRoot::remote(path, Origin::remote("laptop"), None)
-            .with_mirrored_source_path(source)
+        ScanRoot::remote(path, Origin::remote("laptop"), None).with_mirrored_source_path(source)
     }
 
     #[test]
@@ -174,7 +175,10 @@ mod tests {
     fn global_and_individual_workspace_mirrors_remain_narrow() {
         for (source, leaf) in [
             ("~/.config/Cursor/User/globalStorage", "globalStorage"),
-            ("~/.config/Cursor/User/workspaceStorage/selected", "selected"),
+            (
+                "~/.config/Cursor/User/workspaceStorage/selected",
+                "selected",
+            ),
         ] {
             for (slash, retained) in [(false, true), (true, true), (true, false)] {
                 let temp = tempfile::tempdir().unwrap();
@@ -206,7 +210,9 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let container = temp.path().join("opaque_hash");
             let global = container.join(payload).join("globalStorage/state.vscdb");
-            let workspace = container.join(payload).join("workspaceStorage/a/state.vscdb");
+            let workspace = container
+                .join(payload)
+                .join("workspaceStorage/a/state.vscdb");
             put(&global);
             put(&workspace);
             assert_eq!(
@@ -219,7 +225,12 @@ mod tests {
     #[test]
     fn local_and_whole_home_scans_keep_structural_detection() {
         let temp = tempfile::tempdir().unwrap();
-        for source in ["~", "/home/alice", "~/.config/Code/User", "~/workspaceStorage"] {
+        for source in [
+            "~",
+            "/home/alice",
+            "~/.config/Code/User",
+            "~/workspaceStorage",
+        ] {
             assert!(mirrored_db_files(&remote(temp.path().to_path_buf(), source)).is_none());
         }
         let local = ScanRoot::local(temp.path().to_path_buf())
@@ -238,7 +249,10 @@ mod tests {
             );
         }
         assert_eq!(
-            mirrored_db_files(&remote(temp.path().join("missing"), "~/.config/Cursor/User")),
+            mirrored_db_files(&remote(
+                temp.path().join("missing"),
+                "~/.config/Cursor/User"
+            )),
             Some(vec![])
         );
     }

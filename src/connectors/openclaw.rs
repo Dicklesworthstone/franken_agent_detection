@@ -38,7 +38,11 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::jsonl::JsonlLines;
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{excluded_scan_paths_from_env, path_is_excluded};
 use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -337,11 +341,15 @@ impl OpenClawConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
 
         #[cfg(feature = "openclaw-sqlite")]
         for root in Self::sqlite_source_roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             if root.path.is_file() && file_modified_since(&root.path, ctx.since_ts) {
                 out.push(
                     DiscoveredSourceFile::new(
@@ -357,11 +365,17 @@ impl OpenClawConnector {
         }
 
         for mut root in Self::source_roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             if root.path.is_file() {
                 let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
                 root = root.with_path(parent);
             }
             for file in Self::session_files(&root.path) {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }
@@ -377,7 +391,7 @@ impl OpenClawConnector {
                 );
             }
         }
-        out
+        Ok(out)
     }
 
     /// Agent directory name for a per-agent SQLite store path
@@ -467,18 +481,35 @@ impl OpenClawConnector {
         roots
     }
 
-    /// Scan every discovered SQLite store, appending conversations to `convs`
-    /// and returning the `(agent_directory, session_id)` pairs it produced so
-    /// the legacy JSONL pass can skip already-covered sessions.
+    /// Scan every discovered SQLite store, emitting conversations via
+    /// `on_conversation` and returning the `(agent_directory, session_id)`
+    /// pairs it produced so the legacy JSONL pass can skip already-covered
+    /// sessions.
     #[cfg(feature = "openclaw-sqlite")]
     fn scan_sqlite_stores(
         ctx: &ScanContext,
-        convs: &mut Vec<NormalizedConversation>,
-    ) -> std::collections::HashSet<(String, String)> {
+        excluded_paths: &[PathBuf],
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<std::collections::HashSet<(String, String)>> {
         let mut seen = std::collections::HashSet::new();
         for root in Self::sqlite_source_roots(ctx) {
             let db = &root.path;
+            if path_is_excluded(db, excluded_paths) {
+                continue;
+            }
             if !db.is_file() || !file_modified_since(db, ctx.since_ts) {
+                continue;
+            }
+            let discovered = DiscoveredSourceFile::new(
+                "openclaw",
+                &root,
+                db.clone(),
+                DiscoveredSourceRole::SqliteDatabase,
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&discovered) {
                 continue;
             }
             let agent_directory = Self::agent_directory_from_db_path(db);
@@ -490,12 +521,20 @@ impl OpenClawConnector {
                         path = %db.display(),
                         "openclaw: scanned sqlite transcript store"
                     );
+                    let emitted = db_convs.len();
                     for conv in db_convs {
                         if let Some(sid) = conv.metadata.get("session_id").and_then(|v| v.as_str())
                         {
                             seen.insert((agent_directory.clone(), sid.to_string()));
                         }
-                        convs.push(conv);
+                        on_conversation(conv)?;
+                    }
+                    if emitted > 0 && !discovered.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source: discovered,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted: emitted,
+                        })?;
                     }
                 }
                 Err(err) => {
@@ -507,7 +546,7 @@ impl OpenClawConnector {
                 }
             }
         }
-        seen
+        Ok(seen)
     }
 
     /// Flatten `OpenClaw` content blocks into a single string.
@@ -540,6 +579,85 @@ impl OpenClawConnector {
             }
             _ => flatten_content(content),
         }
+    }
+
+    fn parse_session_reader(
+        root: &Path,
+        file: &Path,
+        agent_directory: &str,
+        agent_slug: &str,
+        reader: impl std::io::BufRead,
+    ) -> std::io::Result<Option<NormalizedConversation>> {
+        let source_path = file.to_path_buf();
+        let external_id = source_path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|rel| {
+                rel.with_extension("")
+                    .to_str()
+                    .map(std::string::ToString::to_string)
+            })
+            .or_else(|| {
+                source_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(std::string::ToString::to_string)
+            });
+
+        let external_id = if agent_directory == "openclaw" {
+            external_id
+        } else {
+            external_id.map(|id| format!("{agent_directory}/{id}"))
+        };
+
+        let mut acc = SessionEventAccumulator::default();
+        for line_res in JsonlLines::new(reader) {
+            let line = match line_res {
+                Ok(line) => line,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %file.display(),
+                        error = %error,
+                        "openclaw: discarding incomplete session after read error"
+                    );
+                    return Err(error);
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let val: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            acc.apply_event(val, None);
+        }
+
+        if acc.messages.is_empty() {
+            return Ok(None);
+        }
+
+        let title = acc.title();
+        let workspace = acc.session_cwd.as_ref().map(PathBuf::from);
+
+        let metadata = serde_json::json!({
+            "source": "openclaw",
+            "cwd": acc.session_cwd,
+            "agent_directory": agent_directory,
+        });
+
+        Ok(Some(NormalizedConversation {
+            agent_slug: agent_slug.to_string(),
+            external_id,
+            title,
+            workspace,
+            source_path,
+            started_at: acc.started_at,
+            ended_at: acc.ended_at,
+            metadata,
+            messages: acc.messages,
+        }))
     }
 }
 
@@ -1007,37 +1125,70 @@ impl Connector for OpenClawConnector {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            convs.push(conversation);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
 
         // OpenClaw 2.0 SQLite stores first: sessions they cover must not be
         // double-indexed from leftover/partially-migrated JSONL files.
         #[cfg(feature = "openclaw-sqlite")]
-        let sqlite_sessions = Self::scan_sqlite_stores(ctx, &mut convs);
+        let sqlite_sessions =
+            Self::scan_sqlite_stores(ctx, &excluded_paths, hooks, on_conversation)?;
         #[cfg(not(feature = "openclaw-sqlite"))]
         let sqlite_sessions: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
 
-        let roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
+        let roots = Self::source_roots(ctx);
 
         if roots.is_empty() {
-            return Ok(convs);
+            return Ok(());
         }
 
         let mut scanned_agents = 0usize;
+        let mut total_sessions = 0usize;
 
         for mut root in roots {
-            if root.is_file() {
-                root = root.parent().unwrap_or(&root).to_path_buf();
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
+            if root.path.is_file() {
+                let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
+                root = root.with_path(parent);
             }
 
-            let agent_directory = Self::agent_directory_from_sessions_root(&root);
+            let agent_directory = Self::agent_directory_from_sessions_root(&root.path);
             let agent_slug = Self::agent_slug_for_directory(&agent_directory);
-            let files = Self::session_files(&root);
+            let files = Self::session_files(&root.path);
             let mut agent_file_count = 0usize;
             let mut agent_session_count = 0usize;
             let mut agent_error_count = 0usize;
@@ -1046,7 +1197,10 @@ impl Connector for OpenClawConnector {
                 file_count = files.len(),
                 "openclaw: scanning agent directory"
             );
-            'sources: for file in files {
+            for file in files {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 agent_file_count += 1;
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
@@ -1067,27 +1221,17 @@ impl Connector for OpenClawConnector {
                     }
                 }
 
-                let source_path = file.clone();
-                let external_id = source_path
-                    .strip_prefix(&root)
-                    .ok()
-                    .and_then(|rel| {
-                        rel.with_extension("")
-                            .to_str()
-                            .map(std::string::ToString::to_string)
-                    })
-                    .or_else(|| {
-                        source_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .map(std::string::ToString::to_string)
-                    });
-
-                let external_id = if agent_directory == "openclaw" {
-                    external_id
-                } else {
-                    external_id.map(|id| format!("{agent_directory}/{id}"))
-                };
+                let discovered = DiscoveredSourceFile::new(
+                    "openclaw",
+                    &root,
+                    file.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata();
+                if !hooks.should_scan(&discovered) {
+                    continue;
+                }
 
                 let file_handle = match fs::File::open(&file) {
                     Ok(f) => f,
@@ -1098,57 +1242,30 @@ impl Connector for OpenClawConnector {
                     }
                 };
                 let reader = std::io::BufReader::new(file_handle);
-
-                let mut acc = SessionEventAccumulator::default();
-                for line_res in JsonlLines::new(reader) {
-                    let line = match line_res {
-                        Ok(line) => line,
-                        Err(error) => {
-                            tracing::debug!(
-                                path = %file.display(),
-                                error = %error,
-                                "openclaw: discarding incomplete session after read error"
-                            );
-                            agent_error_count += 1;
-                            continue 'sources;
+                match Self::parse_session_reader(
+                    &root.path,
+                    &file,
+                    &agent_directory,
+                    &agent_slug,
+                    reader,
+                ) {
+                    Ok(Some(conv)) => {
+                        on_conversation(conv)?;
+                        if !discovered.fs_metadata_changed() {
+                            hooks.complete(&SourceCompletion {
+                                source: discovered,
+                                required_sidecars: Vec::new(),
+                                conversations_emitted: 1,
+                            })?;
                         }
-                    };
-                    if line.trim().is_empty() {
-                        continue;
+                        agent_session_count += 1;
+                        total_sessions += 1;
                     }
-
-                    let val: Value = match serde_json::from_str(&line) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    acc.apply_event(val, None);
+                    Ok(None) => {}
+                    Err(_) => {
+                        agent_error_count += 1;
+                    }
                 }
-
-                if acc.messages.is_empty() {
-                    continue;
-                }
-
-                let title = acc.title();
-                let workspace = acc.session_cwd.as_ref().map(PathBuf::from);
-
-                let metadata = serde_json::json!({
-                    "source": "openclaw",
-                    "cwd": acc.session_cwd,
-                    "agent_directory": agent_directory.clone(),
-                });
-
-                convs.push(NormalizedConversation {
-                    agent_slug: agent_slug.clone(),
-                    external_id,
-                    title,
-                    workspace,
-                    source_path,
-                    started_at: acc.started_at,
-                    ended_at: acc.ended_at,
-                    metadata,
-                    messages: acc.messages,
-                });
-                agent_session_count += 1;
             }
 
             scanned_agents += 1;
@@ -1163,15 +1280,15 @@ impl Connector for OpenClawConnector {
 
         tracing::debug!(
             agents = scanned_agents,
-            sessions = convs.len(),
+            sessions = total_sessions,
             "openclaw: completed multi-agent scan"
         );
 
-        Ok(convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 
@@ -1642,6 +1759,81 @@ mod tests {
         assert!(joined.contains("discovered 0 agent session dirs"));
         assert!(joined.contains("discovered 1 agent sqlite stores"));
         assert!(joined.contains("alice"));
+    }
+
+    struct FailingReader {
+        prefix: std::io::Cursor<Vec<u8>>,
+        kind: std::io::ErrorKind,
+        attempts: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            unreachable!("the transcript reader uses BufRead directly")
+        }
+    }
+
+    impl std::io::BufRead for FailingReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if usize::try_from(self.prefix.position()).unwrap() < self.prefix.get_ref().len() {
+                return self.prefix.fill_buf();
+            }
+            self.attempts.set(self.attempts.get() + 1);
+            Err(std::io::Error::new(
+                self.kind,
+                "injected transcript read failure",
+            ))
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.prefix.consume(amount);
+        }
+    }
+
+    #[test]
+    fn reader_failure_discards_complete_prefix_without_retrying() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/alice/sessions");
+        let file = sessions.join("failing.jsonl");
+        let prefix = concat!(
+            "{\"type\":\"session\",\"cwd\":\"/tmp/alice\"}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"complete prefix\"}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"partial",
+        );
+        let healthy = OpenClawConnector::parse_session_reader(
+            &sessions,
+            &file,
+            "alice",
+            "openclaw/alice",
+            std::io::Cursor::new(prefix),
+        )
+        .expect("clean EOF succeeds")
+        .expect("a clean EOF retains the complete record and ignores malformed JSON");
+        assert_eq!(healthy.messages[0].content, "complete prefix");
+
+        for kind in [
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+            let result = OpenClawConnector::parse_session_reader(
+                &sessions,
+                &file,
+                "alice",
+                "openclaw/alice",
+                FailingReader {
+                    prefix: std::io::Cursor::new(prefix.as_bytes().to_vec()),
+                    kind,
+                    attempts: std::rc::Rc::clone(&attempts),
+                },
+            );
+            assert!(
+                result.is_err(),
+                "{kind:?} must discard accumulated messages with an I/O error"
+            );
+            assert_eq!(attempts.get(), 1, "the failed read must not be retried");
+        }
     }
 
     #[cfg(feature = "openclaw-sqlite")]

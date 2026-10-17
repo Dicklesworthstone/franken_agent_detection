@@ -8,11 +8,12 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Repository: <https://github.com/Dicklesworthstone/franken_agent_detection>
 Crate: <https://crates.io/crates/franken-agent-detection>
 
-> **Release vs. tag:** The latest published GitHub Release is
+> **Release vs. tag:** The latest release in this changelog is `v0.3.11`
+> (2026-10-14); `v0.3.10` is tagged in git (2026-10-11), and
 > [`v0.3.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.9)
-> (2026-10-11). `v0.3.4` through `v0.3.7` are git tags and crates.io versions
-> without GitHub Release pages; `v0.3.8` got its tag and Release page on
-> 2026-10-11, after its crates.io publish.
+> (2026-10-11) and [`v0.3.8`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.8)
+> have published GitHub Release pages. `v0.3.1` through `v0.3.7` are git tags
+> and crates.io versions without GitHub Release pages.
 > Earlier GitHub Releases exist for
 > [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4),
 > [`v0.1.5`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.5),
@@ -28,13 +29,23 @@ Crate: <https://crates.io/crates/franken-agent-detection>
 Scope window: 2026-02-15 through HEAD
 [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
 (2026-08-19) for the historical reconstruction below. The current Unreleased
-window is since GitHub Release
-[`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0).
+window is since `v0.3.11` (2026-10-14).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| `v0.3.11` | Release | 2026-10-14 | Continue IDE/CLI connector, Cline SDK sessions, Qwen subagents, Copilot/Amp/Crush usage, Vibe native turns, 15-provider remote mirror discovery (`CASS #520`), 18-provider `CASS_EXCLUDE_PATHS` + per-source boundary hooks, Pi/OMP env-override symmetry, and 34-connector schema/metamorphic conformance laws. |
+| `v0.3.10` | Git tag / crates.io | 2026-10-11 | `sqlite_sync::shutdown_driver()` for clean Windows runtime exit (`CASS #519`) and full error chains on OpenCode SQLite read warnings. |
+| [`v0.3.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.9) | GitHub Release | 2026-10-11 | Qwen native JSONL, Cline native tasks + usage, Gemini/Kimi usage, Claude 32 MiB reply IDs, pre-parse `CASS_EXCLUDE_PATHS` validation, shared `JsonlLines` I/O discard, and custom root detection overrides. |
+| [`v0.3.8`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.8) | GitHub Release | 2026-10-08 | `CASS_EXCLUDE_PATHS` matches relative, `..`, and symlink-alias spellings (`cass 0f1k0`). |
+| `v0.3.7` | Git tag / crates.io | 2026-10-07 | `pi_durable` connector, Pi/OMP archive fidelity + branch provenance, `pi_agent_rust` SQLite sessions (`pi-sqlite`), resumable source boundaries, and Pi/OMP token extraction. |
+| `v0.3.6` | Git tag / crates.io | 2026-10-07 | Compressed Codex rollouts (`.jsonl.zst` via `codex-zstd`, `cass #513`) and case-insensitive rollout extension matching. |
+| `v0.3.5` | Git tag / crates.io | 2026-10-05 | Codebuff / Freebuff continues past individual unparseable transcripts and reports failure counts (`cass #511`). |
+| `v0.3.4` | Git tag / crates.io | 2026-10-05 | Codebuff / Freebuff native locale time-of-day timestamps fall back to message-ID epoch ms (`cass #511`). |
+| `v0.3.3` | Git tag / crates.io | 2026-09-28 | OpenCode 2.x `session_v2`/`session_message` indexing (`cass #504`) and OpenClaw zstd-compressed SQLite events (`GH #25`). |
+| `v0.3.2` | Git tag / crates.io | 2026-09-26 | Configurable Codex rollout admission byte budget (`set_codex_rollout_byte_budget`). |
+| `v0.3.1` | Git tag / crates.io | 2026-09-25 | Claude Code mid-turn queued prompts (`cass #500`), Codex/Pi `CASS_EXCLUDE_PATHS`, streaming 100 MiB read caps, and Codex primary source integrity. |
 | [`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0) | GitHub Release | 2026-09-16 | Shared Codebuff / Freebuff history, SQLite 0.4.1 and Asupersync 0.5 migration, unwind-safe read transactions, and bounded crate contents. |
 | [`v0.2.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.4) | GitHub Release | 2026-09-10 | Copilot CLI workspace restoration, explicit Cursor workspace attribution, exact Prime watch roots, and Grok Bot desktop replicas. |
 | [`v0.2.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.3) | GitHub Release | 2026-09-07 | Devin CLI connector; Antigravity IDE store, Claude `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` detection, muse/goose/hermes/crush scan scoping, Codex token usage, Claude tool results, Cursor/OpenCode dedupe, 100MB scan cap everywhere. |
@@ -52,14 +63,72 @@ window is since GitHub Release
 
 ## [Unreleased]
 
+## [0.3.11] -- 2026-10-14
+
+### Added
+
+- **Continue connector (`continue`, [`b1caca2`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/b1caca2)):**
+  reads Continue IDE and CLI session snapshots from `~/.continue/sessions/<sessionId>.json`
+  and `CONTINUE_GLOBAL_DIR/sessions`. Preserves ordered text, reasoning, tool calls, tool
+  results (preferring IDE tool rows over duplicate `toolCallStates.output`), message IDs,
+  structured tool arguments up to 64 KiB, and per-assistant usage while skipping editor
+  state, prompt logs, retrieved context, and binary attachments.
+- **Cline SDK sessions and usage (`cline`, [`528bf5b`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/528bf5b)):**
+  reads version-1 Cline SDK stores at `~/.cline/data/sessions/<id>/<id>.messages.json`
+  with `<id>.json` manifests (`CLINE_SESSION_DATA_DIR`, `CLINE_DATA_DIR/sessions`,
+  `CLINE_DIR/data/sessions`). Splices resumed SDK turns onto original Cline UI history when
+  both are in scope without double-counting copied pre-resume usage, and separates valid
+  cache read/write buckets from `inputTokens`.
+- **Qwen Code subagent transcripts (`qwen`, [`b1caca2`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/b1caca2)):**
+  ingests `projects/<project>/subagents/<parentSessionId>/agent-<agentId>.jsonl` with
+  optional `.meta.json` sidecars (1 MiB cap), escaped JSON tuple `(parentSessionId, agentId)`
+  external IDs, and deduplicated per-round usage.
+- **Native token extraction for VS Code Copilot, Amp, and Crush:**
+  extracts VS Code Copilot turn-level `output_tokens` and `cass.model_totals`
+  ([`528bf5b`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/528bf5b)),
+  Amp per-assistant 4-bucket usage (`inputTokens`, `outputTokens`,
+  `cacheCreationInputTokens`, `cacheReadInputTokens`,
+  [`b1caca2`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/b1caca2)),
+  and Crush per-message model/provider metadata alongside session-level usage.
+- **Expanded `supports_source_boundaries()` and streaming scan across 11 additional connectors:**
+  Kiro, Grok, Muse, Factory, Prime Agent, Vibe, Kimi, Clawdbot, Antigravity,
+  Codebuff, and OpenClaw now implement `supports_streaming_scan()`,
+  `supports_source_boundaries()`, and `scan_with_source_boundaries()` with pre-parse
+  `should_scan_source` and post-delivery `on_source_complete` lifecycle hooks.
+- **Metamorphic and 34-connector schema conformance suites (`conformance_tests.rs`):**
+  added Law 1 (Detection-Discovery-Scan Monotonicity), Law 2 (Remote Mirror Equivalence
+  and Containment), Law 3 (`JsonlLines` Single-Fault Halting), and
+  `all_compiled_connectors_produce_schema_conformant_conversations` covering all 34
+  registered connector factories.
+
 ### Fixed
 
-- Discover Factory, Cursor, Gemini, Vibe and Prime Agent stores inside remote
-  mirrors that retain only the configured source basename (CASS #520).
-  Hosts attach the configured remote path with
-  `ScanRoot::with_mirrored_source_path`; provider matching uses whole path
-  components, preserves provenance and workspace rewrites, and refuses mirror
-  roots that resolve outside their container. Existing local roots are unchanged.
+- **Remote mirror store discovery (`ScanRoot::with_mirrored_source_path`, CASS #520,
+  [`b0cabe3`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/b0cabe3)..[`b67dad4`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/b67dad4)):**
+  discovers provider stores inside remote mirrors that retain either the configured
+  source basename (`<container>/<leaf>`) or trailing-slash rsync contents copies across
+  Factory, Cursor, Gemini, Vibe, Prime Agent, Kiro, Pi Agent, Oh My Pi, Kimi, Qwen,
+  Grok, Muse, Continue, Claude Code, and Codex. Enforces symlink-free containment within
+  the mirror container and scopes explicit remote roots to `ctx.scan_roots`.
+- **Pre-parse `CASS_EXCLUDE_PATHS` enforcement across 18 providers:**
+  extended pre-parse `excluded_scan_paths_from_env()` validation and `path_is_excluded()`
+  filtering across Continue, Kiro, Grok, Muse, Factory, Qwen, Prime Agent, Vibe, Kimi,
+  Clawdbot, Antigravity, Codebuff, and OpenClaw (joining Claude Code, Codex, Pi Agent,
+  Oh My Pi, and Pi Durable), verified in `tests/exclusion_policy_errors.rs`.
+- **Vibe native reasoning and tool-only turns (`vibe`, [`5198eb5`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/5198eb5)):**
+  retains assistant turns containing only `reasoning_content` or `tool_calls`, exposing
+  structured JSON arguments up to 64 KiB via `invocations`.
+- **Kiro 2.3 `KIRO_HOME` and mid-read I/O error discard (`kiro`, `clawdbot`, `vibe`, `openclaw`):**
+  supports `KIRO_HOME/sessions/cli` and discards transcripts on mid-read I/O errors across
+  Kiro, Clawdbot, Vibe, and OpenClaw (`parse_session_reader` fault-injection tests).
+- **Pi / Oh My Pi detection and scanner env override symmetry:**
+  `detect_installed_agents` and `OmpConnector`/`PiAgentConnector` now honor the same
+  precedence and whitespace trimming for `CASS_OMP_DATA_ROOT`, `OMP_SESSION_DIR`,
+  `OMP_Coding_AGENT_DIR`, `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`,
+  `PI_SESSIONS_DIR`, and `PI_CONFIG_DIR`.
+- **CI and Release toolchain alignment (GH #34):**
+  aligned `.github/workflows/ci.yml` and `.github/workflows/release.yml` to honor
+  `rust-toolchain.toml` (`nightly-2026-08-31`) with `--locked` feature-slice checks.
 
 ## [0.3.10] -- 2026-10-11
 

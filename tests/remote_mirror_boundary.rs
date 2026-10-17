@@ -17,8 +17,10 @@ fn context(container: PathBuf, source: &str) -> ScanContext {
     let state = container.parent().unwrap().join("state");
     ScanContext::with_roots(
         state,
-        vec![ScanRoot::remote(container, Origin::remote("laptop"), None)
-            .with_mirrored_source_path(source)],
+        vec![
+            ScanRoot::remote(container, Origin::remote("laptop"), None)
+                .with_mirrored_source_path(source),
+        ],
         None,
     )
 }
@@ -63,7 +65,10 @@ fn application_named_factory_and_prime_projects_are_not_expanded_again() {
             assert_eq!(scanned[0].messages[0].content, "selected project");
             assert_eq!(scanned[0].source_path, file);
             let native = temp.path().join("native");
-            put(&native.join(store).join("session.jsonl"), content.as_bytes());
+            put(
+                &native.join(store).join("session.jsonl"),
+                content.as_bytes(),
+            );
             let local = ScanContext::with_roots(
                 temp.path().join("state"),
                 vec![ScanRoot::local(native)],
@@ -152,7 +157,10 @@ mod cursor {
             if invalid_leaf {
                 fs::write(container.join("selected"), b"not a directory").unwrap();
             }
-            let ctx = context(container, "~/.config/Cursor/User/workspaceStorage/selected/");
+            let ctx = context(
+                container,
+                "~/.config/Cursor/User/workspaceStorage/selected/",
+            );
             assert_selected_scope(&CursorConnector::new(), &ctx, invalid_leaf);
             assert_eq!(fs::read(&file).unwrap(), bytes);
         }
@@ -169,7 +177,10 @@ mod cursor {
         let leaf = container.join("selected");
         let target = temp.path().join("missing");
         std::os::unix::fs::symlink(&target, &leaf).unwrap();
-        let ctx = context(container, "~/.config/Cursor/User/workspaceStorage/selected/");
+        let ctx = context(
+            container,
+            "~/.config/Cursor/User/workspaceStorage/selected/",
+        );
         assert_selected_scope(&CursorConnector::new(), &ctx, true);
         assert_eq!(fs::read_link(&leaf).unwrap(), target);
         assert_eq!(fs::read(&file).unwrap(), bytes);

@@ -233,10 +233,13 @@ Exclusion entries are literal paths, without shell or tilde expansion. An unset
 or empty `CASS_EXCLUDE_PATHS` leaves scans unrestricted. Invalid Unicode,
 unresolvable entries, or relative entries without a usable working directory
 return an error from affected connectors' scan and discovery methods before
-source hooks or parsing. Absolute entries remain usable without a working
-directory. The existing infallible Pi `discover_sources` and durable
-`store_diagnostics` helpers log invalid-policy errors and return no sources;
-`pi_wire::try_discover_sources` exposes the discovery error to direct callers.
+source hooks or parsing (including Claude Code, Codex, Pi Agent, Oh My Pi, Pi
+Durable, Continue, Kiro, Grok, Muse, Factory, Qwen, Prime Agent, Vibe, Kimi,
+Clawdbot, Antigravity, Codebuff, and OpenClaw). Absolute entries remain usable
+without a working directory. The existing infallible Pi `discover_sources` and
+durable `store_diagnostics` helpers log invalid-policy errors and return no
+sources; `pi_wire::try_discover_sources` exposes the discovery error to direct
+callers.
 
 Claude Code, Factory, Kimi, Kiro, Clawdbot, Vibe, OpenClaw, Muse, Grok, Prime and
 Gemini stop reading a transcript after an underlying I/O error and discard its
@@ -252,6 +255,11 @@ Larger arguments remain in the original `extra` record, and opaque reasoning
 and image payloads do not enter searchable content. Each source row remains
 one normalized message. Per-message token usage remains estimated because
 Vibe stores its API counters separately as cumulative session statistics.
+Similarly, Crush and Muse record API token counters at the session level in
+`conversation.metadata` (`prompt_tokens`/`completion_tokens` for Crush;
+`usage.input_tokens`/`output_tokens` for Muse), so per-message token extraction
+preserves model and provider metadata while falling back to content estimation
+rather than duplicating session totals across assistant turns.
 
 Continue reads IDE and CLI snapshots from
 `~/.continue/sessions/<sessionId>.json`, or `CONTINUE_GLOBAL_DIR/sessions`.
@@ -355,8 +363,8 @@ from reasoning already included in OpenAI-compatible output. Ambiguous
 reasoning stays in metadata; total-only records retain estimation instead
 of receiving a guessed input/output split. Native transcript I/O failures
 discard the incomplete conversation. Qwen streams completed conversations;
-per-source completion hooks and the distinct managed-session format are
-not supported.
+per-source completion hooks and the distinct managed-session format are not
+supported.
 
 Claude Code streaming scans continue to deliver healthy sources after a source
 open/read failure, then return an error with the failure count and the first
@@ -453,8 +461,15 @@ From source:
 ```bash
 git clone https://github.com/Dicklesworthstone/franken_agent_detection
 cd franken_agent_detection
-cargo test --all-features
+cargo test --locked --all-features
 ```
+
+### Toolchain & MSRV
+
+- **Default detection-only build (`default = []`, `rust-version = "1.85"`)**: uses standard Rust 2024 edition syntax with zero optional dependencies.
+- **Non-SQLite connector features (`connectors`, `codex-zstd`, `chatgpt`)**: use Rust `1.88+` `let`-chains.
+- **SQLite-backed connector features** (`cursor`, `opencode`, `goose`, `hermes`, `crush`, `devin`, `shelley`, `openclaw-sqlite`, `pi-sqlite`, `pi-durable`, `all-connectors`): depend on `frankensqlite` and `asupersync`, which require the repository's pinned `rust-toolchain.toml` (`nightly-2026-08-31` or newer).
+- **Repository `.cargo/config.toml`**: sets `rustflags = ["-Z", "threads=4"]` for the pinned nightly toolchain; pass `RUSTFLAGS=""` if building non-SQLite feature slices with a stable compiler inside a checkout of this repository.
 
 ## Troubleshooting
 
@@ -465,6 +480,7 @@ cargo test --all-features
 | A connector scans nothing | Its storage needs a cargo feature (SQLite, crypto) | Enable the feature from the table above, or `all-connectors` |
 | Non-deterministic tests | Real home-dir probing | Use `root_overrides` / explicit `ScanRoot`s over temp directories |
 | Stack overflow in SQLite tests | fsqlite's large debug-mode futures | `.cargo/config.toml` sets `RUST_MIN_STACK`; keep it when vendoring |
+| `-Z threads=4` or `asupersync` MSRV error on stable | Building repository checkout or SQLite features without `rust-toolchain.toml` | Let `rustup` select `rust-toolchain.toml`, or pass `RUSTFLAGS=""` when building non-SQLite features on stable `1.88+` |
 
 ## Limitations
 

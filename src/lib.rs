@@ -1176,14 +1176,31 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         }
         "omp" => {
             // Oh My Pi (`omp`, https://omp.sh) v18 resolves its store via
-            // profiles + XDG (see connectors::omp). Probe the sessions
-            // directory first (highest-signal), then the parent so
-            // detection still fires for fresh installs that haven't
-            // created a session yet, then named-profile and XDG homes.
-            maybe_push(&mut out, &[".omp", "agent", "sessions"]);
-            maybe_push(&mut out, &[".omp", "agent"]);
-            maybe_push(&mut out, &[".omp", "profiles"]);
-            if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+            // profiles + XDG (see connectors::omp). Probe the launch-time
+            // session override first when set, then the sessions directory
+            // (highest-signal), then the parent so detection still fires for
+            // fresh installs that haven't created a session yet, then
+            // named-profile and XDG homes.
+            if let Some(session_dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+            {
+                out.push(PathBuf::from(session_dir));
+            }
+            let cfg = std::env::var("PI_CONFIG_DIR")
+                .ok()
+                .map(|v| v.trim().trim_start_matches(['/', '\\']).to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| ".omp".to_string());
+            maybe_push(&mut out, &[&cfg, "agent", "sessions"]);
+            maybe_push(&mut out, &[&cfg, "agent"]);
+            maybe_push(&mut out, &[&cfg, "profiles"]);
+            if let Some(xdg) = std::env::var("XDG_DATA_HOME")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+            {
                 let app = PathBuf::from(xdg).join("omp");
                 out.push(app.join("sessions"));
                 out.push(app);

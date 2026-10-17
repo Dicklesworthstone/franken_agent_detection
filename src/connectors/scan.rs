@@ -420,45 +420,59 @@ mod tests {
             Connector, factory::FactoryConnector, gemini::GeminiConnector,
             prime_agent::PrimeAgentConnector, vibe::VibeConnector,
         };
-        let cases: Vec<(&str, &str, &str, &str, Box<dyn Connector>)> = vec![
-            (
-                "factory",
-                ".factory/sessions",
-                "project/session.jsonl",
-                concat!(
+        struct MirrorCase {
+            slug: &'static str,
+            store: &'static str,
+            relative: &'static str,
+            content: &'static str,
+            connector: Box<dyn Connector>,
+        }
+        let cases = vec![
+            MirrorCase {
+                slug: "factory",
+                store: ".factory/sessions",
+                relative: "project/session.jsonl",
+                content: concat!(
                     r#"{"type":"session_start","id":"factory-test","cwd":"/work/project"}"#,
                     "\n",
                     r#"{"type":"message","timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"Hello"}}"#
                 ),
-                Box::new(FactoryConnector::new()),
-            ),
-            (
-                "gemini",
-                ".gemini/tmp",
-                "hash/chats/session-test.json",
-                r#"{"sessionId":"gemini-test","projectHash":"hash","messages":[{"type":"user","content":"Hello","timestamp":"2026-01-05T10:00:01Z"}]}"#,
-                Box::new(GeminiConnector::new()),
-            ),
-            (
-                "vibe",
-                ".vibe/logs/session",
-                "session-test/messages.jsonl",
-                r#"{"role":"user","content":"Hello","timestamp":"2026-01-05T10:00:01Z"}"#,
-                Box::new(VibeConnector::new()),
-            ),
-            (
-                "prime_agent",
-                ".prime/agent/sessions",
-                "session.jsonl",
-                concat!(
+                connector: Box::new(FactoryConnector::new()),
+            },
+            MirrorCase {
+                slug: "gemini",
+                store: ".gemini/tmp",
+                relative: "hash/chats/session-test.json",
+                content: r#"{"sessionId":"gemini-test","projectHash":"hash","messages":[{"type":"user","content":"Hello","timestamp":"2026-01-05T10:00:01Z"}]}"#,
+                connector: Box::new(GeminiConnector::new()),
+            },
+            MirrorCase {
+                slug: "vibe",
+                store: ".vibe/logs/session",
+                relative: "session-test/messages.jsonl",
+                content: r#"{"role":"user","content":"Hello","timestamp":"2026-01-05T10:00:01Z"}"#,
+                connector: Box::new(VibeConnector::new()),
+            },
+            MirrorCase {
+                slug: "prime_agent",
+                store: ".prime/agent/sessions",
+                relative: "session.jsonl",
+                content: concat!(
                     r#"{"type":"session","version":3,"id":"prime-test","timestamp":"2026-01-05T10:00:00Z","cwd":"/work/project"}"#,
                     "\n",
                     r#"{"type":"message","id":"aaaa0001","parentId":null,"timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"Hello"}}"#
                 ),
-                Box::new(PrimeAgentConnector::new()),
-            ),
+                connector: Box::new(PrimeAgentConnector::new()),
+            },
         ];
-        for (slug, store, relative, content, connector) in cases {
+        for MirrorCase {
+            slug,
+            store,
+            relative,
+            content,
+            connector,
+        } in cases
+        {
             let parts: Vec<_> = store.split('/').collect();
             // Every configured ancestor: rsync, scp and SFTP retain its leaf
             // inside an opaque safe_path_hash container.

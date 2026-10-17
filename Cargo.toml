@@ -1,7 +1,10 @@
 [package]
 name = "franken-agent-detection"
-version = "0.3.10"
+version = "0.3.11"
 edition = "2024"
+# `rust-version = "1.85"` is the MSRV for the default detection-only build
+# (`default = []`). Enabling `connectors` uses Rust 1.88+ `let`-chains, and
+# SQLite-backed connector features require the pinned `rust-toolchain.toml`.
 rust-version = "1.85"
 license = "MIT"
 description = "Local coding-agent detection and read-only session-history connectors with a normalized conversation model"

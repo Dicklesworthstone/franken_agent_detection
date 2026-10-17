@@ -255,7 +255,9 @@ fn pi_detection_child() {
             .map(|relative| root.join(relative).display().to_string()),
     );
     let durable = detect("pi_durable", None);
-    let agent = std::env::var_os("PI_CODING_AGENT_DIR")
+    let agent = std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map_or_else(|| root.join("home/.pi/agent"), PathBuf::from);
     let durable_root = agent.join("experimental/durable-sessions");
@@ -279,13 +281,15 @@ fn unset_overrides_detect_and_scan_default_pi_history() {
 #[test]
 fn empty_overrides_preserve_default_pi_history() {
     let fixture = Fixture::new();
-    fixture.run(
-        Some(Path::new("")),
-        Some(Path::new("")),
-        &[fixture.default_sessions()],
-        &[0],
-        None,
-    );
+    for blank in ["", " \t "] {
+        fixture.run(
+            Some(Path::new(blank)),
+            Some(Path::new(blank)),
+            &[fixture.default_sessions()],
+            &[0],
+            None,
+        );
+    }
 }
 
 #[test]

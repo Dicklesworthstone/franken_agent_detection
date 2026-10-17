@@ -136,10 +136,10 @@ impl PiAgentConnector {
         home: Option<&Path>,
     ) -> Vec<PathBuf> {
         let mut out = Vec::new();
-        if let Some(sessions) = sessions_dir.filter(|s| !s.is_empty()) {
+        if let Some(sessions) = sessions_dir.map(str::trim).filter(|s| !s.is_empty()) {
             out.push(PathBuf::from(sessions));
         }
-        if let Some(explicit) = coding_agent_dir.filter(|s| !s.is_empty()) {
+        if let Some(explicit) = coding_agent_dir.map(str::trim).filter(|s| !s.is_empty()) {
             out.push(PathBuf::from(explicit));
             return out;
         }
@@ -201,16 +201,11 @@ impl PiAgentConnector {
                 homes.extend(Self::default_homes().into_iter().map(ScanRoot::local));
             }
         } else {
-            if Self::looks_like_root(&ctx.data_dir) {
-                homes.push(ScanRoot::local(ctx.data_dir.clone()));
-            }
-            let mut data_candidates = Vec::new();
-            Self::append_explicit_homes(&mut data_candidates, &ctx.data_dir, &|path| {
-                Self::looks_like_root(path)
-            });
-            homes.extend(data_candidates.into_iter().map(ScanRoot::local));
-
             for scan_root in &ctx.scan_roots {
+                if let Some(mirrored) = scan_root.mirrored_store(&[".pi", "agent", "sessions"]) {
+                    homes.push(scan_root.with_path(mirrored));
+                    continue;
+                }
                 let candidates = [
                     scan_root.path.clone(),
                     scan_root.path.join(".pi/agent"),
@@ -226,6 +221,17 @@ impl PiAgentConnector {
                     Self::looks_like_root(path)
                 });
                 homes.extend(derived.into_iter().map(|path| scan_root.with_path(path)));
+            }
+
+            if !ctx.scan_roots.iter().any(|r| r.path == ctx.data_dir) {
+                if Self::looks_like_root(&ctx.data_dir) {
+                    homes.push(ScanRoot::local(ctx.data_dir.clone()));
+                }
+                let mut data_candidates = Vec::new();
+                Self::append_explicit_homes(&mut data_candidates, &ctx.data_dir, &|path| {
+                    Self::looks_like_root(path)
+                });
+                homes.extend(data_candidates.into_iter().map(ScanRoot::local));
             }
         }
 
@@ -1697,6 +1703,27 @@ mod tests {
             PiAgentConnector::homes_from_overrides(Some(""), None, Some(Path::new("/home/user")));
         assert!(!homes.contains(&PathBuf::new()));
         assert_eq!(homes.len(), 1, "only the pi-mono built-in: {homes:?}");
+    }
+
+    #[test]
+    fn homes_from_overrides_whitespace_only_and_padded_overrides_match_detection() {
+        let home = Path::new("/home/user");
+        assert_eq!(
+            PiAgentConnector::homes_from_overrides(Some(" \t "), Some("  \n "), Some(home)),
+            vec![home.join(".pi/agent")],
+            "whitespace-only overrides must not suppress ~/.pi/agent",
+        );
+        assert_eq!(
+            PiAgentConnector::homes_from_overrides(
+                Some("  /custom/pi-sessions  "),
+                Some(" \t/opt/pi/agent\n"),
+                Some(home),
+            ),
+            vec![
+                PathBuf::from("/custom/pi-sessions"),
+                PathBuf::from("/opt/pi/agent"),
+            ],
+        );
     }
 
     /// A custom sessions root that contains JSONL session files *directly*

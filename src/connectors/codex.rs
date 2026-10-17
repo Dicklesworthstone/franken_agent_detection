@@ -320,7 +320,11 @@ impl CodexConnector {
             } else {
                 let mut explicit = Vec::new();
                 for scan_root in &ctx.scan_roots {
-                    Self::append_explicit_roots(&mut explicit, &scan_root.path);
+                    if let Some(mirrored) = scan_root.mirrored_store(&[".codex", "sessions"]) {
+                        explicit.push(mirrored);
+                    } else {
+                        Self::append_explicit_roots(&mut explicit, &scan_root.path);
+                    }
                 }
                 explicit
                     .into_iter()

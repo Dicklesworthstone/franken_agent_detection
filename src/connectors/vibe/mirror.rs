@@ -40,7 +40,7 @@ impl SessionRoot {
 /// `Some(empty)` is a recognized but unsafe/missing selected subtree: callers
 /// must not fall back to broader probing of the transport container.
 ///
-/// A derived ScanRoot intentionally drops transport metadata. Capture the
+/// A derived `ScanRoot` intentionally drops transport metadata. Capture the
 /// logical prefix here rather than attaching source metadata to a non-container.
 pub(super) fn subtree(root: &ScanRoot) -> Option<Vec<SessionRoot>> {
     if !root.origin.is_remote() {
@@ -110,7 +110,13 @@ mod tests {
         );
         assert_eq!(
             root.external_id(Path::new("opaque_hash/run/child/messages.jsonl")),
-            Some(Path::new("team").join("run").join("child").to_string_lossy().into_owned())
+            Some(
+                Path::new("team")
+                    .join("run")
+                    .join("child")
+                    .to_string_lossy()
+                    .into_owned()
+            )
         );
     }
 

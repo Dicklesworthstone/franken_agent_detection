@@ -61,11 +61,7 @@ fn strict_provider_project_mirrors_ingest_only_the_selected_payload() {
                     case.content.as_bytes(),
                 );
             }
-            let source = format!(
-                "~/{}{}",
-                case.source,
-                if trailing_slash { "/" } else { "" }
-            );
+            let source = format!("~/{}{}", case.source, if trailing_slash { "/" } else { "" });
             let origin = Origin::remote_with_host("remote", "alice@remote");
             let root = ScanRoot::remote(wrapper, origin.clone(), Some(Platform::Linux))
                 .with_mirrored_source_path(source);

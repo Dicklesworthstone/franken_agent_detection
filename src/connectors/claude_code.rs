@@ -265,7 +265,14 @@ impl ClaudeCodeConnector {
                     .collect()
             }
         } else {
-            ctx.scan_roots.clone()
+            ctx.scan_roots
+                .iter()
+                .map(|scan_root| {
+                    scan_root
+                        .mirrored_store(&[".claude", "projects"])
+                        .map_or_else(|| scan_root.clone(), |path| scan_root.with_path(path))
+                })
+                .collect()
         };
 
         roots.sort_by(|a, b| a.path.cmp(&b.path));
