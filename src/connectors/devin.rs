@@ -33,6 +33,7 @@
 
 use std::path::PathBuf;
 
+use super::utils::excluded_scan_paths_from_env;
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation};
 
@@ -49,11 +50,14 @@ use frankensqlite::compat::{OpenFlags, RowExt};
 use frankensqlite::params;
 
 #[cfg(feature = "devin")]
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 #[cfg(feature = "devin")]
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 #[cfg(feature = "devin")]
-use super::utils::env_path_nonempty;
+use super::utils::{env_path_nonempty, path_is_excluded};
 #[cfg(feature = "devin")]
 use crate::types::{NormalizedInvocation, NormalizedMessage};
 
@@ -150,9 +154,14 @@ impl DevinConnector {
         candidates
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
-        Self::database_candidates(ctx)
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
+        Ok(Self::database_candidates(ctx)
             .into_iter()
+            .filter(|(root, db)| {
+                !path_is_excluded(&root.path, &excluded_paths)
+                    && !path_is_excluded(db, &excluded_paths)
+            })
             .map(|(root, db)| {
                 DiscoveredSourceFile::new(
                     "devin",
@@ -163,7 +172,7 @@ impl DevinConnector {
                 )
                 .with_fs_metadata()
             })
-            .collect()
+            .collect())
     }
 
     /// Read every visible session's main chain from one store.
@@ -581,30 +590,80 @@ impl Connector for DevinConnector {
         franken_detection_for_connector("devin").unwrap_or_else(DetectionResult::not_found)
     }
 
+    fn supports_streaming_scan(&self) -> bool {
+        cfg!(feature = "devin")
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        cfg!(feature = "devin")
+    }
+
     #[cfg(feature = "devin")]
-    fn scan(&self, ctx: &super::scan::ScanContext) -> anyhow::Result<Vec<NormalizedConversation>> {
-        let mut conversations = Vec::new();
-        for (_, db) in Self::database_candidates(ctx) {
-            match Self::extract_from_sqlite(&db, ctx.since_ts) {
+    fn scan_with_callback(
+        &self,
+        ctx: &super::scan::ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    #[cfg(feature = "devin")]
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &super::scan::ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let sources = Self::discover_sources(ctx)?;
+        for source in sources {
+            if !hooks.should_scan(&source) {
+                continue;
+            }
+            match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
                 Ok(found) => {
                     tracing::debug!(
                         "devin sqlite: found {} sessions in {}",
                         found.len(),
-                        db.display()
+                        source.source_path.display()
                     );
-                    conversations.extend(found);
+                    let mut conversations_emitted = 0usize;
+                    for conv in found {
+                        on_conversation(conv)?;
+                        conversations_emitted += 1;
+                    }
+                    if conversations_emitted > 0 && !source.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted,
+                        })?;
+                    }
                 }
                 Err(err) => {
-                    tracing::debug!("devin sqlite: failed to read {}: {err:#}", db.display());
+                    tracing::debug!(
+                        "devin sqlite: failed to read {}: {err:#}",
+                        source.source_path.display()
+                    );
                 }
             }
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "devin")]
+    fn scan(&self, ctx: &super::scan::ScanContext) -> anyhow::Result<Vec<NormalizedConversation>> {
+        let mut conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conv| {
+            conversations.push(conv);
+            Ok(())
+        })?;
         Ok(conversations)
     }
 
     /// Without the `devin` feature the connector is detection-only.
     #[cfg(not(feature = "devin"))]
     fn scan(&self, _ctx: &super::scan::ScanContext) -> anyhow::Result<Vec<NormalizedConversation>> {
+        let _ = excluded_scan_paths_from_env()?;
         Ok(Vec::new())
     }
 
@@ -613,7 +672,16 @@ impl Connector for DevinConnector {
         &self,
         ctx: &super::scan::ScanContext,
     ) -> anyhow::Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
+    }
+
+    #[cfg(not(feature = "devin"))]
+    fn discover_source_files(
+        &self,
+        _ctx: &super::scan::ScanContext,
+    ) -> anyhow::Result<Vec<super::scan::DiscoveredSourceFile>> {
+        let _ = excluded_scan_paths_from_env()?;
+        Ok(Vec::new())
     }
 }
 

@@ -62,7 +62,9 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -321,21 +323,32 @@ impl OpenCodeConnector {
         storage_roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
-        Self::discover_sqlite_sources(ctx, &mut out);
-        Self::discover_legacy_storage_sources(ctx, &mut out);
-        out
+        Self::discover_sqlite_sources(ctx, &excluded_paths, &mut out);
+        Self::discover_legacy_storage_sources(ctx, &excluded_paths, &mut out);
+        Ok(out)
     }
 
-    fn discover_sqlite_sources(ctx: &ScanContext, out: &mut Vec<DiscoveredSourceFile>) {
+    fn discover_sqlite_sources(
+        ctx: &ScanContext,
+        excluded_paths: &[PathBuf],
+        out: &mut Vec<DiscoveredSourceFile>,
+    ) {
         let mut seen = HashSet::new();
 
         for root in Self::sqlite_source_roots(ctx) {
+            if path_is_excluded(&root.path, excluded_paths) {
+                continue;
+            }
             if !root.path.is_file() {
                 continue;
             }
             let canonical = std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone());
+            if path_is_excluded(&canonical, excluded_paths) {
+                continue;
+            }
             if !seen.insert(canonical) {
                 continue;
             }
@@ -352,20 +365,29 @@ impl OpenCodeConnector {
         }
     }
 
-    fn discover_legacy_storage_sources(ctx: &ScanContext, out: &mut Vec<DiscoveredSourceFile>) {
+    fn discover_legacy_storage_sources(
+        ctx: &ScanContext,
+        excluded_paths: &[PathBuf],
+        out: &mut Vec<DiscoveredSourceFile>,
+    ) {
         let mut seen_session_files = HashSet::new();
         for root in Self::storage_source_roots(ctx) {
+            if path_is_excluded(&root.path, excluded_paths) {
+                continue;
+            }
             let session_dir = root.path.join("session");
             let message_dir = root.path.join("message");
             let part_dir = root.path.join("part");
-            if !session_dir.exists() {
+            if !session_dir.exists() || path_is_excluded(&session_dir, excluded_paths) {
                 continue;
             }
 
             let session_files: Vec<PathBuf> = WalkDir::new(&session_dir)
                 .into_iter()
+                .filter_entry(|entry| !path_is_excluded(entry.path(), excluded_paths))
                 .flatten()
                 .filter(|entry| entry.file_type().is_file())
+                .filter(|entry| !path_is_excluded(entry.path(), excluded_paths))
                 .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
                 .map(|entry| entry.path().to_path_buf())
                 .collect();
@@ -393,6 +415,7 @@ impl OpenCodeConnector {
                     &session_file,
                     &message_dir,
                     &part_dir,
+                    excluded_paths,
                     out,
                 );
             }
@@ -404,18 +427,24 @@ impl OpenCodeConnector {
         session_file: &Path,
         message_dir: &Path,
         part_dir: &Path,
+        excluded_paths: &[PathBuf],
         out: &mut Vec<DiscoveredSourceFile>,
     ) {
         let Some(session_id) = session_file.file_stem().and_then(|name| name.to_str()) else {
             return;
         };
         let session_msg_dir = message_dir.join(session_id);
-        if !session_msg_dir.exists() {
+        if !session_msg_dir.exists() || path_is_excluded(&session_msg_dir, excluded_paths) {
             return;
         }
 
-        for entry in WalkDir::new(&session_msg_dir).into_iter().flatten() {
+        for entry in WalkDir::new(&session_msg_dir)
+            .into_iter()
+            .filter_entry(|entry| !path_is_excluded(entry.path(), excluded_paths))
+            .flatten()
+        {
             if !entry.file_type().is_file()
+                || path_is_excluded(entry.path(), excluded_paths)
                 || !entry.path().extension().is_some_and(|ext| ext == "json")
             {
                 continue;
@@ -432,7 +461,7 @@ impl OpenCodeConnector {
                 )
                 .with_fs_metadata(),
             );
-            Self::discover_legacy_message_parts(root, &message_file, part_dir, out);
+            Self::discover_legacy_message_parts(root, &message_file, part_dir, excluded_paths, out);
         }
     }
 
@@ -440,14 +469,23 @@ impl OpenCodeConnector {
         root: &ScanRoot,
         message_file: &Path,
         part_dir: &Path,
+        excluded_paths: &[PathBuf],
         out: &mut Vec<DiscoveredSourceFile>,
     ) {
         let Some(message_id) = message_file.file_stem().and_then(|name| name.to_str()) else {
             return;
         };
         let message_part_dir = part_dir.join(message_id);
-        for part_entry in WalkDir::new(&message_part_dir).into_iter().flatten() {
+        if path_is_excluded(&message_part_dir, excluded_paths) {
+            return;
+        }
+        for part_entry in WalkDir::new(&message_part_dir)
+            .into_iter()
+            .filter_entry(|entry| !path_is_excluded(entry.path(), excluded_paths))
+            .flatten()
+        {
             if !part_entry.file_type().is_file()
+                || path_is_excluded(part_entry.path(), excluded_paths)
                 || part_entry
                     .path()
                     .extension()
@@ -1093,8 +1131,25 @@ impl Connector for OpenCodeConnector {
         franken_detection_for_connector("opencode").unwrap_or_else(DetectionResult::not_found)
     }
 
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conv| {
+            convs.push(conv);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut scanned_dbs: HashSet<PathBuf> = HashSet::new();
 
         // --- Phase 1: Try SQLite database(s) (v1.2+) ---
@@ -1122,6 +1177,9 @@ impl Connector for OpenCodeConnector {
 
         if !ctx.use_default_detection() {
             for scan_root in &ctx.scan_roots {
+                if path_is_excluded(&scan_root.path, &excluded_paths) {
+                    continue;
+                }
                 Self::append_explicit_db_candidates(&mut db_candidates, &scan_root.path);
             }
         }
@@ -1133,7 +1191,8 @@ impl Connector for OpenCodeConnector {
         // Deduplicate while preserving priority order.
         {
             let mut seen = HashSet::new();
-            db_candidates.retain(|p| seen.insert(p.clone()));
+            db_candidates
+                .retain(|p| !path_is_excluded(p, &excluded_paths) && seen.insert(p.clone()));
         }
 
         // Session ids seen across ALL db candidates: stale migrated copies
@@ -1144,23 +1203,27 @@ impl Connector for OpenCodeConnector {
         let mut seen_db_session_ids: HashSet<String> = HashSet::new();
 
         for db in db_candidates {
-            if !db.is_file() {
+            if !db.is_file() || path_is_excluded(&db, &excluded_paths) {
                 continue;
             }
             // Canonicalize if possible so two routes to the same file are
             // still deduplicated (e.g. via symlink or `./`-prefixed path).
             let canonical = std::fs::canonicalize(&db).unwrap_or_else(|_| db.clone());
-            if !scanned_dbs.insert(canonical) {
+            if path_is_excluded(&canonical, &excluded_paths) || !scanned_dbs.insert(canonical) {
                 continue;
             }
             match Self::extract_from_sqlite(&db, ctx.since_ts, ctx.progress_tick.as_deref()) {
                 Ok(sqlite_convs) => {
                     let fresh_count = sqlite_convs.len();
-                    convs.extend(sqlite_convs.into_iter().filter(|conv| {
-                        conv.external_id
+                    for conv in sqlite_convs {
+                        if conv
+                            .external_id
                             .as_ref()
                             .is_none_or(|id| seen_db_session_ids.insert(id.clone()))
-                    }));
+                        {
+                            on_conversation(conv)?;
+                        }
+                    }
                     tracing::debug!(
                         "opencode sqlite: found {fresh_count} sessions in {}",
                         db.display()
@@ -1181,8 +1244,7 @@ impl Connector for OpenCodeConnector {
         }
 
         // Collect seen IDs from SQLite results to avoid duplicates with JSON
-        let mut seen_ids: HashSet<String> =
-            convs.iter().filter_map(|c| c.external_id.clone()).collect();
+        let mut seen_ids: HashSet<String> = seen_db_session_ids;
 
         // --- Phase 2: Fall back to JSON file storage (pre-v1.2) ---
         let mut storage_roots: Vec<PathBuf> = Vec::new();
@@ -1193,22 +1255,32 @@ impl Connector for OpenCodeConnector {
                 storage_roots.push(root);
             }
         } else {
-            if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
+            if ctx.data_dir.exists()
+                && !path_is_excluded(&ctx.data_dir, &excluded_paths)
+                && looks_like_opencode_storage(&ctx.data_dir)
+            {
                 storage_roots.push(ctx.data_dir.clone());
             }
             for scan_root in &ctx.scan_roots {
+                if path_is_excluded(&scan_root.path, &excluded_paths) {
+                    continue;
+                }
                 let mut candidates = vec![scan_root.path.clone()];
                 Self::append_explicit_storage_candidates(&mut candidates, &scan_root.path);
                 for candidate in candidates {
-                    if candidate.exists() && looks_like_opencode_storage(&candidate) {
+                    if candidate.exists()
+                        && !path_is_excluded(&candidate, &excluded_paths)
+                        && looks_like_opencode_storage(&candidate)
+                    {
                         storage_roots.push(candidate);
                     }
                 }
             }
         }
 
+        storage_roots.retain(|root| !path_is_excluded(root, &excluded_paths));
         if storage_roots.is_empty() {
-            return Ok(convs);
+            return Ok(());
         }
 
         storage_roots.sort();
@@ -1221,15 +1293,17 @@ impl Connector for OpenCodeConnector {
             let message_dir = storage_root.join("message");
             let part_dir = storage_root.join("part");
 
-            if !session_dir.exists() {
+            if !session_dir.exists() || path_is_excluded(&session_dir, &excluded_paths) {
                 continue;
             }
 
             // Collect all session files
             let session_files: Vec<PathBuf> = WalkDir::new(&session_dir)
                 .into_iter()
+                .filter_entry(|e| !path_is_excluded(e.path(), &excluded_paths))
                 .flatten()
                 .filter(|e| e.file_type().is_file())
+                .filter(|e| !path_is_excluded(e.path(), &excluded_paths))
                 .filter(|e| {
                     e.path()
                         .extension()
@@ -1266,8 +1340,10 @@ impl Connector for OpenCodeConnector {
 
                 // Load messages for this session
                 let session_msg_dir = message_dir.join(&session.id);
-                let messages = if session_msg_dir.exists() {
-                    load_messages(&session_msg_dir, &part_dir)?
+                let messages = if session_msg_dir.exists()
+                    && !path_is_excluded(&session_msg_dir, &excluded_paths)
+                {
+                    load_messages_with_exclusions(&session_msg_dir, &part_dir, &excluded_paths)?
                 } else {
                     Vec::new()
                 };
@@ -1300,7 +1376,7 @@ impl Connector for OpenCodeConnector {
                         .map(|s| s.chars().take(100).collect())
                 });
 
-                convs.push(NormalizedConversation {
+                on_conversation(NormalizedConversation {
                     agent_slug: "opencode".into(),
                     external_id: Some(session.id.clone()),
                     title,
@@ -1313,15 +1389,15 @@ impl Connector for OpenCodeConnector {
                         "project_id": session.project_id,
                     }),
                     messages,
-                });
+                })?;
             }
         }
 
-        Ok(convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 
@@ -1605,15 +1681,26 @@ fn parse_session_file(path: &Path) -> Result<SessionInfo> {
 }
 
 /// Load all messages for a session
+#[cfg(test)]
 fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<NormalizedMessage>> {
+    load_messages_with_exclusions(session_msg_dir, part_dir, &[])
+}
+
+fn load_messages_with_exclusions(
+    session_msg_dir: &Path,
+    part_dir: &Path,
+    excluded_paths: &[PathBuf],
+) -> Result<Vec<NormalizedMessage>> {
     let mut pending: Vec<(Option<i64>, String, NormalizedMessage)> = Vec::new();
 
     // Find all message files for this session
     let msg_files: Vec<PathBuf> = WalkDir::new(session_msg_dir)
         .max_depth(1)
         .into_iter()
+        .filter_entry(|e| !path_is_excluded(e.path(), excluded_paths))
         .flatten()
         .filter(|e| e.file_type().is_file())
+        .filter(|e| !path_is_excluded(e.path(), excluded_paths))
         .filter(|e| {
             e.path()
                 .extension()
@@ -1647,13 +1734,14 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
         let mut parts = Vec::new();
         let msg_part_dir = part_dir.join(&msg_info.id);
 
-        if msg_part_dir.exists() {
+        if msg_part_dir.exists() && !path_is_excluded(&msg_part_dir, excluded_paths) {
             for entry in WalkDir::new(&msg_part_dir)
                 .max_depth(1)
                 .into_iter()
+                .filter_entry(|e| !path_is_excluded(e.path(), excluded_paths))
                 .flatten()
             {
-                if !entry.file_type().is_file() {
+                if !entry.file_type().is_file() || path_is_excluded(entry.path(), excluded_paths) {
                     continue;
                 }
                 let path = entry.path();

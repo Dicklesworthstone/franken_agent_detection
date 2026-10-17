@@ -57,7 +57,7 @@ use walkdir::WalkDir;
 use super::copilot_cli::CopilotCliConnector;
 use super::copilot_vscode;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::read_capped;
+use super::utils::{excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -346,12 +346,19 @@ impl CopilotConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         let mut seen_files = HashSet::new();
         for root in Self::source_roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             let files = Self::find_conversation_files(&root.path);
             for file in files {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(copilot_vscode::source_path_key(&file))
                     || !file_modified_since(&file, ctx.since_ts)
                 {
@@ -371,13 +378,17 @@ impl CopilotConnector {
         }
         // Native VS Code chat-session stores (issue #16).
         out.extend(
-            copilot_vscode::discover_native(&Self::native_scan_bases(ctx), ctx.since_ts)
-                .into_iter()
-                .filter(|source| {
-                    seen_files.insert(copilot_vscode::source_path_key(&source.source_path))
-                }),
+            copilot_vscode::discover_native_with_exclusions(
+                &Self::native_scan_bases(ctx),
+                ctx.since_ts,
+                &excluded_paths,
+            )
+            .into_iter()
+            .filter(|source| {
+                seen_files.insert(copilot_vscode::source_path_key(&source.source_path))
+            }),
         );
-        out
+        Ok(out)
     }
 
     /// Parse a single JSON file that may contain one or more conversations.
@@ -672,23 +683,25 @@ impl CopilotConnector {
         }
         None
     }
-}
-
-impl Connector for CopilotConnector {
-    fn detect(&self) -> DetectionResult {
-        franken_detection_for_connector("copilot").unwrap_or_else(DetectionResult::not_found)
-    }
-
-    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+    #[allow(clippy::unused_self)]
+    fn scan_copilot_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let roots: Vec<PathBuf> = Self::source_roots(ctx)
             .into_iter()
             .map(|root| root.path)
             .collect();
 
-        let mut all_conversations = Vec::new();
         let mut seen_files = HashSet::new();
+        let mut seen_surface_ids: HashSet<String> = HashSet::new();
 
         for root in roots {
+            if path_is_excluded(&root, &excluded_paths) {
+                continue;
+            }
             let files = Self::find_conversation_files(&root);
             tracing::debug!(
                 root = %root.display(),
@@ -697,6 +710,9 @@ impl Connector for CopilotConnector {
             );
 
             for file in files {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !seen_files.insert(copilot_vscode::source_path_key(&file))
                     || !file_modified_since(&file, ctx.since_ts)
                 {
@@ -715,7 +731,12 @@ impl Connector for CopilotConnector {
                             conversations = convs.len(),
                             "copilot: parsed conversation file"
                         );
-                        all_conversations.extend(convs);
+                        for conv in convs {
+                            if let Some(id) = conv.external_id.as_ref() {
+                                seen_surface_ids.insert(id.clone());
+                            }
+                            on_conversation(conv)?;
+                        }
                     }
                     Err(e) => {
                         tracing::debug!(
@@ -733,29 +754,55 @@ impl Connector for CopilotConnector {
         // must be SCANNED too. Previously scan_native had zero production
         // callers: every native conversation was invisible to scan() while
         // discovery flagged its files required_for_reconstruction.
-        let native_conversations =
-            copilot_vscode::scan_native(&Self::native_scan_bases(ctx), ctx.since_ts);
+        let native_conversations = copilot_vscode::scan_native_with_exclusions(
+            &Self::native_scan_bases(ctx),
+            ctx.since_ts,
+            &excluded_paths,
+        );
 
         // Cross-surface dedupe by external id: a session present both as a
         // native entry and as an extension-store export emits once (the
         // extension copy is scanned first, matching discovery order).
-        let mut seen_surface_ids: HashSet<String> = all_conversations
-            .iter()
-            .filter_map(|c| c.external_id.clone())
-            .collect();
         for conversation in native_conversations {
             match conversation.external_id.as_ref() {
                 Some(id) if !seen_surface_ids.insert(id.clone()) => continue,
                 _ => {}
             }
-            all_conversations.push(conversation);
+            on_conversation(conversation)?;
         }
 
-        Ok(all_conversations)
+        Ok(())
+    }
+}
+
+impl Connector for CopilotConnector {
+    fn detect(&self) -> DetectionResult {
+        franken_detection_for_connector("copilot").unwrap_or_else(DetectionResult::not_found)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_copilot_with_callback(ctx, on_conversation)
+    }
+
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let mut conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            conversations.push(conversation);
+            Ok(())
+        })?;
+        Ok(conversations)
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

@@ -28,8 +28,11 @@ use frankensqlite::params;
 
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::env_path_nonempty;
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -82,7 +85,8 @@ impl HermesConnector {
         None
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut candidates: Vec<(ScanRoot, PathBuf)> = Vec::new();
         if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             let root = ScanRoot::local(ctx.data_dir.clone());
@@ -117,9 +121,13 @@ impl HermesConnector {
         }
 
         let mut seen = HashSet::new();
-        candidates
+        Ok(candidates
             .into_iter()
-            .filter(|(_, db_path)| db_path.is_file())
+            .filter(|(root, db_path)| {
+                db_path.is_file()
+                    && !path_is_excluded(&root.path, &excluded_paths)
+                    && !path_is_excluded(db_path, &excluded_paths)
+            })
             .filter(|(_, db_path)| seen.insert(db_path.clone()))
             .map(|(root, db_path)| {
                 DiscoveredSourceFile::new(
@@ -131,7 +139,7 @@ impl HermesConnector {
                 )
                 .with_fs_metadata()
             })
-            .collect()
+            .collect())
     }
 
     /// Extract sessions from the Hermes SQLite database.
@@ -363,68 +371,76 @@ impl Connector for HermesConnector {
         franken_detection_for_connector("hermes").unwrap_or_else(DetectionResult::not_found)
     }
 
-    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut db_paths: Vec<PathBuf> = Vec::new();
-        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
-            db_paths.push(ctx.data_dir.clone());
-        } else if ctx.use_default_detection() {
-            // A state.db under data_dir scopes the scan to it; only
-            // otherwise probe the system store. Probing both leaked the
-            // machine's real sessions into scoped fixture/mirror scans.
-            // HERMES_SQLITE_DB keeps precedence.
-            let candidate = (!ctx.data_dir.as_os_str().is_empty())
-                .then(|| ctx.data_dir.join("state.db"))
-                .filter(|p| p.is_file());
-            if let Some(db) = candidate.filter(|_| env_path_nonempty("HERMES_SQLITE_DB").is_none())
-            {
-                db_paths.push(db);
-            } else if let Some(db) = Self::sqlite_db_path() {
-                db_paths.push(db);
-            }
-        } else {
-            if !ctx.data_dir.as_os_str().is_empty() {
-                db_paths.push(ctx.data_dir.join("state.db"));
-            }
-            for scan_root in &ctx.scan_roots {
-                if scan_root.path.extension().is_some_and(|ext| ext == "db") {
-                    db_paths.push(scan_root.path.clone());
-                }
-                db_paths.push(scan_root.path.join("state.db"));
-                db_paths.push(scan_root.path.join(".hermes/state.db"));
-            }
-        }
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
 
-        {
-            let mut seen = HashSet::new();
-            db_paths.retain(|p| seen.insert(p.clone()));
-        }
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
 
-        let mut convs = Vec::new();
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
 
-        for db in db_paths {
-            if !db.exists() {
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let sources = Self::discover_sources(ctx)?;
+        for source in sources {
+            if !hooks.should_scan(&source) {
                 continue;
             }
-            match Self::extract_from_sqlite(&db, ctx.since_ts) {
+            match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
                 Ok(db_convs) => {
                     tracing::debug!(
                         "hermes sqlite: found {} sessions in {}",
                         db_convs.len(),
-                        db.display()
+                        source.source_path.display()
                     );
-                    convs.extend(db_convs);
+                    let mut conversations_emitted = 0usize;
+                    for conv in db_convs {
+                        on_conversation(conv)?;
+                        conversations_emitted += 1;
+                    }
+                    if conversations_emitted > 0 && !source.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted,
+                        })?;
+                    }
                 }
                 Err(e) => {
-                    tracing::debug!("hermes sqlite: failed to read {}: {e}", db.display());
+                    tracing::debug!(
+                        "hermes sqlite: failed to read {}: {e}",
+                        source.source_path.display()
+                    );
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conv| {
+            convs.push(conv);
+            Ok(())
+        })?;
         Ok(convs)
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

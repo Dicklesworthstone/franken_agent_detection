@@ -40,7 +40,9 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -605,18 +607,30 @@ fn scan_openhands_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = OpenHandsConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for root in roots {
-        if !root.path.exists() {
+        if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
             continue;
         }
         for conversation_dir in OpenHandsConnector::conversation_dirs(&root.path) {
+            if path_is_excluded(&conversation_dir, &excluded_paths) {
+                continue;
+            }
             if !seen.insert(dedupe_path_key(&conversation_dir)) {
                 continue;
             }
             if !OpenHandsConnector::conversation_modified_since(&conversation_dir, ctx.since_ts) {
+                continue;
+            }
+            let base_state_path = conversation_dir.join("base_state.json");
+            if path_is_excluded(&base_state_path, &excluded_paths)
+                || OpenHandsConnector::event_files(&conversation_dir)
+                    .iter()
+                    .any(|p| path_is_excluded(p, &excluded_paths))
+            {
                 continue;
             }
             if let Some(conversation) = parse_conversation(&conversation_dir, &root) {
@@ -629,22 +643,29 @@ fn scan_openhands_with_callback(
     Ok(())
 }
 
-fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+    let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = OpenHandsConnector::source_roots(ctx);
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for root in roots {
-        if !root.path.exists() {
+        if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
             continue;
         }
         for conversation_dir in OpenHandsConnector::conversation_dirs(&root.path) {
+            if path_is_excluded(&conversation_dir, &excluded_paths) {
+                continue;
+            }
             if !OpenHandsConnector::conversation_modified_since(&conversation_dir, ctx.since_ts) {
                 continue;
             }
 
             // The base_state.json is a metadata sidecar (model, tools, skills).
             let base_state_path = conversation_dir.join("base_state.json");
+            if path_is_excluded(&base_state_path, &excluded_paths) {
+                continue;
+            }
             if base_state_path.is_file() && seen.insert(dedupe_path_key(&base_state_path)) {
                 out.push(
                     DiscoveredSourceFile::new(
@@ -660,7 +681,9 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
 
             // Each event file is a required primary-session-log fragment.
             for event_path in OpenHandsConnector::event_files(&conversation_dir) {
-                if !seen.insert(dedupe_path_key(&event_path)) {
+                if path_is_excluded(&event_path, &excluded_paths)
+                    || !seen.insert(dedupe_path_key(&event_path))
+                {
                     continue;
                 }
                 out.push(
@@ -677,7 +700,7 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 impl Connector for OpenHandsConnector {
@@ -699,7 +722,7 @@ impl Connector for OpenHandsConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(discover_sources(ctx))
+        discover_sources(ctx)
     }
 
     fn scan_with_callback(

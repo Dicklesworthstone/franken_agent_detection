@@ -45,7 +45,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
-use super::utils::env_path_nonempty;
+use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -223,11 +223,12 @@ impl ShelleyConnector {
         dedupe_candidates(out)
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         for candidate in Self::candidate_roots(ctx) {
             let db = candidate.root.path.clone();
-            if !db.is_file() {
+            if !db.is_file() || path_is_excluded(&db, &excluded_paths) {
                 continue;
             }
             // Only surface databases that pass Shelley admission: discovery
@@ -240,6 +241,9 @@ impl ShelleyConnector {
             // scan_candidates) must name the same path, or the source-boundary
             // contract cannot pair a conversation with its source.
             let db = canonical_db_path(db);
+            if path_is_excluded(&db, &excluded_paths) {
+                continue;
+            }
             out.push(
                 DiscoveredSourceFile::new(
                     "shelley",
@@ -277,7 +281,7 @@ impl ShelleyConnector {
                 );
             }
         }
-        out
+        Ok(out)
     }
 
     fn scan_candidates(
@@ -285,9 +289,13 @@ impl ShelleyConnector {
         hooks: &mut SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut seen_external: HashSet<String> = HashSet::new();
         for candidate in Self::candidate_roots(ctx) {
             let db = candidate.root.path.clone();
+            if path_is_excluded(&db, &excluded_paths) {
+                continue;
+            }
             if !db.is_file() {
                 if candidate.kind == CandidateKind::Explicit {
                     bail!(
@@ -317,6 +325,9 @@ impl ShelleyConnector {
             // admission so an unchanged database is skipped without even being
             // opened.
             let db = canonical_db_path(db);
+            if path_is_excluded(&db, &excluded_paths) {
+                continue;
+            }
             let discovered = DiscoveredSourceFile::new(
                 "shelley",
                 &candidate.root,
@@ -428,7 +439,7 @@ impl Connector for ShelleyConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

@@ -55,7 +55,11 @@ use base64::prelude::*;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{excluded_scan_paths_from_env, path_is_excluded};
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -363,19 +367,25 @@ impl ChatGptConnector {
         roots
     }
 
-    fn discover_sources(&self, ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         for root in Self::source_roots(ctx) {
-            if !root.path.exists() {
+            if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
             let conv_dirs = Self::find_conversation_dirs(&root.path);
             for (dir_path, is_encrypted) in conv_dirs {
+                if path_is_excluded(&dir_path, &excluded_paths) {
+                    continue;
+                }
                 if is_encrypted && self.encryption_key.is_none() {
                     continue;
                 }
                 for path in Self::conversation_files(&dir_path) {
-                    if !file_modified_since(&path, ctx.since_ts) {
+                    if path_is_excluded(&path, &excluded_paths)
+                        || !file_modified_since(&path, ctx.since_ts)
+                    {
                         continue;
                     }
                     out.push(
@@ -391,7 +401,7 @@ impl ChatGptConnector {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Decrypt an encrypted conversation file
@@ -683,21 +693,50 @@ impl Connector for ChatGptConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
-
         let mut all_convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conv| {
+            all_convs.push(conv);
+            Ok(())
+        })?;
+        Ok(all_convs)
+    }
 
-        for base in roots {
-            if !base.exists() {
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
+        let roots = Self::source_roots(ctx);
+
+        for root in roots {
+            if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
 
-            let conv_dirs = Self::find_conversation_dirs(&base);
+            let conv_dirs = Self::find_conversation_dirs(&root.path);
 
             for (dir_path, is_encrypted) in conv_dirs {
+                if path_is_excluded(&dir_path, &excluded_paths) {
+                    continue;
+                }
                 // Skip encrypted directories if we don't have a key
                 if is_encrypted && self.encryption_key.is_none() {
                     tracing::debug!(
@@ -709,8 +748,21 @@ impl Connector for ChatGptConnector {
 
                 // Walk through conversation files
                 for path in Self::conversation_files(&dir_path) {
-                    // Skip files not modified since last scan
-                    if !file_modified_since(&path, ctx.since_ts) {
+                    if path_is_excluded(&path, &excluded_paths)
+                        || !file_modified_since(&path, ctx.since_ts)
+                    {
+                        continue;
+                    }
+
+                    let discovered = DiscoveredSourceFile::new(
+                        "chatgpt",
+                        &root,
+                        path.clone(),
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata();
+                    if !hooks.should_scan(&discovered) {
                         continue;
                     }
 
@@ -722,7 +774,14 @@ impl Connector for ChatGptConnector {
                                 encrypted = is_encrypted,
                                 "chatgpt extracted conversation"
                             );
-                            all_convs.push(conv);
+                            on_conversation(conv)?;
+                            if !discovered.fs_metadata_changed() {
+                                hooks.complete(&SourceCompletion {
+                                    source: discovered,
+                                    required_sidecars: Vec::new(),
+                                    conversations_emitted: 1,
+                                })?;
+                            }
                         }
                         Ok(None) => {
                             tracing::debug!(
@@ -750,11 +809,11 @@ impl Connector for ChatGptConnector {
             }
         }
 
-        Ok(all_convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(self.discover_sources(ctx))
+        self.discover_sources(ctx)
     }
 }
 

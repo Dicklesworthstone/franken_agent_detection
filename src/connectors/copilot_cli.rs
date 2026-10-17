@@ -24,8 +24,11 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::read_capped;
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -226,10 +229,17 @@ impl CopilotCliConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         for root in Self::source_roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             for file in Self::find_event_files(&root.path) {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
                 }
@@ -245,7 +255,7 @@ impl CopilotCliConnector {
                 );
             }
         }
-        out
+        Ok(out)
     }
 
     /// Parse a JSONL event log file into conversations.
@@ -757,56 +767,76 @@ impl Connector for CopilotCliConnector {
         }
     }
 
-    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
 
-        if roots.is_empty() {
-            return Ok(Vec::new());
-        }
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
 
-        let mut all_conversations = Vec::new();
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
 
-        for root in roots {
-            let files = Self::find_event_files(&root);
-            tracing::debug!(
-                root = %root.display(),
-                file_count = files.len(),
-                "copilot_cli: scanning event files"
-            );
-
-            for file in files {
-                if !file_modified_since(&file, ctx.since_ts) {
-                    continue;
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let sources = Self::discover_sources(ctx)?;
+        for source in sources {
+            if !hooks.should_scan(&source) {
+                continue;
+            }
+            match self.parse_event_log(&source.source_path) {
+                Ok(convs) => {
+                    tracing::debug!(
+                        file = %source.source_path.display(),
+                        conversations = convs.len(),
+                        "copilot_cli: parsed event file"
+                    );
+                    let mut conversations_emitted = 0usize;
+                    for conv in convs {
+                        on_conversation(conv)?;
+                        conversations_emitted += 1;
+                    }
+                    if conversations_emitted > 0 && !source.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted,
+                        })?;
+                    }
                 }
-
-                match self.parse_event_log(&file) {
-                    Ok(convs) => {
-                        tracing::debug!(
-                            file = %file.display(),
-                            conversations = convs.len(),
-                            "copilot_cli: parsed event file"
-                        );
-                        all_conversations.extend(convs);
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            file = %file.display(),
-                            error = %e,
-                            "copilot_cli: skipping unparseable file"
-                        );
-                    }
+                Err(e) => {
+                    tracing::debug!(
+                        file = %source.source_path.display(),
+                        error = %e,
+                        "copilot_cli: skipping unparseable file"
+                    );
                 }
             }
         }
+        Ok(())
+    }
 
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let mut all_conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            all_conversations.push(conversation);
+            Ok(())
+        })?;
         Ok(all_conversations)
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

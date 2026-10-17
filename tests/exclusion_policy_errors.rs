@@ -11,15 +11,23 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(feature = "chatgpt")]
+use franken_agent_detection::connectors::chatgpt::ChatGptConnector;
 #[cfg(feature = "codebuff")]
 use franken_agent_detection::connectors::codebuff::CodebuffConnector;
+#[cfg(feature = "goose")]
+use franken_agent_detection::connectors::goose::GooseConnector;
+#[cfg(feature = "grok-bot")]
+use franken_agent_detection::connectors::grok_bot::GrokBotConnector;
 use franken_agent_detection::connectors::{
-    antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
-    clawdbot::ClawdbotConnector, codex::CodexConnector, continue_dev::ContinueConnector,
-    factory::FactoryConnector, grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector,
-    muse::MuseConnector, omp::OmpConnector, openclaw::OpenClawConnector,
-    pi_agent::PiAgentConnector, pi_durable::PiDurableConnector, pi_wire,
-    prime_agent::PrimeAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
+    aider::AiderConnector, amp::AmpConnector, antigravity::AntigravityConnector,
+    claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, codex::CodexConnector,
+    continue_dev::ContinueConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
+    factory::FactoryConnector, gemini::GeminiConnector, get_connector_factories,
+    grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector, muse::MuseConnector,
+    omp::OmpConnector, openclaw::OpenClawConnector, pi_agent::PiAgentConnector,
+    pi_durable::PiDurableConnector, pi_wire, prime_agent::PrimeAgentConnector, qwen::QwenConnector,
+    vibe::VibeConnector,
 };
 use franken_agent_detection::{
     Connector, DiscoveredSourceFile, NormalizedConversation, ScanContext, ScanRoot,
@@ -51,7 +59,39 @@ const PROVIDERS: &[&str] = &[
     #[cfg(feature = "codebuff")]
     "codebuff",
     "openclaw",
+    "aider",
+    "amp",
+    #[cfg(feature = "chatgpt")]
+    "chatgpt",
+    "copilot",
+    "copilot_cli",
+    "gemini",
+    #[cfg(feature = "goose")]
+    "goose",
+    #[cfg(feature = "grok-bot")]
+    "grok_bot",
 ];
+
+#[cfg(feature = "grok-bot")]
+fn grok_bot_replica_filename() -> String {
+    const KEY: &str = "sand.client.slice.account.auth0%7Cuser_00000000000000000000000000.transcript.replicas.81da155f-cc4c-58b3-aadf-770858d5e55c";
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let bits: Vec<bool> = KEY
+        .bytes()
+        .flat_map(|byte| (0..8).rev().map(move |bit| byte & (1 << bit) != 0))
+        .collect();
+    let encoded: String = bits
+        .chunks(5)
+        .map(|chunk| {
+            let value = chunk
+                .iter()
+                .fold(0_usize, |v, bit| (v << 1) | usize::from(*bit))
+                << (5 - chunk.len());
+            char::from(ALPHABET[value])
+        })
+        .collect();
+    format!("{encoded}.blob")
+}
 
 struct Case {
     provider: &'static str,
@@ -69,104 +109,162 @@ fn context(root: &Path, paths: impl IntoIterator<Item = PathBuf>) -> ScanContext
 }
 
 fn case(root: &Path, provider: &'static str) -> Case {
-    let (connector, directory, filename): (Box<dyn Connector>, &str, &str) = match provider {
+    let (connector, directory, filename): (Box<dyn Connector>, &str, String) = match provider {
         "claude" => (
             Box::new(ClaudeCodeConnector::new()),
             "claude",
-            "session.jsonl",
+            "session.jsonl".to_string(),
         ),
         "codex" => (
             Box::new(CodexConnector::new()),
             "codex",
-            "rollout-policy.jsonl",
+            "rollout-policy.jsonl".to_string(),
         ),
         "pi_agent" => (
             Box::new(PiAgentConnector::new()),
             ".pi/agent",
-            "sessions/2026-10-09T00-00-00_policy.jsonl",
+            "sessions/2026-10-09T00-00-00_policy.jsonl".to_string(),
         ),
         "omp" => (
             Box::new(OmpConnector::new()),
             ".omp/agent",
-            "sessions/2026-10-09T00-00-00_policy.jsonl",
+            "sessions/2026-10-09T00-00-00_policy.jsonl".to_string(),
         ),
-        "pi_durable" => (Box::new(PiDurableConnector::new()), "durable", "main.jsonl"),
+        "pi_durable" => (
+            Box::new(PiDurableConnector::new()),
+            "durable",
+            "main.jsonl".to_string(),
+        ),
         "continue" => (
             Box::new(ContinueConnector::new()),
             ".continue/sessions",
-            "session-1.json",
+            "session-1.json".to_string(),
         ),
         "kiro" => (
             Box::new(KiroConnector::new()),
             ".kiro/sessions/cli",
-            "session.jsonl",
+            "session.jsonl".to_string(),
         ),
         "grok" => (
             Box::new(GrokConnector::new()),
             ".grok/sessions",
-            "group-1/sess-1/updates.jsonl",
+            "group-1/sess-1/updates.jsonl".to_string(),
         ),
         "muse" => (
             Box::new(MuseConnector::new()),
             ".local/share/muse/sessions",
-            "019cccd3-9f97-7351-824f-6b1eb5f199f2/session.jsonl",
+            "019cccd3-9f97-7351-824f-6b1eb5f199f2/session.jsonl".to_string(),
         ),
         "factory" => (
             Box::new(FactoryConnector::new()),
             ".factory/sessions",
-            "-work-demo/sess-1.jsonl",
+            "-work-demo/sess-1.jsonl".to_string(),
         ),
         "qwen" => (
             Box::new(QwenConnector::new()),
             ".qwen",
-            "projects/demo/chats/11111111-2222-3333-4444-555555555555.jsonl",
+            "projects/demo/chats/11111111-2222-3333-4444-555555555555.jsonl".to_string(),
         ),
         "prime_agent" => (
             Box::new(PrimeAgentConnector::new()),
             ".prime/agent/sessions",
-            "0192aa11-0000-7000-8000-000000000001.jsonl",
+            "0192aa11-0000-7000-8000-000000000001.jsonl".to_string(),
         ),
         "vibe" => (
             Box::new(VibeConnector::new()),
             ".vibe/logs/session",
-            "sess-1/messages.jsonl",
+            "sess-1/messages.jsonl".to_string(),
         ),
         "kimi" => (
             Box::new(KimiConnector::new()),
             ".kimi-code/sessions",
-            "workdir/sess-1/agents/main/wire.jsonl",
+            "workdir/sess-1/agents/main/wire.jsonl".to_string(),
         ),
         "clawdbot" => (
             Box::new(ClawdbotConnector::new()),
             ".clawdbot/sessions",
-            "sess-1.jsonl",
+            "sess-1.jsonl".to_string(),
         ),
         "antigravity" => (
             Box::new(AntigravityConnector::new()),
             ".gemini/antigravity-cli",
-            "brain/00000000-0000-0000-0000-000000000001/.system_generated/logs/transcript.jsonl",
+            "brain/00000000-0000-0000-0000-000000000001/.system_generated/logs/transcript.jsonl"
+                .to_string(),
         ),
         #[cfg(feature = "codebuff")]
         "codebuff" => (
             Box::new(CodebuffConnector::new()),
             ".config/manicode/projects",
-            "demo/chats/2026-10-09T00-00-00.000Z/chat-messages.json",
+            "demo/chats/2026-10-09T00-00-00.000Z/chat-messages.json".to_string(),
         ),
         "openclaw" => (
             Box::new(OpenClawConnector::new()),
             ".openclaw/agents/main/sessions",
-            "sess-1.jsonl",
+            "sess-1.jsonl".to_string(),
+        ),
+        "aider" => (
+            Box::new(AiderConnector::new()),
+            "aider-project",
+            ".aider.chat.history.md".to_string(),
+        ),
+        "amp" => (
+            Box::new(AmpConnector::new()),
+            ".local/share/amp",
+            "thread-1.json".to_string(),
+        ),
+        #[cfg(feature = "chatgpt")]
+        "chatgpt" => (
+            Box::new(ChatGptConnector::new()),
+            "com.openai.chat",
+            "conversations-v1/conv-1.json".to_string(),
+        ),
+        "copilot" => (
+            Box::new(CopilotConnector::new()),
+            "Code/User/workspaceStorage",
+            "ws-1/chatSessions/sess-1.json".to_string(),
+        ),
+        "copilot_cli" => (
+            Box::new(CopilotCliConnector::new()),
+            ".copilot/session-state",
+            "sess-1/events.jsonl".to_string(),
+        ),
+        "gemini" => (
+            Box::new(GeminiConnector::new()),
+            ".gemini/tmp",
+            "project-1/chats/session-1.json".to_string(),
+        ),
+        #[cfg(feature = "goose")]
+        "goose" => (
+            Box::new(GooseConnector::new()),
+            ".local/share/goose/sessions",
+            "sess.jsonl".to_string(),
+        ),
+        #[cfg(feature = "grok-bot")]
+        "grok_bot" => (
+            Box::new(GrokBotConnector::new()),
+            "Grok Bot/sand-client-persistence",
+            grok_bot_replica_filename(),
         ),
         other => panic!("unknown provider: {other}"),
     };
-    let roots: Vec<_> = ["private", "public"]
+    let visibilities = ["private", "public"];
+    let roots: Vec<_> = visibilities
         .map(|visibility| root.join(visibility).join(directory))
         .into_iter()
         .collect();
+    let sources = if provider == "goose" {
+        visibilities
+            .into_iter()
+            .zip(&roots)
+            .map(|(visibility, path)| path.join(format!("sess-{visibility}.jsonl")))
+            .collect()
+    } else {
+        roots.iter().map(|path| path.join(&filename)).collect()
+    };
     Case {
         provider,
         connector,
-        sources: roots.iter().map(|path| path.join(filename)).collect(),
+        sources,
         ctx: context(root, roots),
     }
 }
@@ -184,6 +282,10 @@ impl Fixture {
             {
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 let text = format!("policy-{visibility}-{provider}");
+                if provider == "aider" {
+                    std::fs::write(path, format!("> {text}\n")).unwrap();
+                    continue;
+                }
                 let record = match provider {
                     "claude" => json!({"type": "user", "sessionId": text,
                         "message": {"role": "user", "content": text}}),
@@ -265,6 +367,72 @@ impl Fixture {
                         "content": text,
                         "timestamp": "2026-10-09T00:00:00.000Z"
                     }]),
+                    "amp" => json!({
+                        "id": "thread-1",
+                        "title": "Policy",
+                        "messages": [{
+                            "role": "user",
+                            "content": text,
+                            "createdAt": 1_700_000_000_000_i64
+                        }]
+                    }),
+                    "chatgpt" => json!({
+                        "id": "conv-1",
+                        "title": "Policy",
+                        "create_time": 1_700_000_000.0,
+                        "mapping": {
+                            "node-1": {
+                                "id": "node-1",
+                                "message": {
+                                    "id": "msg-1",
+                                    "author": {"role": "user"},
+                                    "create_time": 1_700_000_000.0,
+                                    "content": {"content_type": "text", "parts": [text]}
+                                }
+                            }
+                        }
+                    }),
+                    "copilot" => json!({
+                        "sessionId": "sess-1",
+                        "requests": [{
+                            "requestId": "req-1",
+                            "timestamp": 1_700_000_000_000_i64,
+                            "message": {"text": text},
+                            "response": []
+                        }]
+                    }),
+                    "copilot_cli" => json!({
+                        "type": "user.message",
+                        "id": "e1",
+                        "timestamp": "2026-10-09T00:00:00Z",
+                        "data": {"content": text}
+                    }),
+                    "gemini" => json!({
+                        "sessionId": "sess-1",
+                        "messages": [{
+                            "id": "m1",
+                            "type": "user",
+                            "timestamp": "2026-10-09T00:00:00Z",
+                            "content": text
+                        }]
+                    }),
+                    "goose" => json!({
+                        "role": "user",
+                        "content": [{"type": "text", "text": text}],
+                        "created_at": 1_700_000_000_i64
+                    }),
+                    "grok_bot" => json!({
+                        "schemaVersion": 1,
+                        "value": {
+                            "entries": [{
+                                "id": "e1",
+                                "kind": "message",
+                                "role": "user",
+                                "content": text,
+                                "timestampMs": 1_700_000_000_000_i64
+                            }]
+                        }
+                    }),
                     _ => unreachable!(),
                 };
                 let mut content = String::new();
@@ -532,6 +700,22 @@ fn exclusion_policy_child() {
                 "source changed: {}",
                 path.display()
             );
+        }
+    }
+    if invalid {
+        for (slug, factory) in get_connector_factories() {
+            let connector = factory();
+            assert!(
+                connector.supports_streaming_scan(),
+                "connector {slug} must support streaming scan"
+            );
+            let factory_case = Case {
+                provider: slug,
+                connector,
+                ctx: context(&root, [root.join("private"), root.join("public")]),
+                sources: Vec::new(),
+            };
+            assert_invalid_case(&factory_case);
         }
     }
     let diagnostic_ctx = context(&root, [root.join("durable-diagnostic/main.jsonl")]);

@@ -29,8 +29,13 @@ use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, env_path_nonempty};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -223,14 +228,19 @@ impl GooseConnector {
         }
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut sources = Vec::new();
-        Self::discover_sqlite_sources(ctx, &mut sources);
-        Self::discover_jsonl_sources(ctx, &mut sources);
-        sources
+        Self::discover_sqlite_sources(ctx, &excluded_paths, &mut sources);
+        Self::discover_jsonl_sources(ctx, &excluded_paths, &mut sources);
+        Ok(sources)
     }
 
-    fn discover_sqlite_sources(ctx: &ScanContext, sources: &mut Vec<DiscoveredSourceFile>) {
+    fn discover_sqlite_sources(
+        ctx: &ScanContext,
+        excluded_paths: &[PathBuf],
+        sources: &mut Vec<DiscoveredSourceFile>,
+    ) {
         let mut candidates: Vec<(ScanRoot, PathBuf)> = Vec::new();
         if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
             let root = ScanRoot::local(ctx.data_dir.clone());
@@ -255,6 +265,9 @@ impl GooseConnector {
                 candidates.push((root, db_path));
             }
             for scan_root in &ctx.scan_roots {
+                if path_is_excluded(&scan_root.path, excluded_paths) {
+                    continue;
+                }
                 let mut db_paths = Vec::new();
                 Self::append_db_candidates(&mut db_paths, &scan_root.path);
                 candidates.extend(
@@ -269,6 +282,10 @@ impl GooseConnector {
         sources.extend(
             candidates
                 .into_iter()
+                .filter(|(root, db_path)| {
+                    !path_is_excluded(&root.path, excluded_paths)
+                        && !path_is_excluded(db_path, excluded_paths)
+                })
                 .filter(|(_, db_path)| db_path.is_file())
                 .filter(|(_, db_path)| seen.insert(db_path.clone()))
                 .map(|(root, db_path)| {
@@ -284,7 +301,11 @@ impl GooseConnector {
         );
     }
 
-    fn discover_jsonl_sources(ctx: &ScanContext, sources: &mut Vec<DiscoveredSourceFile>) {
+    fn discover_jsonl_sources(
+        ctx: &ScanContext,
+        excluded_paths: &[PathBuf],
+        sources: &mut Vec<DiscoveredSourceFile>,
+    ) {
         let mut session_roots: Vec<(ScanRoot, PathBuf)> = Vec::new();
         if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_goose_sessions(&ctx.data_dir) {
@@ -295,7 +316,7 @@ impl GooseConnector {
                 session_roots.push((root, dir));
             }
         } else {
-            if ctx.data_dir.exists() {
+            if ctx.data_dir.exists() && !path_is_excluded(&ctx.data_dir, excluded_paths) {
                 let root = ScanRoot::local(ctx.data_dir.clone());
                 let mut roots = Vec::new();
                 Self::append_session_roots(&mut roots, &ctx.data_dir);
@@ -306,6 +327,9 @@ impl GooseConnector {
                 );
             }
             for scan_root in &ctx.scan_roots {
+                if path_is_excluded(&scan_root.path, excluded_paths) {
+                    continue;
+                }
                 let mut roots = Vec::new();
                 Self::append_session_roots(&mut roots, &scan_root.path);
                 session_roots.extend(
@@ -316,6 +340,10 @@ impl GooseConnector {
             }
         }
 
+        session_roots.retain(|(root, sessions_dir)| {
+            !path_is_excluded(&root.path, excluded_paths)
+                && !path_is_excluded(sessions_dir, excluded_paths)
+        });
         session_roots.sort_by(|left, right| left.1.cmp(&right.1));
         session_roots.dedup_by(|left, right| left.1 == right.1);
 
@@ -324,8 +352,10 @@ impl GooseConnector {
             let jsonl_files: Vec<PathBuf> = WalkDir::new(&sessions_dir)
                 .max_depth(2)
                 .into_iter()
+                .filter_entry(|e| !path_is_excluded(e.path(), excluded_paths))
                 .flatten()
                 .filter(|e| e.file_type().is_file())
+                .filter(|e| !path_is_excluded(e.path(), excluded_paths))
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
                 .map(|e| e.path().to_path_buf())
                 .collect();
@@ -607,140 +637,122 @@ impl Connector for GooseConnector {
         franken_detection_for_connector("goose").unwrap_or_else(DetectionResult::not_found)
     }
 
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
-
-        // --- Phase 1: Try SQLite database (v1.20+) ---
-        let mut db_paths: Vec<PathBuf> = Vec::new();
-        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
-            db_paths.push(ctx.data_dir.clone());
-        } else if ctx.use_default_detection() {
-            // Mirror the JSONL policy: a sessions.db under data_dir scopes
-            // the sqlite scan to it; only otherwise probe the system store.
-            // Probing both leaked the machine's real sessions into scoped
-            // fixture/mirror scans. GOOSE_SQLITE_DB keeps precedence.
-            let candidate = (!ctx.data_dir.as_os_str().is_empty())
-                .then(|| ctx.data_dir.join("sessions.db"))
-                .filter(|p| p.is_file());
-            if let Some(db) = candidate.filter(|_| env_path_nonempty("GOOSE_SQLITE_DB").is_none()) {
-                db_paths.push(db);
-            } else if let Some(db) = Self::sqlite_db_path() {
-                db_paths.push(db);
-            }
-        } else {
-            if !ctx.data_dir.as_os_str().is_empty() {
-                db_paths.push(ctx.data_dir.join("sessions.db"));
-            }
-            for scan_root in &ctx.scan_roots {
-                Self::append_db_candidates(&mut db_paths, &scan_root.path);
-            }
-        }
-
-        {
-            let mut seen = HashSet::new();
-            db_paths.retain(|p| seen.insert(p.clone()));
-        }
-
-        for db in db_paths {
-            if !db.exists() {
-                continue;
-            }
-            match Self::extract_from_sqlite(&db, ctx.since_ts) {
-                Ok(sqlite_convs) => {
-                    tracing::debug!(
-                        "goose sqlite: found {} sessions in {}",
-                        sqlite_convs.len(),
-                        db.display()
-                    );
-                    convs.extend(sqlite_convs);
-                }
-                Err(e) => {
-                    tracing::debug!("goose sqlite: failed to read {}: {e}", db.display());
-                }
-            }
-        }
-
-        // Collect seen IDs from SQLite results to avoid duplicates with JSONL
-        let mut seen_ids: HashSet<String> =
-            convs.iter().filter_map(|c| c.external_id.clone()).collect();
-
-        // --- Phase 2: Fall back to JSONL file scanning (pre-v1.20) ---
-        let mut session_roots: Vec<PathBuf> = Vec::new();
-        if ctx.use_default_detection() {
-            if ctx.data_dir.exists() && looks_like_goose_sessions(&ctx.data_dir) {
-                session_roots.push(ctx.data_dir.clone());
-            } else if let Some(dir) = Self::sessions_dir() {
-                session_roots.push(dir);
-            }
-        } else {
-            if ctx.data_dir.exists() {
-                Self::append_session_roots(&mut session_roots, &ctx.data_dir);
-            }
-            for scan_root in &ctx.scan_roots {
-                Self::append_session_roots(&mut session_roots, &scan_root.path);
-            }
-        }
-
-        if session_roots.is_empty() {
-            return Ok(convs);
-        }
-
-        session_roots.sort();
-        session_roots.dedup();
-
-        let mut seen_files: HashSet<PathBuf> = HashSet::new();
-
-        for sessions_dir in session_roots {
-            // Collect all .jsonl files
-            let jsonl_files: Vec<PathBuf> = WalkDir::new(&sessions_dir)
-                .max_depth(2)
-                .into_iter()
-                .flatten()
-                .filter(|e| e.file_type().is_file())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-                .map(|e| e.path().to_path_buf())
-                .collect();
-
-            for jsonl_file in jsonl_files {
-                if !seen_files.insert(dedupe_path_key(&jsonl_file)) {
-                    continue;
-                }
-                if !file_modified_since(&jsonl_file, ctx.since_ts) {
-                    continue;
-                }
-
-                // Use filename stem as session ID
-                let session_id = jsonl_file
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                if !seen_ids.insert(session_id.clone()) {
-                    continue;
-                }
-
-                match parse_goose_jsonl(&jsonl_file, &session_id) {
-                    Ok(conv) => {
-                        if !conv.messages.is_empty() {
-                            convs.push(conv);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "goose jsonl: failed to parse {}: {e}",
-                            jsonl_file.display()
-                        );
-                    }
-                }
-            }
-        }
-
+        self.scan_with_callback(ctx, &mut |conv| {
+            convs.push(conv);
+            Ok(())
+        })?;
         Ok(convs)
     }
 
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let mut hooks = SourceScanHooks::default();
+        self.scan_with_source_boundaries(ctx, &mut hooks, on_conversation)
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let sources = Self::discover_sources(ctx)?;
+        let mut seen_ids: HashSet<String> = HashSet::new();
+
+        for source in sources {
+            if !hooks.should_scan(&source) {
+                continue;
+            }
+            match source.role {
+                DiscoveredSourceRole::SqliteDatabase => {
+                    let mut emitted = 0usize;
+                    match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
+                        Ok(sqlite_convs) => {
+                            tracing::debug!(
+                                "goose sqlite: found {} sessions in {}",
+                                sqlite_convs.len(),
+                                source.source_path.display()
+                            );
+                            for conv in sqlite_convs {
+                                if let Some(ext_id) = &conv.external_id {
+                                    seen_ids.insert(ext_id.clone());
+                                }
+                                on_conversation(conv)?;
+                                emitted += 1;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "goose sqlite: failed to read {}: {e}",
+                                source.source_path.display()
+                            );
+                        }
+                    }
+                    if emitted > 0 && !source.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted: emitted,
+                        })?;
+                    }
+                }
+                DiscoveredSourceRole::PrimarySessionLog => {
+                    let session_id = source
+                        .source_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    if !seen_ids.insert(session_id.clone()) {
+                        continue;
+                    }
+
+                    let mut emitted = 0usize;
+                    match parse_goose_jsonl(&source.source_path, &session_id) {
+                        Ok(conv) => {
+                            if !conv.messages.is_empty() {
+                                on_conversation(conv)?;
+                                emitted = 1;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "goose jsonl: failed to parse {}: {e}",
+                                source.source_path.display()
+                            );
+                        }
+                    }
+                    if emitted > 0 && !source.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted: emitted,
+                        })?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

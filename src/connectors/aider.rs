@@ -13,8 +13,11 @@ use anyhow::Result;
 use serde_json::json;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::read_capped;
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -247,14 +250,20 @@ impl AiderConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
-        let roots = Self::source_roots(ctx);
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
+        let roots: Vec<ScanRoot> = Self::source_roots(ctx)
+            .into_iter()
+            .filter(|root| !path_is_excluded(&root.path, &excluded_paths))
+            .collect();
         let root_refs: Vec<&Path> = roots.iter().map(|root| root.path.as_path()).collect();
         let files = Self::find_chat_files(&root_refs);
 
-        files
+        Ok(files
             .into_iter()
-            .filter(|path| file_modified_since(path, ctx.since_ts))
+            .filter(|path| {
+                !path_is_excluded(path, &excluded_paths) && file_modified_since(path, ctx.since_ts)
+            })
             .filter_map(|path| {
                 roots
                     .iter()
@@ -270,7 +279,7 @@ impl AiderConnector {
                         .with_fs_metadata()
                     })
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -280,32 +289,65 @@ impl Connector for AiderConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let roots = Self::source_roots(ctx);
-
-        if roots.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let root_refs: Vec<&Path> = roots.iter().map(|root| root.path.as_path()).collect();
-        let files = Self::find_chat_files(&root_refs);
-
         let mut conversations = Vec::new();
-        for path in files {
-            if !file_modified_since(&path, ctx.since_ts) {
-                continue;
-            }
-            match self.parse_chat_history(&path) {
-                Ok(conv) => conversations.push(conv),
-                Err(e) => {
-                    tracing::warn!("failed to parse aider history {}: {}", path.display(), e);
-                }
-            }
-        }
+        self.scan_with_callback(ctx, &mut |conv| {
+            conversations.push(conv);
+            Ok(())
+        })?;
         Ok(conversations)
     }
 
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        for discovered in Self::discover_sources(ctx)? {
+            if !hooks.should_scan(&discovered) {
+                continue;
+            }
+            match self.parse_chat_history(&discovered.source_path) {
+                Ok(conv) => {
+                    on_conversation(conv)?;
+                    if !discovered.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source: discovered,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted: 1,
+                        })?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to parse aider history {}: {}",
+                        discovered.source_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

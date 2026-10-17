@@ -4,9 +4,12 @@ use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 use super::token_extraction::extract_amp_tokens;
-use super::utils::{dedupe_path_key, read_capped};
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
     franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
@@ -225,10 +228,11 @@ impl AmpConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         for root in Self::source_roots(ctx) {
-            if !root.path.exists() {
+            if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
             for entry in WalkDir::new(&root.path).into_iter().flatten() {
@@ -236,7 +240,7 @@ impl AmpConnector {
                     continue;
                 }
                 let path = entry.path();
-                if !is_amp_log_file(path) {
+                if path_is_excluded(path, &excluded_paths) || !is_amp_log_file(path) {
                     continue;
                 }
                 out.push(
@@ -251,7 +255,7 @@ impl AmpConnector {
                 );
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -260,26 +264,73 @@ impl Connector for AmpConnector {
         franken_detection_for_connector("amp").unwrap_or_else(DetectionResult::not_found)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conv| {
+            convs.push(conv);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut seen_ids = std::collections::HashSet::<PathBuf>::new();
-        let roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
+        let roots = Self::source_roots(ctx);
 
         for root in roots {
-            if !root.exists() {
+            if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
 
-            for entry in WalkDir::new(&root).into_iter().flatten() {
+            for entry in WalkDir::new(&root.path).into_iter().flatten() {
                 if !entry.file_type().is_file() {
                     continue;
                 }
                 let path = entry.path();
-                if !is_amp_log_file(path) {
+                if path_is_excluded(path, &excluded_paths) || !is_amp_log_file(path) {
+                    continue;
+                }
+                // Key on the full, losslessly-encoded path: is_amp_log_file
+                // accepts any *.json under a "threads" directory, so distinct
+                // files frequently share a stem across roots — a stem-only
+                // key silently dropped every thread after the first.
+                // PathBuf (not Display) keeps non-UTF8 OsStr bytes intact.
+                let key = dedupe_path_key(path);
+                if !seen_ids.insert(key) {
+                    continue;
+                }
+                let discovered = DiscoveredSourceFile::new(
+                    "amp",
+                    &root,
+                    path.to_path_buf(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+                .with_fs_metadata();
+                if !hooks.should_scan(&discovered) {
                     continue;
                 }
                 // NOTE: We intentionally skip the file_modified_since() check for Amp.
@@ -344,7 +395,7 @@ impl Connector for AmpConnector {
                         .filter(|id| !id.trim().is_empty())
                         .map(String::from)
                         .or_else(|| {
-                            path.strip_prefix(&root).ok().and_then(|rel| {
+                            path.strip_prefix(&root.path).ok().and_then(|rel| {
                                 rel.to_str().map(|s| s.trim_start_matches('/').to_string())
                             })
                         })
@@ -355,56 +406,56 @@ impl Connector for AmpConnector {
                         })
                         .or_else(|| Some(path.display().to_string()));
 
-                    // Key on the full, losslessly-encoded path: is_amp_log_file
-                    // accepts any *.json under a "threads" directory, so distinct
-                    // files frequently share a stem across roots — a stem-only
-                    // key silently dropped every thread after the first.
-                    // PathBuf (not Display) keeps non-UTF8 OsStr bytes intact.
-                    let key = dedupe_path_key(path);
-                    if seen_ids.insert(key) {
-                        // Use per-message timestamps when available, falling back
-                        // to the top-level "created" field (millisecond epoch) that
-                        // Amp stores on thread objects.
-                        let thread_created = val.get("created").and_then(parse_timestamp);
-                        let started_at = messages
-                            .iter()
-                            .filter_map(|m| m.created_at)
-                            .min()
-                            .or(thread_created);
-                        let ended_at = messages
-                            .iter()
-                            .filter_map(|m| m.created_at)
-                            .max()
-                            .or(thread_created);
+                    // Use per-message timestamps when available, falling back
+                    // to the top-level "created" field (millisecond epoch) that
+                    // Amp stores on thread objects.
+                    let thread_created = val.get("created").and_then(parse_timestamp);
+                    let started_at = messages
+                        .iter()
+                        .filter_map(|m| m.created_at)
+                        .min()
+                        .or(thread_created);
+                    let ended_at = messages
+                        .iter()
+                        .filter_map(|m| m.created_at)
+                        .max()
+                        .or(thread_created);
 
-                        convs.push(NormalizedConversation {
-                            agent_slug: "amp".into(),
-                            external_id,
-                            title,
-                            workspace,
-                            source_path: path.to_path_buf(),
-                            started_at,
-                            ended_at,
-                            metadata: val.clone(),
-                            messages,
-                        });
-                        tracing::info!(
-                            target: "connector::amp",
-                            source = %path.display(),
-                            messages = convs.last().map_or(0, |c| c.messages.len()),
-                            since_ts = ctx.since_ts,
-                            "amp_scan"
-                        );
+                    let msg_count = messages.len();
+                    on_conversation(NormalizedConversation {
+                        agent_slug: "amp".into(),
+                        external_id,
+                        title,
+                        workspace,
+                        source_path: path.to_path_buf(),
+                        started_at,
+                        ended_at,
+                        metadata: val.clone(),
+                        messages,
+                    })?;
+                    tracing::info!(
+                        target: "connector::amp",
+                        source = %path.display(),
+                        messages = msg_count,
+                        since_ts = ctx.since_ts,
+                        "amp_scan"
+                    );
+                    if !discovered.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source: discovered,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted: 1,
+                        })?;
                     }
                 }
             }
         }
 
-        Ok(convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

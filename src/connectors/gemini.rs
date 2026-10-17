@@ -12,7 +12,10 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{MAX_SCAN_FILE_BYTES, env_path_nonempty, is_injected_context_message};
+use super::utils::{
+    MAX_SCAN_FILE_BYTES, env_path_nonempty, excluded_scan_paths_from_env,
+    is_injected_context_message, path_is_excluded,
+};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -404,14 +407,17 @@ impl GeminiConnector {
         roots
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         for root in Self::source_roots(ctx) {
-            if !root.path.exists() {
+            if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
             for file in Self::session_files(&root.path) {
-                if !file_modified_since(&file, ctx.since_ts) {
+                if path_is_excluded(&file, &excluded_paths)
+                    || !file_modified_since(&file, ctx.since_ts)
+                {
                     continue;
                 }
                 out.push(
@@ -426,7 +432,7 @@ impl GeminiConnector {
                 );
             }
         }
-        out
+        Ok(out)
     }
 
     fn compact_message_extra(raw: &Value) -> Value {
@@ -802,18 +808,20 @@ fn scan_gemini_with_hooks(
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    let excluded_paths = excluded_scan_paths_from_env()?;
     let roots: Vec<ScanRoot> = GeminiConnector::source_roots(ctx);
 
     for root in roots {
-        if !root.path.exists() {
+        if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
             continue;
         }
 
         let files = GeminiConnector::session_files(&root.path);
 
         for file in files {
-            // Skip files not modified since last scan (incremental indexing)
-            if !file_modified_since(&file, ctx.since_ts) {
+            // Skip files excluded or not modified since last scan (incremental indexing)
+            if path_is_excluded(&file, &excluded_paths) || !file_modified_since(&file, ctx.since_ts)
+            {
                 continue;
             }
             // Pre-parse identity, mirrored from discover_sources() (FAD#22).
@@ -1007,7 +1015,7 @@ impl Connector for GeminiConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 
     fn scan_with_callback(

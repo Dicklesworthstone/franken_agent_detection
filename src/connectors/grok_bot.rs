@@ -12,7 +12,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::utils::{dedupe_path_key, env_var_nonempty, read_capped};
+use super::utils::{
+    dedupe_path_key, env_var_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+};
 use super::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks, file_modified_since, franken_detection_for_connector,
@@ -47,9 +49,13 @@ impl GrokBotConnector {
     }
 
     fn discover(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut sources = Vec::new();
         let mut seen = HashSet::new();
         for root in Self::source_roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             // Explicit roots may be a replica, its persistence directory, or
             // the Grok Bot configuration directory. Never recurse elsewhere.
             let paths = if root.path.is_file() {
@@ -61,7 +67,7 @@ impl GrokBotConnector {
                 } else {
                     &root.path
                 };
-                if !directory.exists() {
+                if !directory.exists() || path_is_excluded(directory, &excluded_paths) {
                     continue;
                 }
                 fs::read_dir(directory)
@@ -71,6 +77,7 @@ impl GrokBotConnector {
             };
             for path in paths {
                 if !path.is_file()
+                    || path_is_excluded(&path, &excluded_paths)
                     || replica_key(&path).is_none()
                     || !file_modified_since(&path, ctx.since_ts)
                     || !seen.insert(dedupe_path_key(&path))

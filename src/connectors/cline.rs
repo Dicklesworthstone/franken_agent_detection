@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::read_capped;
+use super::utils::{excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp, utils::dedupe_path_key,
@@ -473,14 +473,24 @@ impl ClineConnector {
         files
     }
 
-    fn source_groups(ctx: &ScanContext) -> Vec<ClineSource> {
+    fn source_groups(ctx: &ScanContext) -> Result<Vec<ClineSource>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
         let mut out = Vec::new();
         let mut seen_task_dirs = HashSet::new();
         for root in Self::source_roots(ctx) {
+            if path_is_excluded(&root.path, &excluded_paths) {
+                continue;
+            }
             for file in Self::source_files(&root.path) {
+                if path_is_excluded(&file, &excluded_paths) {
+                    continue;
+                }
                 let Some(task_dir) = file.parent() else {
                     continue;
                 };
+                if path_is_excluded(task_dir, &excluded_paths) {
+                    continue;
+                }
                 let sdk = Self::sdk_message_id(&file).is_some();
                 // An ancestor of the selected store may be a symlink too.
                 // Keep the original path/provenance in the source record,
@@ -503,6 +513,9 @@ impl ClineConnector {
                 .with_fs_metadata();
                 let meta_path = Self::sdk_manifest_path(&file)
                     .unwrap_or_else(|| task_dir.join("task_metadata.json"));
+                if path_is_excluded(&meta_path, &excluded_paths) {
+                    continue;
+                }
                 let migrated = sdk
                     && read_json(&meta_path).is_some_and(|manifest| {
                         manifest.get("version").and_then(Value::as_u64) == Some(1)
@@ -529,10 +542,10 @@ impl ClineConnector {
                 });
             }
         }
-        Self::pair_migrated_sources(out)
+        Ok(Self::pair_migrated_sources(out)
             .into_iter()
             .filter(|source| source.changed_since(ctx.since_ts))
-            .collect()
+            .collect())
     }
 
     fn pair_migrated_sources(out: Vec<ClineSource>) -> Vec<ClineSource> {
@@ -594,12 +607,12 @@ impl ClineConnector {
         sources.into_iter().flatten().collect()
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let mut out = Vec::new();
-        for source in Self::source_groups(ctx) {
+        for source in Self::source_groups(ctx)? {
             source.into_discovered(&mut out);
         }
-        out
+        Ok(out)
     }
 }
 
@@ -609,14 +622,33 @@ impl Connector for ClineConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        Ok(Self::source_groups(ctx)
-            .iter()
-            .filter_map(parse_source_group)
-            .collect())
+        let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conv| {
+            convs.push(conv);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        for source in &Self::source_groups(ctx)? {
+            if let Some(conv) = parse_source_group(source) {
+                on_conversation(conv)?;
+            }
+        }
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

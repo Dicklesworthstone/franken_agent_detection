@@ -22,8 +22,11 @@ use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
 use super::sqlite_sync::{ConnectionExt, open_with_flags};
 use serde::Deserialize;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::env_path_nonempty;
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -170,10 +173,11 @@ impl CrushConnector {
         db_paths
     }
 
-    fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
-        Self::source_roots(ctx)
+    fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let excluded_paths = excluded_scan_paths_from_env()?;
+        Ok(Self::source_roots(ctx)
             .into_iter()
-            .filter(|root| root.path.exists())
+            .filter(|root| root.path.exists() && !path_is_excluded(&root.path, &excluded_paths))
             .map(|root| {
                 DiscoveredSourceFile::new(
                     "crush",
@@ -184,7 +188,7 @@ impl CrushConnector {
                 )
                 .with_fs_metadata()
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -193,46 +197,82 @@ impl Connector for CrushConnector {
         franken_detection_for_connector("crush").unwrap_or_else(DetectionResult::not_found)
     }
 
-    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut convs = Vec::new();
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
 
-        let db_paths: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
 
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let sources = Self::discover_sources(ctx)?;
         // Track seen session IDs to dedup across global + per-project databases.
         let mut seen_ids: HashSet<String> = HashSet::new();
 
-        for db in &db_paths {
-            if !db.exists() {
+        for source in sources {
+            if !hooks.should_scan(&source) {
                 continue;
             }
-            match Self::extract_from_sqlite(db, ctx.since_ts) {
+            match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
                 Ok(db_convs) => {
                     tracing::debug!(
                         "crush sqlite: found {} sessions in {}",
                         db_convs.len(),
-                        db.display()
+                        source.source_path.display()
                     );
+                    let mut conversations_emitted = 0usize;
                     for conv in db_convs {
                         let id = conv.external_id.clone().unwrap_or_default();
                         if seen_ids.insert(id) {
-                            convs.push(conv);
+                            on_conversation(conv)?;
+                            conversations_emitted += 1;
                         }
+                    }
+                    if conversations_emitted > 0 && !source.fs_metadata_changed() {
+                        hooks.complete(&SourceCompletion {
+                            source,
+                            required_sidecars: Vec::new(),
+                            conversations_emitted,
+                        })?;
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("crush sqlite: failed to read {}: {e}", db.display());
+                    tracing::debug!(
+                        "crush sqlite: failed to read {}: {e}",
+                        source.source_path.display()
+                    );
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conv| {
+            convs.push(conv);
+            Ok(())
+        })?;
         Ok(convs)
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        Ok(Self::discover_sources(ctx))
+        Self::discover_sources(ctx)
     }
 }
 

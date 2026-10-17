@@ -72,7 +72,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanRoot};
-use super::utils::read_capped;
+use super::utils::{path_is_excluded, read_capped};
 use super::{file_modified_since, parse_timestamp};
 use crate::types::{
     NormalizedConversation, NormalizedInvocation, NormalizedMessage, reindex_messages,
@@ -1316,10 +1316,27 @@ fn parse_source(
 /// Scan every native source reachable from `bases`, deduplicating session ids
 /// across storage generations and duplicated trees.
 pub fn scan_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<NormalizedConversation> {
+    scan_native_with_exclusions(bases, since_ts, &[])
+}
+
+pub fn scan_native_with_exclusions(
+    bases: &[ScanRoot],
+    since_ts: Option<i64>,
+    excluded_paths: &[PathBuf],
+) -> Vec<NormalizedConversation> {
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut seen_sessions: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
-    for (_root, source) in collect_sources(bases) {
+    for (root, source) in collect_sources(bases) {
+        if path_is_excluded(&root.path, excluded_paths)
+            || path_is_excluded(&source.path, excluded_paths)
+            || source
+                .workspace_dir
+                .as_deref()
+                .is_some_and(|dir| path_is_excluded(dir, excluded_paths))
+        {
+            continue;
+        }
         if !seen_files.insert(source_path_key(&source.path)) {
             continue;
         }
@@ -1334,10 +1351,27 @@ pub fn scan_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<NormalizedC
 /// Discover the native source files `scan_native` would consume, plus the
 /// `workspace.json` sidecars consulted for workspace resolution.
 pub fn discover_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<DiscoveredSourceFile> {
+    discover_native_with_exclusions(bases, since_ts, &[])
+}
+
+pub fn discover_native_with_exclusions(
+    bases: &[ScanRoot],
+    since_ts: Option<i64>,
+    excluded_paths: &[PathBuf],
+) -> Vec<DiscoveredSourceFile> {
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut seen_sidecars: HashSet<PathBuf> = HashSet::new();
     let mut out = Vec::new();
     for (root, source) in collect_sources(bases) {
+        if path_is_excluded(&root.path, excluded_paths)
+            || path_is_excluded(&source.path, excluded_paths)
+            || source
+                .workspace_dir
+                .as_deref()
+                .is_some_and(|dir| path_is_excluded(dir, excluded_paths))
+        {
+            continue;
+        }
         if !seen_files.insert(source_path_key(&source.path)) {
             continue;
         }
@@ -1356,7 +1390,10 @@ pub fn discover_native(bases: &[ScanRoot], since_ts: Option<i64>) -> Vec<Discove
         );
         if let Some(workspace_dir) = &source.workspace_dir {
             let sidecar = workspace_dir.join("workspace.json");
-            if sidecar.is_file() && seen_sidecars.insert(source_path_key(&sidecar)) {
+            if sidecar.is_file()
+                && !path_is_excluded(&sidecar, excluded_paths)
+                && seen_sidecars.insert(source_path_key(&sidecar))
+            {
                 out.push(
                     DiscoveredSourceFile::new(
                         "copilot",
