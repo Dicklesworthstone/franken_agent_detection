@@ -57,7 +57,7 @@ use super::scan::{
     SourceScanHooks,
 };
 use super::utils::{
-    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
 };
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
@@ -204,7 +204,7 @@ impl GrokConnector {
 fn decode_group_cwd(group_dir: &Path) -> Option<PathBuf> {
     let cwd_file = group_dir.join(".cwd");
     if cwd_file.is_file()
-        && let Ok(content) = fs::read_to_string(&cwd_file)
+        && let Ok(Some(content)) = read_capped(&cwd_file)
     {
         let trimmed = content.trim();
         if !trimmed.is_empty() {
@@ -673,6 +673,7 @@ fn parse_session(session_dir: &Path) -> Result<Option<NormalizedConversation>> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_session_with_readers<R: BufRead>(
     session_dir: &Path,
     open_reader: &mut impl FnMut(&Path) -> std::io::Result<R>,
@@ -680,9 +681,10 @@ fn parse_session_with_readers<R: BufRead>(
     let updates_path = session_dir.join("updates.jsonl");
     let chat_history_path = session_dir.join("chat_history.jsonl");
 
-    let summary: Option<Value> = fs::read_to_string(session_dir.join("summary.json"))
+    let summary: Option<Value> = read_capped(&session_dir.join("summary.json"))
         .ok()
-        .and_then(|content| serde_json::from_str(&content).ok());
+        .flatten()
+        .and_then(|content| serde_json::from_str(content.trim_start_matches('\u{feff}')).ok());
 
     let external_id = summary
         .as_ref()

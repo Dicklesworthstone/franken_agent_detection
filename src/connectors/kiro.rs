@@ -49,7 +49,7 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -202,9 +202,10 @@ impl KiroConnector {
 
         // Metadata sidecar: `<stem>.json` alongside the `.jsonl` log.
         let sidecar = file.with_extension("json");
-        let meta = fs::read_to_string(&sidecar)
+        let meta = read_capped(&sidecar)
             .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}')).ok());
 
         let created_val = meta.as_ref().and_then(|m| m.get("created_at"));
         let conv_created_ms = created_val.and_then(parse_timestamp);

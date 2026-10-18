@@ -1116,8 +1116,8 @@ fn infer_workspace(path: &Path) -> Option<PathBuf> {
 
     // Check for a config/workspace file in the project directory
     let config_path = project_dir.join("config.json");
-    if let Ok(content) = fs::read_to_string(&config_path) {
-        if let Ok(val) = serde_json::from_str::<Value>(&content) {
+    if let Ok(Some(content)) = read_capped(&config_path) {
+        if let Ok(val) = serde_json::from_str::<Value>(content.trim_start_matches('\u{feff}')) {
             for key in &["workspace", "projectPath", "cwd", "path"] {
                 if let Some(path_str) = val.get(*key).and_then(|v| v.as_str()) {
                     if !path_str.is_empty() {

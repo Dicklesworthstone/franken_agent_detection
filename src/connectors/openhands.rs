@@ -41,7 +41,7 @@ use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::{
-    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
 };
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
@@ -199,8 +199,8 @@ impl OpenHandsConnector {
     }
 
     fn read_json_file(path: &Path) -> Option<Value> {
-        let content = fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
+        let content = read_capped(path).ok().flatten()?;
+        serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()
     }
 
     fn read_base_state(conversation_dir: &Path) -> Option<Value> {

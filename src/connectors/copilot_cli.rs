@@ -18,12 +18,14 @@
 //! Copilot Chat JSON files) so that CLI-specific event logs are discovered and
 //! indexed independently.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use super::jsonl::JsonlLines;
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
@@ -265,6 +267,25 @@ impl CopilotCliConnector {
     /// fields) and assemble them into a single conversation per session file.
     #[allow(clippy::too_many_lines)]
     fn parse_event_log(&self, path: &Path) -> Result<Vec<NormalizedConversation>> {
+        let is_jsonl = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
+
+        if is_jsonl {
+            if let Ok(meta) = std::fs::metadata(path)
+                && meta.len() > 100 * 1024 * 1024
+            {
+                tracing::warn!(
+                    path = %path.display(),
+                    "copilot_cli: event log exceeds the scan size cap; skipping"
+                );
+                return Ok(Vec::new());
+            }
+            let file = std::fs::File::open(path)?;
+            return self.parse_event_log_jsonl_reader(path, BufReader::new(file));
+        }
+
         // Event logs accumulate; enforce the project's 100MB scan cap.
         let content = match read_capped(path) {
             Ok(Some(content)) => content,
@@ -284,17 +305,22 @@ impl CopilotCliConnector {
         // and returns empty — silently dropping the session. (.jsonl is
         // always line-delimited; copilot.rs gates the same dispatch with
         // !is_jsonl.)
-        let is_jsonl = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
-        let trimmed = content.trim_start();
-        if !is_jsonl && (trimmed.starts_with('{') || trimmed.starts_with('[')) {
-            if let Ok(val) = serde_json::from_str::<Value>(&content) {
-                return Ok(self.parse_session_json(&val, path));
-            }
+        let trimmed = content.trim_start_matches('\u{feff}').trim_start();
+        if (trimmed.starts_with('{') || trimmed.starts_with('['))
+            && let Ok(val) = serde_json::from_str::<Value>(trimmed)
+        {
+            return Ok(self.parse_session_json(&val, path));
         }
 
+        self.parse_event_log_jsonl_reader(path, std::io::Cursor::new(content.into_bytes()))
+    }
+
+    #[allow(clippy::too_many_lines, clippy::unused_self)]
+    fn parse_event_log_jsonl_reader(
+        &self,
+        path: &Path,
+        reader: impl BufRead,
+    ) -> Result<Vec<NormalizedConversation>> {
         // JSONL: each line is a separate JSON event.
         let mut messages = Vec::new();
         let mut started_at: Option<i64> = None;
@@ -302,8 +328,9 @@ impl CopilotCliConnector {
         let mut session_id: Option<String> = None;
         let mut workspace: Option<PathBuf> = None;
 
-        for line in content.lines() {
-            let line = line.trim();
+        for line_res in JsonlLines::new(reader) {
+            let line = line_res?;
+            let line = line.trim_start_matches('\u{feff}').trim();
             if line.is_empty() {
                 continue;
             }
@@ -1405,5 +1432,49 @@ mod tests {
         let ctx = ScanContext::local_default(root, Some(far_future));
         let convs = connector.scan(&ctx).unwrap();
         assert!(convs.is_empty());
+    }
+
+    #[test]
+    fn copilot_cli_jsonl_mid_read_io_error_discards_incomplete_and_skips_corrupt_utf8() {
+        use std::io::{self, BufReader, Cursor, Read};
+
+        struct FailingReader(io::ErrorKind);
+        impl Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "simulated mid-read failure"))
+            }
+        }
+
+        let connector = CopilotCliConnector::new();
+        let prefix = "{\"type\":\"user.message\",\"content\":\"complete prefix\",\"timestamp\":1700000000000}\n";
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Interrupted,
+        ] {
+            let reader = BufReader::new(prefix.as_bytes().chain(FailingReader(kind)));
+            assert!(
+                connector
+                    .parse_event_log_jsonl_reader(Path::new("events.jsonl"), reader)
+                    .is_err(),
+                "mid-stream {kind:?} must discard incomplete Copilot CLI event log"
+            );
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            b"\xef\xbb\xbf{\"type\":\"user.message\",\"content\":\"first valid\",\"timestamp\":1700000000000}\n",
+        );
+        bytes.extend_from_slice(b"{\"type\":\"assistant.message\",\"content\":\"\xffcorrupt\"}\n");
+        bytes.extend_from_slice(
+            b"{\"type\":\"assistant.message\",\"content\":\"second valid\",\"timestamp\":1700000001000}\n",
+        );
+        let convs = connector
+            .parse_event_log_jsonl_reader(Path::new("events.jsonl"), Cursor::new(bytes))
+            .expect("corrupt UTF-8 line should be skipped");
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        assert_eq!(convs[0].messages[0].content, "first valid");
+        assert_eq!(convs[0].messages[1].content, "second valid");
     }
 }

@@ -80,11 +80,25 @@ window is since `v0.3.11` (2026-10-14).
   with `SourceScanHooks` (`should_scan_source` and `on_source_complete`) for `aider`, `amp`,
   `chatgpt`, `copilot_cli`, `crush`, `devin`, `goose`, and `hermes`.
 
+- **OpenClaw API token extraction and broader model/provider extraction (`franken_agent_detection-cng`):**
+  wired `openclaw` into the Pi-format token extractor in `extract_tokens_for_agent` so
+  OpenClaw assistant messages (`extra.message.usage`, `extra.message.model`,
+  `extra.message.provider`, and `toolCall` content blocks) emit full `TokenDataSource::Api`
+  token counts, model, provider, and tool call counts; extended model/provider extraction to
+  cover `grok`, `goose`, `vibe`, `clawdbot`, `codebuff`, `copilot_cli`, `hermes`, `devin`,
+  and `chatgpt`.
+
 ### Fixed
 
 - **Shelley 0-based `sequence_id` conformance and `--all-features` Clippy cleanliness (`franken_agent_detection-da4`):**
   aligned Shelley's conformance test fixture with real Shelley 0-based `sequence_id`
   ordering and resolved all `--all-features --all-targets` Clippy `-D warnings` lints.
+- **`JsonlLines` mid-read I/O safety and 100% `read_capped` enforcement (`franken_agent_detection-s85`):**
+  wired `JsonlLines` into `goose`, `antigravity`, `cursor`, and `copilot_cli` JSONL parsers
+  so corrupt UTF-8 lines (`0xFF`) are skipped while mid-stream I/O errors discard incomplete
+  transcripts cleanly, and replaced all remaining unbounded `fs::read_to_string` sidecar/JSON
+  reads (`openhands`, `kimi`, `kiro`, `factory`, `grok`, `qwen`, `copilot_vscode`) with
+  `read_capped`.
 
 ## [0.3.11] -- 2026-10-14
 

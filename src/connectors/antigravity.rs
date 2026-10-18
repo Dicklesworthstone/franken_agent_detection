@@ -65,18 +65,21 @@
 //! best-effort message keyed off `source`, with the raw `type` kept in
 //! `extra.agy_type`. (See the agy version-compatibility guard work.)
 
+use std::fs;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
+use super::jsonl::JsonlLines;
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
 use super::utils::{
-    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
 };
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
@@ -317,15 +320,45 @@ impl AntigravityConnector {
     }
 
     /// Read a transcript file into per-step JSON records, tolerating blank lines
-    /// and individual malformed lines (skipped + logged, never fatal).
+    /// and individual malformed/non-UTF-8 lines (skipped + logged, never fatal),
+    /// while discarding incomplete transcripts on mid-stream I/O errors.
     fn read_transcript_records(transcript: &Path) -> Vec<Value> {
         // Transcripts accumulate; enforce the project's 100MB scan cap.
-        let Some(text) = read_capped(transcript).ok().flatten() else {
+        if let Ok(meta) = fs::metadata(transcript)
+            && meta.len() > 100 * 1024 * 1024
+        {
+            tracing::warn!(
+                transcript = %transcript.display(),
+                size_bytes = meta.len(),
+                "antigravity: transcript exceeds the scan size cap; skipping"
+            );
+            return Vec::new();
+        }
+        let Ok(file) = fs::File::open(transcript) else {
             return Vec::new();
         };
+        Self::read_transcript_records_from(transcript, BufReader::new(file)).unwrap_or_default()
+    }
+
+    fn read_transcript_records_from(
+        transcript: &Path,
+        reader: impl BufRead,
+    ) -> io::Result<Vec<Value>> {
         let mut records = Vec::new();
-        for (lineno, line) in text.lines().enumerate() {
-            let trimmed = line.trim();
+        for (lineno, line_res) in JsonlLines::new(reader).enumerate() {
+            let line = match line_res {
+                Ok(line) => line,
+                Err(err) => {
+                    tracing::warn!(
+                        transcript = %transcript.display(),
+                        line = lineno + 1,
+                        error = %err,
+                        "antigravity: aborting transcript after mid-stream read error"
+                    );
+                    return Err(err);
+                }
+            };
+            let trimmed = line.trim_start_matches('\u{feff}').trim();
             if trimmed.is_empty() {
                 continue;
             }
@@ -339,7 +372,7 @@ impl AntigravityConnector {
                 ),
             }
         }
-        records
+        Ok(records)
     }
 }
 
@@ -1627,5 +1660,51 @@ mod tests {
             conv.metadata["data_root"],
             fixture_base().to_string_lossy().as_ref()
         );
+    }
+
+    #[test]
+    fn antigravity_mid_read_io_error_discards_incomplete_transcript_and_skips_corrupt_utf8() {
+        use std::io::{self, BufReader, Cursor, Read};
+
+        struct FailingReader(io::ErrorKind);
+        impl Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "simulated mid-read failure"))
+            }
+        }
+
+        let prefix = "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>complete prefix</USER_REQUEST>\"}\n";
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Interrupted,
+        ] {
+            let reader = BufReader::new(prefix.as_bytes().chain(FailingReader(kind)));
+            assert!(
+                AntigravityConnector::read_transcript_records_from(
+                    Path::new("transcript.jsonl"),
+                    reader
+                )
+                .is_err(),
+                "mid-stream {kind:?} must discard incomplete Antigravity transcript"
+            );
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            b"\xef\xbb\xbf{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>first valid</USER_REQUEST>\"}\n",
+        );
+        bytes.extend_from_slice(b"{\"step_index\":1,\"content\":\"\xffcorrupt\"}\n");
+        bytes.extend_from_slice(
+            b"{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"second valid\"}\n",
+        );
+        let records = AntigravityConnector::read_transcript_records_from(
+            Path::new("transcript.jsonl"),
+            Cursor::new(bytes),
+        )
+        .expect("corrupt UTF-8 line should be skipped");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["step_index"], 0);
+        assert_eq!(records[1]["step_index"], 2);
     }
 }

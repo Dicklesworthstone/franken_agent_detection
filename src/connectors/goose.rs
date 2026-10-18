@@ -961,8 +961,7 @@ fn parse_goose_jsonl_reader(
     let mut pending: Vec<(Option<i64>, String, NormalizedMessage)> = Vec::new();
 
     for (line_idx, line_res) in JsonlLines::new(reader).enumerate() {
-        let line =
-            line_res.with_context(|| format!("read Goose JSONL file {}", path.display()))?;
+        let line = line_res.with_context(|| format!("read Goose JSONL file {}", path.display()))?;
         let line = line.trim_start_matches('\u{feff}').trim();
         if line.is_empty() {
             continue;

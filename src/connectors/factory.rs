@@ -26,7 +26,7 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -481,9 +481,10 @@ fn parse_factory_session_reader(
     // Load settings file if it exists for additional metadata
     let settings_path = path.with_extension("settings.json");
     let model_info = if settings_path.exists() {
-        fs::read_to_string(&settings_path)
+        read_capped(&settings_path)
             .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .flatten()
+            .and_then(|s| serde_json::from_str::<Value>(s.trim_start_matches('\u{feff}')).ok())
             .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
     } else {
         None

@@ -34,7 +34,7 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -440,8 +440,8 @@ fn infer_workspace(wire_path: &Path) -> Option<PathBuf> {
 
     // Try reading state.json for workspace/cwd info
     let state_path = session_dir.join("state.json");
-    if let Ok(content) = fs::read_to_string(&state_path) {
-        if let Ok(val) = serde_json::from_str::<Value>(&content) {
+    if let Ok(Some(content)) = read_capped(&state_path) {
+        if let Ok(val) = serde_json::from_str::<Value>(content.trim_start_matches('\u{feff}')) {
             // Check common fields for workspace path
             for key in &["cwd", "workspace", "workspacePath", "projectPath"] {
                 if let Some(path_str) = val.get(*key).and_then(|v| v.as_str()) {
@@ -749,10 +749,10 @@ struct KimiCodeState {
 /// Best-effort read of `<sessionId>/state.json`. Missing or malformed files
 /// yield an empty state; parsing continues from the wire log alone.
 fn read_kimi_code_state(session_root: &Path) -> KimiCodeState {
-    let Ok(content) = fs::read_to_string(session_root.join("state.json")) else {
+    let Ok(Some(content)) = read_capped(&session_root.join("state.json")) else {
         return KimiCodeState::default();
     };
-    let Ok(val) = serde_json::from_str::<Value>(&content) else {
+    let Ok(val) = serde_json::from_str::<Value>(content.trim_start_matches('\u{feff}')) else {
         return KimiCodeState::default();
     };
     KimiCodeState {

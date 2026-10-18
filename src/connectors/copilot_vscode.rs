@@ -716,8 +716,15 @@ fn parse_file_uri(uri: &str) -> Option<PathBuf> {
 /// Resolve the workspace folder for a `workspaceStorage/<id>` directory from
 /// its `workspace.json` sidecar.
 pub fn workspace_for_storage_dir(storage_dir: &Path) -> Option<PathBuf> {
-    let raw = match fs::read_to_string(storage_dir.join("workspace.json")) {
-        Ok(raw) => raw,
+    let raw = match read_capped(&storage_dir.join("workspace.json")) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            tracing::warn!(
+                dir = %storage_dir.display(),
+                "copilot: workspace.json sidecar exceeds scan size cap; skipping"
+            );
+            return None;
+        }
         Err(err) => {
             tracing::debug!(
                 dir = %storage_dir.display(),
@@ -727,7 +734,7 @@ pub fn workspace_for_storage_dir(storage_dir: &Path) -> Option<PathBuf> {
             return None;
         }
     };
-    let val: Value = match serde_json::from_str(&raw) {
+    let val: Value = match serde_json::from_str(raw.trim_start_matches('\u{feff}')) {
         Ok(val) => val,
         Err(err) => {
             tracing::debug!(

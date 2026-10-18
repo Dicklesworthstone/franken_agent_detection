@@ -942,9 +942,9 @@ pub fn extract_tokens_for_agent(
         // work) is deliberately NOT read: pi keeps it out of the main
         // model-call accounting.
         //
-        // Pi durable (`pi_durable`) keeps the same pi-ai assistant message
-        // under `extra.message`.
-        "pi_agent" | "omp" | "pi_durable" => {
+        // Pi durable (`pi_durable`) and OpenClaw (`openclaw`) keep the same
+        // pi-ai assistant message under `extra.message`.
+        "pi_agent" | "omp" | "pi_durable" | "openclaw" => {
             let entry_type = extra.get("type").and_then(Value::as_str);
             let is_assistant =
                 extra.pointer("/message/role").and_then(Value::as_str) == Some("assistant");
@@ -1063,7 +1063,8 @@ pub fn extract_tokens_for_agent(
                 }
             }
         }
-        "cursor" | "factory" | "opencode" | "antigravity" => {
+        "cursor" | "factory" | "opencode" | "antigravity" | "grok" | "goose" | "vibe"
+        | "clawdbot" | "codebuff" | "copilot_cli" | "hermes" | "devin" | "chatgpt" => {
             let model_name = extra
                 .get("model")
                 .or_else(|| extra.pointer("/cass/model"))
@@ -1071,11 +1072,23 @@ pub fn extract_tokens_for_agent(
                 .or_else(|| extra.pointer("/modelConfig/modelName"))
                 .or_else(|| extra.get("modelType"))
                 .or_else(|| extra.get("modelID"))
+                .or_else(|| extra.get("model_name"))
+                .or_else(|| extra.pointer("/_meta/modelId"))
                 .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
                 .map(String::from);
-            let provider = model_name
-                .as_deref()
-                .map(|name| normalize_model(name).provider);
+            let provider = extra
+                .get("provider")
+                .or_else(|| extra.pointer("/message/provider"))
+                .or_else(|| extra.pointer("/cass/provider"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from)
+                .or_else(|| {
+                    model_name
+                        .as_deref()
+                        .map(|name| normalize_model(name).provider)
+                });
             ExtractedTokenUsage {
                 model_name,
                 provider,
@@ -1455,5 +1468,61 @@ mod tests {
         );
         assert_eq!(usage.provider.as_deref(), Some("anthropic"));
         assert!(usage.output_tokens.unwrap() > 0);
+    }
+
+    #[test]
+    fn extract_tokens_for_agent_openclaw_extracts_pi_format_api_usage_and_tool_calls() {
+        let raw = serde_json::json!({
+            "type": "message",
+            "id": "m2",
+            "message": {
+                "role": "assistant",
+                "provider": "anthropic",
+                "model": "claude-opus-4-5",
+                "content": [
+                    {"type": "text", "text": "Hi there!"},
+                    {"type": "toolCall", "id": "tc1", "name": "exec", "arguments": {}}
+                ],
+                "usage": {
+                    "input": 120,
+                    "output": 45,
+                    "cacheRead": 30,
+                    "cacheWrite": 15
+                }
+            }
+        });
+        let usage = extract_tokens_for_agent("openclaw", &raw, "Hi there!", "assistant");
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+        assert_eq!(usage.model_name.as_deref(), Some("claude-opus-4-5"));
+        assert_eq!(usage.provider.as_deref(), Some("anthropic"));
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.output_tokens, Some(45));
+        assert_eq!(usage.cache_read_tokens, Some(30));
+        assert_eq!(usage.cache_creation_tokens, Some(15));
+        assert!(usage.has_tool_calls);
+        assert_eq!(usage.tool_call_count, 1);
+    }
+
+    #[test]
+    fn extract_tokens_for_agent_grok_and_goose_preserve_model_and_provider() {
+        let grok_raw = serde_json::json!({
+            "_meta": {
+                "modelId": "claude-sonnet-4-5"
+            }
+        });
+        let grok_usage = extract_tokens_for_agent("grok", &grok_raw, "Grok answer", "assistant");
+        assert_eq!(grok_usage.data_source, TokenDataSource::Estimated);
+        assert_eq!(grok_usage.model_name.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(grok_usage.provider.as_deref(), Some("anthropic"));
+
+        let goose_raw = serde_json::json!({
+            "model": "gpt-4o",
+            "session_id": "sess-1"
+        });
+        let goose_usage =
+            extract_tokens_for_agent("goose", &goose_raw, "Goose answer", "assistant");
+        assert_eq!(goose_usage.data_source, TokenDataSource::Estimated);
+        assert_eq!(goose_usage.model_name.as_deref(), Some("gpt-4o"));
+        assert_eq!(goose_usage.provider.as_deref(), Some("openai"));
     }
 }

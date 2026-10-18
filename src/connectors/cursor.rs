@@ -28,12 +28,14 @@
 mod storage_roots;
 
 use std::collections::{HashMap, HashSet};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use frankensqlite::compat::{OpenFlags, RowExt};
 use frankensqlite::params;
 
+use super::jsonl::JsonlLines;
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
@@ -1130,17 +1132,20 @@ impl CursorConnector {
     }
 
     /// Read a JSONL transcript into per-line records, skipping blank and
-    /// individually-malformed lines (warned, never fatal).
+    /// individually-malformed/non-UTF-8 lines (warned, never fatal) while
+    /// discarding incomplete transcripts on mid-stream I/O errors.
     fn read_agent_transcript_records(transcript: &Path) -> Vec<Value> {
-        let text = match read_capped(transcript) {
-            Ok(Some(text)) => text,
-            Ok(None) => {
-                tracing::warn!(
-                    transcript = %transcript.display(),
-                    "cursor: agent transcript exceeds the scan size cap; skipping"
-                );
-                return Vec::new();
-            }
+        if let Ok(meta) = std::fs::metadata(transcript)
+            && meta.len() > 100 * 1024 * 1024
+        {
+            tracing::warn!(
+                transcript = %transcript.display(),
+                "cursor: agent transcript exceeds the scan size cap; skipping"
+            );
+            return Vec::new();
+        }
+        let file = match std::fs::File::open(transcript) {
+            Ok(file) => file,
             Err(err) => {
                 tracing::warn!(
                     transcript = %transcript.display(),
@@ -1150,9 +1155,29 @@ impl CursorConnector {
                 return Vec::new();
             }
         };
+        Self::read_agent_transcript_records_from(transcript, BufReader::new(file))
+            .unwrap_or_default()
+    }
+
+    fn read_agent_transcript_records_from(
+        transcript: &Path,
+        reader: impl BufRead,
+    ) -> io::Result<Vec<Value>> {
         let mut records = Vec::new();
-        for (lineno, line) in text.lines().enumerate() {
-            let trimmed = line.trim();
+        for (lineno, line_res) in JsonlLines::new(reader).enumerate() {
+            let line = match line_res {
+                Ok(line) => line,
+                Err(err) => {
+                    tracing::warn!(
+                        transcript = %transcript.display(),
+                        line = lineno + 1,
+                        error = %err,
+                        "cursor: aborting agent transcript after mid-stream read error"
+                    );
+                    return Err(err);
+                }
+            };
+            let trimmed = line.trim_start_matches('\u{feff}').trim();
             if trimmed.is_empty() {
                 continue;
             }
@@ -1166,7 +1191,7 @@ impl CursorConnector {
                 ),
             }
         }
-        records
+        Ok(records)
     }
 
     /// Map one transcript record to a normalized message, or `None` when it
@@ -3375,5 +3400,47 @@ mod agent_transcript_tests {
         let tmp = TempDir::new().unwrap();
         let convs = CursorConnector::new().scan(&ctx_for(tmp.path())).unwrap();
         assert!(convs.is_empty());
+    }
+
+    #[test]
+    fn cursor_agent_transcript_mid_read_io_error_discards_incomplete_and_skips_corrupt_utf8() {
+        use std::io::{self, BufReader, Cursor, Read};
+
+        struct FailingReader(io::ErrorKind);
+        impl Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "simulated mid-read failure"))
+            }
+        }
+
+        let prefix = "{\"role\":\"user\",\"content\":\"complete prefix\"}\n";
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Interrupted,
+        ] {
+            let reader = BufReader::new(prefix.as_bytes().chain(FailingReader(kind)));
+            assert!(
+                CursorConnector::read_agent_transcript_records_from(
+                    Path::new("transcript.jsonl"),
+                    reader
+                )
+                .is_err(),
+                "mid-stream {kind:?} must discard incomplete Cursor agent transcript"
+            );
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\xef\xbb\xbf{\"role\":\"user\",\"content\":\"first valid\"}\n");
+        bytes.extend_from_slice(b"{\"role\":\"assistant\",\"content\":\"\xffcorrupt\"}\n");
+        bytes.extend_from_slice(b"{\"role\":\"assistant\",\"content\":\"second valid\"}\n");
+        let records = CursorConnector::read_agent_transcript_records_from(
+            Path::new("transcript.jsonl"),
+            Cursor::new(bytes),
+        )
+        .expect("corrupt UTF-8 line should be skipped");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["content"], "first valid");
+        assert_eq!(records[1]["content"], "second valid");
     }
 }
