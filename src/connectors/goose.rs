@@ -19,12 +19,14 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use frankensqlite::compat::{OpenFlags, RowExt};
 use frankensqlite::{Row, SqliteValue, params};
 
+use super::jsonl::JsonlLines;
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 use serde::Deserialize;
 use walkdir::WalkDir;
@@ -717,7 +719,7 @@ impl Connector for GooseConnector {
                         .unwrap_or("unknown")
                         .to_string();
 
-                    if !seen_ids.insert(session_id.clone()) {
+                    if seen_ids.contains(&session_id) {
                         continue;
                     }
 
@@ -725,6 +727,7 @@ impl Connector for GooseConnector {
                     match parse_goose_jsonl(&source.source_path, &session_id) {
                         Ok(conv) => {
                             if !conv.messages.is_empty() {
+                                seen_ids.insert(session_id);
                                 on_conversation(conv)?;
                                 emitted = 1;
                             }
@@ -936,13 +939,31 @@ fn parse_goose_content_json(json_str: &str) -> (String, Vec<NormalizedInvocation
 
 /// Parse a legacy Goose JSONL session file.
 fn parse_goose_jsonl(path: &Path, session_id: &str) -> Result<NormalizedConversation> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("read Goose JSONL file {}", path.display()))?;
+    if let Ok(meta) = fs::metadata(path)
+        && meta.len() > 100 * 1024 * 1024
+    {
+        anyhow::bail!(
+            "Goose JSONL file exceeds scan size cap ({} bytes): {}",
+            meta.len(),
+            path.display()
+        );
+    }
+    let file = fs::File::open(path)
+        .with_context(|| format!("open Goose JSONL file {}", path.display()))?;
+    parse_goose_jsonl_reader(path, session_id, BufReader::new(file))
+}
 
+fn parse_goose_jsonl_reader(
+    path: &Path,
+    session_id: &str,
+    reader: impl BufRead,
+) -> Result<NormalizedConversation> {
     let mut pending: Vec<(Option<i64>, String, NormalizedMessage)> = Vec::new();
 
-    for (line_idx, line) in content.lines().enumerate() {
-        let line = line.trim();
+    for (line_idx, line_res) in JsonlLines::new(reader).enumerate() {
+        let line =
+            line_res.with_context(|| format!("read Goose JSONL file {}", path.display()))?;
+        let line = line.trim_start_matches('\u{feff}').trim();
         if line.is_empty() {
             continue;
         }
@@ -1014,6 +1035,14 @@ fn parse_goose_jsonl(path: &Path, session_id: &str) -> Result<NormalizedConversa
             Some("user".to_string())
         };
 
+        let mut extra = serde_json::json!({
+            "message_id": msg_id,
+            "session_id": session_id,
+        });
+        if let Some(ref model) = entry.model {
+            extra["model"] = serde_json::json!(model);
+        }
+
         pending.push((
             created_at,
             msg_id.clone(),
@@ -1023,10 +1052,7 @@ fn parse_goose_jsonl(path: &Path, session_id: &str) -> Result<NormalizedConversa
                 author,
                 created_at,
                 content: content_text,
-                extra: serde_json::json!({
-                    "message_id": msg_id,
-                    "session_id": session_id,
-                }),
+                extra,
                 invocations,
                 snippets: Vec::new(),
             },
@@ -1819,5 +1845,50 @@ mod tests {
                 && source.role == DiscoveredSourceRole::PrimarySessionLog
                 && source.required_for_reconstruction
         }));
+    }
+
+    #[test]
+    fn goose_jsonl_mid_read_io_error_discards_incomplete_transcript_and_skips_corrupt_utf8() {
+        use std::io::{self, BufReader, Cursor, Read};
+
+        struct FailingReader(io::ErrorKind);
+        impl Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "simulated mid-read failure"))
+            }
+        }
+
+        let prefix =
+            "{\"role\":\"user\",\"content\":\"complete prefix\",\"created_at\":1700000000}\n";
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Interrupted,
+        ] {
+            let reader = BufReader::new(prefix.as_bytes().chain(FailingReader(kind)));
+            assert!(
+                parse_goose_jsonl_reader(Path::new("sess-1.jsonl"), "sess-1", reader).is_err(),
+                "mid-stream {kind:?} must discard incomplete Goose JSONL session"
+            );
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            b"\xef\xbb\xbf{\"role\":\"user\",\"content\":\"first valid\",\"created_at\":1700000000}\n",
+        );
+        bytes.extend_from_slice(b"{\"role\":\"assistant\",\"content\":\"\xffcorrupt\"}\n");
+        bytes.extend_from_slice(
+            b"{\"role\":\"assistant\",\"content\":\"second valid\",\"model\":\"claude-sonnet-4-5\",\"created_at\":1700000001}\n",
+        );
+        let conv =
+            parse_goose_jsonl_reader(Path::new("sess-1.jsonl"), "sess-1", Cursor::new(bytes))
+                .expect("corrupt UTF-8 line should be skipped");
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[0].content, "first valid");
+        assert_eq!(conv.messages[1].content, "second valid");
+        assert_eq!(
+            conv.messages[1].extra.get("model").and_then(|v| v.as_str()),
+            Some("claude-sonnet-4-5")
+        );
     }
 }
