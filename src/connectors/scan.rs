@@ -577,7 +577,7 @@ mod tests {
                 slug: "copilot",
                 store: ".config/Code/User/globalStorage/github.copilot-chat",
                 relative: "session-1.json",
-                content: r#"{"sessionId":"sess-1","responderUsername":"GitHub Copilot","requests":[{"requestId":"req-1","timestamp":1700000000000,"message":{"text":"Hello"},"response":[]}]}"#,
+                content: r#"{"id":"conv-1","workspaceFolder":"/work/project","turns":[{"request":{"message":"Hello","timestamp":1700000000000}}]}"#,
                 connector: Box::new(CopilotConnector::new()),
             },
         ];
@@ -627,6 +627,16 @@ mod tests {
                     assert_eq!(
                         conversations[0].workspace,
                         Some(PathBuf::from("/work/project"))
+                    );
+                }
+                if slug == "copilot" {
+                    assert_eq!(
+                        conversations[0].workspace,
+                        Some(PathBuf::from("/local/work/project"))
+                    );
+                    assert_eq!(
+                        conversations[0].metadata.pointer("/cass/workspace_original"),
+                        Some(&serde_json::json!("/work/project"))
                     );
                 }
             }

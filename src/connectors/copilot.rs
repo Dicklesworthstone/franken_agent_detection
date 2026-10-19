@@ -785,21 +785,18 @@ impl CopilotConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         let excluded_paths = excluded_scan_paths_from_env()?;
-        let roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
+        let roots = Self::source_roots(ctx);
 
         let mut seen_files = HashSet::new();
         let mut seen_surface_ids: HashSet<String> = HashSet::new();
 
         for root in roots {
-            if path_is_excluded(&root, &excluded_paths) {
+            if path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
-            let files = Self::find_conversation_files(&root);
+            let files = Self::find_conversation_files(&root.path);
             tracing::debug!(
-                root = %root.display(),
+                root = %root.path.display(),
                 file_count = files.len(),
                 "copilot: scanning conversation files"
             );
@@ -826,7 +823,8 @@ impl CopilotConnector {
                             conversations = convs.len(),
                             "copilot: parsed conversation file"
                         );
-                        for conv in convs {
+                        for mut conv in convs {
+                            root.apply_workspace_rewrite(&mut conv);
                             if let Some(id) = conv.external_id.as_ref() {
                                 seen_surface_ids.insert(id.clone());
                             }
