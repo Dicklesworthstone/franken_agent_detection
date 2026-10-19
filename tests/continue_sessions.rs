@@ -426,6 +426,10 @@ fn continue_scopes_discovery_streaming_and_provenance_agree() {
             Some(PathBuf::from("/mapped/project"))
         );
         assert_eq!(
+            collected[0].metadata["cass"]["workspace_original"],
+            "/remote/project"
+        );
+        assert_eq!(
             collected[0].metadata["origin"]["source_id"],
             "continue-host"
         );

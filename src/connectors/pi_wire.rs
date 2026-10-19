@@ -26,11 +26,15 @@
 //! - `model_change` entries carry a bare `model` field (pi-mono writes
 //!   `provider` + `modelId`); either spelling updates the tracked model.
 
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
+use super::jsonl::JsonlLines;
+use super::utils::{
+    dedupe_path_key, excluded_scan_paths_from_env, open_capped_reader, path_is_excluded,
+};
 use crate::types::{NormalizedConversation, NormalizedMessage};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -818,8 +822,8 @@ pub fn parse_session_file(
     // Session transcripts are append-only logs that grow without bound;
     // enforce the project's 100MB scan cap (chatgpt policy) instead of
     // reading an arbitrarily large file into memory.
-    let content = match read_capped(&source_path) {
-        Ok(Some(content)) => content,
+    let reader = match open_capped_reader(&source_path) {
+        Ok(Some(reader)) => reader,
         Ok(None) => {
             tracing::debug!(
                 path = %source_path.display(),
@@ -833,7 +837,21 @@ pub fn parse_session_file(
         }
     };
 
-    parse_session_records(content.lines(), source_path, external_id, agent_slug)
+    parse_session_file_reader(reader, source_path, external_id, agent_slug)
+}
+
+fn parse_session_file_reader(
+    reader: impl BufRead,
+    source_path: PathBuf,
+    external_id: Option<String>,
+    agent_slug: &str,
+) -> Option<NormalizedConversation> {
+    parse_session_records(
+        JsonlLines::new(reader),
+        source_path,
+        external_id,
+        agent_slug,
+    )
 }
 
 /// Parse pi-family session records — one JSON document per item, in storage
@@ -841,8 +859,8 @@ pub fn parse_session_file(
 /// its entry rows by `seq`). `extra.cass.source_line` is the 1-based position
 /// of the record in that sequence.
 #[allow(clippy::too_many_lines)]
-fn parse_session_records<'a>(
-    records: impl IntoIterator<Item = &'a str>,
+fn parse_session_records<S: AsRef<str>>(
+    records: impl IntoIterator<Item = std::io::Result<S>>,
     source_path: PathBuf,
     external_id: Option<String>,
     agent_slug: &str,
@@ -862,8 +880,19 @@ fn parse_session_records<'a>(
     let mut labels: HashMap<String, String> = HashMap::new();
     let mut header_leaf: Option<String> = None;
 
-    for (line_idx, line) in records.into_iter().enumerate() {
-        let line = line.trim_start_matches('\u{feff}');
+    for (line_idx, line_res) in records.into_iter().enumerate() {
+        let line = match line_res {
+            Ok(line) => line,
+            Err(e) => {
+                tracing::debug!(
+                    path = %source_path.display(),
+                    error = %e,
+                    "{agent_slug}: aborting session after mid-stream I/O error"
+                );
+                return None;
+            }
+        };
+        let line = line.as_ref().trim_start_matches('\u{feff}');
         if line.trim().is_empty() {
             continue;
         }
@@ -1276,7 +1305,7 @@ pub fn parse_sqlite_session(
         .and_then(|rel| rel.to_str().map(String::from))
         .or_else(|| path.file_name().and_then(|s| s.to_str()).map(String::from));
     let mut conversation = parse_session_records(
-        records.iter().map(String::as_str),
+        records.iter().map(|s| Ok(s.as_str())),
         path.to_path_buf(),
         external_id,
         agent_slug,
@@ -1596,4 +1625,71 @@ const fn parse_sqlite_source(
     _agent_slug: &str,
 ) -> Option<NormalizedConversation> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Cursor, Read};
+
+    struct FailingAfterPrefixReader {
+        prefix: Cursor<Vec<u8>>,
+    }
+
+    impl Read for FailingAfterPrefixReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            let len = available.len().min(buf.len());
+            buf[..len].copy_from_slice(&available[..len]);
+            self.consume(len);
+            Ok(len)
+        }
+    }
+
+    impl BufRead for FailingAfterPrefixReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if usize::try_from(self.prefix.position()).unwrap() < self.prefix.get_ref().len() {
+                return self.prefix.fill_buf();
+            }
+            Err(io::Error::other("simulated mid-stream I/O error"))
+        }
+
+        fn consume(&mut self, amt: usize) {
+            self.prefix.consume(amt);
+        }
+    }
+
+    #[test]
+    fn pi_wire_jsonl_skips_corrupt_utf8_line_and_discards_on_io_error() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\xEF\xBB\xBF{\"type\":\"session\",\"id\":\"pi-utf8\",\"timestamp\":\"2026-01-10T10:00:00Z\",\"cwd\":\"/work/pi\"}\n");
+        bytes.extend_from_slice(b"{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-01-10T10:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"first valid turn\"}}\n");
+        bytes.extend_from_slice(b"{\"type\":\"message\",\"content\":\"\xFFcorrupt utf8\"}\n");
+        bytes.extend_from_slice(b"{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2026-01-10T10:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":\"second valid turn\"}}\n");
+
+        let conv = parse_session_file_reader(
+            Cursor::new(bytes.clone()),
+            PathBuf::from("/tmp/pi-utf8.jsonl"),
+            Some("pi-utf8".to_string()),
+            "pi_agent",
+        )
+        .expect("corrupt UTF-8 line should be skipped without dropping valid turns");
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[0].content, "first valid turn");
+        assert_eq!(conv.messages[1].content, "second valid turn");
+
+        let failing = FailingAfterPrefixReader {
+            prefix: Cursor::new(bytes),
+        };
+        assert!(
+            parse_session_file_reader(
+                failing,
+                PathBuf::from("/tmp/pi-utf8.jsonl"),
+                Some("pi-utf8".to_string()),
+                "pi_agent",
+            )
+            .is_none(),
+            "mid-stream I/O error must discard partial pi_wire session"
+        );
+    }
 }

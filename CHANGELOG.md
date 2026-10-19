@@ -93,12 +93,18 @@ window is since `v0.3.11` (2026-10-14).
 - **Shelley 0-based `sequence_id` conformance and `--all-features` Clippy cleanliness (`franken_agent_detection-da4`):**
   aligned Shelley's conformance test fixture with real Shelley 0-based `sequence_id`
   ordering and resolved all `--all-features --all-targets` Clippy `-D warnings` lints.
-- **`JsonlLines` mid-read I/O safety and 100% `read_capped` enforcement (`franken_agent_detection-s85`):**
-  wired `JsonlLines` into `goose`, `antigravity`, `cursor`, and `copilot_cli` JSONL parsers
-  so corrupt UTF-8 lines (`0xFF`) are skipped while mid-stream I/O errors discard incomplete
-  transcripts cleanly, and replaced all remaining unbounded `fs::read_to_string` sidecar/JSON
-  reads (`openhands`, `kimi`, `kiro`, `factory`, `grok`, `qwen`, `copilot_vscode`) with
-  `read_capped`.
+- **`JsonlLines` mid-read I/O safety and 100% `read_capped` enforcement (`franken_agent_detection-s85`, `franken_agent_detection-hvi`):**
+  wired `JsonlLines` and `open_capped_reader` into `goose`, `antigravity`, `cursor`,
+  `copilot_cli`, `pi_wire` (`pi_agent` and `omp`), and `copilot_vscode` (`NativeFormat::AppendLog`)
+  JSONL parsers so corrupt UTF-8 lines (`0xFF`) are skipped while mid-stream I/O errors discard
+  incomplete transcripts cleanly, and replaced all remaining unbounded `fs::read_to_string`
+  sidecar/JSON reads (`openhands`, `kimi`, `kiro`, `factory`, `grok`, `qwen`, `copilot_vscode`)
+  with `read_capped`.
+- **Preserved `metadata.cass.workspace_original` in `ScanRoot::apply_workspace_rewrite` (`franken_agent_detection-7uj`):**
+  added `ScanRoot::apply_workspace_rewrite(&self, conv: &mut NormalizedConversation)` in
+  `src/connectors/scan.rs` and wired it into `cursor` (both SQLite Composer and Agent
+  transcripts), `continue_dev`, and `openhands` so connector-side workspace rewrites record
+  the pre-rewrite path in `metadata.cass.workspace_original` for downstream CASS indexing.
 
 ## [0.3.11] -- 2026-10-14
 

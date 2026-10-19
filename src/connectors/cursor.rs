@@ -1304,10 +1304,6 @@ impl CursorConnector {
         } else {
             "unresolved"
         };
-        let workspace = explicit_workspace.map(|w| {
-            let rewritten = root.rewrite_workspace(&w.to_string_lossy(), Some(CURSOR_AGENT_SLUG));
-            PathBuf::from(rewritten)
-        });
 
         let title = messages
             .iter()
@@ -1333,17 +1329,19 @@ impl CursorConnector {
             metadata.insert("cursor_project_dir".to_string(), Value::String(p.clone()));
         }
 
-        Some(NormalizedConversation {
+        let mut conv = NormalizedConversation {
             agent_slug: CURSOR_AGENT_SLUG.to_string(),
             external_id,
             title,
-            workspace,
+            workspace: explicit_workspace,
             source_path: transcript.to_path_buf(),
             started_at,
             ended_at,
             metadata: Value::Object(metadata),
             messages,
-        })
+        };
+        root.apply_workspace_rewrite(&mut conv);
+        Some(conv)
     }
 
     /// Emit Agent-transcript conversations (additive to Composer).
@@ -1414,17 +1412,14 @@ impl CursorConnector {
         let mut seen_db_session_ids: HashSet<String> = HashSet::new();
 
         // Composer (`state.vscdb` -> `composerData:*`) — unchanged behavior.
-        let roots: Vec<PathBuf> = Self::source_roots(ctx)
-            .into_iter()
-            .map(|root| root.path)
-            .collect();
+        let roots = Self::source_roots(ctx);
 
         for root in roots {
-            if !root.exists() || path_is_excluded(&root, &excluded_paths) {
+            if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
 
-            let db_files = Self::find_db_files(&root);
+            let db_files = Self::find_db_files(&root.path);
 
             for db_path in db_files {
                 if path_is_excluded(&db_path, &excluded_paths) {
@@ -1438,13 +1433,14 @@ impl CursorConnector {
                 match Self::extract_from_db(&db_path, ctx.since_ts) {
                     Ok(convs) => {
                         let mut kept = 0;
-                        for conv in convs {
+                        for mut conv in convs {
                             match conv.external_id.as_ref() {
                                 Some(id) if !seen_db_session_ids.insert(id.clone()) => {
                                     continue;
                                 }
                                 _ => {}
                             }
+                            root.apply_workspace_rewrite(&mut conv);
                             kept += 1;
                             on_conversation(conv)?;
                         }
@@ -3318,6 +3314,12 @@ mod agent_transcript_tests {
                 .iter()
                 .all(|c| c.workspace.as_deref() == Some(Path::new("/mapped/projects/my-app")))
         );
+        assert!(mapped.iter().all(|c| {
+            c.metadata
+                .pointer("/cass/workspace_original")
+                .and_then(Value::as_str)
+                == Some("/home/example/projects/my-app")
+        }));
     }
 
     #[test]

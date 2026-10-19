@@ -67,12 +67,14 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanRoot};
-use super::utils::{path_is_excluded, read_capped};
+use super::utils::{open_capped_reader, path_is_excluded, read_capped};
 use super::{file_modified_since, parse_timestamp};
 use crate::types::{
     NormalizedConversation, NormalizedInvocation, NormalizedMessage, reindex_messages,
@@ -531,11 +533,28 @@ fn apply_push(
 /// normal crash/power-loss artifact for this format); malformed or
 /// inapplicable interior entries are skipped-and-logged.
 pub fn replay_append_log(content: &str, path: &Path) -> Option<Value> {
-    let lines: Vec<&str> = content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
+    replay_append_log_reader(std::io::Cursor::new(content.as_bytes()), path)
+}
+
+pub fn replay_append_log_reader(reader: impl BufRead, path: &Path) -> Option<Value> {
+    let mut lines: Vec<String> = Vec::new();
+    for line_res in JsonlLines::new(reader) {
+        let line = match line_res {
+            Ok(line) => line,
+            Err(err) => {
+                tracing::warn!(
+                    transcript = %path.display(),
+                    error = %err,
+                    "copilot: aborting append-log replay after mid-stream I/O error"
+                );
+                return None;
+            }
+        };
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
+        if !trimmed.is_empty() {
+            lines.push(trimmed.to_string());
+        }
+    }
     let mut state: Option<Value> = None;
 
     for (pos, line) in lines.iter().enumerate() {
@@ -1270,7 +1289,7 @@ fn parse_source(
             }
         }
         NativeFormat::AppendLog => {
-            let Some(raw) = read_capped(&source.path).unwrap_or_else(|err| {
+            let Some(reader) = open_capped_reader(&source.path).unwrap_or_else(|err| {
                 tracing::warn!(
                     source = %source.path.display(),
                     error = %err,
@@ -1284,7 +1303,7 @@ fn parse_source(
                 );
                 return Vec::new();
             };
-            match replay_append_log(&raw, &source.path) {
+            match replay_append_log_reader(reader, &source.path) {
                 Some(session) => vec![session],
                 None => return Vec::new(),
             }
@@ -2027,5 +2046,72 @@ mod tests {
             assert_eq!(convs.len(), 1);
             assert_eq!(convs[0].external_id.as_deref(), Some("map-1"));
         }
+    }
+
+    #[test]
+    fn append_log_reader_skips_corrupt_utf8_and_discards_on_io_error() {
+        use std::io::{self, Cursor, Read};
+
+        struct FailingAfterPrefixReader {
+            prefix: Cursor<Vec<u8>>,
+        }
+
+        impl Read for FailingAfterPrefixReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let available = self.fill_buf()?;
+                let len = available.len().min(buf.len());
+                buf[..len].copy_from_slice(&available[..len]);
+                self.consume(len);
+                Ok(len)
+            }
+        }
+
+        impl BufRead for FailingAfterPrefixReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if usize::try_from(self.prefix.position()).unwrap() < self.prefix.get_ref().len() {
+                    return self.prefix.fill_buf();
+                }
+                Err(io::Error::other("simulated mid-stream I/O error"))
+            }
+
+            fn consume(&mut self, amt: usize) {
+                self.prefix.consume(amt);
+            }
+        }
+
+        let snapshot = json!({
+            "kind": 0,
+            "v": copilot_session("append-utf8", "Initial question", "Initial answer.")
+        });
+        let push = json!({
+            "kind": 1,
+            "k": ["customTitle"],
+            "v": "Updated title after corrupt line"
+        });
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\xEF\xBB\xBF");
+        bytes.extend_from_slice(snapshot.to_string().as_bytes());
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"{\"kind\":1,\"v\":\"\xFFcorrupt utf8\"}\n");
+        bytes.extend_from_slice(push.to_string().as_bytes());
+        bytes.push(b'\n');
+
+        let state = replay_append_log_reader(
+            Cursor::new(bytes.clone()),
+            Path::new("/tmp/append-utf8.jsonl"),
+        )
+        .expect("corrupt UTF-8 line should be skipped without dropping valid append log");
+        assert_eq!(
+            state.get("customTitle").and_then(Value::as_str),
+            Some("Updated title after corrupt line")
+        );
+
+        let failing = FailingAfterPrefixReader {
+            prefix: Cursor::new(bytes),
+        };
+        assert!(
+            replay_append_log_reader(failing, Path::new("/tmp/append-utf8.jsonl")).is_none(),
+            "mid-stream I/O error must discard partial append-log state"
+        );
     }
 }

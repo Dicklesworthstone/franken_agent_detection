@@ -169,13 +169,7 @@ impl ContinueConnector {
             let emitted = usize::from(conversation.is_some());
             if let Some(conversation) = &mut conversation {
                 conversation.metadata["origin"] = serde_json::to_value(&source.root.origin)?;
-                if let Some(workspace) = &conversation.workspace {
-                    conversation.workspace = Some(PathBuf::from(
-                        source
-                            .root
-                            .rewrite_workspace(&workspace.to_string_lossy(), Some("continue")),
-                    ));
-                }
+                source.root.apply_workspace_rewrite(conversation);
             }
             if let Some(conversation) = conversation {
                 emit(conversation)?;

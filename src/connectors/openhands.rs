@@ -588,19 +588,19 @@ fn parse_conversation(
     let metadata =
         OpenHandsConnector::conversation_metadata(base_state.as_ref(), &configured_tools);
 
-    Some(NormalizedConversation {
+    let mut conv = NormalizedConversation {
         agent_slug: "openhands".to_string(),
         external_id,
         title,
-        workspace: workspace
-            .map(|path| scan_root.rewrite_workspace(&path.to_string_lossy(), Some("openhands")))
-            .map(PathBuf::from),
+        workspace,
         source_path,
         started_at,
         ended_at,
         metadata,
         messages,
-    })
+    };
+    scan_root.apply_workspace_rewrite(&mut conv);
+    Some(conv)
 }
 
 fn scan_openhands_with_callback(

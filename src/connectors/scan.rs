@@ -155,6 +155,42 @@ impl ScanRoot {
 
         path.to_string()
     }
+
+    /// Apply workspace rewriting rules to a conversation in-place, preserving
+    /// the original pre-rewrite path in `metadata.cass.workspace_original` when
+    /// a rule modifies `conv.workspace`.
+    pub fn apply_workspace_rewrite(&self, conv: &mut crate::types::NormalizedConversation) {
+        if self.workspace_rewrites.is_empty() {
+            return;
+        }
+        let Some(original_workspace) = conv
+            .workspace
+            .as_ref()
+            .map(|ws| ws.to_string_lossy().to_string())
+        else {
+            return;
+        };
+        let rewritten = self.rewrite_workspace(&original_workspace, Some(&conv.agent_slug));
+        if rewritten != original_workspace {
+            if !conv.metadata.is_object() {
+                conv.metadata = serde_json::json!({});
+            }
+            if let Some(obj) = conv.metadata.as_object_mut() {
+                let cass = obj
+                    .entry("cass".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if !cass.is_object() {
+                    *cass = serde_json::json!({});
+                }
+                if let Some(cass_obj) = cass.as_object_mut() {
+                    cass_obj
+                        .entry("workspace_original".to_string())
+                        .or_insert_with(|| serde_json::Value::String(original_workspace));
+                }
+            }
+            conv.workspace = Some(PathBuf::from(rewritten));
+        }
+    }
 }
 
 /// A cheap "still alive" tick a connector may call during a long internal scan.
@@ -740,5 +776,41 @@ mod tests {
         assert_eq!(ctx.scan_roots.len(), 1);
         assert!(!ctx.use_default_detection());
         assert_eq!(ctx.since_ts, Some(1000));
+    }
+
+    #[test]
+    fn scan_root_apply_workspace_rewrite_preserves_workspace_original() {
+        let root = ScanRoot::local(PathBuf::from("/home")).with_rewrite("/remote/work", "/local");
+        let mut conv = crate::types::NormalizedConversation {
+            agent_slug: "openhands".to_string(),
+            external_id: Some("oh-1".to_string()),
+            title: Some("test".to_string()),
+            workspace: Some(PathBuf::from("/remote/work/app")),
+            source_path: PathBuf::from("/tmp/oh-1"),
+            started_at: None,
+            ended_at: None,
+            metadata: serde_json::json!({"source": "openhands"}),
+            messages: Vec::new(),
+        };
+
+        root.apply_workspace_rewrite(&mut conv);
+        assert_eq!(conv.workspace, Some(PathBuf::from("/local/app")));
+        assert_eq!(
+            conv.metadata
+                .pointer("/cass/workspace_original")
+                .and_then(serde_json::Value::as_str),
+            Some("/remote/work/app")
+        );
+
+        // A second pass with a chained rule must not overwrite the original pre-rewrite path.
+        let chained = ScanRoot::local(PathBuf::from("/home")).with_rewrite("/local", "/final");
+        chained.apply_workspace_rewrite(&mut conv);
+        assert_eq!(conv.workspace, Some(PathBuf::from("/final/app")));
+        assert_eq!(
+            conv.metadata
+                .pointer("/cass/workspace_original")
+                .and_then(serde_json::Value::as_str),
+            Some("/remote/work/app")
+        );
     }
 }

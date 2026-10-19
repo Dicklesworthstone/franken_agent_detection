@@ -179,6 +179,21 @@ pub(crate) fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
     capped::read_capped(path)
 }
 
+/// Open a session-store file for line-oriented streaming if its size is within
+/// [`MAX_SCAN_FILE_BYTES`]. Returns `Ok(None)` when the file exceeds the cap.
+pub(crate) fn open_capped_reader(
+    path: &Path,
+) -> std::io::Result<Option<std::io::BufReader<std::fs::File>>> {
+    let file = std::fs::File::open(path)?;
+    if file
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() > MAX_SCAN_FILE_BYTES)
+    {
+        return Ok(None);
+    }
+    Ok(Some(std::io::BufReader::new(file)))
+}
+
 /// True when a user message is harness-injected context rather than a
 /// human-authored prompt (`# AGENTS.md instructions …`,
 /// `<environment_context>`, `<session_context>`, `<user_instructions>`).
