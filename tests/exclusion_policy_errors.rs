@@ -25,9 +25,9 @@ use franken_agent_detection::connectors::{
     continue_dev::ContinueConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
     factory::FactoryConnector, gemini::GeminiConnector, get_connector_factories,
     grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector, muse::MuseConnector,
-    omp::OmpConnector, openclaw::OpenClawConnector, pi_agent::PiAgentConnector,
-    pi_durable::PiDurableConnector, pi_wire, prime_agent::PrimeAgentConnector, qwen::QwenConnector,
-    vibe::VibeConnector,
+    omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
+    pi_agent::PiAgentConnector, pi_durable::PiDurableConnector, pi_wire,
+    prime_agent::PrimeAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
 };
 use franken_agent_detection::{
     Connector, DiscoveredSourceFile, NormalizedConversation, ScanContext, ScanRoot,
@@ -59,6 +59,7 @@ const PROVIDERS: &[&str] = &[
     #[cfg(feature = "codebuff")]
     "codebuff",
     "openclaw",
+    "openhands",
     "aider",
     "amp",
     #[cfg(feature = "chatgpt")]
@@ -203,6 +204,11 @@ fn case(root: &Path, provider: &'static str) -> Case {
             ".openclaw/agents/main/sessions",
             "sess-1.jsonl".to_string(),
         ),
+        "openhands" => (
+            Box::new(OpenHandsConnector::new()),
+            ".openhands/conversations",
+            "conv-1/events/event-00000-1.json".to_string(),
+        ),
         "aider" => (
             Box::new(AiderConnector::new()),
             "aider-project",
@@ -333,6 +339,15 @@ impl Fixture {
                         "id": "m1",
                         "timestamp": "2026-10-09T00:00:00Z",
                         "message": {"role": "user", "content": text}
+                    }),
+                    "openhands" => json!({
+                        "kind": "MessageEvent",
+                        "source": "user",
+                        "timestamp": "2026-10-09T00:00:00Z",
+                        "llm_message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": text}]
+                        }
                     }),
                     "qwen" => json!({
                         "uuid": "u1",

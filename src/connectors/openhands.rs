@@ -39,7 +39,10 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 use super::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
 };
@@ -614,8 +617,9 @@ fn parse_conversation(
     Some(conv)
 }
 
-fn scan_openhands_with_callback(
+fn scan_openhands_with_hooks(
     ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
     let excluded_paths = excluded_scan_paths_from_env()?;
@@ -637,16 +641,68 @@ fn scan_openhands_with_callback(
                 continue;
             }
             let base_state_path = conversation_dir.join("base_state.json");
+            let event_files = OpenHandsConnector::event_files(&conversation_dir);
             if path_is_excluded(&base_state_path, &excluded_paths)
-                || OpenHandsConnector::event_files(&conversation_dir)
+                || event_files
                     .iter()
                     .any(|p| path_is_excluded(p, &excluded_paths))
             {
                 continue;
             }
+            let Some((primary_path, sidecar_paths)) = event_files.split_first() else {
+                continue;
+            };
+            let primary = DiscoveredSourceFile::new(
+                "openhands",
+                &root,
+                primary_path.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&primary) {
+                continue;
+            }
+            let optional_base_state = base_state_path.is_file().then(|| {
+                DiscoveredSourceFile::new(
+                    "openhands",
+                    &root,
+                    base_state_path,
+                    DiscoveredSourceRole::MetadataSidecar,
+                    false,
+                )
+                .with_fs_metadata()
+            });
+            let required_sidecars: Vec<DiscoveredSourceFile> = sidecar_paths
+                .iter()
+                .map(|path| {
+                    DiscoveredSourceFile::new(
+                        "openhands",
+                        &root,
+                        path.clone(),
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata()
+                })
+                .collect();
             if let Some(conversation) = parse_conversation(&conversation_dir, &root) {
                 on_conversation(conversation)
                     .with_context(|| format!("emit conversation {}", conversation_dir.display()))?;
+                if !primary.fs_metadata_changed()
+                    && required_sidecars
+                        .iter()
+                        .all(|sidecar| !sidecar.fs_metadata_changed())
+                    && optional_base_state
+                        .as_ref()
+                        .is_none_or(|sidecar| !sidecar.fs_metadata_changed())
+                {
+                    hooks.complete(&SourceCompletion {
+                        source: primary,
+                        required_sidecars,
+                        conversations_emitted: 1,
+                    })?;
+                }
             }
         }
     }
@@ -721,7 +777,7 @@ impl Connector for OpenHandsConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
-        scan_openhands_with_callback(ctx, &mut |conv| {
+        self.scan_with_callback(ctx, &mut |conv| {
             convs.push(conv);
             Ok(())
         })?;
@@ -729,6 +785,10 @@ impl Connector for OpenHandsConnector {
     }
 
     fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
         true
     }
 
@@ -741,7 +801,16 @@ impl Connector for OpenHandsConnector {
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        scan_openhands_with_callback(ctx, on_conversation)
+        scan_openhands_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_openhands_with_hooks(ctx, hooks, on_conversation)
     }
 }
 
@@ -1112,5 +1181,72 @@ mod tests {
             convs.is_empty(),
             "future since_ts should skip older fixture"
         );
+    }
+
+    #[test]
+    fn scan_with_source_boundaries_reports_sidecars_and_honors_skip_hook() {
+        let ctx = fixture_ctx();
+        let connector = OpenHandsConnector::new();
+        assert!(connector.supports_source_boundaries());
+
+        let mut visited = Vec::new();
+        let mut completions = Vec::new();
+        let mut emitted = Vec::new();
+        {
+            let mut should_scan = |source: &DiscoveredSourceFile| {
+                visited.push(source.source_path.clone());
+                true
+            };
+            let mut on_complete = |completion: &SourceCompletion| {
+                completions.push((
+                    completion.source.source_path.clone(),
+                    completion.required_sidecars.len(),
+                    completion.conversations_emitted,
+                ));
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: Some(&mut should_scan),
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conv| {
+                    emitted.push(conv);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(visited.len(), 1);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, emitted[0].source_path);
+        assert!(
+            completions[0].1 >= 7,
+            "expected remaining fixture event files in required_sidecars"
+        );
+        assert_eq!(completions[0].2, 1);
+
+        // Returning false from should_scan_source skips parsing and completion.
+        let mut skipped_emitted = 0;
+        let mut skipped_completed = 0;
+        {
+            let mut should_scan = |_: &DiscoveredSourceFile| false;
+            let mut on_complete = |_: &SourceCompletion| {
+                skipped_completed += 1;
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: Some(&mut should_scan),
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| {
+                    skipped_emitted += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(skipped_emitted, 0);
+        assert_eq!(skipped_completed, 0);
     }
 }
