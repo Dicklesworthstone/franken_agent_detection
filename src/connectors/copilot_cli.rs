@@ -206,6 +206,23 @@ impl CopilotCliConnector {
             }
         } else {
             for scan_root in &ctx.scan_roots {
+                let mut matched_mirror = false;
+                for store in [
+                    &[".copilot", "session-state"][..],
+                    &[".copilot", "history-session-state"][..],
+                    &[".config", "gh-copilot"][..],
+                    &[".config", "gh", "copilot"][..],
+                    &[".local", "share", "github-copilot"][..],
+                ] {
+                    if let Some(mirrored) = scan_root.mirrored_store(store) {
+                        roots.push(scan_root.with_path(mirrored));
+                        matched_mirror = true;
+                    }
+                }
+                if matched_mirror {
+                    continue;
+                }
+
                 let candidates = [
                     scan_root.path.join(".copilot/session-state"),
                     scan_root.path.join(".copilot/history-session-state"),
@@ -233,13 +250,16 @@ impl CopilotCliConnector {
 
     fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let excluded_paths = excluded_scan_paths_from_env()?;
+        let mut seen_files = std::collections::HashSet::new();
         let mut out = Vec::new();
         for root in Self::source_roots(ctx) {
             if path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
             for file in Self::find_event_files(&root.path) {
-                if path_is_excluded(&file, &excluded_paths) {
+                if path_is_excluded(&file, &excluded_paths)
+                    || !seen_files.insert(super::utils::dedupe_path_key(&file))
+                {
                     continue;
                 }
                 if !file_modified_since(&file, ctx.since_ts) {

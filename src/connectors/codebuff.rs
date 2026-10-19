@@ -62,7 +62,11 @@ impl CodebuffConnector {
             let candidates = if root.path.is_file() {
                 vec![root.path.clone()]
             } else {
-                let projects = if root.path.file_name().is_some_and(|name| name == "projects") {
+                let projects = if let Some(mirrored) =
+                    root.mirrored_store(&[".config", "manicode", "projects"])
+                {
+                    mirrored
+                } else if root.path.file_name().is_some_and(|name| name == "projects") {
                     root.path.clone()
                 } else if root.path.join("projects").is_dir() {
                     root.path.join("projects")

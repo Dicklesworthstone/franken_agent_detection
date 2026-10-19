@@ -163,6 +163,11 @@ impl CrushConnector {
                 if scan_root.path.extension().is_some_and(|ext| ext == "db") {
                     db_paths.push(scan_root.clone());
                 }
+                for store in [&[".local", "share", "crush"][..], &[".crush"][..]] {
+                    if let Some(mirrored) = scan_root.mirrored_store(store) {
+                        db_paths.push(scan_root.with_path(mirrored.join("crush.db")));
+                    }
+                }
                 db_paths.push(scan_root.with_path(scan_root.path.join("crush.db")));
                 db_paths.push(scan_root.with_path(scan_root.path.join(".crush/crush.db")));
             }

@@ -28,13 +28,26 @@ pub(super) fn resolve(container: &Path, source: &str, store: &[&str]) -> Option<
     let strict_layout = matches!(
         store,
         [
-            ".factory" | ".kimi-code" | ".kimi" | ".grok" | ".continue" | ".codex",
+            ".factory"
+                | ".kimi-code"
+                | ".kimi"
+                | ".grok"
+                | ".continue"
+                | ".codex"
+                | ".clawdbot"
+                | ".goose",
             "sessions",
         ] | [".prime" | ".pi" | ".omp", "agent", "sessions"]
-            | [".local", "share", "omp" | "muse", "sessions"]
+            | [".local", "share", "omp" | "muse" | "goose", "sessions"]
             | [".qwen" | ".claude", "projects"]
             | [".qwen", "tmp"]
             | [".kiro", "sessions", "cli"]
+            | [".openhands" | ".openhands-state", "conversations"]
+            | [".copilot", "session-state" | "history-session-state"]
+            | [".config", "gh-copilot"]
+            | [".config", "gh", "copilot"]
+            | [".local", "share", "github-copilot"]
+            | [".gemini", "antigravity" | "antigravity-cli", "brain"]
     );
     let matched = if strict_layout
         && components

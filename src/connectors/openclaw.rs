@@ -328,11 +328,26 @@ impl OpenClawConnector {
             }
         } else {
             for root in &ctx.scan_roots {
-                roots.extend(
-                    Self::roots_from_scan_path(&root.path)
-                        .into_iter()
-                        .map(|path| root.with_path(path)),
-                );
+                let mut matched_mirror = false;
+                if let Some(mirrored_agents) = root.mirrored_store(&[".openclaw", "agents"]) {
+                    roots.extend(
+                        Self::find_agent_session_dirs_at(&mirrored_agents)
+                            .into_iter()
+                            .map(|path| root.with_path(path)),
+                    );
+                    matched_mirror = true;
+                }
+                if let Some(mirrored_sessions) = root.mirrored_store(&[".openclaw", "sessions"]) {
+                    roots.push(root.with_path(mirrored_sessions));
+                    matched_mirror = true;
+                }
+                if !matched_mirror {
+                    roots.extend(
+                        Self::roots_from_scan_path(&root.path)
+                            .into_iter()
+                            .map(|path| root.with_path(path)),
+                    );
+                }
             }
         }
 
@@ -343,6 +358,7 @@ impl OpenClawConnector {
 
     fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let excluded_paths = excluded_scan_paths_from_env()?;
+        let mut seen_files = std::collections::HashSet::new();
         let mut out = Vec::new();
 
         #[cfg(feature = "openclaw-sqlite")]
@@ -350,7 +366,10 @@ impl OpenClawConnector {
             if path_is_excluded(&root.path, &excluded_paths) {
                 continue;
             }
-            if root.path.is_file() && file_modified_since(&root.path, ctx.since_ts) {
+            if root.path.is_file()
+                && file_modified_since(&root.path, ctx.since_ts)
+                && seen_files.insert(super::utils::dedupe_path_key(&root.path))
+            {
                 out.push(
                     DiscoveredSourceFile::new(
                         "openclaw",
@@ -373,7 +392,9 @@ impl OpenClawConnector {
                 root = root.with_path(parent);
             }
             for file in Self::session_files(&root.path) {
-                if path_is_excluded(&file, &excluded_paths) {
+                if path_is_excluded(&file, &excluded_paths)
+                    || !seen_files.insert(super::utils::dedupe_path_key(&file))
+                {
                     continue;
                 }
                 if !file_modified_since(&file, ctx.since_ts) {
@@ -468,6 +489,13 @@ impl OpenClawConnector {
             }
         } else {
             for root in &ctx.scan_roots {
+                if let Some(mirrored_agents) = root.mirrored_store(&[".openclaw", "agents"]) {
+                    roots.extend(
+                        Self::find_agent_db_paths_at(&mirrored_agents)
+                            .into_iter()
+                            .map(|path| root.with_path(path)),
+                    );
+                }
                 roots.extend(
                     Self::sqlite_roots_from_scan_path(&root.path)
                         .into_iter()

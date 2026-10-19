@@ -108,6 +108,10 @@ impl ClawdbotConnector {
             }
         } else {
             for root in &ctx.scan_roots {
+                if let Some(mirrored) = root.mirrored_store(&[".clawdbot", "sessions"]) {
+                    roots.push(root.with_path(mirrored));
+                    continue;
+                }
                 let candidate = root.path.join(".clawdbot").join("sessions");
                 if candidate.exists() {
                     roots.push(root.with_path(candidate));

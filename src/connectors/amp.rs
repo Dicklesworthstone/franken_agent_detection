@@ -217,7 +217,83 @@ impl AmpConnector {
             let mut explicit_roots = Vec::new();
             for scan_root in &ctx.scan_roots {
                 let mut candidates = Vec::new();
-                Self::append_explicit_roots(&mut candidates, &scan_root.path);
+                for store in [
+                    &[".local", "share", "amp"][..],
+                    &["Library", "Application Support", "amp"][..],
+                    &["AppData", "Roaming", "amp"][..],
+                    &[".config", "Code", "User", "globalStorage", "sourcegraph.amp"][..],
+                    &[
+                        ".config",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ][..],
+                    &[
+                        ".config",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ][..],
+                    &[
+                        "Library",
+                        "Application Support",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ][..],
+                    &[
+                        "Library",
+                        "Application Support",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ][..],
+                    &[
+                        "Library",
+                        "Application Support",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ][..],
+                    &[
+                        "AppData",
+                        "Roaming",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ][..],
+                    &[
+                        "AppData",
+                        "Roaming",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ][..],
+                    &[
+                        "AppData",
+                        "Roaming",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ][..],
+                ] {
+                    if let Some(mirrored) = scan_root.mirrored_store(store)
+                        && Self::looks_like_root(&mirrored)
+                    {
+                        candidates.push(mirrored);
+                    }
+                }
+                if candidates.is_empty() {
+                    Self::append_explicit_roots(&mut candidates, &scan_root.path);
+                }
                 explicit_roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
             }
             explicit_roots
@@ -230,6 +306,7 @@ impl AmpConnector {
 
     fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let excluded_paths = excluded_scan_paths_from_env()?;
+        let mut seen_files = std::collections::HashSet::new();
         let mut out = Vec::new();
         for root in Self::source_roots(ctx) {
             if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
@@ -240,7 +317,10 @@ impl AmpConnector {
                     continue;
                 }
                 let path = entry.path();
-                if path_is_excluded(path, &excluded_paths) || !is_amp_log_file(path) {
+                if path_is_excluded(path, &excluded_paths)
+                    || !is_amp_log_file(path)
+                    || !seen_files.insert(super::utils::dedupe_path_key(path))
+                {
                     continue;
                 }
                 out.push(

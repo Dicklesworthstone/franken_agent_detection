@@ -115,6 +115,9 @@ impl HermesConnector {
                 if scan_root.path.extension().is_some_and(|ext| ext == "db") {
                     candidates.push((scan_root.clone(), scan_root.path.clone()));
                 }
+                if let Some(mirrored) = scan_root.mirrored_store(&[".hermes"]) {
+                    candidates.push((scan_root.clone(), mirrored.join("state.db")));
+                }
                 candidates.push((scan_root.clone(), scan_root.path.join("state.db")));
                 candidates.push((scan_root.clone(), scan_root.path.join(".hermes/state.db")));
             }

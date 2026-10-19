@@ -259,7 +259,18 @@ impl AntigravityConnector {
                     .collect()
             }
         } else {
-            ctx.scan_roots.clone()
+            let mut explicit = Vec::new();
+            for root in &ctx.scan_roots {
+                if let Some(mirrored) = root
+                    .mirrored_store(&[".gemini", "antigravity", "brain"])
+                    .or_else(|| root.mirrored_store(&[".gemini", "antigravity-cli", "brain"]))
+                {
+                    explicit.push(root.with_path(mirrored));
+                } else {
+                    explicit.push(root.clone());
+                }
+            }
+            explicit
         };
 
         roots.sort_by(|a, b| a.path.cmp(&b.path));

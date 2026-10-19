@@ -101,7 +101,18 @@ impl OpenHandsConnector {
                 vec![ScanRoot::local(Self::conversations_root())]
             }
         } else {
-            ctx.scan_roots.clone()
+            let mut explicit = Vec::new();
+            for root in &ctx.scan_roots {
+                if let Some(mirrored) = root
+                    .mirrored_store(&[".openhands", "conversations"])
+                    .or_else(|| root.mirrored_store(&[".openhands-state", "conversations"]))
+                {
+                    explicit.push(root.with_path(mirrored));
+                } else {
+                    explicit.push(root.clone());
+                }
+            }
+            explicit
         };
 
         roots.sort_by(|a, b| a.path.cmp(&b.path));

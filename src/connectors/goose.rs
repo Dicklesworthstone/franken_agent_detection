@@ -271,6 +271,14 @@ impl GooseConnector {
                     continue;
                 }
                 let mut db_paths = Vec::new();
+                for store in [
+                    &[".local", "share", "goose", "sessions"][..],
+                    &[".goose", "sessions"][..],
+                ] {
+                    if let Some(mirrored) = scan_root.mirrored_store(store) {
+                        db_paths.push(mirrored.join("sessions.db"));
+                    }
+                }
                 Self::append_db_candidates(&mut db_paths, &scan_root.path);
                 candidates.extend(
                     db_paths
@@ -333,6 +341,16 @@ impl GooseConnector {
                     continue;
                 }
                 let mut roots = Vec::new();
+                for store in [
+                    &[".local", "share", "goose", "sessions"][..],
+                    &[".goose", "sessions"][..],
+                ] {
+                    if let Some(mirrored) = scan_root.mirrored_store(store)
+                        && looks_like_goose_sessions(&mirrored)
+                    {
+                        roots.push(mirrored);
+                    }
+                }
                 Self::append_session_roots(&mut roots, &scan_root.path);
                 session_roots.extend(
                     roots

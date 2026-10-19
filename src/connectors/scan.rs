@@ -451,9 +451,17 @@ mod tests {
     use crate::types::Origin;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn remote_mirrors_discover_and_scan_provider_stores() {
+        #[cfg(feature = "codebuff")]
+        use crate::connectors::codebuff::CodebuffConnector;
+        #[cfg(feature = "goose")]
+        use crate::connectors::goose::GooseConnector;
         use crate::connectors::{
-            Connector, factory::FactoryConnector, gemini::GeminiConnector,
+            Connector, amp::AmpConnector, antigravity::AntigravityConnector,
+            clawdbot::ClawdbotConnector, cline::ClineConnector, copilot::CopilotConnector,
+            copilot_cli::CopilotCliConnector, factory::FactoryConnector, gemini::GeminiConnector,
+            openclaw::OpenClawConnector, openhands::OpenHandsConnector,
             prime_agent::PrimeAgentConnector, vibe::VibeConnector,
         };
         struct MirrorCase {
@@ -499,6 +507,78 @@ mod tests {
                     r#"{"type":"message","id":"aaaa0001","parentId":null,"timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"Hello"}}"#
                 ),
                 connector: Box::new(PrimeAgentConnector::new()),
+            },
+            MirrorCase {
+                slug: "clawdbot",
+                store: ".clawdbot/sessions",
+                relative: "session.jsonl",
+                content: r#"{"role":"user","content":"Hello","timestamp":"2026-01-05T10:00:01Z"}"#,
+                connector: Box::new(ClawdbotConnector::new()),
+            },
+            MirrorCase {
+                slug: "openclaw",
+                store: ".openclaw/agents",
+                relative: "openclaw/sessions/session.jsonl",
+                content: r#"{"type":"message","id":"m1","timestamp":"2026-01-05T10:00:01Z","message":{"role":"user","content":"Hello"}}"#,
+                connector: Box::new(OpenClawConnector::new()),
+            },
+            MirrorCase {
+                slug: "openhands",
+                store: ".openhands/conversations",
+                relative: "conv-1/events/event-00000-1.json",
+                content: r#"{"kind":"MessageEvent","source":"user","timestamp":"2026-01-05T10:00:01Z","llm_message":{"role":"user","content":[{"type":"text","text":"Hello"}]}}"#,
+                connector: Box::new(OpenHandsConnector::new()),
+            },
+            MirrorCase {
+                slug: "copilot_cli",
+                store: ".copilot/session-state",
+                relative: "sess-1/events.jsonl",
+                content: r#"{"type":"user.message","id":"e1","timestamp":"2026-01-05T10:00:01Z","data":{"content":"Hello"}}"#,
+                connector: Box::new(CopilotCliConnector::new()),
+            },
+            #[cfg(feature = "goose")]
+            MirrorCase {
+                slug: "goose",
+                store: ".local/share/goose/sessions",
+                relative: "sess.jsonl",
+                content: r#"{"role":"user","content":[{"type":"text","text":"Hello"}],"created_at":1700000000}"#,
+                connector: Box::new(GooseConnector::new()),
+            },
+            #[cfg(feature = "codebuff")]
+            MirrorCase {
+                slug: "codebuff",
+                store: ".config/manicode/projects",
+                relative: "demo/chats/2026-01-05T10-00-00.000Z/chat-messages.json",
+                content: r#"[{"id":"user-1700000000000","variant":"user","content":"Hello","timestamp":"2026-01-05T10:00:00.000Z"}]"#,
+                connector: Box::new(CodebuffConnector::new()),
+            },
+            MirrorCase {
+                slug: "antigravity",
+                store: ".gemini/antigravity/brain",
+                relative: "00000000-0000-0000-0000-000000000001/.system_generated/logs/transcript.jsonl",
+                content: r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-01-05T10:00:01Z","content":"Hello"}"#,
+                connector: Box::new(AntigravityConnector::new()),
+            },
+            MirrorCase {
+                slug: "amp",
+                store: ".local/share/amp",
+                relative: "thread-1.json",
+                content: r#"{"id":"thread-1","title":"Test","messages":[{"role":"user","content":"Hello","createdAt":1700000000000}]}"#,
+                connector: Box::new(AmpConnector::new()),
+            },
+            MirrorCase {
+                slug: "cline",
+                store: ".config/Code/User/globalStorage",
+                relative: "saoudrizwan.claude-dev/tasks/task-1/ui_messages.json",
+                content: r#"[{"ts":1700000000000,"type":"say","say":"text","text":"Hello"}]"#,
+                connector: Box::new(ClineConnector::new()),
+            },
+            MirrorCase {
+                slug: "copilot",
+                store: ".config/Code/User/globalStorage/github.copilot-chat",
+                relative: "session-1.json",
+                content: r#"{"sessionId":"sess-1","responderUsername":"GitHub Copilot","requests":[{"requestId":"req-1","timestamp":1700000000000,"message":{"text":"Hello"},"response":[]}]}"#,
+                connector: Box::new(CopilotConnector::new()),
             },
         ];
         for MirrorCase {

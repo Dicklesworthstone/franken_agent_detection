@@ -284,15 +284,33 @@ impl CopilotConnector {
     /// either store family.
     fn native_scan_bases(ctx: &ScanContext) -> Vec<ScanRoot> {
         if !ctx.use_default_detection() {
-            return ctx
-                .scan_roots
-                .iter()
-                // Directory expansion already selects native containers.
-                // Only an exact CLI file could otherwise be admitted by
-                // the native scanner's generic JSON-file entry point.
-                .filter(|root| !(root.path.is_file() && Self::is_cli_only_scope(&root.path)))
-                .cloned()
-                .collect();
+            let mut bases = Vec::new();
+            for root in &ctx.scan_roots {
+                if root.path.is_file() && Self::is_cli_only_scope(&root.path) {
+                    continue;
+                }
+                let mut matched_mirror = false;
+                for store in [
+                    &[".config", "Code", "User"][..],
+                    &[".config", "Code - Insiders", "User"][..],
+                    &[".config", "VSCodium", "User"][..],
+                    &["Library", "Application Support", "Code", "User"][..],
+                    &["Library", "Application Support", "Code - Insiders", "User"][..],
+                    &["Library", "Application Support", "VSCodium", "User"][..],
+                    &["AppData", "Roaming", "Code", "User"][..],
+                    &["AppData", "Roaming", "Code - Insiders", "User"][..],
+                    &["AppData", "Roaming", "VSCodium", "User"][..],
+                ] {
+                    if let Some(mirrored) = root.mirrored_store(store) {
+                        bases.push(root.with_path(mirrored));
+                        matched_mirror = true;
+                    }
+                }
+                if !matched_mirror {
+                    bases.push(root.clone());
+                }
+            }
+            return bases;
         }
         if Self::looks_like_copilot_storage(&ctx.data_dir) || Self::is_cli_only_scope(&ctx.data_dir)
         {
@@ -336,7 +354,84 @@ impl CopilotConnector {
         } else {
             for scan_root in &ctx.scan_roots {
                 let mut candidates = Vec::new();
-                Self::append_explicit_roots(&mut candidates, &scan_root.path);
+                for store in [
+                    &[
+                        ".config",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ][..],
+                    &[
+                        ".config",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ][..],
+                    &[
+                        ".config",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ][..],
+                    &[
+                        "Library",
+                        "Application Support",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ][..],
+                    &[
+                        "Library",
+                        "Application Support",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ][..],
+                    &[
+                        "Library",
+                        "Application Support",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ][..],
+                    &[
+                        "AppData",
+                        "Roaming",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ][..],
+                    &[
+                        "AppData",
+                        "Roaming",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ][..],
+                    &[
+                        "AppData",
+                        "Roaming",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                        "github.copilot-chat",
+                    ][..],
+                ] {
+                    if let Some(mirrored) = scan_root.mirrored_store(store) {
+                        candidates.push(mirrored);
+                    }
+                }
+                if candidates.is_empty() {
+                    Self::append_explicit_roots(&mut candidates, &scan_root.path);
+                }
                 roots.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
             }
         }

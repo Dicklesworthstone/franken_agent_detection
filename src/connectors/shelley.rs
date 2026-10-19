@@ -205,6 +205,12 @@ impl ShelleyConnector {
                 });
                 continue;
             }
+            if let Some(mirrored) = scan_root.mirrored_store(&[".config", "shelley"]) {
+                out.push(Candidate {
+                    root: scan_root.with_path(mirrored.join("shelley.db")),
+                    kind: CandidateKind::Auto,
+                });
+            }
             out.push(Candidate {
                 root: scan_root.with_path(scan_root.path.join("shelley.db")),
                 kind: CandidateKind::Auto,

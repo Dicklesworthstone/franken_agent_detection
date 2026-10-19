@@ -145,6 +145,11 @@ impl DevinConnector {
             }
         } else {
             for scan_root in &ctx.scan_roots {
+                if let Some(mirrored) =
+                    scan_root.mirrored_store(&[".local", "share", "devin", "cli"])
+                {
+                    candidates.push((scan_root.clone(), mirrored.join("sessions.db")));
+                }
                 let db = Self::database_path_from_root(&scan_root.path);
                 candidates.push((scan_root.clone(), db));
             }

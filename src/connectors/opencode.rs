@@ -277,6 +277,16 @@ impl OpenCodeConnector {
         if !ctx.use_default_detection() {
             for scan_root in &ctx.scan_roots {
                 let mut candidates = Vec::new();
+                for store in [
+                    &[".local", "share", "opencode"][..],
+                    &[".config", "opencode"][..],
+                    &["Library", "Application Support", "opencode"][..],
+                    &["AppData", "Roaming", "opencode"][..],
+                ] {
+                    if let Some(mirrored) = scan_root.mirrored_store(store) {
+                        candidates.push(mirrored.join("opencode.db"));
+                    }
+                }
                 Self::append_explicit_db_candidates(&mut candidates, &scan_root.path);
                 db_candidates.extend(candidates.into_iter().map(|path| scan_root.with_path(path)));
             }
@@ -309,6 +319,16 @@ impl OpenCodeConnector {
             }
             for scan_root in &ctx.scan_roots {
                 let mut candidates = vec![scan_root.path.clone()];
+                for store in [
+                    &[".local", "share", "opencode", "storage"][..],
+                    &[".config", "opencode", "storage"][..],
+                    &["Library", "Application Support", "opencode", "storage"][..],
+                    &["AppData", "Roaming", "opencode", "storage"][..],
+                ] {
+                    if let Some(mirrored) = scan_root.mirrored_store(store) {
+                        candidates.push(mirrored);
+                    }
+                }
                 Self::append_explicit_storage_candidates(&mut candidates, &scan_root.path);
                 for candidate in candidates {
                     if candidate.exists() && looks_like_opencode_storage(&candidate) {
@@ -1180,6 +1200,16 @@ impl Connector for OpenCodeConnector {
                 if path_is_excluded(&scan_root.path, &excluded_paths) {
                     continue;
                 }
+                for store in [
+                    &[".local", "share", "opencode"][..],
+                    &[".config", "opencode"][..],
+                    &["Library", "Application Support", "opencode"][..],
+                    &["AppData", "Roaming", "opencode"][..],
+                ] {
+                    if let Some(mirrored) = scan_root.mirrored_store(store) {
+                        db_candidates.push(mirrored.join("opencode.db"));
+                    }
+                }
                 Self::append_explicit_db_candidates(&mut db_candidates, &scan_root.path);
             }
         }
@@ -1266,6 +1296,16 @@ impl Connector for OpenCodeConnector {
                     continue;
                 }
                 let mut candidates = vec![scan_root.path.clone()];
+                for store in [
+                    &[".local", "share", "opencode", "storage"][..],
+                    &[".config", "opencode", "storage"][..],
+                    &["Library", "Application Support", "opencode", "storage"][..],
+                    &["AppData", "Roaming", "opencode", "storage"][..],
+                ] {
+                    if let Some(mirrored) = scan_root.mirrored_store(store) {
+                        candidates.push(mirrored);
+                    }
+                }
                 Self::append_explicit_storage_candidates(&mut candidates, &scan_root.path);
                 for candidate in candidates {
                     if candidate.exists()

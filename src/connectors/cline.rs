@@ -404,6 +404,55 @@ impl ClineConnector {
             let mut explicit = Vec::new();
             for root in &ctx.scan_roots {
                 let mut paths = Vec::new();
+                for store in [
+                    &[".cline", "data", "sessions"][..],
+                    &[".config", "Code", "User", "globalStorage"][..],
+                    &[".config", "Code - Insiders", "User", "globalStorage"][..],
+                    &[".config", "VSCodium", "User", "globalStorage"][..],
+                    &[".config", "Cursor", "User", "globalStorage"][..],
+                    &[
+                        "Library",
+                        "Application Support",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                    ][..],
+                    &[
+                        "Library",
+                        "Application Support",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                    ][..],
+                    &[
+                        "Library",
+                        "Application Support",
+                        "VSCodium",
+                        "User",
+                        "globalStorage",
+                    ][..],
+                    &[
+                        "Library",
+                        "Application Support",
+                        "Cursor",
+                        "User",
+                        "globalStorage",
+                    ][..],
+                    &["AppData", "Roaming", "Code", "User", "globalStorage"][..],
+                    &[
+                        "AppData",
+                        "Roaming",
+                        "Code - Insiders",
+                        "User",
+                        "globalStorage",
+                    ][..],
+                    &["AppData", "Roaming", "VSCodium", "User", "globalStorage"][..],
+                    &["AppData", "Roaming", "Cursor", "User", "globalStorage"][..],
+                ] {
+                    if let Some(mirrored) = root.mirrored_store(store) {
+                        Self::append_explicit_roots(&mut paths, &mirrored);
+                    }
+                }
                 Self::append_explicit_roots(&mut paths, &root.path);
                 explicit.extend(paths.into_iter().map(|path| root.with_path(path)));
             }
