@@ -327,6 +327,7 @@ impl CopilotConnector {
             .collect()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots: Vec<ScanRoot> = Vec::new();
 

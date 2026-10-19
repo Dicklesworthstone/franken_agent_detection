@@ -203,6 +203,7 @@ impl AmpConnector {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots: Vec<ScanRoot> = if ctx.use_default_detection() {
             if Self::looks_like_root(&ctx.data_dir) {
@@ -221,7 +222,13 @@ impl AmpConnector {
                     &[".local", "share", "amp"][..],
                     &["Library", "Application Support", "amp"][..],
                     &["AppData", "Roaming", "amp"][..],
-                    &[".config", "Code", "User", "globalStorage", "sourcegraph.amp"][..],
+                    &[
+                        ".config",
+                        "Code",
+                        "User",
+                        "globalStorage",
+                        "sourcegraph.amp",
+                    ][..],
                     &[
                         ".config",
                         "Code - Insiders",

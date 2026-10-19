@@ -635,7 +635,9 @@ mod tests {
                         Some(PathBuf::from("/local/work/project"))
                     );
                     assert_eq!(
-                        conversations[0].metadata.pointer("/cass/workspace_original"),
+                        conversations[0]
+                            .metadata
+                            .pointer("/cass/workspace_original"),
                         Some(&serde_json::json!("/work/project"))
                     );
                 }

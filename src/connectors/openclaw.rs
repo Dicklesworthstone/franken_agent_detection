@@ -328,26 +328,17 @@ impl OpenClawConnector {
             }
         } else {
             for root in &ctx.scan_roots {
-                let mut matched_mirror = false;
+                let mut candidates = Vec::new();
                 if let Some(mirrored_agents) = root.mirrored_store(&[".openclaw", "agents"]) {
-                    roots.extend(
-                        Self::find_agent_session_dirs_at(&mirrored_agents)
-                            .into_iter()
-                            .map(|path| root.with_path(path)),
-                    );
-                    matched_mirror = true;
+                    candidates.extend(Self::find_agent_session_dirs_at(&mirrored_agents));
                 }
                 if let Some(mirrored_sessions) = root.mirrored_store(&[".openclaw", "sessions"]) {
-                    roots.push(root.with_path(mirrored_sessions));
-                    matched_mirror = true;
+                    candidates.push(mirrored_sessions);
                 }
-                if !matched_mirror {
-                    roots.extend(
-                        Self::roots_from_scan_path(&root.path)
-                            .into_iter()
-                            .map(|path| root.with_path(path)),
-                    );
+                if candidates.is_empty() {
+                    candidates = Self::roots_from_scan_path(&root.path);
                 }
+                roots.extend(candidates.into_iter().map(|path| root.with_path(path)));
             }
         }
 

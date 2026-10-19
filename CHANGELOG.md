@@ -72,14 +72,20 @@ window is since `v0.3.11` (2026-10-14).
   `hermes`, `opencode`, `openhands`, and `shelley`), achieving 100% 34-connector coverage
   across `discover_source_files()`, `scan()`, `scan_with_callback()`, and
   `scan_with_source_boundaries()`.
-- **100% 34-connector streaming scan and 28-connector per-source boundary hooks (`franken_agent_detection-xzo`):**
+- **100% 34-connector streaming scan and 29-connector per-source boundary hooks (`franken_agent_detection-xzo`, `franken_agent_detection-v03`):**
   implemented `supports_streaming_scan() -> true` and `scan_with_callback()` across all
   remaining connectors (`aider`, `amp`, `chatgpt`, `cline`, `copilot`, `copilot_vscode`,
   `copilot_cli`, `crush`, `cursor`, `devin`, `goose`, `hermes`, and `opencode`), and
   implemented `supports_source_boundaries() -> true` and `scan_with_source_boundaries()`
   with `SourceScanHooks` (`should_scan_source` and `on_source_complete`) for `aider`, `amp`,
-  `chatgpt`, `copilot_cli`, `crush`, `devin`, `goose`, and `hermes`.
-
+  `chatgpt`, `copilot_cli`, `crush`, `devin`, `goose`, `hermes`, and `openhands`.
+- **30-provider `ScanRoot::mirrored_store` remote mirror discovery (`franken_agent_detection-e33`):**
+  wired `ScanRoot::mirrored_store` and `strict_layout` rules into 15 additional store-based
+  connectors (`clawdbot`, `openclaw`, `openhands`, `copilot_cli`, `goose`, `codebuff`,
+  `antigravity`, `opencode`, `amp`, `crush`, `devin`, `hermes`, `shelley`, `cline`, and
+  `copilot`), bringing `ScanRoot::mirrored_store` coverage to all 30 store-based connectors
+  and verifying multi-depth remote mirror discovery and scanning across 25 providers in
+  `remote_mirrors_discover_and_scan_provider_stores`.
 - **OpenClaw API token extraction and broader model/provider extraction (`franken_agent_detection-cng`):**
   wired `openclaw` into the Pi-format token extractor in `extract_tokens_for_agent` so
   OpenClaw assistant messages (`extra.message.usage`, `extra.message.model`,
@@ -103,8 +109,9 @@ window is since `v0.3.11` (2026-10-14).
 - **Preserved `metadata.cass.workspace_original` in `ScanRoot::apply_workspace_rewrite` (`franken_agent_detection-7uj`):**
   added `ScanRoot::apply_workspace_rewrite(&self, conv: &mut NormalizedConversation)` in
   `src/connectors/scan.rs` and wired it into `cursor` (both SQLite Composer and Agent
-  transcripts), `continue_dev`, and `openhands` so connector-side workspace rewrites record
-  the pre-rewrite path in `metadata.cass.workspace_original` for downstream CASS indexing.
+  transcripts), `continue_dev`, `openhands`, and `copilot` so connector-side workspace
+  rewrites record the pre-rewrite path in `metadata.cass.workspace_original` for downstream
+  CASS indexing.
 
 ## [0.3.11] -- 2026-10-14
 
