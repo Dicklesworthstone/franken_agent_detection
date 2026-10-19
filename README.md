@@ -159,10 +159,12 @@ Beyond `scan`:
 | API | Purpose |
 |---|---|
 | `discover_source_files` | Pre-parse list of the files a scan will read (role, origin, size/mtime), so hosts can mirror sources before parsing |
-| `scan_with_callback` / `supports_streaming_scan` | Emit conversations incrementally instead of materializing the corpus |
-| `scan_with_source_boundaries` / `supports_source_boundaries` | Resumable ingestion: a pre-parse skip predicate and a per-source completion event (with required sidecars such as SQLite WALs) |
-| `ScanRoot::remote` + `Origin` | Scan synced copies of remote machines, keeping host provenance |
-| `CASS_EXCLUDE_PATHS` | Comma/newline-separated files or directories the Claude Code, Codex and Pi-family connectors skip before opening them. Entries match whole path components; relative, `..` and symlinked spellings of an existing directory match too. Exact Codex JSONL exclusions cover both the plain and compressed (`.jsonl.zst`) representation. Other connectors read every source; hosts filter their conversations by `source_path` |
+| `scan_with_callback` / `supports_streaming_scan` | Emit conversations incrementally instead of materializing the corpus (supported by all 34 connectors) |
+| `scan_with_source_boundaries` / `supports_source_boundaries` | Resumable ingestion: a pre-parse skip predicate and a per-source completion event (with required sidecars such as SQLite WALs), supported by 29 single-source connectors |
+| `ScanRoot::remote` + `Origin` + `with_mirrored_source_path` | Scan synced copies of remote machines across all 30 store-based connectors (`ScanRoot::mirrored_store`), keeping host provenance |
+| `ScanRoot::with_rewrite` (`apply_workspace_rewrite`) | Rewrite remote workspace prefixes (`from -> to`) and record `metadata.cass.workspace_original` across all 34 connectors |
+| `ScanContext::with_progress_tick` (`progress_tick`) | Host stall-watchdog liveness callback (`cass#373 Variant A`), invoked per scanned source/session across all 34 connectors |
+| `CASS_EXCLUDE_PATHS` | Comma/newline-separated files or directories that all 34 connectors skip before opening or parsing them. Entries match whole path components; relative, `..` and symlinked spellings of an existing directory match too. Exact Codex JSONL exclusions cover both the plain and compressed (`.jsonl.zst`) representation |
 
 Aider accepts an exact `.aider.chat.history.md` as its scan context, including
 an intentionally selected archived copy. A missing exact file yields no
@@ -234,9 +236,18 @@ or empty `CASS_EXCLUDE_PATHS` leaves scans unrestricted. Invalid Unicode,
 unresolvable entries, or relative entries without a usable working directory
 return an error from all 34 connectors' scan and discovery methods before
 source hooks or parsing. All 34 connectors support streaming callback scans
-(`supports_streaming_scan() == true`), and 28 connectors also expose per-source
+(`supports_streaming_scan() == true`), workspace path rewrites
+(`ScanRoot::with_rewrite`), and progress liveness ticks
+(`ScanContext::with_progress_tick`). Twenty-nine connectors expose per-source
 lifecycle boundary hooks (`supports_source_boundaries() == true` via
-`scan_with_source_boundaries()`). Absolute entries remain usable without a
+`scan_with_source_boundaries()`); the remaining 5 cross-source connectors
+(`cline`, `copilot`, `cursor`, `opencode`, and `qwen`) correlate, splice, or
+deduplicate sessions across multiple files/DBs before emitting conversations and
+therefore report `supports_source_boundaries() == false`. All 30 store-based
+connectors resolve remote mirror containers via `ScanRoot::mirrored_store`
+(the remaining 4 project/explicit-root connectors — `aider`, `chatgpt`,
+`grok_bot`, and `pi_durable` — scan project directories, single files, or OS
+application caches directly). Absolute exclusion entries remain usable without a
 working directory. The existing infallible Pi `discover_sources` and durable
 `store_diagnostics` helpers log invalid-policy errors and return no sources;
 `pi_wire::try_discover_sources` exposes the discovery error to direct callers.

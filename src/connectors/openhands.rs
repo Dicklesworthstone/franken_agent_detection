@@ -663,6 +663,7 @@ fn scan_openhands_with_hooks(
             if !hooks.should_scan(&primary) {
                 continue;
             }
+            ctx.tick();
             let optional_base_state = base_state_path.is_file().then(|| {
                 DiscoveredSourceFile::new(
                     "openhands",

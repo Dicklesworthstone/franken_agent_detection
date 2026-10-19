@@ -790,6 +790,7 @@ fn scan_muse_with_hooks(
             if !hooks.should_scan(&discovered) {
                 continue;
             }
+            ctx.tick();
             let conversation = match parse_session(&session_file) {
                 Ok(conversation) => conversation,
                 Err(error) => {
@@ -801,7 +802,8 @@ fn scan_muse_with_hooks(
                     continue;
                 }
             };
-            if let Some(conversation) = conversation {
+            if let Some(mut conversation) = conversation {
+                root.apply_workspace_rewrite(&mut conversation);
                 on_conversation(conversation).with_context(|| {
                     format!("emit muse conversation {}", session_file.display())
                 })?;

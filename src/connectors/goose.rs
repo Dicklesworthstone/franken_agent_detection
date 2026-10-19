@@ -696,6 +696,7 @@ impl Connector for GooseConnector {
             if !hooks.should_scan(&source) {
                 continue;
             }
+            ctx.tick();
             match source.role {
                 DiscoveredSourceRole::SqliteDatabase => {
                     let mut emitted = 0usize;
@@ -706,7 +707,8 @@ impl Connector for GooseConnector {
                                 sqlite_convs.len(),
                                 source.source_path.display()
                             );
-                            for conv in sqlite_convs {
+                            for mut conv in sqlite_convs {
+                                ctx.apply_workspace_rewrite_for_path(&source.scan_root, &mut conv);
                                 if let Some(ext_id) = &conv.external_id {
                                     seen_ids.insert(ext_id.clone());
                                 }
@@ -743,8 +745,9 @@ impl Connector for GooseConnector {
 
                     let mut emitted = 0usize;
                     match parse_goose_jsonl(&source.source_path, &session_id) {
-                        Ok(conv) => {
+                        Ok(mut conv) => {
                             if !conv.messages.is_empty() {
+                                ctx.apply_workspace_rewrite_for_path(&source.scan_root, &mut conv);
                                 seen_ids.insert(session_id);
                                 on_conversation(conv)?;
                                 emitted = 1;

@@ -1351,6 +1351,7 @@ impl CursorConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         for (root, transcript) in Self::agent_transcript_sources(ctx, excluded_paths) {
+            ctx.tick();
             if let Some(conv) = Self::parse_agent_transcript(&transcript, &root, excluded_paths) {
                 on_conversation(conv)?;
             }
@@ -1429,6 +1430,7 @@ impl CursorConnector {
                 if !file_modified_since(&db_path, ctx.since_ts) {
                     continue;
                 }
+                ctx.tick();
 
                 match Self::extract_from_db(&db_path, ctx.since_ts) {
                     Ok(convs) => {

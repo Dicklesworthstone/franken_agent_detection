@@ -896,6 +896,7 @@ fn scan_grok_with_parser(
                     continue;
                 }
             }
+            ctx.tick();
             let conversation = match parse(&session_dir) {
                 Ok(conversation) => conversation,
                 Err(error) => {
@@ -907,7 +908,8 @@ fn scan_grok_with_parser(
                     continue;
                 }
             };
-            if let Some(conversation) = conversation {
+            if let Some(mut conversation) = conversation {
+                root.apply_workspace_rewrite(&mut conversation);
                 on_conversation(conversation)
                     .with_context(|| format!("emit grok conversation {}", session_dir.display()))?;
                 if let Some(primary) = primary {

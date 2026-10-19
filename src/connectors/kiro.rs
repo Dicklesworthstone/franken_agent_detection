@@ -454,7 +454,9 @@ impl Connector for KiroConnector {
                 if !hooks.should_scan(&discovered) {
                     continue;
                 }
-                if let Some(conversation) = Self::parse_session_file(&root, &file) {
+                ctx.tick();
+                if let Some(mut conversation) = Self::parse_session_file(&root, &file) {
+                    root.apply_workspace_rewrite(&mut conversation);
                     on_conversation(conversation)?;
                     let changed = discovered.fs_metadata_changed()
                         || sidecar_discovered

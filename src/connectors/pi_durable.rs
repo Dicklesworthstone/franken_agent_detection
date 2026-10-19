@@ -1358,10 +1358,12 @@ impl Connector for PiDurableConnector {
             if !hooks.should_scan(&source) {
                 continue;
             }
+            ctx.tick();
             match scan_candidate(&candidate) {
                 Ok(conversations) => {
                     let emitted = conversations.len();
-                    for conversation in conversations {
+                    for mut conversation in conversations {
+                        candidate.root.apply_workspace_rewrite(&mut conversation);
                         on_conversation(conversation)?;
                     }
                     let changed = source.fs_metadata_changed()

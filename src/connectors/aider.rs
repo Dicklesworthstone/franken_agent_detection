@@ -323,8 +323,10 @@ impl Connector for AiderConnector {
             if !hooks.should_scan(&discovered) {
                 continue;
             }
+            ctx.tick();
             match self.parse_chat_history(&discovered.source_path) {
-                Ok(conv) => {
+                Ok(mut conv) => {
+                    ctx.apply_workspace_rewrite_for_path(&discovered.scan_root, &mut conv);
                     on_conversation(conv)?;
                     if !discovered.fs_metadata_changed() {
                         hooks.complete(&SourceCompletion {

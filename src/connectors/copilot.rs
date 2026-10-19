@@ -811,6 +811,7 @@ impl CopilotConnector {
                 {
                     continue;
                 }
+                ctx.tick();
 
                 // CLI event logs are handled exclusively by the
                 // copilot_cli connector (which also handles Chronicle
@@ -858,6 +859,7 @@ impl CopilotConnector {
         // native entry and as an extension-store export emits once (the
         // extension copy is scanned first, matching discovery order).
         for conversation in native_conversations {
+            ctx.tick();
             match conversation.external_id.as_ref() {
                 Some(id) if !seen_surface_ids.insert(id.clone()) => continue,
                 _ => {}

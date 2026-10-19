@@ -1245,7 +1245,8 @@ impl Connector for OpenCodeConnector {
             match Self::extract_from_sqlite(&db, ctx.since_ts, ctx.progress_tick.as_deref()) {
                 Ok(sqlite_convs) => {
                     let fresh_count = sqlite_convs.len();
-                    for conv in sqlite_convs {
+                    for mut conv in sqlite_convs {
+                        ctx.apply_workspace_rewrite_for_path(&db, &mut conv);
                         if conv
                             .external_id
                             .as_ref()
@@ -1360,6 +1361,7 @@ impl Connector for OpenCodeConnector {
                 if !session_has_updates(&session_file, &message_dir, &part_dir, ctx.since_ts) {
                     continue;
                 }
+                ctx.tick();
 
                 // Parse session
                 let session = match parse_session_file(&session_file) {
@@ -1416,7 +1418,7 @@ impl Connector for OpenCodeConnector {
                         .map(|s| s.chars().take(100).collect())
                 });
 
-                on_conversation(NormalizedConversation {
+                let mut conv = NormalizedConversation {
                     agent_slug: "opencode".into(),
                     external_id: Some(session.id.clone()),
                     title,
@@ -1429,7 +1431,9 @@ impl Connector for OpenCodeConnector {
                         "project_id": session.project_id,
                     }),
                     messages,
-                })?;
+                };
+                ctx.apply_workspace_rewrite_for_path(&session_file, &mut conv);
+                on_conversation(conv)?;
             }
         }
 

@@ -665,6 +665,7 @@ fn scan_claude_with_readers<R: BufRead>(
                 );
                 continue;
             }
+            ctx.tick();
             let file_size_bytes = fs::metadata(&path).ok().map(|metadata| metadata.len());
             let compact_message_extra =
                 ClaudeCodeConnector::should_compact_large_message_extra(file_size_bytes);
@@ -1031,7 +1032,7 @@ fn scan_claude_with_readers<R: BufRead>(
                     })
             });
 
-            on_conversation(NormalizedConversation {
+            let mut conv = NormalizedConversation {
                 agent_slug: "claude_code".into(),
                 external_id: if source_kind == "claude_code_desktop_sidecar" {
                     cli_session_id.clone().or_else(|| session_id.clone())
@@ -1063,7 +1064,9 @@ fn scan_claude_with_readers<R: BufRead>(
                     "parentSessionId": parent_session_id
                 }),
                 messages,
-            })?;
+            };
+            root.apply_workspace_rewrite(&mut conv);
+            on_conversation(conv)?;
 
             // Source complete: the (single) conversation derived from this
             // transcript was delivered. Suppressed when the file changed

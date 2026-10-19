@@ -25,6 +25,7 @@ const CLINE_EXTENSIONS: [&str; 2] = ["saoudrizwan.claude-dev", "rooveterinaryinc
 const LEGACY_RESUME_WARNING: &str = "Warning: this is a legacy conversation, which means tool names may have changed. Please use the most up-to-date tools you are aware of.";
 
 struct ClineSource {
+    root: ScanRoot,
     primary: DiscoveredSourceFile,
     metadata: Option<DiscoveredSourceFile>,
     legacy: Option<Box<Self>>,
@@ -583,6 +584,7 @@ impl ClineConnector {
                     .with_fs_metadata()
                 });
                 out.push(ClineSource {
+                    root: root.clone(),
                     primary,
                     metadata,
                     legacy: None,
@@ -689,7 +691,9 @@ impl Connector for ClineConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         for source in &Self::source_groups(ctx)? {
-            if let Some(conv) = parse_source_group(source) {
+            ctx.tick();
+            if let Some(mut conv) = parse_source_group(source) {
+                source.root.apply_workspace_rewrite(&mut conv);
                 on_conversation(conv)?;
             }
         }

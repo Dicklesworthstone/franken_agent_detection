@@ -420,6 +420,7 @@ impl Connector for AmpConnector {
                 if !hooks.should_scan(&discovered) {
                     continue;
                 }
+                ctx.tick();
                 // NOTE: We intentionally skip the file_modified_since() check for Amp.
                 // Amp does not update file mtime when new messages are added to a thread,
                 // so mtime-based incremental indexing would miss new messages.
@@ -509,7 +510,7 @@ impl Connector for AmpConnector {
                         .or(thread_created);
 
                     let msg_count = messages.len();
-                    on_conversation(NormalizedConversation {
+                    let mut conv = NormalizedConversation {
                         agent_slug: "amp".into(),
                         external_id,
                         title,
@@ -519,7 +520,9 @@ impl Connector for AmpConnector {
                         ended_at,
                         metadata: val.clone(),
                         messages,
-                    })?;
+                    };
+                    root.apply_workspace_rewrite(&mut conv);
+                    on_conversation(conv)?;
                     tracing::info!(
                         target: "connector::amp",
                         source = %path.display(),

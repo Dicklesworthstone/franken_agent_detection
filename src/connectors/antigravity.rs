@@ -796,7 +796,9 @@ fn scan_antigravity_with_hooks(
             if !hooks.should_scan(&discovered) {
                 continue;
             }
-            if let Some(conversation) = parse_conversation(&conversation_dir, &root) {
+            ctx.tick();
+            if let Some(mut conversation) = parse_conversation(&conversation_dir, &root) {
+                root.apply_workspace_rewrite(&mut conversation);
                 on_conversation(conversation).with_context(|| {
                     format!(
                         "emit antigravity conversation {}",

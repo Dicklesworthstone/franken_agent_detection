@@ -65,6 +65,13 @@ window is since `v0.3.11` (2026-10-14).
 
 ### Added
 
+- **100% 34-connector `ScanRoot::apply_workspace_rewrite` and `ScanContext::progress_tick` (`franken_agent_detection-14u`, `franken_agent_detection-kds`, `franken_agent_detection-f9a`):**
+  added `ScanContext::tick(&self)` and `ScanContext::apply_workspace_rewrite_for_path` in
+  `src/connectors/scan.rs` and wired both across all remaining connectors so 100% of all 34
+  connectors honor `ScanRoot::with_rewrite(from, to)` (updating `conv.workspace` and recording
+  `metadata.cass.workspace_original`) and invoke `ctx.progress_tick` (`cass#373 Variant A`
+  stall-watchdog liveness) during scans; enforced both invariants across all 34 connectors in
+  `all_compiled_connectors_produce_schema_conformant_conversations`.
 - **100% 34-connector `CASS_EXCLUDE_PATHS` enforcement (`franken_agent_detection-uji`):**
   wired `excluded_scan_paths_from_env()` pre-parse validation and `path_is_excluded()`
   filtering across all remaining connectors (`aider`, `amp`, `chatgpt`, `cline`, `copilot`,

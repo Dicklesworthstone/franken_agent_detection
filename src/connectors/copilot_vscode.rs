@@ -1369,7 +1369,10 @@ pub fn scan_native_with_exclusions(
         if !file_modified_since(&source.path, since_ts) {
             continue;
         }
-        out.extend(parse_source(&source, &mut seen_sessions));
+        for mut conv in parse_source(&source, &mut seen_sessions) {
+            root.apply_workspace_rewrite(&mut conv);
+            out.push(conv);
+        }
     }
     out
 }

@@ -352,9 +352,13 @@ impl Connector for QwenConnector {
                 if !qwen_source_modified_since(&session_path, ctx.since_ts) {
                     continue;
                 }
+                ctx.tick();
 
                 match parse_qwen_session(&session_path) {
-                    Ok(Some(conv)) => on_conversation(conv)?,
+                    Ok(Some(mut conv)) => {
+                        root.apply_workspace_rewrite(&mut conv);
+                        on_conversation(conv)?;
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         tracing::debug!(

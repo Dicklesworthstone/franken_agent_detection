@@ -150,16 +150,15 @@ impl ShelleyConnector {
     fn candidate_roots(ctx: &ScanContext) -> Vec<Candidate> {
         let mut out: Vec<Candidate> = Vec::new();
 
-        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
-            // cass fixture/scoped convention: a *.db data_dir IS the database.
-            out.push(Candidate {
-                root: ScanRoot::local(ctx.data_dir.clone()),
-                kind: CandidateKind::Explicit,
-            });
-            return dedupe_candidates(out);
-        }
-
         if ctx.use_default_detection() {
+            if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
+                // cass fixture/scoped convention: a *.db data_dir IS the database.
+                out.push(Candidate {
+                    root: ScanRoot::local(ctx.data_dir.clone()),
+                    kind: CandidateKind::Explicit,
+                });
+                return dedupe_candidates(out);
+            }
             if let Some(env_db) = env_path_nonempty(SHELLEY_DB_ENV) {
                 out.push(Candidate {
                     root: ScanRoot::local(env_db),
@@ -189,14 +188,8 @@ impl ShelleyConnector {
             return dedupe_candidates(out);
         }
 
-        // Explicit scan roots. Remote roots suppress local defaults entirely.
-        let scoped = ctx.data_dir.join("shelley.db");
-        if scoped.is_file() {
-            out.push(Candidate {
-                root: ScanRoot::local(scoped),
-                kind: CandidateKind::Auto,
-            });
-        }
+        // Explicit scan roots first so supplied ScanRoot provenance,
+        // workspace_rewrites, and mirrored_source_path are preserved.
         for scan_root in &ctx.scan_roots {
             if scan_root.path.is_file() {
                 out.push(Candidate {
@@ -225,6 +218,20 @@ impl ShelleyConnector {
                 ),
                 kind: CandidateKind::Auto,
             });
+        }
+        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
+            out.push(Candidate {
+                root: ScanRoot::local(ctx.data_dir.clone()),
+                kind: CandidateKind::Explicit,
+            });
+        } else {
+            let scoped = ctx.data_dir.join("shelley.db");
+            if scoped.is_file() {
+                out.push(Candidate {
+                    root: ScanRoot::local(scoped),
+                    kind: CandidateKind::Auto,
+                });
+            }
         }
         dedupe_candidates(out)
     }
@@ -360,10 +367,12 @@ impl ShelleyConnector {
                 );
                 continue;
             }
+            ctx.tick();
             match scan_one_database(&db, candidate.kind, ctx.since_ts) {
                 Ok(convs) => {
                     let mut emitted = 0usize;
-                    for conv in convs {
+                    for mut conv in convs {
+                        candidate.root.apply_workspace_rewrite(&mut conv);
                         let key = conv.external_id.clone().unwrap_or_default();
                         if seen_external.insert(key) {
                             on_conversation(conv)?;

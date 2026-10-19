@@ -298,6 +298,7 @@ impl Connector for GrokBotConnector {
             if !hooks.should_scan(&source) {
                 continue;
             }
+            ctx.tick();
             let conversation = match parse_replica(&source) {
                 Ok(conversation) => conversation,
                 Err(error) => {
@@ -306,7 +307,8 @@ impl Connector for GrokBotConnector {
                 }
             };
             let conversations_emitted = usize::from(conversation.is_some());
-            if let Some(conversation) = conversation {
+            if let Some(mut conversation) = conversation {
+                ctx.apply_workspace_rewrite_for_path(&source.scan_root, &mut conversation);
                 on_conversation(conversation)?;
             }
             if !source.fs_metadata_changed() {

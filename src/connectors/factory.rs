@@ -278,9 +278,11 @@ impl Connector for FactoryConnector {
                 if !hooks.should_scan(&discovered) {
                     continue;
                 }
+                ctx.tick();
 
                 match parse_factory_session(path) {
-                    Ok(Some(conv)) => {
+                    Ok(Some(mut conv)) => {
+                        root.apply_workspace_rewrite(&mut conv);
                         on_conversation(conv)?;
                         if !discovered.fs_metadata_changed() {
                             hooks.complete(&SourceCompletion {

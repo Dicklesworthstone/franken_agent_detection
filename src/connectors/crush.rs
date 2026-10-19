@@ -232,6 +232,7 @@ impl Connector for CrushConnector {
             if !hooks.should_scan(&source) {
                 continue;
             }
+            ctx.tick();
             match Self::extract_from_sqlite(&source.source_path, ctx.since_ts) {
                 Ok(db_convs) => {
                     tracing::debug!(
@@ -240,7 +241,8 @@ impl Connector for CrushConnector {
                         source.source_path.display()
                     );
                     let mut conversations_emitted = 0usize;
-                    for conv in db_convs {
+                    for mut conv in db_convs {
+                        ctx.apply_workspace_rewrite_for_path(&source.scan_root, &mut conv);
                         let id = conv.external_id.clone().unwrap_or_default();
                         if seen_ids.insert(id) {
                             on_conversation(conv)?;

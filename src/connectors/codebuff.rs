@@ -453,7 +453,11 @@ impl Connector for CodebuffConnector {
                     continue;
                 }
                 match parse_session(&source) {
-                    Ok(Some(conversation)) => {
+                    Ok(Some(mut conversation)) => {
+                        ctx.apply_workspace_rewrite_for_path(
+                            &source.source_path,
+                            &mut conversation,
+                        );
                         emit(conversation)?;
                         if !source.fs_metadata_changed() {
                             hooks.complete(&SourceCompletion {
@@ -469,9 +473,7 @@ impl Connector for CodebuffConnector {
                         first_failure.get_or_insert_with(|| (source.source_path.clone(), error));
                     }
                 }
-                if let Some(tick) = &ctx.progress_tick {
-                    tick();
-                }
+                ctx.tick();
             }
         }
         match first_failure {

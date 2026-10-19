@@ -836,6 +836,7 @@ fn scan_gemini_with_hooks(
             if !hooks.should_scan(&discovered) {
                 continue;
             }
+            ctx.tick();
             let file_size_bytes = fs::metadata(&file).ok().map(|metadata| metadata.len());
             let compact_message_extra =
                 GeminiConnector::should_compact_large_message_extra(file_size_bytes);
@@ -965,7 +966,7 @@ fn scan_gemini_with_hooks(
                     .map(std::path::Path::to_path_buf)
             });
 
-            on_conversation(NormalizedConversation {
+            let mut conv = NormalizedConversation {
                 agent_slug: "gemini".into(),
                 external_id: session_id
                     .or_else(|| file.file_stem().and_then(|s| s.to_str()).map(String::from)),
@@ -979,7 +980,9 @@ fn scan_gemini_with_hooks(
                     "project_hash": project_hash
                 }),
                 messages,
-            })?;
+            };
+            root.apply_workspace_rewrite(&mut conv);
+            on_conversation(conv)?;
 
             // Source complete: the session's conversation was delivered.
             // Withheld when the file changed while being parsed.

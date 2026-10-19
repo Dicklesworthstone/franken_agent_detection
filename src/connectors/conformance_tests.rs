@@ -956,6 +956,9 @@ mod conformance {
 
         #[test]
         fn all_compiled_connectors_produce_schema_conformant_conversations() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
             for (slug, factory) in get_connector_factories() {
                 let tmp = TempDir::new().expect("create temp dir for connector fixture");
                 let Some(ctx) = build_connector_fixture_context(slug, tmp.path()) else {
@@ -975,6 +978,12 @@ mod conformance {
                     continue;
                 };
 
+                let ticks = Arc::new(AtomicUsize::new(0));
+                let ticks_clone = Arc::clone(&ticks);
+                let ctx = ctx.with_progress_tick(Arc::new(move || {
+                    ticks_clone.fetch_add(1, Ordering::Relaxed);
+                }));
+
                 let convs = factory().scan(&ctx).unwrap_or_else(|err| {
                     // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and scan error in conformance test.
                     panic!("{slug}: schema conformance fixture scan failed: {err}")
@@ -983,11 +992,46 @@ mod conformance {
                     !convs.is_empty(),
                     "{slug}: schema conformance fixture yielded no conversations"
                 );
+                assert!(
+                    ticks.load(Ordering::Relaxed) >= 1,
+                    "{slug}: scan did not invoke ctx.progress_tick at least once"
+                );
                 for conv in &convs {
                     validate_conversation(conv, slug);
                     for msg in &conv.messages {
                         validate_message(msg, slug);
                     }
+                }
+
+                if let Some(orig_ws) = convs[0].workspace.as_ref().and_then(|p| p.to_str()) {
+                    let rewritten_roots = ctx
+                        .scan_roots
+                        .iter()
+                        .cloned()
+                        .map(|r| r.with_rewrite(orig_ws, "/conformance-rewritten-workspace"))
+                        .collect();
+                    let rewrite_ctx = ScanContext::with_roots(
+                        ctx.data_dir.clone(),
+                        rewritten_roots,
+                        ctx.since_ts,
+                    );
+                    let rewritten_convs = factory().scan(&rewrite_ctx).unwrap_or_else(|err| {
+                        // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and rewrite scan error in conformance test.
+                        panic!("{slug}: workspace rewrite conformance scan failed: {err}")
+                    });
+                    assert_eq!(
+                        rewritten_convs[0].workspace.as_deref(),
+                        Some(std::path::Path::new("/conformance-rewritten-workspace")),
+                        "{slug}: connector did not apply ScanRoot workspace_rewrites"
+                    );
+                    assert_eq!(
+                        rewritten_convs[0]
+                            .metadata
+                            .pointer("/cass/workspace_original")
+                            .and_then(|v| v.as_str()),
+                        Some(orig_ws),
+                        "{slug}: connector did not record /cass/workspace_original after rewrite"
+                    );
                 }
             }
         }

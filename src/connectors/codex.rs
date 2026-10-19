@@ -582,6 +582,7 @@ fn scan_codex_with_hooks(
             if !hooks.should_scan(&discovered) {
                 continue;
             }
+            ctx.tick();
             let Some(format) = RolloutFormat::of(&file) else {
                 continue;
             };
@@ -1007,7 +1008,7 @@ fn scan_codex_with_hooks(
                         .map(|s| s.chars().take(100).collect())
                 });
 
-            on_conversation(NormalizedConversation {
+            let mut conv = NormalizedConversation {
                 agent_slug: "codex".to_string(),
                 external_id,
                 title,
@@ -1017,7 +1018,9 @@ fn scan_codex_with_hooks(
                 ended_at,
                 metadata: serde_json::json!({"source": if format == RolloutFormat::Json { "rollout_json" } else { "rollout" }}),
                 messages,
-            })?;
+            };
+            root.apply_workspace_rewrite(&mut conv);
+            on_conversation(conv)?;
 
             // Source complete: the rollout's conversation was delivered.
             // Withheld when the file changed while being parsed.

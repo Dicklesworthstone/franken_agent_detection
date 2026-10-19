@@ -1557,6 +1557,7 @@ pub fn scan_roots_with_boundaries(
         }
         let sessions = sessions_dir(home);
         let tag = |mut conversation: NormalizedConversation| {
+            root.apply_workspace_rewrite(&mut conversation);
             if let Some(profile) = profile {
                 if let Some(meta) = conversation.metadata.as_object_mut() {
                     meta.insert(
@@ -1584,6 +1585,7 @@ pub fn scan_roots_with_boundaries(
             if !hooks.should_scan(&source) {
                 continue;
             }
+            ctx.tick();
             let parsed = if sqlite {
                 parse_sqlite_source(&source.source_path, &sessions, agent_slug)
             } else {

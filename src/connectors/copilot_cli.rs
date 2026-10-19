@@ -841,6 +841,7 @@ impl Connector for CopilotCliConnector {
             if !hooks.should_scan(&source) {
                 continue;
             }
+            ctx.tick();
             match self.parse_event_log(&source.source_path) {
                 Ok(convs) => {
                     tracing::debug!(
@@ -849,7 +850,8 @@ impl Connector for CopilotCliConnector {
                         "copilot_cli: parsed event file"
                     );
                     let mut conversations_emitted = 0usize;
-                    for conv in convs {
+                    for mut conv in convs {
+                        ctx.apply_workspace_rewrite_for_path(&source.source_path, &mut conv);
                         on_conversation(conv)?;
                         conversations_emitted += 1;
                     }

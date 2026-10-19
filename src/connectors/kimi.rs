@@ -388,6 +388,7 @@ impl Connector for KimiConnector {
                 if !hooks.should_scan(&discovered) {
                     continue;
                 }
+                ctx.tick();
 
                 let parsed = modern_wire_layout(&wire_path).map_or_else(
                     || parse_kimi_session(&wire_path),
@@ -395,7 +396,8 @@ impl Connector for KimiConnector {
                 );
 
                 match parsed {
-                    Ok(Some(conv)) => {
+                    Ok(Some(mut conv)) => {
+                        root.apply_workspace_rewrite(&mut conv);
                         on_conversation(conv)?;
                         if !discovered.fs_metadata_changed() {
                             hooks.complete(&SourceCompletion {

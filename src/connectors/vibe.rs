@@ -525,6 +525,7 @@ impl Connector for VibeConnector {
                 if !hooks.should_scan(&discovered) {
                     continue;
                 }
+                ctx.tick();
 
                 let file_handle = match fs::File::open(&file) {
                     Ok(f) => f,
@@ -538,7 +539,8 @@ impl Connector for VibeConnector {
                     }
                 };
                 let reader = std::io::BufReader::new(file_handle);
-                if let Some(conv) = Self::parse_session_reader(&source, &file, reader) {
+                if let Some(mut conv) = Self::parse_session_reader(&source, &file, reader) {
+                    source.root.apply_workspace_rewrite(&mut conv);
                     on_conversation(conv)?;
                     if !discovered.fs_metadata_changed() {
                         hooks.complete(&SourceCompletion {

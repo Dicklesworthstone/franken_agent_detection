@@ -531,6 +531,7 @@ impl OpenClawConnector {
             if !hooks.should_scan(&discovered) {
                 continue;
             }
+            ctx.tick();
             let agent_directory = Self::agent_directory_from_db_path(db);
             match sqlite_store::extract_from_sqlite(db, &agent_directory, ctx.since_ts) {
                 Ok(db_convs) => {
@@ -541,7 +542,8 @@ impl OpenClawConnector {
                         "openclaw: scanned sqlite transcript store"
                     );
                     let emitted = db_convs.len();
-                    for conv in db_convs {
+                    for mut conv in db_convs {
+                        root.apply_workspace_rewrite(&mut conv);
                         if let Some(sid) = conv.metadata.get("session_id").and_then(|v| v.as_str())
                         {
                             seen.insert((agent_directory.clone(), sid.to_string()));
@@ -1251,6 +1253,7 @@ impl Connector for OpenClawConnector {
                 if !hooks.should_scan(&discovered) {
                     continue;
                 }
+                ctx.tick();
 
                 let file_handle = match fs::File::open(&file) {
                     Ok(f) => f,
@@ -1268,7 +1271,8 @@ impl Connector for OpenClawConnector {
                     &agent_slug,
                     reader,
                 ) {
-                    Ok(Some(conv)) => {
+                    Ok(Some(mut conv)) => {
+                        root.apply_workspace_rewrite(&mut conv);
                         on_conversation(conv)?;
                         if !discovered.fs_metadata_changed() {
                             hooks.complete(&SourceCompletion {

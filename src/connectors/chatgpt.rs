@@ -765,9 +765,11 @@ impl Connector for ChatGptConnector {
                     if !hooks.should_scan(&discovered) {
                         continue;
                     }
+                    ctx.tick();
 
                     match self.parse_conversation_file(&path, ctx.since_ts, is_encrypted) {
-                        Ok(Some(conv)) => {
+                        Ok(Some(mut conv)) => {
+                            root.apply_workspace_rewrite(&mut conv);
                             tracing::debug!(
                                 path = %path.display(),
                                 messages = conv.messages.len(),

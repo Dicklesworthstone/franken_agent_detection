@@ -5,7 +5,7 @@ mod mirror;
 use crate::connectors::path_trie::PathTrie;
 use crate::types::{Origin, PathMapping, Platform};
 use once_cell::sync::OnceCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -264,6 +264,31 @@ impl ScanContext {
     pub fn with_progress_tick(mut self, tick: ScanProgressTick) -> Self {
         self.progress_tick = Some(tick);
         self
+    }
+
+    /// Invoke the configured liveness tick, if any (cass#373 Variant A).
+    #[inline]
+    pub fn tick(&self) {
+        if let Some(tick) = &self.progress_tick {
+            tick();
+        }
+    }
+
+    /// Apply workspace rewrites from the most specific matching [`ScanRoot`]
+    /// in `scan_roots` for a discovered source path or root path.
+    pub fn apply_workspace_rewrite_for_path(
+        &self,
+        path: &Path,
+        conv: &mut crate::types::NormalizedConversation,
+    ) {
+        if let Some(root) = self
+            .scan_roots
+            .iter()
+            .filter(|r| path == r.path || path.starts_with(&r.path))
+            .max_by_key(|r| r.path.as_os_str().len())
+        {
+            root.apply_workspace_rewrite(conv);
+        }
     }
 
     /// Legacy accessor for backward compatibility.
@@ -623,13 +648,7 @@ mod tests {
                 assert_eq!(conversations.len(), 1, "{slug} at depth {depth}");
                 assert_eq!(conversations[0].agent_slug, slug);
                 assert_eq!(conversations[0].source_path, target);
-                if matches!(slug, "factory" | "prime_agent") {
-                    assert_eq!(
-                        conversations[0].workspace,
-                        Some(PathBuf::from("/work/project"))
-                    );
-                }
-                if slug == "copilot" {
+                if matches!(slug, "factory" | "prime_agent" | "copilot") {
                     assert_eq!(
                         conversations[0].workspace,
                         Some(PathBuf::from("/local/work/project"))

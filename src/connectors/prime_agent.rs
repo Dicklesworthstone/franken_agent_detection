@@ -1063,8 +1063,10 @@ impl Connector for PrimeAgentConnector {
                 if !hooks.should_scan(&discovered) {
                     continue;
                 }
+                ctx.tick();
                 match parse_session_file(&file) {
-                    Ok(Some(conversation)) => {
+                    Ok(Some(mut conversation)) => {
+                        root.apply_workspace_rewrite(&mut conversation);
                         on_conversation(conversation)?;
                         if !discovered.fs_metadata_changed() {
                             hooks.complete(&SourceCompletion {

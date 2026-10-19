@@ -368,6 +368,7 @@ impl Connector for ClawdbotConnector {
                 if !hooks.should_scan(&discovered) {
                     continue;
                 }
+                ctx.tick();
 
                 let file_handle = match fs::File::open(&file) {
                     Ok(f) => f,
@@ -377,7 +378,8 @@ impl Connector for ClawdbotConnector {
                     }
                 };
                 let reader = std::io::BufReader::new(file_handle);
-                if let Some(conv) = Self::parse_session_reader(&root.path, &file, reader) {
+                if let Some(mut conv) = Self::parse_session_reader(&root.path, &file, reader) {
+                    root.apply_workspace_rewrite(&mut conv);
                     on_conversation(conv)?;
                     if !discovered.fs_metadata_changed() {
                         hooks.complete(&SourceCompletion {
