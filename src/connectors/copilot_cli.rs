@@ -31,8 +31,13 @@ use super::scan::{
     SourceScanHooks,
 };
 use super::utils::{excluded_scan_paths_from_env, path_is_excluded, read_capped};
-use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use super::{
+    Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
+    parse_timestamp, unwrap_skill_invocations,
+};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct CopilotCliConnector;
 
@@ -396,8 +401,19 @@ impl CopilotCliConnector {
                 (other, None) => other,
             };
 
-            let (role, content) = Self::extract_event_message(&event, event_type);
-            if role.is_empty() || content.trim().is_empty() {
+            let (role, mut content) = Self::extract_event_message(&event, event_type);
+            if role.is_empty() {
+                continue;
+            }
+            let invocations = Self::extract_invocations(&event);
+            if content.trim().is_empty() && !invocations.is_empty() {
+                content = invocations
+                    .iter()
+                    .map(|inv| format!("[Tool: {}]", inv.name))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            if content.trim().is_empty() {
                 continue;
             }
 
@@ -412,7 +428,7 @@ impl CopilotCliConnector {
                 created_at: ts,
                 content,
                 extra: event,
-                invocations: Vec::new(),
+                invocations,
                 snippets: Vec::new(),
             });
         }
@@ -465,6 +481,7 @@ impl CopilotCliConnector {
     }
 
     /// Parse a legacy CLI session-state JSON file (single JSON document).
+    #[allow(clippy::too_many_lines)]
     fn parse_session_json(&self, val: &Value, path: &Path) -> Vec<NormalizedConversation> {
         // Try extracting messages from "events" or "history" arrays.
         let events = val
@@ -505,8 +522,19 @@ impl CopilotCliConnector {
                 (other, None) => other,
             };
 
-            let (role, content) = Self::extract_event_message(event, event_type);
-            if role.is_empty() || content.trim().is_empty() {
+            let (role, mut content) = Self::extract_event_message(event, event_type);
+            if role.is_empty() {
+                continue;
+            }
+            let invocations = Self::extract_invocations(event);
+            if content.trim().is_empty() && !invocations.is_empty() {
+                content = invocations
+                    .iter()
+                    .map(|inv| format!("[Tool: {}]", inv.name))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            if content.trim().is_empty() {
                 continue;
             }
 
@@ -521,7 +549,7 @@ impl CopilotCliConnector {
                 created_at: ts,
                 content,
                 extra: event.clone(),
-                invocations: Vec::new(),
+                invocations,
                 snippets: Vec::new(),
             });
         }
@@ -723,6 +751,64 @@ impl CopilotCliConnector {
         }
 
         String::new()
+    }
+
+    /// Extract structured tool/skill invocations from top-level or nested
+    /// `data`/`payload` envelopes (`content` `tool_use` blocks, Chronicle
+    /// `toolRequests`, and OpenAI-style `tool_calls`).
+    fn extract_invocations(event: &Value) -> Vec<NormalizedInvocation> {
+        let mut invocations = Vec::new();
+        let wrappers: [Option<&Value>; 3] = [Some(event), event.get("data"), event.get("payload")];
+        for wrapper in wrappers.into_iter().flatten() {
+            for key in ["content", "message"] {
+                if let Some(field) = wrapper.get(key) {
+                    invocations.extend(extract_invocations_from_content_blocks(field));
+                }
+            }
+            for key in ["toolRequests", "tool_requests", "tool_calls", "toolCalls"] {
+                let Some(arr) = wrapper.get(key).and_then(Value::as_array) else {
+                    continue;
+                };
+                for call in arr {
+                    let func = call.get("function");
+                    let name = call
+                        .get("name")
+                        .or_else(|| call.get("toolName"))
+                        .or_else(|| call.get("tool"))
+                        .and_then(Value::as_str)
+                        .or_else(|| func.and_then(|f| f.get("name")).and_then(Value::as_str))
+                        .filter(|n| !n.trim().is_empty());
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    let call_id = call
+                        .get("id")
+                        .or_else(|| call.get("toolCallId"))
+                        .or_else(|| call.get("call_id"))
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .map(String::from);
+                    let raw_args = call
+                        .get("input")
+                        .or_else(|| call.get("arguments"))
+                        .or_else(|| func.and_then(|f| f.get("arguments")));
+                    let arguments = raw_args.map(|arg| {
+                        arg.as_str()
+                            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                            .unwrap_or_else(|| arg.clone())
+                    });
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: name.to_string(),
+                        raw_name: None,
+                        call_id,
+                        arguments,
+                    });
+                }
+            }
+        }
+        unwrap_skill_invocations(&mut invocations);
+        invocations
     }
 
     /// Look up a string-valued field under any of the provided keys, searching
@@ -1396,6 +1482,17 @@ mod tests {
         assert!(conv.messages[2].content.contains("lib.rs"));
         assert_eq!(conv.messages[3].role, "assistant");
         assert!(conv.messages[3].content.contains("connector factories"));
+        assert_eq!(conv.messages[3].invocations.len(), 1);
+        assert_eq!(conv.messages[3].invocations[0].kind, "tool");
+        assert_eq!(conv.messages[3].invocations[0].name, "Read");
+        assert_eq!(
+            conv.messages[3].invocations[0]
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("path"))
+                .and_then(Value::as_str),
+            Some("lib.rs")
+        );
         // Title derived from first user message.
         assert!(
             conv.title

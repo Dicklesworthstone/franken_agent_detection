@@ -21,10 +21,12 @@ use super::scan::{
 };
 use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
 use super::{
-    Connector, file_modified_since, flatten_content, franken_detection_for_connector,
-    parse_timestamp,
+    Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
+    franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct ClawdbotConnector;
 
@@ -217,7 +219,55 @@ impl ClawdbotConnector {
                 .get("role")
                 .and_then(|v| v.as_str())
                 .unwrap_or("assistant");
-            let content = val.get("content").map(flatten_content).unwrap_or_default();
+            let mut invocations = val
+                .get("content")
+                .map(extract_invocations_from_content_blocks)
+                .unwrap_or_default();
+            if let Some(tool_calls) = val.get("tool_calls").and_then(Value::as_array) {
+                for call in tool_calls {
+                    let func = call.get("function");
+                    let name = call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .or_else(|| func.and_then(|f| f.get("name")).and_then(Value::as_str))
+                        .filter(|n| !n.trim().is_empty());
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    let call_id = call
+                        .get("id")
+                        .or_else(|| call.get("toolCallId"))
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .map(String::from);
+                    let raw_args = call
+                        .get("arguments")
+                        .or_else(|| call.get("input"))
+                        .or_else(|| func.and_then(|f| f.get("arguments")));
+                    let arguments = raw_args.map(|arg| {
+                        arg.as_str()
+                            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                            .unwrap_or_else(|| arg.clone())
+                    });
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: name.to_string(),
+                        raw_name: None,
+                        call_id,
+                        arguments,
+                    });
+                }
+            }
+            unwrap_skill_invocations(&mut invocations);
+
+            let mut content = val.get("content").map(flatten_content).unwrap_or_default();
+            if content.trim().is_empty() && !invocations.is_empty() {
+                content = invocations
+                    .iter()
+                    .map(|inv| format!("[Tool: {}]", inv.name))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
 
             if content.trim().is_empty() {
                 continue;
@@ -242,7 +292,7 @@ impl ClawdbotConnector {
                 created_at: created,
                 content,
                 extra: val,
-                invocations: Vec::new(),
+                invocations,
                 snippets: Vec::new(),
             });
         }
@@ -604,5 +654,48 @@ mod tests {
             );
             assert_eq!(attempts.get(), 1, "the failed read must not be retried");
         }
+    }
+
+    #[test]
+    fn parse_session_extracts_content_block_and_tool_call_invocations() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".clawdbot/sessions");
+        let file = sessions.join("tools.jsonl");
+        let data = concat!(
+            "{\"role\":\"user\",\"content\":\"Run tests\",\"timestamp\":\"2026-03-01T10:00:00Z\"}\n",
+            "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Checking\"},{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"bash\",\"input\":{\"cmd\":\"cargo test\"}},{\"type\":\"tool_use\",\"id\":\"tu_2\",\"name\":\"load_skill\",\"input\":{\"name\":\"rust-testing\"}}],\"timestamp\":\"2026-03-01T10:00:01Z\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"tc_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"src/lib.rs\\\"}\"}}],\"timestamp\":\"2026-03-01T10:00:02Z\"}\n"
+        );
+        let conv =
+            ClawdbotConnector::parse_session_reader(&sessions, &file, std::io::Cursor::new(data))
+                .expect("should parse tool session");
+        assert_eq!(conv.messages.len(), 3);
+        assert_eq!(conv.messages[1].invocations.len(), 2);
+        assert_eq!(conv.messages[1].invocations[0].kind, "tool");
+        assert_eq!(conv.messages[1].invocations[0].name, "bash");
+        assert_eq!(
+            conv.messages[1].invocations[0].call_id.as_deref(),
+            Some("tu_1")
+        );
+        assert_eq!(conv.messages[1].invocations[1].kind, "skill");
+        assert_eq!(conv.messages[1].invocations[1].name, "rust-testing");
+        assert_eq!(
+            conv.messages[1].invocations[1].raw_name.as_deref(),
+            Some("load_skill")
+        );
+        assert_eq!(conv.messages[2].invocations.len(), 1);
+        assert_eq!(conv.messages[2].invocations[0].name, "read_file");
+        assert_eq!(
+            conv.messages[2].invocations[0].call_id.as_deref(),
+            Some("tc_1")
+        );
+        assert_eq!(
+            conv.messages[2].invocations[0]
+                .arguments
+                .as_ref()
+                .and_then(|v| v.get("path"))
+                .and_then(Value::as_str),
+            Some("src/lib.rs")
+        );
     }
 }

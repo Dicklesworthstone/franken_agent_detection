@@ -65,6 +65,23 @@ window is since `v0.3.11` (2026-10-14).
 
 ### Added
 
+- **34-connector real-fixture discovery, streaming callback, and source-boundary conformance (`franken_agent_detection-1b3`):**
+  extended `checked_in_fixture_stores_produce_schema_conformant_conversations` and
+  `all_compiled_connectors_produce_schema_conformant_conversations` in
+  `src/connectors/conformance_tests.rs` to verify against populated fixtures that every
+  connector's `discover_source_files(&ctx)` returns non-empty valid `DiscoveredSourceFile`
+  records with matching `provider_slug` and covers every emitted conversation's `source_path`,
+  that `supports_streaming_scan() == true` and `scan_with_callback(&ctx)` produces
+  conversations identical to `scan(&ctx)` across all 34 connectors, and that all 29
+  `supports_source_boundaries() == true` connectors emit matching conversations and valid
+  `SourceCompletion` events while honoring `should_scan_source == false`.
+- **Structured `NormalizedInvocation` extraction across `copilot_cli`, `opencode`, `crush`, and `clawdbot` (`franken_agent_detection-h40`):**
+  wired structured tool and skill invocation extraction (plus `unwrap_skill_invocations`) into
+  `copilot_cli` (Chronicle `toolRequests`, `tool_calls`, and `content`/`message` `tool_use`
+  blocks), `opencode` (1.x `PartInfo` / `SqlitePartData` tool parts and 2.x `session_message`
+  `assistant` tool items, `skill` rows, and `shell` rows), `crush` (`tool_call` / `tool_use` /
+  `tool` parts), and `clawdbot` (`content` `tool_use` blocks and OpenAI-style `tool_calls`),
+  preserving tool-call-only assistant turns that were previously dropped when text was empty.
 - **100% 34-connector `ScanRoot::apply_workspace_rewrite` and `ScanContext::progress_tick` (`franken_agent_detection-14u`, `franken_agent_detection-kds`, `franken_agent_detection-f9a`):**
   added `ScanContext::tick(&self)` and `ScanContext::apply_workspace_rewrite_for_path` in
   `src/connectors/scan.rs` and wired both across all remaining connectors so 100% of all 34

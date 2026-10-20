@@ -65,8 +65,12 @@ use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanR
 use super::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
 };
-use super::{Connector, file_modified_since, franken_detection_for_connector};
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use super::{
+    Connector, file_modified_since, franken_detection_for_connector, unwrap_skill_invocations,
+};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct OpenCodeConnector;
 
@@ -758,11 +762,20 @@ impl OpenCodeConnector {
                     continue;
                 }
             };
-            let Some((role, author, content)) = v2_message_content(&row.message_type, &data) else {
+            let Some((role, author, mut content)) = v2_message_content(&row.message_type, &data)
+            else {
                 continue;
             };
+            let invocations = v2_message_invocations(&row.message_type, &data);
             if content.trim().is_empty() {
-                continue;
+                if invocations.is_empty() {
+                    continue;
+                }
+                content = invocations
+                    .iter()
+                    .map(|inv| format!("[Tool: {}]", inv.name))
+                    .collect::<Vec<_>>()
+                    .join("\n");
             }
             let col_ts = row
                 .time_created_raw
@@ -785,7 +798,7 @@ impl OpenCodeConnector {
                     "type": row.message_type,
                     "seq": row.seq,
                 }),
-                invocations: Vec::new(),
+                invocations,
                 snippets: Vec::new(),
             };
             pending_by_session
@@ -879,14 +892,22 @@ impl OpenCodeConnector {
             };
 
             let parts = parts_by_message.remove(&row.id).unwrap_or_default();
-            let content_text = if !parts.is_empty() {
+            let invocations = extract_invocations_from_parts(&parts);
+            let mut content_text = if !parts.is_empty() {
                 assemble_content_from_parts(&parts)
             } else {
                 String::new()
             };
 
             if content_text.trim().is_empty() {
-                continue;
+                if invocations.is_empty() {
+                    continue;
+                }
+                content_text = invocations
+                    .iter()
+                    .map(|inv| format!("[Tool: {}]", inv.name))
+                    .collect::<Vec<_>>()
+                    .join("\n");
             }
 
             let role = msg_data.role.unwrap_or_else(|| "assistant".to_string());
@@ -922,7 +943,7 @@ impl OpenCodeConnector {
                             "message_id": message_id,
                             "session_id": session_id,
                         }),
-                        invocations: Vec::new(),
+                        invocations,
                         snippets: Vec::new(),
                     },
                 });
@@ -993,6 +1014,8 @@ impl OpenCodeConnector {
                             message_id: None,
                             part_type: part_data.part_type,
                             text: part_data.text,
+                            tool: part_data.tool,
+                            call_id: part_data.call_id,
                             state: part_data.state,
                         });
                 }
@@ -1057,7 +1080,7 @@ struct SqliteMessageData {
 }
 
 /// Deserialized part.data JSON from SQLite.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct SqlitePartData {
     #[serde(default)]
     id: Option<String>,
@@ -1067,6 +1090,10 @@ struct SqlitePartData {
     part_type: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default, alias = "name", alias = "toolName")]
+    tool: Option<String>,
+    #[serde(default, rename = "callID", alias = "callId", alias = "call_id")]
+    call_id: Option<String>,
     #[serde(default)]
     state: Option<ToolState>,
 }
@@ -1121,7 +1148,7 @@ struct MessageTime {
 }
 
 /// Part info from part/{messageID}/{partID}.json
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 struct PartInfo {
     #[serde(default)]
     #[allow(dead_code)]
@@ -1135,13 +1162,19 @@ struct PartInfo {
     part_type: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default, alias = "name", alias = "toolName")]
+    tool: Option<String>,
+    #[serde(default, rename = "callID", alias = "callId", alias = "call_id")]
+    call_id: Option<String>,
     // Tool state for tool parts
     #[serde(default)]
     state: Option<ToolState>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 struct ToolState {
+    #[serde(default, alias = "arguments", alias = "args")]
+    input: Option<serde_json::Value>,
     #[serde(default)]
     output: Option<String>,
 }
@@ -1584,6 +1617,96 @@ fn assemble_v2_assistant_content(data: &serde_json::Value) -> String {
     pieces.join("\n\n")
 }
 
+fn v2_message_invocations(
+    message_type: &str,
+    data: &serde_json::Value,
+) -> Vec<NormalizedInvocation> {
+    let mut invocations = Vec::new();
+    match message_type {
+        "assistant" => {
+            if let Some(items) = data.get("content").and_then(serde_json::Value::as_array) {
+                for item in items {
+                    if item.get("type").and_then(serde_json::Value::as_str) != Some("tool") {
+                        continue;
+                    }
+                    let Some(name) = item
+                        .get("name")
+                        .or_else(|| item.get("tool"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    let call_id = item
+                        .get("id")
+                        .or_else(|| item.get("callID"))
+                        .or_else(|| item.get("callId"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let arguments = item
+                        .pointer("/state/input")
+                        .or_else(|| item.get("input"))
+                        .or_else(|| item.get("arguments"))
+                        .filter(|v| !v.is_null())
+                        .cloned();
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: name.to_string(),
+                        raw_name: None,
+                        call_id,
+                        arguments,
+                    });
+                }
+            }
+        }
+        "skill" => {
+            if let Some(name) = data
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let call_id = data
+                    .get("skill")
+                    .or_else(|| data.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                invocations.push(NormalizedInvocation {
+                    kind: "skill".to_string(),
+                    name: name.to_string(),
+                    raw_name: None,
+                    call_id,
+                    arguments: None,
+                });
+            }
+        }
+        "shell" => {
+            if let Some(command) = data
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                invocations.push(NormalizedInvocation {
+                    kind: "tool".to_string(),
+                    name: "shell".to_string(),
+                    raw_name: None,
+                    call_id: None,
+                    arguments: Some(serde_json::json!({ "command": command })),
+                });
+            }
+        }
+        _ => {}
+    }
+    unwrap_skill_invocations(&mut invocations);
+    invocations
+}
+
 fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
     row.get(index).and_then(|value| {
         if matches!(value, SqliteValue::Null) {
@@ -1797,10 +1920,18 @@ fn load_messages_with_exclusions(
         }
         sort_parts_for_message(&mut parts);
 
-        // Assemble message content from parts
-        let content_text = assemble_content_from_parts(&parts);
+        // Assemble message content and invocations from parts
+        let invocations = extract_invocations_from_parts(&parts);
+        let mut content_text = assemble_content_from_parts(&parts);
         if content_text.trim().is_empty() {
-            continue;
+            if invocations.is_empty() {
+                continue;
+            }
+            content_text = invocations
+                .iter()
+                .map(|inv| format!("[Tool: {}]", inv.name))
+                .collect::<Vec<_>>()
+                .join("\n");
         }
 
         // Determine role
@@ -1834,7 +1965,7 @@ fn load_messages_with_exclusions(
                     "message_id": message_id,
                     "session_id": msg_info.session_id,
                 }),
-                invocations: Vec::new(),
+                invocations,
                 snippets: Vec::new(),
             },
         ));
@@ -1920,6 +2051,44 @@ fn assemble_content_from_parts(parts: &[PartInfo]) -> String {
     }
 
     content_pieces.join("\n\n")
+}
+
+fn extract_invocations_from_parts(parts: &[PartInfo]) -> Vec<NormalizedInvocation> {
+    let mut invocations = Vec::new();
+    for part in parts {
+        if part.part_type.as_deref() != Some("tool") {
+            continue;
+        }
+        let Some(name) = part
+            .tool
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let call_id = part
+            .call_id
+            .as_deref()
+            .or(part.id.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let arguments = part
+            .state
+            .as_ref()
+            .and_then(|state| state.input.clone())
+            .filter(|v| !v.is_null());
+        invocations.push(NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: name.to_string(),
+            raw_name: None,
+            call_id,
+            arguments,
+        });
+    }
+    unwrap_skill_invocations(&mut invocations);
+    invocations
 }
 
 #[cfg(test)]
@@ -2094,7 +2263,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("text".into()),
                 text: Some("Hello, world!".into()),
-                state: None,
+                ..PartInfo::default()
             },
             PartInfo {
                 id: Some("p2".into()),
@@ -2102,7 +2271,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("text".into()),
                 text: Some("Second part".into()),
-                state: None,
+                ..PartInfo::default()
             },
         ];
         let content = assemble_content_from_parts(&parts);
@@ -2119,8 +2288,10 @@ mod tests {
             part_type: Some("tool".into()),
             text: None,
             state: Some(ToolState {
+                input: None,
                 output: Some("Tool executed successfully".into()),
             }),
+            ..PartInfo::default()
         }];
         let content = assemble_content_from_parts(&parts);
         assert!(content.contains("[Tool Output]"));
@@ -2135,7 +2306,7 @@ mod tests {
             message_id: Some("m1".into()),
             part_type: Some("reasoning".into()),
             text: Some("Let me think about this...".into()),
-            state: None,
+            ..PartInfo::default()
         }];
         let content = assemble_content_from_parts(&parts);
         assert!(content.contains("[Reasoning]"));
@@ -2150,7 +2321,7 @@ mod tests {
             message_id: Some("m1".into()),
             part_type: Some("patch".into()),
             text: Some("@@ -1,3 +1,4 @@".into()),
-            state: None,
+            ..PartInfo::default()
         }];
         let content = assemble_content_from_parts(&parts);
         assert!(content.contains("[Patch]"));
@@ -2166,7 +2337,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("text".into()),
                 text: Some("".into()),
-                state: None,
+                ..PartInfo::default()
             },
             PartInfo {
                 id: Some("p2".into()),
@@ -2174,7 +2345,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("text".into()),
                 text: Some("   ".into()),
-                state: None,
+                ..PartInfo::default()
             },
             PartInfo {
                 id: Some("p3".into()),
@@ -2182,7 +2353,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("text".into()),
                 text: Some("Actual content".into()),
-                state: None,
+                ..PartInfo::default()
             },
         ];
         let content = assemble_content_from_parts(&parts);
@@ -2198,7 +2369,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("step-start".into()),
                 text: Some("Starting...".into()),
-                state: None,
+                ..PartInfo::default()
             },
             PartInfo {
                 id: Some("p2".into()),
@@ -2206,7 +2377,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("step-finish".into()),
                 text: Some("Done".into()),
-                state: None,
+                ..PartInfo::default()
             },
         ];
         let content = assemble_content_from_parts(&parts);
@@ -2222,7 +2393,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("text".into()),
                 text: Some("Here's my analysis:".into()),
-                state: None,
+                ..PartInfo::default()
             },
             PartInfo {
                 id: Some("p2".into()),
@@ -2230,7 +2401,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("reasoning".into()),
                 text: Some("Thinking...".into()),
-                state: None,
+                ..PartInfo::default()
             },
             PartInfo {
                 id: Some("p3".into()),
@@ -2239,8 +2410,10 @@ mod tests {
                 part_type: Some("tool".into()),
                 text: None,
                 state: Some(ToolState {
+                    input: None,
                     output: Some("Result: 42".into()),
                 }),
+                ..PartInfo::default()
             },
         ];
         let content = assemble_content_from_parts(&parts);
@@ -2258,7 +2431,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("text".into()),
                 text: Some("second".into()),
-                state: None,
+                ..PartInfo::default()
             },
             PartInfo {
                 id: Some("a".into()),
@@ -2266,7 +2439,7 @@ mod tests {
                 message_id: Some("m1".into()),
                 part_type: Some("text".into()),
                 text: Some("first".into()),
-                state: None,
+                ..PartInfo::default()
             },
         ];
 
@@ -4663,10 +4836,78 @@ mod tests {
         );
         assert_eq!(session.messages[1].extra["seq"], 2);
         assert_eq!(session.messages[1].extra["type"], "assistant");
+        assert_eq!(session.messages[1].invocations.len(), 1);
+        assert_eq!(session.messages[1].invocations[0].kind, "tool");
+        assert_eq!(session.messages[1].invocations[0].name, "read");
+        assert_eq!(
+            session.messages[1].invocations[0].call_id.as_deref(),
+            Some("call_1")
+        );
+        assert_eq!(
+            session.messages[1].invocations[0].arguments,
+            Some(json!({"path": "a.rs"}))
+        );
         assert_eq!(
             (session.messages[0].idx, session.messages[1].idx),
             (0, 1),
             "messages are reindexed in seq order"
+        );
+    }
+
+    #[test]
+    fn extract_invocations_from_v1_parts_and_v2_messages_unwraps_skills() {
+        let parts: Vec<PartInfo> = vec![
+            serde_json::from_value(json!({
+                "id": "part-1",
+                "type": "tool",
+                "tool": "read",
+                "callID": "call-read-1",
+                "state": {
+                    "input": {"path": "src/lib.rs"},
+                    "output": "pub mod connectors;"
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "id": "part-2",
+                "type": "tool",
+                "tool": "skill",
+                "callID": "call-skill-1",
+                "state": {
+                    "input": {"name": "commit"}
+                }
+            }))
+            .unwrap(),
+        ];
+        let v1_invs = extract_invocations_from_parts(&parts);
+        assert_eq!(v1_invs.len(), 2);
+        assert_eq!(v1_invs[0].kind, "tool");
+        assert_eq!(v1_invs[0].name, "read");
+        assert_eq!(v1_invs[0].call_id.as_deref(), Some("call-read-1"));
+        assert_eq!(v1_invs[0].arguments, Some(json!({"path": "src/lib.rs"})));
+        assert_eq!(v1_invs[1].kind, "skill");
+        assert_eq!(v1_invs[1].name, "commit");
+        assert_eq!(v1_invs[1].raw_name.as_deref(), Some("skill"));
+
+        let v2_skill = v2_message_invocations(
+            "skill",
+            &json!({"skill": "sk_1", "name": "review", "text": "Check each hunk."}),
+        );
+        assert_eq!(v2_skill.len(), 1);
+        assert_eq!(v2_skill[0].kind, "skill");
+        assert_eq!(v2_skill[0].name, "review");
+        assert_eq!(v2_skill[0].call_id.as_deref(), Some("sk_1"));
+
+        let v2_shell = v2_message_invocations(
+            "shell",
+            &json!({"command": "cargo test", "status": "exited"}),
+        );
+        assert_eq!(v2_shell.len(), 1);
+        assert_eq!(v2_shell[0].kind, "tool");
+        assert_eq!(v2_shell[0].name, "shell");
+        assert_eq!(
+            v2_shell[0].arguments,
+            Some(json!({"command": "cargo test"}))
         );
     }
 

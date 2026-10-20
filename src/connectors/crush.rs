@@ -27,8 +27,10 @@ use super::scan::{
     SourceScanHooks,
 };
 use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
-use super::{Connector, franken_detection_for_connector};
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use super::{Connector, franken_detection_for_connector, unwrap_skill_invocations};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct CrushConnector;
 
@@ -322,7 +324,16 @@ fn group_rows_into_conversations(rows: &[CrushRow], db_path: &Path) -> Vec<Norma
     let mut current_meta: Option<SessionMeta> = None;
 
     for row in rows {
-        let content = extract_text_from_parts(row.parts_json.as_deref());
+        let mut invocations = extract_invocations_from_parts(row.parts_json.as_deref());
+        unwrap_skill_invocations(&mut invocations);
+        let mut content = extract_text_from_parts(row.parts_json.as_deref());
+        if content.trim().is_empty() && !invocations.is_empty() {
+            content = invocations
+                .iter()
+                .map(|inv| format!("[Tool: {}]", inv.name))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
         if content.trim().is_empty() {
             continue;
         }
@@ -352,7 +363,7 @@ fn group_rows_into_conversations(rows: &[CrushRow], db_path: &Path) -> Vec<Norma
                 "model": row.model,
                 "provider": row.provider,
             }),
-            invocations: Vec::new(),
+            invocations,
             snippets: Vec::new(),
         });
 
@@ -398,6 +409,53 @@ fn extract_text_from_parts(parts_json: Option<&str>) -> String {
         .filter_map(|p| p.text.as_deref())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Extract structured tool invocations from Crush's `parts` JSON column.
+fn extract_invocations_from_parts(parts_json: Option<&str>) -> Vec<NormalizedInvocation> {
+    let Some(json) = parts_json else {
+        return Vec::new();
+    };
+    let Ok(parts) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return Vec::new();
+    };
+    let mut invocations = Vec::new();
+    for item in parts {
+        let part_type = item.get("type").and_then(serde_json::Value::as_str);
+        if !matches!(part_type, Some("tool_call" | "tool_use" | "tool")) {
+            continue;
+        }
+        let Some(name) = item
+            .get("name")
+            .or_else(|| item.get("tool"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|n| !n.trim().is_empty())
+        else {
+            continue;
+        };
+        let call_id = item
+            .get("id")
+            .or_else(|| item.get("call_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(String::from);
+        let arguments = item
+            .get("input")
+            .or_else(|| item.get("arguments"))
+            .map(|arg| {
+                arg.as_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .unwrap_or_else(|| arg.clone())
+            });
+        invocations.push(NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: name.to_string(),
+            raw_name: None,
+            call_id,
+            arguments,
+        });
+    }
+    invocations
 }
 
 /// Flush accumulated messages into a `NormalizedConversation` and push to `convs`.
@@ -598,5 +656,56 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-scope"));
         assert_eq!(convs[0].source_path, db_path);
+    }
+
+    #[test]
+    fn group_rows_extracts_tool_invocations_and_preserves_tool_only_turns() {
+        let rows = vec![
+            CrushRow {
+                session_id: "s-tools".to_string(),
+                title: Some("Tool Crush".to_string()),
+                prompt_tokens: Some(10),
+                completion_tokens: Some(20),
+                cost: Some(0.01),
+                role: Some("user".to_string()),
+                parts_json: Some(r#"[{"type":"text","text":"Run bash"}]"#.to_string()),
+                created_at: Some(1_733_000_000_000),
+                model: None,
+                provider: None,
+            },
+            CrushRow {
+                session_id: "s-tools".to_string(),
+                title: Some("Tool Crush".to_string()),
+                prompt_tokens: Some(10),
+                completion_tokens: Some(20),
+                cost: Some(0.01),
+                role: Some("assistant".to_string()),
+                parts_json: Some(
+                    r#"[{"type":"tool_call","id":"call-1","name":"bash","input":"{\"command\":\"cargo check\"}"}]"#
+                        .to_string(),
+                ),
+                created_at: Some(1_733_000_001_000),
+                model: Some("claude-sonnet-4".to_string()),
+                provider: Some("anthropic".to_string()),
+            },
+        ];
+        let convs = group_rows_into_conversations(&rows, Path::new("/tmp/crush.db"));
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        assert_eq!(convs[0].messages[1].content, "[Tool: bash]");
+        assert_eq!(convs[0].messages[1].invocations.len(), 1);
+        assert_eq!(convs[0].messages[1].invocations[0].name, "bash");
+        assert_eq!(
+            convs[0].messages[1].invocations[0].call_id.as_deref(),
+            Some("call-1")
+        );
+        assert_eq!(
+            convs[0].messages[1].invocations[0]
+                .arguments
+                .as_ref()
+                .and_then(|v| v.get("command"))
+                .and_then(serde_json::Value::as_str),
+            Some("cargo check")
+        );
     }
 }

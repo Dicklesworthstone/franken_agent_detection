@@ -570,7 +570,7 @@ mod conformance {
                 ("openhands", "fixtures/openhands"),
             ];
 
-            for (slug, rel) in fixtures {
+            for &(slug, rel) in fixtures {
                 let root = manifest.join(rel);
                 assert!(
                     root.exists(),
@@ -581,7 +581,7 @@ mod conformance {
 
                 let matched = get_connector_factories()
                     .into_iter()
-                    .find(|(factory_slug, _)| factory_slug == slug);
+                    .find(|(factory_slug, _)| *factory_slug == slug);
                 let Some((_, factory)) = matched else {
                     // ubs:ignore[rust.ownership.panic-macro] — Missing registered fixture connector is a test failure, not a production fallback.
                     panic!("no registered factory for fixture connector {slug}");
@@ -601,6 +601,163 @@ mod conformance {
                     for msg in &conv.messages {
                         validate_message(msg, slug);
                     }
+                }
+
+                let connector = factory();
+                let discovered = connector.discover_source_files(&ctx).unwrap_or_else(|err| {
+                    // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and discovery error in conformance test.
+                    panic!("{slug}: discover_source_files on fixture failed: {err}")
+                });
+                assert!(
+                    !discovered.is_empty(),
+                    "{slug}: discover_source_files yielded no sources for populated fixture"
+                );
+                let expected_provider: &str = if matches!(slug, "claude") {
+                    "claude_code"
+                } else {
+                    slug
+                };
+                for source in &discovered {
+                    assert_eq!(
+                        source.provider_slug, expected_provider,
+                        "{slug}: discovered source reported unexpected provider_slug"
+                    );
+                    assert!(
+                        !source.source_path.as_os_str().is_empty(),
+                        "{slug}: discovered source had empty source_path"
+                    );
+                    assert!(
+                        !source.scan_root.as_os_str().is_empty(),
+                        "{slug}: discovered source had empty scan_root"
+                    );
+                    assert!(
+                        !source.role.as_str().is_empty(),
+                        "{slug}: discovered source had empty role"
+                    );
+                }
+                for conv in &convs {
+                    let covered = discovered.iter().any(|src| {
+                        conv.source_path == src.source_path
+                            || conv.source_path.starts_with(&src.source_path)
+                    });
+                    assert!(
+                        covered,
+                        "{slug}: conversation source_path {} not covered by discover_source_files {:?}",
+                        conv.source_path.display(),
+                        discovered
+                            .iter()
+                            .map(|s| &s.source_path)
+                            .collect::<Vec<_>>()
+                    );
+                }
+
+                assert!(
+                    connector.supports_streaming_scan(),
+                    "{slug}: all 34 connectors must support streaming scan"
+                );
+                let mut streamed = Vec::new();
+                connector
+                    .scan_with_callback(&ctx, &mut |conv| {
+                        streamed.push(conv);
+                        Ok(())
+                    })
+                    .unwrap_or_else(|err| {
+                        // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and streaming scan error in conformance test.
+                        panic!("{slug}: scan_with_callback failed: {err}")
+                    });
+                assert_eq!(
+                    serde_json::to_value(&streamed).expect("serialize streamed"),
+                    serde_json::to_value(&convs).expect("serialize convs"),
+                    "{slug}: scan_with_callback output differed from scan()"
+                );
+
+                let cross_source_connectors: &[&str] =
+                    &["cline", "copilot", "cursor", "opencode", "qwen"];
+                let expected_boundaries = !cross_source_connectors.contains(&slug);
+                assert_eq!(
+                    connector.supports_source_boundaries(),
+                    expected_boundaries,
+                    "{slug}: unexpected supports_source_boundaries() value"
+                );
+                if connector.supports_source_boundaries() {
+                    let mut boundary_convs = Vec::new();
+                    let mut completions = Vec::new();
+                    let mut should_scan = |_src: &crate::connectors::DiscoveredSourceFile| true;
+                    let mut on_complete = |comp: &crate::connectors::SourceCompletion| {
+                        completions.push((
+                            comp.source.provider_slug.clone(),
+                            comp.source.source_path.clone(),
+                            comp.conversations_emitted,
+                        ));
+                        Ok(())
+                    };
+                    let mut hooks = crate::connectors::SourceScanHooks {
+                        should_scan_source: Some(&mut should_scan),
+                        on_source_complete: Some(&mut on_complete),
+                    };
+                    connector
+                        .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conv| {
+                            boundary_convs.push(conv);
+                            Ok(())
+                        })
+                        .unwrap_or_else(|err| {
+                            // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and boundary scan error in conformance test.
+                            panic!("{slug}: scan_with_source_boundaries failed: {err}")
+                        });
+                    assert_eq!(
+                        serde_json::to_value(&boundary_convs).expect("serialize boundary_convs"),
+                        serde_json::to_value(&convs).expect("serialize convs"),
+                        "{slug}: scan_with_source_boundaries output differed from scan()"
+                    );
+                    assert!(
+                        !completions.is_empty(),
+                        "{slug}: supports_source_boundaries() == true but emitted 0 SourceCompletion events"
+                    );
+                    for (prov, comp_path, emitted) in &completions {
+                        assert_eq!(
+                            prov, expected_provider,
+                            "{slug}: completion provider_slug mismatch"
+                        );
+                        assert!(
+                            *emitted >= 1,
+                            "{slug}: completion reported 0 conversations_emitted"
+                        );
+                        assert!(
+                            discovered.iter().any(|d| &d.source_path == comp_path),
+                            "{slug}: completion source_path {} not in discover_source_files",
+                            comp_path.display()
+                        );
+                    }
+
+                    let mut skipped_convs = Vec::new();
+                    let mut skipped_completions = 0usize;
+                    let mut skip_all = |_src: &crate::connectors::DiscoveredSourceFile| false;
+                    let mut on_skip_complete = |_comp: &crate::connectors::SourceCompletion| {
+                        skipped_completions += 1;
+                        Ok(())
+                    };
+                    let mut skip_hooks = crate::connectors::SourceScanHooks {
+                        should_scan_source: Some(&mut skip_all),
+                        on_source_complete: Some(&mut on_skip_complete),
+                    };
+                    connector
+                        .scan_with_source_boundaries(&ctx, &mut skip_hooks, &mut |conv| {
+                            skipped_convs.push(conv);
+                            Ok(())
+                        })
+                        .unwrap_or_else(|err| {
+                            // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and skip boundary scan error in conformance test.
+                            panic!("{slug}: scan_with_source_boundaries(skip_all) failed: {err}")
+                        });
+                    assert!(
+                        skipped_convs.is_empty(),
+                        "{slug}: should_scan_source=false still emitted {} conversations",
+                        skipped_convs.len()
+                    );
+                    assert_eq!(
+                        skipped_completions, 0,
+                        "{slug}: should_scan_source=false still emitted {skipped_completions} completions"
+                    );
                 }
             }
         }
@@ -1001,6 +1158,163 @@ mod conformance {
                     for msg in &conv.messages {
                         validate_message(msg, slug);
                     }
+                }
+
+                let connector = factory();
+                let discovered = connector.discover_source_files(&ctx).unwrap_or_else(|err| {
+                    // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and discovery error in conformance test.
+                    panic!("{slug}: discover_source_files on fixture failed: {err}")
+                });
+                assert!(
+                    !discovered.is_empty(),
+                    "{slug}: discover_source_files yielded no sources for populated fixture"
+                );
+                let expected_provider: &str = if matches!(slug, "claude") {
+                    "claude_code"
+                } else {
+                    slug
+                };
+                for source in &discovered {
+                    assert_eq!(
+                        source.provider_slug, expected_provider,
+                        "{slug}: discovered source reported unexpected provider_slug"
+                    );
+                    assert!(
+                        !source.source_path.as_os_str().is_empty(),
+                        "{slug}: discovered source had empty source_path"
+                    );
+                    assert!(
+                        !source.scan_root.as_os_str().is_empty(),
+                        "{slug}: discovered source had empty scan_root"
+                    );
+                    assert!(
+                        !source.role.as_str().is_empty(),
+                        "{slug}: discovered source had empty role"
+                    );
+                }
+                for conv in &convs {
+                    let covered = discovered.iter().any(|src| {
+                        conv.source_path == src.source_path
+                            || conv.source_path.starts_with(&src.source_path)
+                    });
+                    assert!(
+                        covered,
+                        "{slug}: conversation source_path {} not covered by discover_source_files {:?}",
+                        conv.source_path.display(),
+                        discovered
+                            .iter()
+                            .map(|s| &s.source_path)
+                            .collect::<Vec<_>>()
+                    );
+                }
+
+                assert!(
+                    connector.supports_streaming_scan(),
+                    "{slug}: all 34 connectors must support streaming scan"
+                );
+                let mut streamed = Vec::new();
+                connector
+                    .scan_with_callback(&ctx, &mut |conv| {
+                        streamed.push(conv);
+                        Ok(())
+                    })
+                    .unwrap_or_else(|err| {
+                        // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and streaming scan error in conformance test.
+                        panic!("{slug}: scan_with_callback failed: {err}")
+                    });
+                assert_eq!(
+                    serde_json::to_value(&streamed).expect("serialize streamed"),
+                    serde_json::to_value(&convs).expect("serialize convs"),
+                    "{slug}: scan_with_callback output differed from scan()"
+                );
+
+                let cross_source_connectors: &[&str] =
+                    &["cline", "copilot", "cursor", "opencode", "qwen"];
+                let expected_boundaries = !cross_source_connectors.contains(&slug);
+                assert_eq!(
+                    connector.supports_source_boundaries(),
+                    expected_boundaries,
+                    "{slug}: unexpected supports_source_boundaries() value"
+                );
+                if connector.supports_source_boundaries() {
+                    let mut boundary_convs = Vec::new();
+                    let mut completions = Vec::new();
+                    let mut should_scan = |_src: &crate::connectors::DiscoveredSourceFile| true;
+                    let mut on_complete = |comp: &crate::connectors::SourceCompletion| {
+                        completions.push((
+                            comp.source.provider_slug.clone(),
+                            comp.source.source_path.clone(),
+                            comp.conversations_emitted,
+                        ));
+                        Ok(())
+                    };
+                    let mut hooks = crate::connectors::SourceScanHooks {
+                        should_scan_source: Some(&mut should_scan),
+                        on_source_complete: Some(&mut on_complete),
+                    };
+                    connector
+                        .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conv| {
+                            boundary_convs.push(conv);
+                            Ok(())
+                        })
+                        .unwrap_or_else(|err| {
+                            // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and boundary scan error in conformance test.
+                            panic!("{slug}: scan_with_source_boundaries failed: {err}")
+                        });
+                    assert_eq!(
+                        serde_json::to_value(&boundary_convs).expect("serialize boundary_convs"),
+                        serde_json::to_value(&convs).expect("serialize convs"),
+                        "{slug}: scan_with_source_boundaries output differed from scan()"
+                    );
+                    assert!(
+                        !completions.is_empty(),
+                        "{slug}: supports_source_boundaries() == true but emitted 0 SourceCompletion events"
+                    );
+                    for (prov, comp_path, emitted) in &completions {
+                        assert_eq!(
+                            prov, expected_provider,
+                            "{slug}: completion provider_slug mismatch"
+                        );
+                        assert!(
+                            *emitted >= 1,
+                            "{slug}: completion reported 0 conversations_emitted"
+                        );
+                        assert!(
+                            discovered.iter().any(|d| &d.source_path == comp_path),
+                            "{slug}: completion source_path {} not in discover_source_files",
+                            comp_path.display()
+                        );
+                    }
+
+                    let mut skipped_convs = Vec::new();
+                    let mut skipped_completions = 0usize;
+                    let mut skip_all = |_src: &crate::connectors::DiscoveredSourceFile| false;
+                    let mut on_skip_complete = |_comp: &crate::connectors::SourceCompletion| {
+                        skipped_completions += 1;
+                        Ok(())
+                    };
+                    let mut skip_hooks = crate::connectors::SourceScanHooks {
+                        should_scan_source: Some(&mut skip_all),
+                        on_source_complete: Some(&mut on_skip_complete),
+                    };
+                    connector
+                        .scan_with_source_boundaries(&ctx, &mut skip_hooks, &mut |conv| {
+                            skipped_convs.push(conv);
+                            Ok(())
+                        })
+                        .unwrap_or_else(|err| {
+                            // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and skip boundary scan error in conformance test.
+                            panic!("{slug}: scan_with_source_boundaries(skip_all) failed: {err}")
+                        });
+                    assert!(
+                        skipped_convs.is_empty(),
+                        "{slug}: should_scan_source=false still emitted {} conversations",
+                        skipped_convs.len()
+                    );
+                    assert_eq!(
+                        skipped_completions, 0,
+                        "{slug}: should_scan_source=false still emitted {skipped_completions} completions"
+                    );
                 }
 
                 if let Some(orig_ws) = convs[0].workspace.as_ref().and_then(|p| p.to_str()) {
