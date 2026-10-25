@@ -786,18 +786,15 @@ impl OpenCodeConnector {
                     .and_then(serde_json::Value::as_i64),
             )
             .or(col_ts);
+            let tool_call_count = invocations.len();
+            let extra = build_v2_message_extra(&row, &data, tool_call_count);
             let message = NormalizedMessage {
                 idx: 0,
                 role: role.to_string(),
                 author,
                 created_at,
                 content,
-                extra: serde_json::json!({
-                    "message_id": row.id,
-                    "session_id": row.session_id,
-                    "type": row.message_type,
-                    "seq": row.seq,
-                }),
+                extra,
                 invocations,
                 snippets: Vec::new(),
             };
@@ -919,14 +916,26 @@ impl OpenCodeConnector {
                 normalize_opencode_timestamp(msg_data.time.as_ref().and_then(|t| t.created))
                     .or(col_ts);
 
+            let resolved_model_id =
+                resolve_v1_model_id(msg_data.model_id.as_deref(), msg_data.model.as_ref());
+            let resolved_provider_id =
+                resolve_v1_provider_id(msg_data.provider_id.as_deref(), msg_data.model.as_ref());
             let author = if role == "assistant" {
-                msg_data.model_id.clone()
+                resolved_model_id.clone()
             } else {
                 Some("user".to_string())
             };
 
             let message_id = row.id;
             let session_id = row.session_id;
+            let extra = build_v1_message_extra(
+                &message_id,
+                Some(&session_id),
+                resolved_model_id.as_deref(),
+                resolved_provider_id.as_deref(),
+                msg_data.tokens.as_ref(),
+                invocations.len(),
+            );
             pending_by_session
                 .entry(session_id.clone())
                 .or_default()
@@ -939,10 +948,7 @@ impl OpenCodeConnector {
                         author,
                         created_at,
                         content: content_text,
-                        extra: serde_json::json!({
-                            "message_id": message_id,
-                            "session_id": session_id,
-                        }),
+                        extra,
                         invocations,
                         snippets: Vec::new(),
                     },
@@ -1077,6 +1083,12 @@ struct SqliteMessageData {
     time: Option<MessageTime>,
     #[serde(rename = "modelID", default)]
     model_id: Option<String>,
+    #[serde(rename = "providerID", default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    model: Option<serde_json::Value>,
+    #[serde(default)]
+    tokens: Option<serde_json::Value>,
 }
 
 /// Deserialized part.data JSON from SQLite.
@@ -1134,6 +1146,12 @@ struct MessageInfo {
     time: Option<MessageTime>,
     #[serde(rename = "modelID", default)]
     model_id: Option<String>,
+    #[serde(rename = "providerID", default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    model: Option<serde_json::Value>,
+    #[serde(default)]
+    tokens: Option<serde_json::Value>,
     #[serde(rename = "sessionID", default)]
     session_id: Option<String>,
 }
@@ -1707,6 +1725,158 @@ fn v2_message_invocations(
     invocations
 }
 
+fn resolve_v1_model_id(
+    model_id: Option<&str>,
+    model: Option<&serde_json::Value>,
+) -> Option<String> {
+    model_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            model
+                .and_then(|m| {
+                    m.as_str()
+                        .or_else(|| m.get("modelID").and_then(serde_json::Value::as_str))
+                        .or_else(|| m.get("id").and_then(serde_json::Value::as_str))
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn resolve_v1_provider_id(
+    provider_id: Option<&str>,
+    model: Option<&serde_json::Value>,
+) -> Option<String> {
+    provider_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            model
+                .and_then(|m| {
+                    m.get("providerID")
+                        .or_else(|| m.get("provider"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn build_v1_message_extra(
+    message_id: &str,
+    session_id: Option<&str>,
+    model_id: Option<&str>,
+    provider_id: Option<&str>,
+    tokens: Option<&serde_json::Value>,
+    tool_call_count: usize,
+) -> serde_json::Value {
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "message_id".to_string(),
+        serde_json::Value::String(message_id.to_string()),
+    );
+    extra.insert(
+        "session_id".to_string(),
+        session_id.map_or(serde_json::Value::Null, |s| {
+            serde_json::Value::String(s.to_string())
+        }),
+    );
+    if let Some(model) = model_id.map(str::trim).filter(|s| !s.is_empty()) {
+        extra.insert(
+            "modelID".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    if let Some(provider) = provider_id.map(str::trim).filter(|s| !s.is_empty()) {
+        extra.insert(
+            "providerID".to_string(),
+            serde_json::Value::String(provider.to_string()),
+        );
+    }
+    if let Some(tokens) = tokens.filter(|v| v.is_object()) {
+        extra.insert("tokens".to_string(), tokens.clone());
+    }
+    if tool_call_count > 0 {
+        extra.insert(
+            "cass".to_string(),
+            serde_json::json!({ "tool_call_count": tool_call_count }),
+        );
+    }
+    serde_json::Value::Object(extra)
+}
+
+fn build_v2_message_extra(
+    row: &SqliteV2MessageRow,
+    data: &serde_json::Value,
+    tool_call_count: usize,
+) -> serde_json::Value {
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "message_id".to_string(),
+        serde_json::Value::String(row.id.clone()),
+    );
+    extra.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(row.session_id.clone()),
+    );
+    extra.insert(
+        "type".to_string(),
+        serde_json::Value::String(row.message_type.clone()),
+    );
+    extra.insert(
+        "seq".to_string(),
+        row.seq
+            .map_or(serde_json::Value::Null, serde_json::Value::from),
+    );
+    if let Some(model_id) = data
+        .pointer("/model/id")
+        .or_else(|| data.pointer("/model/modelID"))
+        .or_else(|| data.get("modelID"))
+        .or_else(|| data.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        extra.insert(
+            "modelID".to_string(),
+            serde_json::Value::String(model_id.to_string()),
+        );
+    }
+    if let Some(provider_id) = data
+        .pointer("/model/providerID")
+        .or_else(|| data.pointer("/model/provider"))
+        .or_else(|| data.get("providerID"))
+        .or_else(|| data.get("provider"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        extra.insert(
+            "providerID".to_string(),
+            serde_json::Value::String(provider_id.to_string()),
+        );
+    }
+    if let Some(tokens) = data
+        .get("tokens")
+        .or_else(|| data.get("usage"))
+        .filter(|v| v.is_object())
+    {
+        extra.insert("tokens".to_string(), tokens.clone());
+    }
+    if tool_call_count > 0 {
+        extra.insert(
+            "cass".to_string(),
+            serde_json::json!({ "tool_call_count": tool_call_count }),
+        );
+    }
+    serde_json::Value::Object(extra)
+}
+
 fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
     row.get(index).and_then(|value| {
         if matches!(value, SqliteValue::Null) {
@@ -1945,13 +2115,25 @@ fn load_messages_with_exclusions(
             normalize_opencode_timestamp(msg_info.time.as_ref().and_then(|t| t.created));
 
         // Author from model_id for assistant messages
+        let resolved_model_id =
+            resolve_v1_model_id(msg_info.model_id.as_deref(), msg_info.model.as_ref());
+        let resolved_provider_id =
+            resolve_v1_provider_id(msg_info.provider_id.as_deref(), msg_info.model.as_ref());
         let author = if role == "assistant" {
-            msg_info.model_id.clone()
+            resolved_model_id.clone()
         } else {
             Some("user".to_string())
         };
 
         let message_id = msg_info.id.clone();
+        let extra = build_v1_message_extra(
+            &message_id,
+            msg_info.session_id.as_deref(),
+            resolved_model_id.as_deref(),
+            resolved_provider_id.as_deref(),
+            msg_info.tokens.as_ref(),
+            invocations.len(),
+        );
         pending.push((
             created_at,
             message_id.clone(),
@@ -1961,10 +2143,7 @@ fn load_messages_with_exclusions(
                 author,
                 created_at,
                 content: content_text,
-                extra: serde_json::json!({
-                    "message_id": message_id,
-                    "session_id": msg_info.session_id,
-                }),
+                extra,
                 invocations,
                 snippets: Vec::new(),
             },
@@ -5158,5 +5337,98 @@ mod tests {
         );
         assert_eq!(render("location-switched", json!({"location": {}})), None);
         assert_eq!(render("idle", json!({"outcome": "succeeded"})), None);
+    }
+
+    #[test]
+    fn sqlite_v1_and_v2_preserve_model_provider_tokens_and_tool_call_counts() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+
+        // v1 session with assistant message carrying modelID, providerID, tokens, and a tool part
+        conn.execute(
+            "INSERT INTO session (id, title, directory, project_id, time_created, time_updated) VALUES ('ses_v1', 'V1 Session', '/workspace', 'proj', 1700000000000, 1700000010000)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_v1', 'ses_v1', '{\"role\":\"assistant\",\"modelID\":\"claude-sonnet-4-5\",\"providerID\":\"anthropic\",\"tokens\":{\"input\":400,\"output\":120,\"reasoning\":30,\"cache\":{\"read\":80,\"write\":20}}}', 1700000005000)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data) VALUES ('prt_v1', 'msg_v1', '{\"type\":\"tool\",\"tool\":\"bash\",\"callID\":\"call_v1\",\"state\":{\"input\":{\"command\":\"cargo test\"},\"output\":\"ok\"}}')",
+            params![],
+        )
+        .unwrap();
+
+        // v2 session with assistant message carrying model, tokens, and a tool item
+        insert_v2_session(&conn, "ses_v2", "V2 Session", 1_700_000_020_000);
+        insert_v2_message(
+            &conn,
+            "ses_v2",
+            1,
+            "assistant",
+            r#"{"model":{"id":"gpt-5","providerID":"openai"},"tokens":{"input":250,"output":90,"reasoning":15,"cache":{"read":40,"write":10}},"content":[{"type":"text","text":"Running check"},{"type":"tool","id":"call_v2","name":"read","state":{"input":{"path":"src/lib.rs"},"content":[]}}]}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        let v1 = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("ses_v1"))
+            .expect("v1 session");
+        let v1_msg = &v1.messages[0];
+        assert_eq!(
+            v1_msg.extra.get("modelID").and_then(|v| v.as_str()),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(
+            v1_msg.extra.get("providerID").and_then(|v| v.as_str()),
+            Some("anthropic")
+        );
+        assert_eq!(
+            v1_msg
+                .extra
+                .pointer("/tokens/input")
+                .and_then(|v| v.as_i64()),
+            Some(400)
+        );
+        assert_eq!(
+            v1_msg
+                .extra
+                .pointer("/cass/tool_call_count")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+
+        let v2 = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("ses_v2"))
+            .expect("v2 session");
+        let v2_msg = &v2.messages[0];
+        assert_eq!(
+            v2_msg.extra.get("modelID").and_then(|v| v.as_str()),
+            Some("gpt-5")
+        );
+        assert_eq!(
+            v2_msg.extra.get("providerID").and_then(|v| v.as_str()),
+            Some("openai")
+        );
+        assert_eq!(
+            v2_msg
+                .extra
+                .pointer("/tokens/output")
+                .and_then(|v| v.as_i64()),
+            Some(90)
+        );
+        assert_eq!(
+            v2_msg
+                .extra
+                .pointer("/cass/tool_call_count")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
     }
 }
