@@ -693,6 +693,22 @@ fn parse_session(session_file: &Path) -> Result<Option<NormalizedConversation>> 
         // Un-run or telemetry-only transcript; nothing to index.
         return Ok(None);
     }
+    for msg in &mut messages {
+        if let Some(obj) = msg.extra.as_object_mut() {
+            if msg.role == "assistant"
+                && let Some(model) = &model_name
+            {
+                msg.author = Some(model.clone());
+                obj.insert("model".to_string(), Value::String(model.clone()));
+            }
+            if !msg.invocations.is_empty() {
+                obj.insert(
+                    "cass".to_string(),
+                    serde_json::json!({ "tool_call_count": msg.invocations.len() }),
+                );
+            }
+        }
+    }
     reindex_messages(&mut messages);
 
     // Gotcha 1: subagent transcripts never carry a metadata record; they run

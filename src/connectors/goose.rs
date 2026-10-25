@@ -468,8 +468,25 @@ impl GooseConnector {
                 }
             }
 
+            // Parse model info from model_config_json if available
+            let model_name = session
+                .model_config_json
+                .as_deref()
+                .and_then(|json_str| serde_json::from_str::<serde_json::Value>(json_str).ok())
+                .and_then(|v| {
+                    v.get("model")
+                        .or_else(|| v.get("model_name"))
+                        .and_then(|m| m.as_str())
+                        .map(std::string::ToString::to_string)
+                });
+
             // Load messages for this session
-            let messages = Self::load_messages_sqlite(&conn, &session.id)?;
+            let messages = Self::load_messages_sqlite(
+                &conn,
+                &session.id,
+                model_name.as_deref(),
+                session.provider_name.as_deref(),
+            )?;
             if messages.is_empty() {
                 continue;
             }
@@ -487,18 +504,6 @@ impl GooseConnector {
                     .and_then(|m| m.content.lines().next())
                     .map(|s| s.chars().take(100).collect())
             });
-
-            // Parse model info from model_config_json if available
-            let model_name = session
-                .model_config_json
-                .as_deref()
-                .and_then(|json_str| serde_json::from_str::<serde_json::Value>(json_str).ok())
-                .and_then(|v| {
-                    v.get("model")
-                        .or_else(|| v.get("model_name"))
-                        .and_then(|m| m.as_str())
-                        .map(std::string::ToString::to_string)
-                });
 
             convs.push(NormalizedConversation {
                 agent_slug: "goose".into(),
@@ -523,7 +528,12 @@ impl GooseConnector {
     }
 
     /// Load messages for a session from SQLite.
-    fn load_messages_sqlite(conn: &Connection, session_id: &str) -> Result<Vec<NormalizedMessage>> {
+    fn load_messages_sqlite(
+        conn: &Connection,
+        session_id: &str,
+        session_model: Option<&str>,
+        session_provider: Option<&str>,
+    ) -> Result<Vec<NormalizedMessage>> {
         let rows: Vec<GooseSqliteMessage> = conn.query_map_collect(
             "SELECT message_id, role, content_json, created_timestamp, tokens, metadata_json \
              FROM messages WHERE session_id = ? ORDER BY created_timestamp ASC",
@@ -562,25 +572,67 @@ impl GooseConnector {
                 continue;
             }
 
-            // Extract model info from metadata_json if available
+            // Extract model and provider info from metadata_json or session defaults
+            let parsed_meta = row
+                .metadata_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
             let author = if role == "assistant" {
-                row.metadata_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                parsed_meta
+                    .as_ref()
                     .and_then(|v| {
                         v.get("model")
                             .or_else(|| v.get("model_name"))
                             .and_then(|m| m.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
                             .map(std::string::ToString::to_string)
+                    })
+                    .or_else(|| {
+                        session_model
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
                     })
             } else {
                 Some("user".to_string())
+            };
+            let provider = if role == "assistant" {
+                parsed_meta
+                    .as_ref()
+                    .and_then(|v| {
+                        v.get("provider")
+                            .or_else(|| v.get("provider_name"))
+                            .and_then(|p| p.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(std::string::ToString::to_string)
+                    })
+                    .or_else(|| {
+                        session_provider
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    })
+            } else {
+                None
             };
 
             let mut extra = serde_json::json!({
                 "message_id": msg_id,
                 "session_id": session_id,
             });
+            if role == "assistant"
+                && let Some(ref model) = author
+            {
+                extra["model"] = serde_json::json!(model);
+            }
+            if let Some(ref provider) = provider {
+                extra["provider"] = serde_json::json!(provider);
+            }
+            if !invocations.is_empty() {
+                extra["cass"] = serde_json::json!({ "tool_call_count": invocations.len() });
+            }
             if let Some(tokens) = row.tokens {
                 extra["tokens"] = serde_json::json!(tokens);
             }
@@ -1061,6 +1113,9 @@ fn parse_goose_jsonl_reader(
         });
         if let Some(ref model) = entry.model {
             extra["model"] = serde_json::json!(model);
+        }
+        if !invocations.is_empty() {
+            extra["cass"] = serde_json::json!({ "tool_call_count": invocations.len() });
         }
 
         pending.push((

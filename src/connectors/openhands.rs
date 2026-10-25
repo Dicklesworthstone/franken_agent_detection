@@ -458,11 +458,20 @@ fn parse_conversation(
                     extra.insert("activated_skills".to_string(), Value::Array(skills.clone()));
                 }
 
+                let author = if role == "assistant" {
+                    OpenHandsConnector::model_from_base_state(base_state.as_ref())
+                } else {
+                    None
+                };
+                if let Some(ref model) = author {
+                    extra.insert("model".to_string(), Value::String(model.clone()));
+                }
+
                 update_time_bounds(&mut started_at, &mut ended_at, created);
                 messages.push(NormalizedMessage {
                     idx: 0,
                     role: role.to_string(),
-                    author: None,
+                    author,
                     created_at: created,
                     content,
                     extra: Value::Object(extra),
@@ -506,13 +515,22 @@ fn parse_conversation(
                 if let Some(id) = &call_id {
                     action_index_by_call_id.insert(id.clone(), message_index);
                 }
+                let author = OpenHandsConnector::model_from_base_state(base_state.as_ref());
+                let mut action_extra = serde_json::Map::new();
+                if let Some(ref model) = author {
+                    action_extra.insert("model".to_string(), Value::String(model.clone()));
+                }
+                action_extra.insert(
+                    "cass".to_string(),
+                    serde_json::json!({ "tool_call_count": 1 }),
+                );
                 messages.push(NormalizedMessage {
                     idx: 0,
                     role: "assistant".to_string(),
-                    author: None,
+                    author,
                     created_at: created,
                     content,
-                    extra: Value::Object(serde_json::Map::new()),
+                    extra: Value::Object(action_extra),
                     invocations: vec![NormalizedInvocation {
                         kind: "tool".to_string(),
                         name: tool_name,

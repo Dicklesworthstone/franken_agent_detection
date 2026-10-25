@@ -852,6 +852,91 @@ pub fn estimate_tokens_from_content(content: &str, role: &str) -> ExtractedToken
     usage
 }
 
+fn extract_opencode_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
+    let model_name = extra
+        .get("modelID")
+        .or_else(|| extra.get("model"))
+        .or_else(|| extra.pointer("/model/id"))
+        .or_else(|| extra.pointer("/model/modelID"))
+        .or_else(|| extra.pointer("/cass/model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let provider = extra
+        .get("providerID")
+        .or_else(|| extra.get("provider"))
+        .or_else(|| extra.pointer("/model/providerID"))
+        .or_else(|| extra.pointer("/model/provider"))
+        .or_else(|| extra.pointer("/cass/provider"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            model_name
+                .as_deref()
+                .map(|name| normalize_model(name).provider)
+        });
+    let tool_call_count = u32::try_from(
+        extra
+            .pointer("/cass/tool_call_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    )
+    .unwrap_or(u32::MAX);
+    let mut extracted = ExtractedTokenUsage {
+        model_name,
+        provider,
+        has_tool_calls: tool_call_count > 0,
+        tool_call_count,
+        ..Default::default()
+    };
+    if role != "assistant" {
+        return extracted;
+    }
+
+    if let Some(tokens) = extra
+        .get("tokens")
+        .or_else(|| extra.get("usage"))
+        .filter(|v| v.is_object())
+    {
+        let read_nonneg = |ptr: &str| {
+            tokens
+                .pointer(ptr)
+                .and_then(Value::as_i64)
+                .filter(|v| *v >= 0)
+        };
+        let input = read_nonneg("/input").or_else(|| read_nonneg("/input_tokens"));
+        let output = read_nonneg("/output").or_else(|| read_nonneg("/output_tokens"));
+        let reasoning = read_nonneg("/reasoning").or_else(|| read_nonneg("/reasoning_tokens"));
+        let cache_read = read_nonneg("/cache/read")
+            .or_else(|| read_nonneg("/cacheRead"))
+            .or_else(|| read_nonneg("/cache_read_tokens"));
+        let cache_write = read_nonneg("/cache/write")
+            .or_else(|| read_nonneg("/cacheWrite"))
+            .or_else(|| read_nonneg("/cache_creation_tokens"));
+
+        // OpenCode zero-initializes `tokens` on message creation and populates
+        // real counts when the step completes; require at least one positive
+        // count so unpopulated zero-initialized structs still fall back to
+        // content estimation.
+        let has_positive_api_count = [input, output, reasoning, cache_read, cache_write]
+            .into_iter()
+            .flatten()
+            .any(|v| v > 0);
+        if has_positive_api_count {
+            extracted.input_tokens = input;
+            extracted.output_tokens = output;
+            extracted.thinking_tokens = reasoning;
+            extracted.cache_read_tokens = cache_read;
+            extracted.cache_creation_tokens = cache_write;
+            extracted.data_source = TokenDataSource::Api;
+        }
+    }
+    extracted
+}
+
 /// Extract token usage from a message, dispatching by agent type.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -862,14 +947,15 @@ pub fn extract_tokens_for_agent(
     role: &str,
 ) -> ExtractedTokenUsage {
     let extracted = match agent_slug {
-        "claude_code" => extract_claude_code_tokens(extra),
+        "claude_code" | "claude" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
         "gemini" => extract_gemini_tokens(extra, role),
         "qwen" => extract_qwen_tokens(extra, role),
         "cline" => extract_cline_tokens(extra, role),
         "continue" => super::continue_dev::extract_tokens(extra, role),
-        "copilot" | "github-copilot" => extract_copilot_tokens(extra, role),
+        "copilot" | "github-copilot" | "copilot_vscode" => extract_copilot_tokens(extra, role),
         "amp" => extract_amp_tokens(extra, role),
+        "opencode" => extract_opencode_tokens(extra, role),
         // The modern Kimi parser attaches recognized usage.record input and
         // output counts to the preceding assistant message. Read only that
         // attachment: raw bookkeeping events and cumulative/session totals
@@ -1063,23 +1149,31 @@ pub fn extract_tokens_for_agent(
                 }
             }
         }
-        "cursor" | "factory" | "opencode" | "antigravity" | "grok" | "goose" | "vibe"
-        | "clawdbot" | "codebuff" | "copilot_cli" | "hermes" | "devin" | "chatgpt" => {
+        "cursor" | "factory" | "antigravity" | "grok" | "goose" | "vibe" | "clawdbot"
+        | "codebuff" | "copilot_cli" | "hermes" | "devin" | "chatgpt" | "kiro" | "muse"
+        | "openhands" => {
             let model_name = extra
                 .get("model")
                 .or_else(|| extra.pointer("/cass/model"))
                 .or_else(|| extra.pointer("/message/model"))
                 .or_else(|| extra.pointer("/modelConfig/modelName"))
+                .or_else(|| extra.pointer("/modelInfo/modelName"))
                 .or_else(|| extra.get("modelType"))
                 .or_else(|| extra.get("modelID"))
                 .or_else(|| extra.get("model_name"))
                 .or_else(|| extra.pointer("/_meta/modelId"))
+                .or_else(|| extra.pointer("/metadata/model_slug"))
+                .or_else(|| extra.pointer("/data/model"))
+                .or_else(|| extra.pointer("/payload/model"))
+                .or_else(|| extra.pointer("/session_state/model_info/model_id"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
                 .map(String::from);
             let provider = extra
                 .get("provider")
+                .or_else(|| extra.get("provider_name"))
                 .or_else(|| extra.pointer("/message/provider"))
+                .or_else(|| extra.pointer("/modelInfo/provider"))
                 .or_else(|| extra.pointer("/cass/provider"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
@@ -1089,9 +1183,18 @@ pub fn extract_tokens_for_agent(
                         .as_deref()
                         .map(|name| normalize_model(name).provider)
                 });
+            let tool_call_count = u32::try_from(
+                extra
+                    .pointer("/cass/tool_call_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u32::MAX);
             ExtractedTokenUsage {
                 model_name,
                 provider,
+                has_tool_calls: tool_call_count > 0,
+                tool_call_count,
                 ..Default::default()
             }
         }
@@ -1118,9 +1221,18 @@ pub fn extract_tokens_for_agent(
                         .as_deref()
                         .map(|name| normalize_model(name).provider)
                 });
+            let tool_call_count = u32::try_from(
+                extra
+                    .pointer("/cass/tool_call_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u32::MAX);
             ExtractedTokenUsage {
                 model_name,
                 provider,
+                has_tool_calls: tool_call_count > 0,
+                tool_call_count,
                 ..Default::default()
             }
         }
@@ -1524,5 +1636,118 @@ mod tests {
         assert_eq!(goose_usage.data_source, TokenDataSource::Estimated);
         assert_eq!(goose_usage.model_name.as_deref(), Some("gpt-4o"));
         assert_eq!(goose_usage.provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn extract_tokens_for_agent_opencode_extracts_api_tokens_and_zero_fallback() {
+        let raw_api = serde_json::json!({
+            "message_id": "msg_1",
+            "session_id": "ses_1",
+            "modelID": "claude-sonnet-4-5",
+            "providerID": "anthropic",
+            "tokens": {
+                "input": 420,
+                "output": 135,
+                "reasoning": 25,
+                "cache": {
+                    "read": 90,
+                    "write": 15
+                }
+            },
+            "cass": {
+                "tool_call_count": 2
+            }
+        });
+        let usage = extract_tokens_for_agent("opencode", &raw_api, "Done!", "assistant");
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+        assert_eq!(usage.model_name.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(usage.provider.as_deref(), Some("anthropic"));
+        assert_eq!(usage.input_tokens, Some(420));
+        assert_eq!(usage.output_tokens, Some(135));
+        assert_eq!(usage.thinking_tokens, Some(25));
+        assert_eq!(usage.cache_read_tokens, Some(90));
+        assert_eq!(usage.cache_creation_tokens, Some(15));
+        assert!(usage.has_tool_calls);
+        assert_eq!(usage.tool_call_count, 2);
+
+        let raw_zero = serde_json::json!({
+            "message_id": "msg_2",
+            "session_id": "ses_1",
+            "modelID": "gpt-5",
+            "providerID": "openai",
+            "tokens": {
+                "input": 0,
+                "output": 0,
+                "reasoning": 0,
+                "cache": {
+                    "read": 0,
+                    "write": 0
+                }
+            }
+        });
+        let zero_usage = extract_tokens_for_agent(
+            "opencode",
+            &raw_zero,
+            "Estimated fallback text",
+            "assistant",
+        );
+        assert_eq!(zero_usage.data_source, TokenDataSource::Estimated);
+        assert_eq!(zero_usage.model_name.as_deref(), Some("gpt-5"));
+        assert_eq!(zero_usage.provider.as_deref(), Some("openai"));
+        assert!(zero_usage.output_tokens.unwrap() > 0);
+    }
+
+    #[test]
+    fn extract_tokens_for_agent_attributes_models_and_tool_calls_across_connectors() {
+        for (slug, extra, expected_model, expected_provider, expected_tools) in [
+            (
+                "kiro",
+                serde_json::json!({"model": "claude-opus-4-6", "cass": {"tool_call_count": 1}}),
+                "claude-opus-4-6",
+                "anthropic",
+                1_u32,
+            ),
+            (
+                "muse",
+                serde_json::json!({"model": "claude-sonnet-4-5", "cass": {"tool_call_count": 2}}),
+                "claude-sonnet-4-5",
+                "anthropic",
+                2_u32,
+            ),
+            (
+                "openhands",
+                serde_json::json!({"model": "gpt-4o", "cass": {"tool_call_count": 1}}),
+                "gpt-4o",
+                "openai",
+                1_u32,
+            ),
+            (
+                "chatgpt",
+                serde_json::json!({"metadata": {"model_slug": "gpt-4o"}, "cass": {"tool_call_count": 1}}),
+                "gpt-4o",
+                "openai",
+                1_u32,
+            ),
+            (
+                "copilot_cli",
+                serde_json::json!({"data": {"model": "claude-sonnet-4-5"}, "cass": {"tool_call_count": 3}}),
+                "claude-sonnet-4-5",
+                "anthropic",
+                3_u32,
+            ),
+            (
+                "crush",
+                serde_json::json!({"model": "gemini-2.5-pro", "provider": "google", "cass": {"tool_call_count": 1}}),
+                "gemini-2.5-pro",
+                "google",
+                1_u32,
+            ),
+        ] {
+            let usage = extract_tokens_for_agent(slug, &extra, "Assistant reply", "assistant");
+            assert_eq!(usage.model_name.as_deref(), Some(expected_model), "{slug}");
+            assert_eq!(usage.provider.as_deref(), Some(expected_provider), "{slug}");
+            assert!(usage.has_tool_calls, "{slug}");
+            assert_eq!(usage.tool_call_count, expected_tools, "{slug}");
+        }
     }
 }

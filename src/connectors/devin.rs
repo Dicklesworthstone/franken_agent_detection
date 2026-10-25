@@ -533,6 +533,18 @@ pub(crate) fn message_from_chat_message(
                     serde_json::Value::String(thinking.to_owned()),
                 );
             }
+            if let Some(model_str) = model.filter(|s| !s.trim().is_empty()) {
+                extra.insert(
+                    "model".into(),
+                    serde_json::Value::String(model_str.to_owned()),
+                );
+            }
+            if !invocations.is_empty() {
+                extra.insert(
+                    "cass".into(),
+                    serde_json::json!({ "tool_call_count": invocations.len() }),
+                );
+            }
             let text = join_nonempty(&[
                 content,
                 (!call_lines.is_empty()).then(|| call_lines.join("\n")),

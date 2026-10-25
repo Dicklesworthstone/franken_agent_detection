@@ -65,6 +65,24 @@ window is since `v0.3.11` (2026-10-14).
 
 ### Added
 
+- **OpenCode 1.x and 2.x API token usage, model/provider metadata, and tool-call extraction (`franken_agent_detection-td3`):**
+  preserved `modelID`, `providerID`, `tokens` (`input`, `output`, `reasoning`, `cache.read`,
+  `cache.write`), and `cass.tool_call_count` on `NormalizedMessage.extra` across OpenCode 1.x
+  SQLite (`load_sqlite_messages_by_session`), 1.x flat-file JSON (`load_messages_with_exclusions`),
+  and 2.x SQLite (`load_sqlite_v2_messages_by_session`), and added `extract_opencode_tokens` in
+  `src/connectors/token_extraction.rs` with zero-initialized fallback to content estimation.
+- **Per-message model, provider, and tool-call attribution across `devin`, `hermes`, `goose`, `kiro`, `muse`, `openhands`, `chatgpt`, `crush`, and `token_extraction` (`franken_agent_detection-ah1`):**
+  propagated session/message model, provider, and `cass.tool_call_count` metadata onto assistant
+  `NormalizedMessage` records across `devin`, `hermes`, `goose` (SQLite and JSONL), `kiro`, `muse`,
+  `openhands`, and `crush`, and extended `extract_tokens_for_agent` to cover `kiro`, `muse`,
+  `openhands`, `copilot_vscode`, and `claude`, plus `/metadata/model_slug` (`chatgpt`),
+  `/data/model` and `/payload/model` (`copilot_cli`), and `/modelInfo/modelName` (`cursor`).
+- **Structured `NormalizedInvocation` extraction across `cursor` bubbles, `chatgpt`, and `copilot` (`franken_agent_detection-4j9`):**
+  wired structured tool and skill invocation extraction (plus `unwrap_skill_invocations`) into
+  `cursor` Composer bubbles (`toolFormerData`, `toolCalls`/`tool_calls`, and array `content`
+  blocks), `chatgpt` (`tool_calls`, `metadata.invoked_plugin`, `recipient != "all"` tool turns, and
+  `content` blocks), and `copilot` (`toolCalls`/`tool_calls` and `toolInvocationSerialized`
+  response parts).
 - **34-connector real-fixture discovery, streaming callback, and source-boundary conformance (`franken_agent_detection-1b3`):**
   extended `checked_in_fixture_stores_produce_schema_conformant_conversations` and
   `all_compiled_connectors_produce_schema_conformant_conversations` in

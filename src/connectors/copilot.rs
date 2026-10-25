@@ -57,12 +57,16 @@ use walkdir::WalkDir;
 use super::copilot_cli::CopilotCliConnector;
 use super::copilot_vscode;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{excluded_scan_paths_from_env, path_is_excluded, read_capped};
-use super::{
-    Connector, file_modified_since, flatten_content, franken_detection_for_connector,
-    parse_timestamp,
+use super::utils::{
+    excluded_scan_paths_from_env, path_is_excluded, read_capped, unwrap_skill_invocations,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use super::{
+    Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
+    franken_detection_for_connector, parse_timestamp,
+};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct CopilotConnector;
 
@@ -601,7 +605,21 @@ impl CopilotConnector {
                 }
 
                 if let Some(response) = turn.get("response") {
-                    let content = Self::extract_message_content(response);
+                    let raw_content = Self::extract_message_content(response);
+                    let invocations = Self::extract_message_invocations(response);
+                    let content = if raw_content.trim().is_empty() {
+                        if invocations.is_empty() {
+                            String::new()
+                        } else {
+                            invocations
+                                .iter()
+                                .map(|inv| format!("[Tool: {}]", inv.name))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    } else {
+                        raw_content
+                    };
                     if !content.trim().is_empty() {
                         let ts = Self::extract_turn_timestamp(response);
                         started_at = match (started_at, ts) {
@@ -615,14 +633,24 @@ impl CopilotConnector {
                             (other, None) => other,
                         };
 
+                        let mut extra = response.clone();
+                        if !invocations.is_empty()
+                            && let Some(obj) = extra.as_object_mut()
+                        {
+                            obj.insert(
+                                "cass".to_string(),
+                                serde_json::json!({ "tool_call_count": invocations.len() }),
+                            );
+                        }
+
                         messages.push(NormalizedMessage {
                             idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
                             role: "assistant".to_string(),
                             author: Some("copilot".to_string()),
                             created_at: ts,
                             content,
-                            extra: response.clone(),
-                            invocations: Vec::new(),
+                            extra,
+                            invocations,
                             snippets: Vec::new(),
                         });
                     }
@@ -641,10 +669,24 @@ impl CopilotConnector {
                     .unwrap_or("assistant")
                     .to_string();
 
-                let content = Self::extract_message_content(msg);
-                if content.trim().is_empty() {
-                    continue;
-                }
+                let raw_content = Self::extract_message_content(msg);
+                let invocations = if role == "user" {
+                    Vec::new()
+                } else {
+                    Self::extract_message_invocations(msg)
+                };
+                let content = if raw_content.trim().is_empty() {
+                    if invocations.is_empty() {
+                        continue;
+                    }
+                    invocations
+                        .iter()
+                        .map(|inv| format!("[Tool: {}]", inv.name))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    raw_content
+                };
 
                 let ts = Self::extract_turn_timestamp(msg);
                 started_at = match (started_at, ts) {
@@ -658,6 +700,16 @@ impl CopilotConnector {
                     (other, None) => other,
                 };
 
+                let mut extra = msg.clone();
+                if !invocations.is_empty()
+                    && let Some(obj) = extra.as_object_mut()
+                {
+                    obj.insert(
+                        "cass".to_string(),
+                        serde_json::json!({ "tool_call_count": invocations.len() }),
+                    );
+                }
+
                 messages.push(NormalizedMessage {
                     idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
                     role: role.clone(),
@@ -668,8 +720,8 @@ impl CopilotConnector {
                     }),
                     created_at: ts,
                     content,
-                    extra: msg.clone(),
-                    invocations: Vec::new(),
+                    extra,
+                    invocations,
                     snippets: Vec::new(),
                 });
             }
@@ -767,6 +819,106 @@ impl CopilotConnector {
         }
 
         String::new()
+    }
+
+    fn extract_message_invocations(val: &Value) -> Vec<NormalizedInvocation> {
+        let parse_json_or_clone = |v: &Value| -> Value {
+            v.as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or_else(|| v.clone())
+        };
+        let mut invocations = Vec::new();
+
+        // 1. toolCalls / tool_calls arrays (top-level or under result/metadata)
+        for ptr in [
+            "/toolCalls",
+            "/tool_calls",
+            "/result/metadata/toolCalls",
+            "/metadata/toolCalls",
+        ] {
+            if let Some(arr) = val.pointer(ptr).and_then(Value::as_array) {
+                for item in arr {
+                    let func = item.get("function");
+                    let Some(name) = item
+                        .get("name")
+                        .or_else(|| item.get("toolId"))
+                        .or_else(|| item.get("toolName"))
+                        .or_else(|| func.and_then(|f| f.get("name")))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    let call_id = item
+                        .get("id")
+                        .or_else(|| item.get("toolCallId"))
+                        .or_else(|| item.get("callId"))
+                        .or_else(|| item.get("call_id"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    let arguments = item
+                        .get("arguments")
+                        .or_else(|| item.get("input"))
+                        .or_else(|| item.get("parameters"))
+                        .or_else(|| func.and_then(|f| f.get("arguments")))
+                        .filter(|v| !v.is_null())
+                        .map(parse_json_or_clone);
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: name.to_string(),
+                        raw_name: None,
+                        call_id,
+                        arguments,
+                    });
+                }
+            }
+        }
+
+        // 2. Serialized Copilot response parts (`toolInvocationSerialized` or `tool_use` blocks)
+        for key in ["message", "content", "value", "response"] {
+            if let Some(arr) = val.get(key).and_then(Value::as_array) {
+                invocations.extend(extract_invocations_from_content_blocks(&Value::Array(
+                    arr.clone(),
+                )));
+                for part in arr {
+                    if matches!(
+                        part.get("kind").and_then(Value::as_str),
+                        Some("toolInvocationSerialized" | "toolInvocation")
+                    ) && let Some(name) = part
+                        .get("toolId")
+                        .or_else(|| part.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        invocations.push(NormalizedInvocation {
+                            kind: "tool".to_string(),
+                            name: name.to_string(),
+                            raw_name: None,
+                            call_id: part
+                                .get("toolCallId")
+                                .or_else(|| part.get("id"))
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(String::from),
+                            arguments: part
+                                .pointer("/toolSpecificData/rawInput")
+                                .or_else(|| part.get("input"))
+                                .or_else(|| part.get("arguments"))
+                                .filter(|v| !v.is_null())
+                                .map(parse_json_or_clone),
+                        });
+                    }
+                }
+            }
+        }
+
+        unwrap_skill_invocations(&mut invocations);
+        invocations
     }
 
     /// Extract timestamp from a turn/message object.
@@ -1332,5 +1484,59 @@ mod tests {
         deduped.sort();
         deduped.dedup();
         assert_eq!(paths, deduped);
+    }
+
+    #[test]
+    fn parse_conversation_extracts_tool_calls_and_serialized_invocations() {
+        let conv_json = serde_json::json!({
+            "id": "copilot-tools-1",
+            "turns": [
+                {
+                    "request": { "message": "Read README and run skill", "timestamp": 1_700_000_000_000_i64 },
+                    "response": {
+                        "timestamp": 1_700_000_001_000_i64,
+                        "toolCalls": [
+                            {
+                                "id": "tc_1",
+                                "name": "skill",
+                                "arguments": "{\"name\":\"commit\"}"
+                            }
+                        ],
+                        "response": [
+                            {
+                                "kind": "toolInvocationSerialized",
+                                "toolId": "copilot_readFile",
+                                "toolCallId": "tc_2",
+                                "toolSpecificData": {
+                                    "rawInput": {"path": "README.md"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let conv = CopilotConnector::parse_single_conversation(
+            &conv_json,
+            Path::new("/tmp/conversations.json"),
+        )
+        .expect("conversation parsed");
+        assert_eq!(conv.messages.len(), 2);
+        let assistant = &conv.messages[1];
+        assert_eq!(assistant.invocations.len(), 2);
+        assert_eq!(assistant.invocations[0].kind, "skill");
+        assert_eq!(assistant.invocations[0].name, "commit");
+        assert_eq!(assistant.invocations[0].raw_name.as_deref(), Some("skill"));
+        assert_eq!(assistant.invocations[1].kind, "tool");
+        assert_eq!(assistant.invocations[1].name, "copilot_readFile");
+        assert_eq!(assistant.invocations[1].call_id.as_deref(), Some("tc_2"));
+        assert_eq!(
+            assistant
+                .extra
+                .pointer("/cass/tool_call_count")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
     }
 }

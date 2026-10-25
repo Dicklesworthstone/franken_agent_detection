@@ -309,13 +309,33 @@ impl KiroConnector {
                 last_ts = Some(ts);
             }
 
+            let mut extra = record;
+            let author = if role == "assistant" {
+                model_id.clone()
+            } else {
+                None
+            };
+            if let Some(obj) = extra.as_object_mut() {
+                if role == "assistant"
+                    && let Some(ref model) = model_id
+                {
+                    obj.insert("model".to_string(), Value::String(model.clone()));
+                }
+                if !invocations.is_empty() {
+                    obj.insert(
+                        "cass".to_string(),
+                        serde_json::json!({ "tool_call_count": invocations.len() }),
+                    );
+                }
+            }
+
             messages.push(NormalizedMessage {
                 idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
                 role: role.to_string(),
-                author: None,
+                author,
                 created_at: effective_ts,
                 content,
-                extra: record,
+                extra,
                 invocations,
                 snippets: Vec::new(),
             });

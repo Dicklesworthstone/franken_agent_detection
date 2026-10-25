@@ -353,16 +353,21 @@ fn group_rows_into_conversations(rows: &[CrushRow], db_path: &Path) -> Vec<Norma
             Some("user".to_string())
         };
 
+        let mut extra = serde_json::json!({
+            "model": row.model,
+            "provider": row.provider,
+        });
+        if !invocations.is_empty() {
+            extra["cass"] = serde_json::json!({ "tool_call_count": invocations.len() });
+        }
+
         current_messages.push(NormalizedMessage {
             idx: 0,
             role,
             author,
             created_at: row.created_at,
             content,
-            extra: serde_json::json!({
-                "model": row.model,
-                "provider": row.provider,
-            }),
+            extra,
             invocations,
             snippets: Vec::new(),
         });

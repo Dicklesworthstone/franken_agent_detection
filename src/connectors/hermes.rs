@@ -203,7 +203,7 @@ impl HermesConnector {
                 }
             }
 
-            let messages = Self::load_messages(&conn, &session.id)?;
+            let messages = Self::load_messages(&conn, &session.id, session.model.as_deref())?;
             if messages.is_empty() {
                 continue;
             }
@@ -252,7 +252,11 @@ impl HermesConnector {
     }
 
     /// Load and normalize messages for a session.
-    fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<NormalizedMessage>> {
+    fn load_messages(
+        conn: &Connection,
+        session_id: &str,
+        session_model: Option<&str>,
+    ) -> Result<Vec<NormalizedMessage>> {
         let rows: Vec<HermesMessage> = conn.query_map_collect(
             "SELECT role, content, tool_calls, tool_name, tool_call_id, reasoning, timestamp \
              FROM messages WHERE session_id = ? ORDER BY timestamp ASC",
@@ -300,7 +304,10 @@ impl HermesConnector {
             let invocations = parse_tool_calls(row.tool_calls.as_deref());
 
             let author = if role == "assistant" {
-                None // model info is at session level, not message level
+                session_model
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
             } else if role == "tool" {
                 row.tool_name.clone()
             } else {
@@ -308,6 +315,14 @@ impl HermesConnector {
             };
 
             let mut extra = serde_json::json!({});
+            if role == "assistant"
+                && let Some(ref model) = author
+            {
+                extra["model"] = serde_json::json!(model);
+            }
+            if !invocations.is_empty() {
+                extra["cass"] = serde_json::json!({ "tool_call_count": invocations.len() });
+            }
             if let Some(ref name) = row.tool_name {
                 extra["tool_name"] = serde_json::json!(name);
             }

@@ -59,9 +59,14 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{excluded_scan_paths_from_env, path_is_excluded};
-use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use super::utils::{excluded_scan_paths_from_env, path_is_excluded, unwrap_skill_invocations};
+use super::{
+    Connector, extract_invocations_from_content_blocks, file_modified_since,
+    franken_detection_for_connector, parse_timestamp,
+};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 /// Nonce size for AES-GCM (12 bytes)
 const NONCE_SIZE: usize = 12;
@@ -547,27 +552,39 @@ impl ChatGptConnector {
 
                 // Get content
                 let content_val = msg.get("content");
-                let content_str = if let Some(parts) = content_val
+                let raw_content_str = content_val
                     .and_then(|c| c.get("parts"))
                     .and_then(|p| p.as_array())
-                {
-                    parts
+                    .map_or_else(
+                        || {
+                            content_val
+                                .and_then(|c| c.get("text"))
+                                .and_then(|t| t.as_str())
+                                .map(str::to_string)
+                                .unwrap_or_default()
+                        },
+                        |parts| {
+                            parts
+                                .iter()
+                                .filter_map(|p| p.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        },
+                    );
+
+                let invocations = Self::extract_message_invocations(msg, role, &raw_content_str);
+                let content_str = if raw_content_str.trim().is_empty() {
+                    if invocations.is_empty() {
+                        continue;
+                    }
+                    invocations
                         .iter()
-                        .filter_map(|p| p.as_str())
+                        .map(|inv| format!("[Tool: {}]", inv.name))
                         .collect::<Vec<_>>()
                         .join("\n")
-                } else if let Some(text) = content_val
-                    .and_then(|c| c.get("text"))
-                    .and_then(|t| t.as_str())
-                {
-                    text.to_string()
                 } else {
-                    continue;
+                    raw_content_str
                 };
-
-                if content_str.trim().is_empty() {
-                    continue;
-                }
 
                 // Get timestamp (ChatGPT uses float seconds)
                 let created_at = msg
@@ -599,14 +616,24 @@ impl ChatGptConnector {
                     .and_then(|v| v.as_str())
                     .map(String::from);
 
+                let mut extra = msg.clone();
+                if !invocations.is_empty()
+                    && let Some(obj) = extra.as_object_mut()
+                {
+                    obj.insert(
+                        "cass".to_string(),
+                        serde_json::json!({ "tool_call_count": invocations.len() }),
+                    );
+                }
+
                 messages.push(NormalizedMessage {
                     idx: messages.len() as i64,
                     role: role.to_string(),
                     author: model,
                     created_at,
                     content: content_str,
-                    extra: msg.clone(),
-                    invocations: Vec::new(),
+                    extra,
+                    invocations,
                     snippets: Vec::new(),
                 });
             }
@@ -626,11 +653,20 @@ impl ChatGptConnector {
                     continue;
                 }
 
-                let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
-
-                if content.trim().is_empty() {
-                    continue;
-                }
+                let raw_content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let invocations = Self::extract_message_invocations(item, role, raw_content);
+                let content = if raw_content.trim().is_empty() {
+                    if invocations.is_empty() {
+                        continue;
+                    }
+                    invocations
+                        .iter()
+                        .map(|inv| format!("[Tool: {}]", inv.name))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    raw_content.to_string()
+                };
 
                 let created_at = item
                     .get("timestamp")
@@ -652,14 +688,24 @@ impl ChatGptConnector {
                     (None, None) => None,
                 };
 
+                let mut extra = item.clone();
+                if !invocations.is_empty()
+                    && let Some(obj) = extra.as_object_mut()
+                {
+                    obj.insert(
+                        "cass".to_string(),
+                        serde_json::json!({ "tool_call_count": invocations.len() }),
+                    );
+                }
+
                 messages.push(NormalizedMessage {
                     idx: messages.len() as i64,
                     role: role.to_string(),
                     author: None,
                     created_at,
-                    content: content.to_string(),
-                    extra: item.clone(),
-                    invocations: Vec::new(),
+                    content,
+                    extra,
+                    invocations,
                     snippets: Vec::new(),
                 });
             }
@@ -684,6 +730,122 @@ impl ChatGptConnector {
             }),
             messages,
         }))
+    }
+
+    fn extract_message_invocations(
+        msg: &Value,
+        role: &str,
+        content_text: &str,
+    ) -> Vec<NormalizedInvocation> {
+        let parse_json_or_clone = |v: &Value| -> Value {
+            v.as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or_else(|| v.clone())
+        };
+        let mut invocations = Vec::new();
+
+        // 1. OpenAI-style tool_calls array (top-level or under metadata)
+        for ptr in ["/tool_calls", "/metadata/tool_calls"] {
+            if let Some(arr) = msg.pointer(ptr).and_then(Value::as_array) {
+                for item in arr {
+                    let func = item.get("function");
+                    let Some(name) = item
+                        .get("name")
+                        .or_else(|| func.and_then(|f| f.get("name")))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    let call_id = item
+                        .get("id")
+                        .or_else(|| item.get("call_id"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    let arguments = item
+                        .get("arguments")
+                        .or_else(|| item.get("input"))
+                        .or_else(|| func.and_then(|f| f.get("arguments")))
+                        .filter(|v| !v.is_null())
+                        .map(parse_json_or_clone);
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: name.to_string(),
+                        raw_name: None,
+                        call_id,
+                        arguments,
+                    });
+                }
+            }
+        }
+
+        // 2. ChatGPT invoked_plugin metadata
+        if let Some(plugin) = msg
+            .pointer("/metadata/invoked_plugin")
+            .and_then(Value::as_object)
+            && let Some(namespace) = plugin
+                .get("namespace")
+                .or_else(|| plugin.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            let call_id = plugin
+                .get("plugin_id")
+                .or_else(|| plugin.get("id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            invocations.push(NormalizedInvocation {
+                kind: "tool".to_string(),
+                name: namespace.to_string(),
+                raw_name: None,
+                call_id,
+                arguments: None,
+            });
+        }
+
+        // 3. ChatGPT assistant messages directed at a tool recipient (e.g. "python", "browser", "dalle.text2im", "web.run", "bio")
+        if role == "assistant"
+            && let Some(recipient) = msg
+                .get("recipient")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|r| !r.is_empty() && *r != "all")
+        {
+            let arguments = if content_text.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_str::<Value>(content_text.trim())
+                        .unwrap_or_else(|_| serde_json::json!({ "input": content_text })),
+                )
+            };
+            invocations.push(NormalizedInvocation {
+                kind: "tool".to_string(),
+                name: recipient.to_string(),
+                raw_name: None,
+                call_id: msg
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+                arguments,
+            });
+        }
+
+        // 4. Content block arrays (tool_use)
+        if let Some(blocks) = msg.get("content").filter(|v| v.is_array()) {
+            invocations.extend(extract_invocations_from_content_blocks(blocks));
+        }
+
+        unwrap_skill_invocations(&mut invocations);
+        invocations
     }
 }
 
@@ -2024,5 +2186,64 @@ mod tests {
         assert_eq!(convs.len(), 1, "should extract only the valid conversation");
         assert_eq!(convs[0].messages[0].content, "Valid conversation");
         crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
+    }
+
+    #[test]
+    fn parse_conversation_extracts_tool_calls_plugin_and_recipient_invocations() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("conv_tools.json");
+        let conv_json = json!({
+            "id": "conv-tools",
+            "title": "Tool session",
+            "mapping": {
+                "n1": {
+                    "message": {
+                        "id": "m1",
+                        "author": {"role": "assistant"},
+                        "recipient": "python",
+                        "content": {"content_type": "code", "text": "print(6 * 7)"},
+                        "create_time": 1700000001.0,
+                        "metadata": {
+                            "model_slug": "gpt-4o",
+                            "invoked_plugin": {"namespace": "Wolfram", "plugin_id": "plug_1"},
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "skill",
+                                        "arguments": "{\"name\":\"review\"}"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        fs::write(&file_path, conv_json.to_string()).unwrap();
+
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let conv = connector
+            .parse_conversation_file(&file_path, None, false)
+            .unwrap()
+            .expect("conversation parsed");
+        assert_eq!(conv.messages.len(), 1);
+        let msg = &conv.messages[0];
+        assert_eq!(msg.invocations.len(), 3);
+        assert_eq!(msg.invocations[0].kind, "skill");
+        assert_eq!(msg.invocations[0].name, "review");
+        assert_eq!(msg.invocations[0].raw_name.as_deref(), Some("skill"));
+        assert_eq!(msg.invocations[1].name, "Wolfram");
+        assert_eq!(msg.invocations[1].call_id.as_deref(), Some("plug_1"));
+        assert_eq!(msg.invocations[2].name, "python");
+        assert_eq!(
+            msg.extra
+                .pointer("/cass/tool_call_count")
+                .and_then(|v| v.as_u64()),
+            Some(3)
+        );
     }
 }

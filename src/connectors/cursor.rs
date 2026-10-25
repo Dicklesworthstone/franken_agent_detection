@@ -42,13 +42,17 @@ use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::{
-    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    read_capped, unwrap_skill_invocations,
 };
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage, reindex_messages};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+    reindex_messages,
+};
 
 /// Cursor v0.40+ bubble type constants (numeric encoding)
 mod bubble_type {
@@ -748,6 +752,97 @@ impl CursorConnector {
         })
     }
 
+    fn extract_bubble_invocations(bubble: &Value) -> Vec<NormalizedInvocation> {
+        let parse_json_or_clone = |v: &Value| -> Value {
+            v.as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or_else(|| v.clone())
+        };
+        let mut invocations = Vec::new();
+
+        // 1. Cursor v0.40+ toolFormerData object: {"name": "...", "toolCallId": "...", "rawArgs": "...", "params": "..."}
+        if let Some(tf) = bubble.get("toolFormerData").and_then(Value::as_object) {
+            if let Some(name) = tf
+                .get("name")
+                .or_else(|| tf.get("toolName"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let call_id = tf
+                    .get("toolCallId")
+                    .or_else(|| tf.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                let arguments = tf
+                    .get("params")
+                    .or_else(|| tf.get("rawArgs"))
+                    .or_else(|| tf.get("args"))
+                    .or_else(|| tf.get("input"))
+                    .filter(|v| !v.is_null())
+                    .map(parse_json_or_clone);
+                invocations.push(NormalizedInvocation {
+                    kind: "tool".to_string(),
+                    name: name.to_string(),
+                    raw_name: None,
+                    call_id,
+                    arguments,
+                });
+            }
+        }
+
+        // 2. toolCalls / tool_calls array on the bubble
+        for key in ["toolCalls", "tool_calls"] {
+            if let Some(arr) = bubble.get(key).and_then(Value::as_array) {
+                for item in arr {
+                    let func = item.get("function");
+                    let Some(name) = item
+                        .get("name")
+                        .or_else(|| item.get("toolName"))
+                        .or_else(|| func.and_then(|f| f.get("name")))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    let call_id = item
+                        .get("id")
+                        .or_else(|| item.get("toolCallId"))
+                        .or_else(|| item.get("call_id"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    let arguments = item
+                        .get("arguments")
+                        .or_else(|| item.get("input"))
+                        .or_else(|| item.get("params"))
+                        .or_else(|| func.and_then(|f| f.get("arguments")))
+                        .filter(|v| !v.is_null())
+                        .map(parse_json_or_clone);
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: name.to_string(),
+                        raw_name: None,
+                        call_id,
+                        arguments,
+                    });
+                }
+            }
+        }
+
+        // 3. Array-typed content blocks
+        if let Some(content_blocks) = bubble.get("content").filter(|v| v.is_array()) {
+            invocations.extend(extract_invocations_from_content_blocks(content_blocks));
+        }
+
+        unwrap_skill_invocations(&mut invocations);
+        invocations
+    }
+
     /// Parse a bubble (message) from Cursor's format.
     ///
     /// Handles both new format (v0.40+) and legacy formats:
@@ -755,17 +850,36 @@ impl CursorConnector {
     /// - Role: numeric type (1=user, 2=assistant) or string type/role
     /// - Author: modelType (new) or model (legacy)
     fn parse_bubble(bubble: &Value, idx: usize) -> Option<NormalizedMessage> {
+        let invocations = Self::extract_bubble_invocations(bubble);
+
         // Extract content - try all known field names in priority order
-        let content = bubble
+        let raw_content = bubble
             .get("text")
             .and_then(|v| v.as_str())
             .or_else(|| bubble.get("rawText").and_then(|v| v.as_str()))
             .or_else(|| bubble.get("content").and_then(|v| v.as_str()))
-            .or_else(|| bubble.get("message").and_then(|v| v.as_str()))?;
+            .or_else(|| bubble.get("message").and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .or_else(|| {
+                bubble
+                    .get("content")
+                    .filter(|v| v.is_array())
+                    .map(flatten_content)
+            })
+            .unwrap_or_default();
 
-        if content.trim().is_empty() {
-            return None;
-        }
+        let content = if raw_content.trim().is_empty() {
+            if invocations.is_empty() {
+                return None;
+            }
+            invocations
+                .iter()
+                .map(|inv| format!("[Tool: {}]", inv.name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            raw_content
+        };
 
         // Extract role - try numeric type first (v0.40+), then string type/role (legacy)
         let role = bubble
@@ -811,14 +925,24 @@ impl CursorConnector {
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        let mut extra = bubble.clone();
+        if !invocations.is_empty()
+            && let Some(obj) = extra.as_object_mut()
+        {
+            obj.insert(
+                "cass".to_string(),
+                serde_json::json!({ "tool_call_count": invocations.len() }),
+            );
+        }
+
         Some(NormalizedMessage {
             idx: idx as i64,
             role,
             author,
             created_at,
-            content: content.to_string(),
-            extra: bubble.clone(),
-            invocations: Vec::new(),
+            content,
+            extra,
+            invocations,
             snippets: Vec::new(),
         })
     }
@@ -1231,13 +1355,21 @@ impl CursorConnector {
             return None;
         }
 
+        let mut extra = Map::new();
+        if !invocations.is_empty() {
+            extra.insert(
+                "cass".to_string(),
+                serde_json::json!({ "tool_call_count": invocations.len() }),
+            );
+        }
+
         Some(NormalizedMessage {
             idx: 0,
             role,
             author: None,
             created_at,
             content,
-            extra: Value::Object(Map::new()),
+            extra: Value::Object(extra),
             invocations,
             snippets: Vec::new(),
         })
@@ -3446,5 +3578,50 @@ mod agent_transcript_tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["content"], "first valid");
         assert_eq!(records[1]["content"], "second valid");
+    }
+
+    #[test]
+    fn parse_bubble_extracts_tool_former_data_and_tool_calls() {
+        let bubble = serde_json::json!({
+            "type": 2,
+            "modelType": "claude-sonnet-4-5",
+            "toolFormerData": {
+                "name": "read_file",
+                "toolCallId": "call_tf_1",
+                "params": "{\"path\":\"src/lib.rs\"}"
+            },
+            "toolCalls": [
+                {
+                    "id": "call_tc_2",
+                    "name": "skill",
+                    "arguments": {"name": "commit"}
+                }
+            ]
+        });
+
+        let msg = CursorConnector::parse_bubble(&bubble, 0).expect("tool-only bubble should parse");
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.content, "[Tool: read_file]\n[Tool: commit]");
+        assert_eq!(msg.invocations.len(), 2);
+        assert_eq!(msg.invocations[0].kind, "tool");
+        assert_eq!(msg.invocations[0].name, "read_file");
+        assert_eq!(msg.invocations[0].call_id.as_deref(), Some("call_tf_1"));
+        assert_eq!(
+            msg.invocations[0]
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("path"))
+                .and_then(Value::as_str),
+            Some("src/lib.rs")
+        );
+        assert_eq!(msg.invocations[1].kind, "skill");
+        assert_eq!(msg.invocations[1].name, "commit");
+        assert_eq!(msg.invocations[1].raw_name.as_deref(), Some("skill"));
+        assert_eq!(
+            msg.extra
+                .pointer("/cass/tool_call_count")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
     }
 }

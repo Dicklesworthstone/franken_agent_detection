@@ -5349,17 +5349,14 @@ mod tests {
         // v1 session with assistant message carrying modelID, providerID, tokens, and a tool part
         conn.execute(
             "INSERT INTO session (id, title, directory, project_id, time_created, time_updated) VALUES ('ses_v1', 'V1 Session', '/workspace', 'proj', 1700000000000, 1700000010000)",
-            params![],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_v1', 'ses_v1', '{\"role\":\"assistant\",\"modelID\":\"claude-sonnet-4-5\",\"providerID\":\"anthropic\",\"tokens\":{\"input\":400,\"output\":120,\"reasoning\":30,\"cache\":{\"read\":80,\"write\":20}}}', 1700000005000)",
-            params![],
+            "INSERT INTO message (id, session_id, data, time_created, time_updated) VALUES ('msg_v1', 'ses_v1', '{\"role\":\"assistant\",\"modelID\":\"claude-sonnet-4-5\",\"providerID\":\"anthropic\",\"tokens\":{\"input\":400,\"output\":120,\"reasoning\":30,\"cache\":{\"read\":80,\"write\":20}}}', 1700000005000, 1700000005000)",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO part (id, message_id, data) VALUES ('prt_v1', 'msg_v1', '{\"type\":\"tool\",\"tool\":\"bash\",\"callID\":\"call_v1\",\"state\":{\"input\":{\"command\":\"cargo test\"},\"output\":\"ok\"}}')",
-            params![],
+            "INSERT INTO part (id, message_id, session_id, data, time_created, time_updated) VALUES ('prt_v1', 'msg_v1', 'ses_v1', '{\"type\":\"tool\",\"tool\":\"bash\",\"callID\":\"call_v1\",\"state\":{\"input\":{\"command\":\"cargo test\"},\"output\":\"ok\"}}', 1700000005000, 1700000005000)",
         )
         .unwrap();
 
@@ -5381,25 +5378,31 @@ mod tests {
             .expect("v1 session");
         let v1_msg = &v1.messages[0];
         assert_eq!(
-            v1_msg.extra.get("modelID").and_then(|v| v.as_str()),
+            v1_msg
+                .extra
+                .get("modelID")
+                .and_then(serde_json::Value::as_str),
             Some("claude-sonnet-4-5")
         );
         assert_eq!(
-            v1_msg.extra.get("providerID").and_then(|v| v.as_str()),
+            v1_msg
+                .extra
+                .get("providerID")
+                .and_then(serde_json::Value::as_str),
             Some("anthropic")
         );
         assert_eq!(
             v1_msg
                 .extra
                 .pointer("/tokens/input")
-                .and_then(|v| v.as_i64()),
+                .and_then(serde_json::Value::as_i64),
             Some(400)
         );
         assert_eq!(
             v1_msg
                 .extra
                 .pointer("/cass/tool_call_count")
-                .and_then(|v| v.as_u64()),
+                .and_then(serde_json::Value::as_u64),
             Some(1)
         );
 
@@ -5409,25 +5412,31 @@ mod tests {
             .expect("v2 session");
         let v2_msg = &v2.messages[0];
         assert_eq!(
-            v2_msg.extra.get("modelID").and_then(|v| v.as_str()),
+            v2_msg
+                .extra
+                .get("modelID")
+                .and_then(serde_json::Value::as_str),
             Some("gpt-5")
         );
         assert_eq!(
-            v2_msg.extra.get("providerID").and_then(|v| v.as_str()),
+            v2_msg
+                .extra
+                .get("providerID")
+                .and_then(serde_json::Value::as_str),
             Some("openai")
         );
         assert_eq!(
             v2_msg
                 .extra
                 .pointer("/tokens/output")
-                .and_then(|v| v.as_i64()),
+                .and_then(serde_json::Value::as_i64),
             Some(90)
         );
         assert_eq!(
             v2_msg
                 .extra
                 .pointer("/cass/tool_call_count")
-                .and_then(|v| v.as_u64()),
+                .and_then(serde_json::Value::as_u64),
             Some(1)
         );
     }
