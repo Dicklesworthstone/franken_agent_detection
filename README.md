@@ -140,8 +140,9 @@ are re-exported at the crate root. Connector-derived annotations live under
 `cass.tool_call_count` across tool-using turns). `extract_tokens_for_agent`
 turns a message's `extra` into exact API token usage where the agent records it
 (and an estimate otherwise) while preserving model, provider (`anthropic`,
-`openai`, `google`, `mistral`, `xai`, or explicit provider metadata), and
-`tool_call_count` / `has_tool_calls` across all 34 connectors.
+`openai`, `google`, `mistral`, `xai`, `moonshot`, `deepseek`, or explicit
+provider metadata), and `tool_call_count` / `has_tool_calls` across all 34
+connectors (including qualified `openclaw/<agent>` multi-agent slugs).
 
 Claude Code session files of **32 MiB or larger** retain compact metadata in
 `extra.cass` instead of duplicating the full raw record. Reply identifiers are

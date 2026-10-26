@@ -65,6 +65,15 @@ window is since `v0.3.11` (2026-10-14).
 
 ### Added
 
+- **Qualified `openclaw/<agent>` token extraction, Kimi/DeepSeek model attribution, and end-to-end conformance (`franken_agent_detection-sih`, `franken_agent_detection-eo6`, `franken_agent_detection-d4i`):**
+  fixed `extract_tokens_for_agent` in `src/connectors/token_extraction.rs` to match qualified
+  `openclaw/<agent>` slugs (such as `"openclaw/main"`) emitted by `OpenClawConnector` alongside
+  literal `"openclaw"`, propagated `model` and `cass.tool_call_count` metadata in `KimiConnector`
+  (`llm.request`, `usage.record`, `tool.call`, and legacy `ToolCall`) and extracted `model_name`
+  and `provider` in the `"kimi"` arm of `extract_tokens_for_agent`, extended `normalize_model` to
+  recognize Moonshot (`kimi`/`moonshot` -> `provider: "moonshot"`) and DeepSeek (`deepseek` ->
+  `provider: "deepseek"`), and added end-to-end tool/skill `NormalizedInvocation` and token
+  extraction conformance tests across `openclaw/main`, `kimi`, and `aider`.
 - **Crate-root public API re-exports, Aider and Grok Bot model/invocation extraction, and 34-connector token conformance gate (`franken_agent_detection-08h`, `franken_agent_detection-3zd`, `franken_agent_detection-u80`):**
   re-exported `MuseConnector`, `ScanProgressTick`, `unwrap_skill_invocations`, and
   `percent_decode_utf8` at the crate root (and `ScanProgressTick` in `src/connectors/mod.rs`),

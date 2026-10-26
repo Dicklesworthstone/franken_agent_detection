@@ -915,7 +915,7 @@ mod conformance {
                     let r = base.join("aider-project");
                     write_fixture_file(
                         &r.join(".aider.chat.history.md"),
-                        "# aider chat started at 2026-03-01 10:00:00\n\n#### Hello Aider\n\nHi from Aider!\n",
+                        "# aider chat started at 2026-03-01 10:00:00\nMain model: claude-sonnet-4-5 with diff edit format\n\n#### /run cargo test\n\nHi from Aider!\n",
                     );
                     r
                 }
@@ -963,7 +963,7 @@ mod conformance {
                     let r = base.join(".kimi-code/sessions");
                     write_fixture_file(
                         &r.join("workdir/sess-1/agents/main/wire.jsonl"),
-                        "{\"type\":\"turn.prompt\",\"time\":\"2026-10-09T00:00:00Z\",\"input\":\"Hello Kimi\"}\n",
+                        "{\"type\":\"turn.prompt\",\"time\":\"2026-10-09T00:00:00Z\",\"input\":\"Hello Kimi\"}\n{\"type\":\"llm.request\",\"time\":\"2026-10-09T00:00:01Z\",\"model\":\"kimi-k2-0711-preview\"}\n{\"type\":\"context.append_loop_event\",\"time\":\"2026-10-09T00:00:02Z\",\"event\":{\"type\":\"tool.call\",\"toolCallId\":\"tc1\",\"name\":\"load_skill\",\"args\":{\"name\":\"debugging\"}}}\n{\"type\":\"context.append_loop_event\",\"time\":\"2026-10-09T00:00:03Z\",\"event\":{\"type\":\"content.part\",\"part\":{\"type\":\"text\",\"text\":\"Hi from Kimi\"}}}\n{\"type\":\"usage.record\",\"time\":\"2026-10-09T00:00:04Z\",\"usage\":{\"input_tokens\":100,\"output_tokens\":25}}\n",
                     );
                     r
                 }
@@ -987,7 +987,7 @@ mod conformance {
                     let r = base.join(".openclaw/agents/main/sessions");
                     write_fixture_file(
                         &r.join("sess-1.jsonl"),
-                        "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-10-09T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Hello OpenClaw\"}}\n",
+                        "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-10-09T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Hello OpenClaw\"}}\n{\"type\":\"message\",\"id\":\"m2\",\"timestamp\":\"2026-10-09T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-4-6\",\"content\":[{\"type\":\"text\",\"text\":\"Hi from OpenClaw\"},{\"type\":\"toolCall\",\"id\":\"tc1\",\"name\":\"exec\",\"arguments\":{\"cmd\":\"ls\"}},{\"type\":\"toolCall\",\"id\":\"tc2\",\"name\":\"load_skill\",\"arguments\":{\"name\":\"deploy\"}}],\"usage\":{\"input\":180,\"output\":60,\"cacheRead\":30,\"cacheWrite\":10}}}\n",
                     );
                     r
                 }
@@ -1453,6 +1453,123 @@ mod conformance {
                     }
                 }
             }
+        }
+
+        #[test]
+        fn openclaw_qualified_slug_and_kimi_aider_end_to_end_token_and_invocation_conformance() {
+            let tmp = TempDir::new().expect("tempdir");
+
+            // 1. OpenClaw multi-agent store (`conv.agent_slug == "openclaw/main"`)
+            let openclaw_ctx =
+                build_connector_fixture_context("openclaw", tmp.path()).expect("openclaw ctx");
+            let openclaw_convs = crate::connectors::openclaw::OpenClawConnector::new()
+                .scan(&openclaw_ctx)
+                .expect("scan openclaw");
+            assert_eq!(openclaw_convs.len(), 1);
+            let oc_conv = &openclaw_convs[0];
+            assert_eq!(oc_conv.agent_slug, "openclaw/main");
+            assert_eq!(oc_conv.messages.len(), 2);
+            let oc_asst = &oc_conv.messages[1];
+            assert_eq!(oc_asst.invocations.len(), 2);
+            assert_eq!(oc_asst.invocations[0].kind, "tool");
+            assert_eq!(oc_asst.invocations[0].name, "exec");
+            assert_eq!(oc_asst.invocations[1].kind, "skill");
+            assert_eq!(oc_asst.invocations[1].name, "deploy");
+            assert_eq!(
+                oc_asst.invocations[1].raw_name.as_deref(),
+                Some("load_skill")
+            );
+            let oc_usage = crate::connectors::extract_tokens_for_agent(
+                &oc_conv.agent_slug,
+                &oc_asst.extra,
+                &oc_asst.content,
+                &oc_asst.role,
+            );
+            assert_eq!(
+                oc_usage.data_source,
+                crate::connectors::TokenDataSource::Api
+            );
+            assert_eq!(oc_usage.model_name.as_deref(), Some("claude-opus-4-6"));
+            assert_eq!(oc_usage.provider.as_deref(), Some("anthropic"));
+            assert_eq!(oc_usage.input_tokens, Some(180));
+            assert_eq!(oc_usage.output_tokens, Some(60));
+            assert_eq!(oc_usage.cache_read_tokens, Some(30));
+            assert_eq!(oc_usage.cache_creation_tokens, Some(10));
+            assert!(oc_usage.has_tool_calls);
+            assert_eq!(oc_usage.tool_call_count, 2);
+
+            // 2. Kimi Code (`conv.agent_slug == "kimi"`)
+            let kimi_ctx = build_connector_fixture_context("kimi", tmp.path()).expect("kimi ctx");
+            let kimi_convs = crate::connectors::kimi::KimiConnector::new()
+                .scan(&kimi_ctx)
+                .expect("scan kimi");
+            assert_eq!(kimi_convs.len(), 1);
+            let kimi_conv = &kimi_convs[0];
+            assert_eq!(kimi_conv.messages.len(), 3);
+            let kimi_tool_msg = &kimi_conv.messages[1];
+            assert_eq!(kimi_tool_msg.invocations.len(), 1);
+            assert_eq!(kimi_tool_msg.invocations[0].kind, "skill");
+            assert_eq!(kimi_tool_msg.invocations[0].name, "debugging");
+            assert_eq!(
+                kimi_tool_msg.invocations[0].raw_name.as_deref(),
+                Some("load_skill")
+            );
+            let kimi_tool_usage = crate::connectors::extract_tokens_for_agent(
+                &kimi_conv.agent_slug,
+                &kimi_tool_msg.extra,
+                &kimi_tool_msg.content,
+                &kimi_tool_msg.role,
+            );
+            assert_eq!(
+                kimi_tool_usage.model_name.as_deref(),
+                Some("kimi-k2-0711-preview")
+            );
+            assert_eq!(kimi_tool_usage.provider.as_deref(), Some("moonshot"));
+            assert!(kimi_tool_usage.has_tool_calls);
+            assert_eq!(kimi_tool_usage.tool_call_count, 1);
+
+            let kimi_reply_msg = &kimi_conv.messages[2];
+            let kimi_reply_usage = crate::connectors::extract_tokens_for_agent(
+                &kimi_conv.agent_slug,
+                &kimi_reply_msg.extra,
+                &kimi_reply_msg.content,
+                &kimi_reply_msg.role,
+            );
+            assert_eq!(
+                kimi_reply_usage.data_source,
+                crate::connectors::TokenDataSource::Api
+            );
+            assert_eq!(
+                kimi_reply_usage.model_name.as_deref(),
+                Some("kimi-k2-0711-preview")
+            );
+            assert_eq!(kimi_reply_usage.provider.as_deref(), Some("moonshot"));
+            assert_eq!(kimi_reply_usage.input_tokens, Some(100));
+            assert_eq!(kimi_reply_usage.output_tokens, Some(25));
+
+            // 3. Aider (`conv.agent_slug == "aider"`)
+            let aider_ctx =
+                build_connector_fixture_context("aider", tmp.path()).expect("aider ctx");
+            let aider_convs = crate::connectors::aider::AiderConnector::new()
+                .scan(&aider_ctx)
+                .expect("scan aider");
+            assert_eq!(aider_convs.len(), 1);
+            let aider_conv = &aider_convs[0];
+            assert_eq!(aider_conv.messages[0].invocations.len(), 1);
+            assert_eq!(aider_conv.messages[0].invocations[0].name, "shell");
+            let aider_user_usage = crate::connectors::extract_tokens_for_agent(
+                &aider_conv.agent_slug,
+                &aider_conv.messages[0].extra,
+                &aider_conv.messages[0].content,
+                &aider_conv.messages[0].role,
+            );
+            assert_eq!(
+                aider_user_usage.model_name.as_deref(),
+                Some("claude-sonnet-4-5")
+            );
+            assert_eq!(aider_user_usage.provider.as_deref(), Some("anthropic"));
+            assert!(aider_user_usage.has_tool_calls);
+            assert_eq!(aider_user_usage.tool_call_count, 1);
         }
     }
 
