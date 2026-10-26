@@ -65,12 +65,23 @@ window is since `v0.3.11` (2026-10-14).
 
 ### Added
 
-- **OpenCode 1.x and 2.x API token usage, model/provider metadata, and tool-call extraction (`franken_agent_detection-td3`):**
+- **34-connector `extract_tokens_for_agent` tool-call/model/provider parity and `unwrap_skill_invocations` (`franken_agent_detection-woj`):**
+  wired `cass.tool_call_count`, `tool_call_count` / `has_tool_calls` extraction in
+  `extract_tokens_for_agent`, and `unwrap_skill_invocations` across all 34 connectors
+  (`claude_code`, `cline`, `amp`, `codex`, `gemini`, `kimi`, `prime_agent`, `openclaw`,
+  `antigravity`, `grok`, `vibe`, `clawdbot`, `codebuff`, `factory`, `copilot_cli`, `goose`,
+  `hermes`, `devin`, `kiro`, `muse`, `openhands`, `qwen`, `continue_dev`, `shelley`, `pi_wire`,
+  `pi_durable`, `aider`, and `grok_bot`), and extended `normalize_model` to recognize Mistral
+  (`mistral`, `codestral`, `devstral`, `pixtral`, `ministral`) and xAI (`grok`) model prefixes.
+- **OpenCode 1.x and 2.x API token usage, Aider and Grok Bot invocation/model extraction, and 32-connector invocation conformance (`franken_agent_detection-td3`):**
   preserved `modelID`, `providerID`, `tokens` (`input`, `output`, `reasoning`, `cache.read`,
   `cache.write`), and `cass.tool_call_count` on `NormalizedMessage.extra` across OpenCode 1.x
   SQLite (`load_sqlite_messages_by_session`), 1.x flat-file JSON (`load_messages_with_exclusions`),
-  and 2.x SQLite (`load_sqlite_v2_messages_by_session`), and added `extract_opencode_tokens` in
-  `src/connectors/token_extraction.rs` with zero-initialized fallback to content estimation.
+  and 2.x SQLite (`load_sqlite_v2_messages_by_session`), added `extract_opencode_tokens` in
+  `src/connectors/token_extraction.rs` with zero-initialized fallback to content estimation,
+  wired structured `NormalizedInvocation` and model/`cass.tool_call_count` extraction into
+  `aider` and `grok_bot`, and expanded the conformance test suite to enforce structured
+  invocation extraction across 32 tool-bearing connectors.
 - **Per-message model, provider, and tool-call attribution across `devin`, `hermes`, `goose`, `kiro`, `muse`, `openhands`, `chatgpt`, `crush`, and `token_extraction` (`franken_agent_detection-ah1`):**
   propagated session/message model, provider, and `cass.tool_call_count` metadata onto assistant
   `NormalizedMessage` records across `devin`, `hermes`, `goose` (SQLite and JSONL), `kiro`, `muse`,
@@ -138,6 +149,11 @@ window is since `v0.3.11` (2026-10-14).
 
 ### Fixed
 
+- **Codex `progress_tick` ordering for oversized rollout admission and snapshot integrity (`franken_agent_detection-88y`):**
+  removed the pre-open `ctx.tick()` before `RolloutReader::open` in `CodexConnector` (relying on
+  `RolloutReader::open` passing `ctx.progress_tick` into `Records::next_record()` after
+  `admit_rollout_len` and `file.metadata()` snapshot capture) and placed `ctx.tick()` after
+  `read_capped(&file)` on the legacy `.json` rollout branch.
 - **Shelley 0-based `sequence_id` conformance and `--all-features` Clippy cleanliness (`franken_agent_detection-da4`):**
   aligned Shelley's conformance test fixture with real Shelley 0-based `sequence_id`
   ordering and resolved all `--all-features --all-targets` Clippy `-D warnings` lints.

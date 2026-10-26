@@ -521,6 +521,27 @@ pub fn normalize_model(raw: &str) -> ModelInfo {
         };
     }
 
+    if lower.starts_with("mistral")
+        || lower.starts_with("codestral")
+        || lower.starts_with("devstral")
+        || lower.starts_with("pixtral")
+        || lower.starts_with("ministral")
+    {
+        return ModelInfo {
+            family: "mistral".into(),
+            tier: raw.to_string(),
+            provider: "mistral".into(),
+        };
+    }
+
+    if lower.starts_with("grok") {
+        return ModelInfo {
+            family: "grok".into(),
+            tier: raw.to_string(),
+            provider: "xai".into(),
+        };
+    }
+
     ModelInfo {
         family: "unknown".into(),
         tier: raw.to_string(),
@@ -1339,11 +1360,9 @@ pub fn extract_tokens_for_agent(
                                         .iter()
                                         .filter(|call| {
                                             call.as_object().is_some_and(|obj| {
-                                                matches!(
-                                                    obj.get("type"),
-                                                    None | Some(Value::Null)
-                                                ) || obj.get("type").and_then(Value::as_str)
-                                                    == Some("function")
+                                                matches!(obj.get("type"), None | Some(Value::Null))
+                                                    || obj.get("type").and_then(Value::as_str)
+                                                        == Some("function")
                                             }) && call
                                                 .pointer("/function/name")
                                                 .and_then(Value::as_str)
@@ -1865,6 +1884,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn extract_tokens_for_agent_attributes_models_and_tool_calls_across_connectors() {
         for (slug, extra, expected_model, expected_provider, expected_tools) in [
             (
@@ -1983,9 +2003,12 @@ mod tests {
                 "name": "shell",
                 "arguments": "{\"cmd\":[\"ls\"]}"
             },
-            "token_usage": {
-                "input_tokens": 100,
-                "output_tokens": 25
+            "cass": {
+                "token_usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 25,
+                    "data_source": "api"
+                }
             }
         });
         let codex_usage =
@@ -2016,23 +2039,16 @@ mod tests {
         assert_eq!(gemini_usage.tool_call_count, 2);
 
         let kimi_raw = serde_json::json!({
-            "events": [
-                {
-                    "type": "StatusUpdate",
-                    "payload": {
-                        "token_usage": {
-                            "input_other": 150,
-                            "output": 60
-                        }
-                    }
-                },
-                {
-                    "type": "ToolCall",
-                    "payload": {
-                        "name": "ReadFile"
-                    }
+            "event": {
+                "type": "tool.call"
+            },
+            "cass": {
+                "token_usage": {
+                    "input_tokens": 150,
+                    "output_tokens": 60,
+                    "data_source": "api"
                 }
-            ]
+            }
         });
         let kimi_usage = extract_tokens_for_agent("kimi", &kimi_raw, "Read file", "assistant");
         assert_eq!(kimi_usage.data_source, TokenDataSource::Api);
@@ -2055,10 +2071,7 @@ mod tests {
         let prime_usage =
             extract_tokens_for_agent("prime_agent", &prime_raw, "Checking", "assistant");
         assert_eq!(prime_usage.data_source, TokenDataSource::Api);
-        assert_eq!(
-            prime_usage.model_name.as_deref(),
-            Some("claude-sonnet-4-5")
-        );
+        assert_eq!(prime_usage.model_name.as_deref(), Some("claude-sonnet-4-5"));
         assert_eq!(prime_usage.provider.as_deref(), Some("anthropic"));
         assert!(prime_usage.has_tool_calls);
         assert_eq!(prime_usage.tool_call_count, 1);

@@ -131,10 +131,15 @@ fn main() -> anyhow::Result<()> {
 Every connector produces `NormalizedConversation`s: `agent_slug`,
 `external_id`, `title`, `workspace`, `source_path`, timestamps, `metadata`,
 and `NormalizedMessage`s (`role`, `author`, `content`, `created_at`, structured
-tool `invocations`, and the raw provider record in `extra`). Connector-derived
-annotations live under `extra.cass` (for example branch and context membership
-for Pi sessions). `extract_tokens_for_agent` turns a message's `extra` into
-exact token usage where the agent records it, and an estimate otherwise.
+tool and skill `invocations` with `skill`/`load_skill` wrappers normalized via
+`unwrap_skill_invocations`, and the raw provider record in `extra`).
+Connector-derived annotations live under `extra.cass` (for example branch and
+context membership for Pi sessions, or `cass.tool_call_count` across tool-using
+turns). `extract_tokens_for_agent` turns a message's `extra` into exact API
+token usage where the agent records it (and an estimate otherwise) while
+preserving model, provider (`anthropic`, `openai`, `google`, `mistral`, `xai`,
+or explicit provider metadata), and `tool_call_count` / `has_tool_calls`
+across all 34 connectors.
 
 Claude Code session files of **32 MiB or larger** retain compact metadata in
 `extra.cass` instead of duplicating the full raw record. Reply identifiers are
@@ -270,7 +275,16 @@ Similarly, Crush and Muse record API token counters at the session level in
 `conversation.metadata` (`prompt_tokens`/`completion_tokens` for Crush;
 `usage.input_tokens`/`output_tokens` for Muse), so per-message token extraction
 preserves model and provider metadata while falling back to content estimation
-rather than duplicating session totals across assistant turns.
+rather than duplicating session totals across assistant turns. OpenCode 1.x
+(SQLite and flat-file JSON) and 2.x (`session_v2`/`session_message`) preserve
+per-message `modelID`, `providerID`, `tokens` (`input`, `output`, `reasoning`,
+`cache.read`, `cache.write`), and `cass.tool_call_count` on `extra`, surfacing
+positive API token counts via `extract_tokens_for_agent("opencode", ...)` and
+falling back to content estimation for zero-initialized `Tokens::default()`
+blocks. Aider and Grok Bot also extract structured `NormalizedInvocation`
+entries (such as Aider `#### /run` / `#### /git` / `#### /test` commands and
+Grok Bot `tool_calls` / `tool_use` / `function_call` blocks) alongside
+per-message model and `cass.tool_call_count` metadata.
 
 Continue reads IDE and CLI snapshots from
 `~/.continue/sessions/<sessionId>.json`, or `CONTINUE_GLOBAL_DIR/sessions`.

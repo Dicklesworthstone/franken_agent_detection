@@ -301,8 +301,8 @@ fn parse_session(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
             .map(|blocks| {
                 render_blocks(
                     blocks
-                    .as_array()
-                    .context("message blocks must be an array")?,
+                        .as_array()
+                        .context("message blocks must be an array")?,
                     &mut invocations,
                 )
             })
