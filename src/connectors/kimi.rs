@@ -645,6 +645,20 @@ fn parse_kimi_session_reader(
                     }]
                 });
                 unwrap_skill_invocations(&mut invocations);
+                let mut extra = val;
+                if !invocations.is_empty() {
+                    if let Some(obj) = extra.as_object_mut() {
+                        let cass = obj
+                            .entry("cass")
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        if let Some(cass_obj) = cass.as_object_mut() {
+                            cass_obj.insert(
+                                "tool_call_count".to_string(),
+                                Value::from(invocations.len()),
+                            );
+                        }
+                    }
+                }
 
                 messages.push(NormalizedMessage {
                     idx: 0,
@@ -652,7 +666,7 @@ fn parse_kimi_session_reader(
                     author: None,
                     created_at: created,
                     content,
-                    extra: val,
+                    extra,
                     invocations,
                     snippets: Vec::new(),
                 });
@@ -924,6 +938,7 @@ fn parse_kimi_code_session_reader(
     let mut pending_prompt: Option<PendingPrompt> = None;
     // toolCallId -> index of the message carrying that tool.call invocation.
     let mut call_index_by_id: HashMap<String, usize> = HashMap::new();
+    let mut active_model: Option<String> = None;
 
     for line_res in JsonlLines::new(reader) {
         let line = line_res.with_context(|| format!("read kimi wire file {}", path.display()))?;
@@ -1022,13 +1037,26 @@ fn parse_kimi_code_session_reader(
                             continue;
                         }
                         let author = (part_type == "think").then(|| "reasoning".to_string());
+                        let mut extra = val;
+                        if let Some(ref model) = active_model {
+                            if let Some(obj) = extra.as_object_mut() {
+                                let cass = obj
+                                    .entry("cass")
+                                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                                if let Some(cass_obj) = cass.as_object_mut() {
+                                    cass_obj
+                                        .entry("model".to_string())
+                                        .or_insert_with(|| Value::String(model.clone()));
+                                }
+                            }
+                        }
                         messages.push(NormalizedMessage {
                             idx: 0,
                             role: "assistant".to_string(),
                             author,
                             created_at: created,
                             content: text.to_string(),
-                            extra: val,
+                            extra,
                             invocations: Vec::new(),
                             snippets: Vec::new(),
                         });
@@ -1054,13 +1082,30 @@ fn parse_kimi_code_session_reader(
                         if let Some(id) = call_id {
                             call_index_by_id.insert(id, messages.len());
                         }
+                        let mut extra = val;
+                        if let Some(obj) = extra.as_object_mut() {
+                            let cass = obj
+                                .entry("cass")
+                                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                            if let Some(cass_obj) = cass.as_object_mut() {
+                                cass_obj.insert(
+                                    "tool_call_count".to_string(),
+                                    Value::from(invocations.len()),
+                                );
+                                if let Some(ref model) = active_model {
+                                    cass_obj
+                                        .entry("model".to_string())
+                                        .or_insert_with(|| Value::String(model.clone()));
+                                }
+                            }
+                        }
                         messages.push(NormalizedMessage {
                             idx: 0,
                             role: "assistant".to_string(),
                             author: None,
                             created_at: created,
                             content,
-                            extra: val,
+                            extra,
                             invocations,
                             snippets: Vec::new(),
                         });
@@ -1110,6 +1155,16 @@ fn parse_kimi_code_session_reader(
             // and its context.append_message echo — the pending prompt must
             // survive them or the dedup only works under strict adjacency
             // and the prompt duplicates (fresh-eyes finding, cass#351).
+            "llm.request" => {
+                if let Some(model) = val
+                    .get("model")
+                    .or_else(|| val.pointer("/request/model"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    active_model = Some(model.to_string());
+                }
+            }
             "usage.record" => {
                 // Documented event type (module header) with no published
                 // field shape; accept both a flat token record and one
@@ -1118,6 +1173,15 @@ fn parse_kimi_code_session_reader(
                 // guessed. Bookkeeping only: the pending turn.prompt must
                 // survive it (cass#351).
                 let block = val.get("usage").unwrap_or(&val);
+                let record_model = val
+                    .get("model")
+                    .or_else(|| block.get("model"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(String::from);
+                if let Some(ref model) = record_model {
+                    active_model = Some(model.clone());
+                }
                 let field = |key: &str| {
                     block.get(key).and_then(Value::as_i64).or_else(|| {
                         block
@@ -1136,6 +1200,9 @@ fn parse_kimi_code_session_reader(
                 }
                 if let Some(output) = output_tokens {
                     usage.insert("output_tokens".to_string(), Value::from(output));
+                }
+                if let Some(ref model) = record_model.as_ref().or(active_model.as_ref()) {
+                    usage.insert("model".to_string(), Value::String((*model).clone()));
                 }
                 // Cache-field semantics are unpublished for Kimi; preserve
                 // alternate spellings VERBATIM rather than remapping onto
@@ -1159,6 +1226,12 @@ fn parse_kimi_code_session_reader(
                             .entry("cass")
                             .or_insert_with(|| Value::Object(serde_json::Map::new()));
                         if let Some(cass_obj) = cass.as_object_mut() {
+                            if let Some(ref model) = record_model.as_ref().or(active_model.as_ref())
+                            {
+                                cass_obj
+                                    .entry("model".to_string())
+                                    .or_insert_with(|| Value::String((*model).clone()));
+                            }
                             cass_obj.insert("token_usage".to_string(), Value::Object(usage));
                         }
                     }

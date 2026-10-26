@@ -542,6 +542,22 @@ pub fn normalize_model(raw: &str) -> ModelInfo {
         };
     }
 
+    if lower.starts_with("kimi") || lower.starts_with("moonshot") {
+        return ModelInfo {
+            family: "kimi".into(),
+            tier: raw.to_string(),
+            provider: "moonshot".into(),
+        };
+    }
+
+    if lower.starts_with("deepseek") {
+        return ModelInfo {
+            family: "deepseek".into(),
+            tier: raw.to_string(),
+            provider: "deepseek".into(),
+        };
+    }
+
     ModelInfo {
         family: "unknown".into(),
         tier: raw.to_string(),
@@ -1078,6 +1094,29 @@ pub fn extract_tokens_for_agent(
         // metadata because Kimi's additive/subset semantics are unknown.
         "kimi" => {
             let usage = extra.pointer("/cass/token_usage");
+            let model_name = extra
+                .get("model")
+                .or_else(|| extra.pointer("/cass/model"))
+                .or_else(|| usage.and_then(|u| u.get("model")))
+                .or_else(|| extra.pointer("/message/model"))
+                .or_else(|| extra.pointer("/message/payload/model"))
+                .or_else(|| extra.pointer("/event/model"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from);
+            let provider = extra
+                .get("provider")
+                .or_else(|| extra.pointer("/cass/provider"))
+                .or_else(|| usage.and_then(|u| u.get("provider")))
+                .or_else(|| extra.pointer("/message/provider"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from)
+                .or_else(|| {
+                    model_name
+                        .as_deref()
+                        .map(|name| normalize_model(name).provider)
+                });
             let read = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
             let input_tokens = read("input_tokens");
             let output_tokens = read("output_tokens");
@@ -1093,6 +1132,8 @@ pub fn extract_tokens_for_agent(
                     u32::from(is_tool_call)
                 });
             ExtractedTokenUsage {
+                model_name,
+                provider,
                 input_tokens,
                 output_tokens,
                 has_tool_calls: tool_call_count > 0,
@@ -1178,9 +1219,12 @@ pub fn extract_tokens_for_agent(
         // work) is deliberately NOT read: pi keeps it out of the main
         // model-call accounting.
         //
-        // Pi durable (`pi_durable`) and OpenClaw (`openclaw`) keep the same
-        // pi-ai assistant message under `extra.message`.
-        "pi_agent" | "omp" | "pi_durable" | "openclaw" => {
+        // Pi durable (`pi_durable`) and OpenClaw (`openclaw` and qualified
+        // `openclaw/<agent>` slugs) keep the same pi-ai assistant message
+        // under `extra.message`.
+        slug if matches!(slug, "pi_agent" | "omp" | "pi_durable" | "openclaw")
+            || slug.starts_with("openclaw/") =>
+        {
             let entry_type = extra.get("type").and_then(Value::as_str);
             let is_assistant =
                 extra.pointer("/message/role").and_then(Value::as_str) == Some("assistant");
@@ -1192,12 +1236,16 @@ pub fn extract_tokens_for_agent(
             let model_name = extra
                 .pointer("/message/model")
                 .or_else(|| extra.pointer("/cass/model"))
+                .or_else(|| extra.get("model"))
                 .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
                 .map(String::from);
             let provider = extra
                 .pointer("/message/provider")
                 .or_else(|| extra.pointer("/cass/provider"))
+                .or_else(|| extra.get("provider"))
                 .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
                 .map(String::from)
                 .or_else(|| {
                     model_name
@@ -2075,5 +2123,81 @@ mod tests {
         assert_eq!(prime_usage.provider.as_deref(), Some("anthropic"));
         assert!(prime_usage.has_tool_calls);
         assert_eq!(prime_usage.tool_call_count, 1);
+    }
+
+    #[test]
+    fn extract_tokens_for_agent_supports_qualified_openclaw_agent_slugs_and_kimi_models() {
+        let openclaw_raw = serde_json::json!({
+            "type": "message",
+            "id": "m2",
+            "message": {
+                "role": "assistant",
+                "provider": "anthropic",
+                "model": "claude-opus-4-6",
+                "content": [
+                    {"type": "text", "text": "Hi from openclaw/main!"},
+                    {"type": "toolCall", "id": "tc1", "name": "exec", "arguments": {"cmd": "ls"}}
+                ],
+                "usage": {
+                    "input": 210,
+                    "output": 75,
+                    "cacheRead": 40,
+                    "cacheWrite": 10
+                }
+            }
+        });
+        for slug in ["openclaw", "openclaw/main", "openclaw/coder"] {
+            let usage = extract_tokens_for_agent(
+                slug,
+                &openclaw_raw,
+                "Hi from openclaw/main!",
+                "assistant",
+            );
+            assert_eq!(usage.data_source, TokenDataSource::Api, "{slug}");
+            assert_eq!(
+                usage.model_name.as_deref(),
+                Some("claude-opus-4-6"),
+                "{slug}"
+            );
+            assert_eq!(usage.provider.as_deref(), Some("anthropic"), "{slug}");
+            assert_eq!(usage.input_tokens, Some(210), "{slug}");
+            assert_eq!(usage.output_tokens, Some(75), "{slug}");
+            assert_eq!(usage.cache_read_tokens, Some(40), "{slug}");
+            assert_eq!(usage.cache_creation_tokens, Some(10), "{slug}");
+            assert!(usage.has_tool_calls, "{slug}");
+            assert_eq!(usage.tool_call_count, 1, "{slug}");
+        }
+
+        let kimi_model = normalize_model("kimi-k2-0711-preview");
+        assert_eq!(kimi_model.family, "kimi");
+        assert_eq!(kimi_model.provider, "moonshot");
+
+        let deepseek_model = normalize_model("deepseek-reasoner");
+        assert_eq!(deepseek_model.family, "deepseek");
+        assert_eq!(deepseek_model.provider, "deepseek");
+
+        let kimi_raw = serde_json::json!({
+            "cass": {
+                "model": "kimi-k2-0711-preview",
+                "tool_call_count": 1,
+                "token_usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 45,
+                    "model": "kimi-k2-0711-preview",
+                    "data_source": "api"
+                }
+            }
+        });
+        let kimi_usage = extract_tokens_for_agent("kimi", &kimi_raw, "Running tool", "assistant");
+        assert_eq!(kimi_usage.data_source, TokenDataSource::Api);
+        assert_eq!(
+            kimi_usage.model_name.as_deref(),
+            Some("kimi-k2-0711-preview")
+        );
+        assert_eq!(kimi_usage.provider.as_deref(), Some("moonshot"));
+        assert_eq!(kimi_usage.input_tokens, Some(120));
+        assert_eq!(kimi_usage.output_tokens, Some(45));
+        assert!(kimi_usage.has_tool_calls);
+        assert_eq!(kimi_usage.tool_call_count, 1);
     }
 }
