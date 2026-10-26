@@ -582,7 +582,6 @@ fn scan_codex_with_hooks(
             if !hooks.should_scan(&discovered) {
                 continue;
             }
-            ctx.tick();
             let Some(format) = RolloutFormat::of(&file) else {
                 continue;
             };
@@ -939,6 +938,7 @@ fn scan_codex_with_hooks(
                         continue;
                     }
                 };
+                ctx.tick();
                 let content = content.trim_start_matches('\u{feff}');
                 let val: Value = match serde_json::from_str(content) {
                     Ok(v) => v,
