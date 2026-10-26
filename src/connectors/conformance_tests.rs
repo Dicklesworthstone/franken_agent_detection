@@ -1457,6 +1457,7 @@ mod conformance {
 
         #[test]
         fn openclaw_qualified_slug_and_kimi_aider_end_to_end_token_and_invocation_conformance() {
+            use crate::connectors::Connector;
             let tmp = TempDir::new().expect("tempdir");
 
             // 1. OpenClaw multi-agent store (`conv.agent_slug == "openclaw/main"`)
@@ -1555,21 +1556,42 @@ mod conformance {
                 .expect("scan aider");
             assert_eq!(aider_convs.len(), 1);
             let aider_conv = &aider_convs[0];
-            assert_eq!(aider_conv.messages[0].invocations.len(), 1);
-            assert_eq!(aider_conv.messages[0].invocations[0].name, "shell");
+            let aider_user_msg = aider_conv
+                .messages
+                .iter()
+                .find(|m| m.role == "user")
+                .expect("aider user message");
+            assert_eq!(aider_user_msg.invocations.len(), 1);
+            assert_eq!(aider_user_msg.invocations[0].name, "run");
+            assert_eq!(
+                aider_user_msg.invocations[0].raw_name.as_deref(),
+                Some("/run")
+            );
             let aider_user_usage = crate::connectors::extract_tokens_for_agent(
                 &aider_conv.agent_slug,
-                &aider_conv.messages[0].extra,
-                &aider_conv.messages[0].content,
-                &aider_conv.messages[0].role,
+                &aider_user_msg.extra,
+                &aider_user_msg.content,
+                &aider_user_msg.role,
             );
-            assert_eq!(
-                aider_user_usage.model_name.as_deref(),
-                Some("claude-sonnet-4-5")
-            );
-            assert_eq!(aider_user_usage.provider.as_deref(), Some("anthropic"));
             assert!(aider_user_usage.has_tool_calls);
             assert_eq!(aider_user_usage.tool_call_count, 1);
+
+            let aider_asst_msg = aider_conv
+                .messages
+                .iter()
+                .find(|m| m.role == "assistant")
+                .expect("aider assistant message");
+            let aider_asst_usage = crate::connectors::extract_tokens_for_agent(
+                &aider_conv.agent_slug,
+                &aider_asst_msg.extra,
+                &aider_asst_msg.content,
+                &aider_asst_msg.role,
+            );
+            assert_eq!(
+                aider_asst_usage.model_name.as_deref(),
+                Some("claude-sonnet-4-5")
+            );
+            assert_eq!(aider_asst_usage.provider.as_deref(), Some("anthropic"));
         }
     }
 

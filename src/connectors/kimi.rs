@@ -1036,6 +1036,7 @@ fn parse_kimi_code_session_reader(
                         if text.trim().is_empty() {
                             continue;
                         }
+                        let content = text.to_string();
                         let author = (part_type == "think").then(|| "reasoning".to_string());
                         let mut extra = val;
                         if let Some(ref model) = active_model {
@@ -1055,7 +1056,7 @@ fn parse_kimi_code_session_reader(
                             role: "assistant".to_string(),
                             author,
                             created_at: created,
-                            content: text.to_string(),
+                            content,
                             extra,
                             invocations: Vec::new(),
                             snippets: Vec::new(),
@@ -1201,8 +1202,8 @@ fn parse_kimi_code_session_reader(
                 if let Some(output) = output_tokens {
                     usage.insert("output_tokens".to_string(), Value::from(output));
                 }
-                if let Some(ref model) = record_model.as_ref().or(active_model.as_ref()) {
-                    usage.insert("model".to_string(), Value::String((*model).clone()));
+                if let Some(model) = record_model.as_ref().or(active_model.as_ref()) {
+                    usage.insert("model".to_string(), Value::String(model.clone()));
                 }
                 // Cache-field semantics are unpublished for Kimi; preserve
                 // alternate spellings VERBATIM rather than remapping onto
@@ -1226,11 +1227,10 @@ fn parse_kimi_code_session_reader(
                             .entry("cass")
                             .or_insert_with(|| Value::Object(serde_json::Map::new()));
                         if let Some(cass_obj) = cass.as_object_mut() {
-                            if let Some(ref model) = record_model.as_ref().or(active_model.as_ref())
-                            {
+                            if let Some(model) = record_model.as_ref().or(active_model.as_ref()) {
                                 cass_obj
                                     .entry("model".to_string())
-                                    .or_insert_with(|| Value::String((*model).clone()));
+                                    .or_insert_with(|| Value::String(model.clone()));
                             }
                             cass_obj.insert("token_usage".to_string(), Value::Object(usage));
                         }
