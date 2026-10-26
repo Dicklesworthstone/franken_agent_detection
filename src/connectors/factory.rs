@@ -26,7 +26,10 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
+use super::utils::{
+    dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+    unwrap_skill_invocations,
+};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -426,15 +429,26 @@ fn parse_factory_session_reader(
                     .and_then(|v| v.as_str())
                     .map(String::from);
 
-                let invocations =
+                let mut invocations =
                     content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
+                unwrap_skill_invocations(&mut invocations);
+                let role = role.to_string();
+                let mut extra = val;
+                if !invocations.is_empty()
+                    && let Some(obj) = extra.as_object_mut()
+                {
+                    obj.insert(
+                        "cass".to_string(),
+                        serde_json::json!({ "tool_call_count": invocations.len() }),
+                    );
+                }
                 messages.push(NormalizedMessage {
                     idx: 0, // Will be reassigned after collection
-                    role: role.to_string(),
+                    role,
                     author,
                     created_at: created,
                     content: content_str,
-                    extra: val,
+                    extra,
                     invocations,
                     snippets: Vec::new(),
                 });

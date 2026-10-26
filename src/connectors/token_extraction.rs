@@ -151,9 +151,31 @@ fn extract_cline_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
                 .as_deref()
                 .map(|name| normalize_model(name).provider)
         });
+    let tool_call_count = extra
+        .pointer("/cass/tool_call_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok())
+        .unwrap_or_else(|| {
+            extra
+                .get("content")
+                .and_then(Value::as_array)
+                .map_or(0, |blocks| {
+                    u32::try_from(
+                        blocks
+                            .iter()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("tool_use")
+                            })
+                            .count(),
+                    )
+                    .unwrap_or(u32::MAX)
+                })
+        });
     let mut usage = ExtractedTokenUsage {
         model_name,
         provider,
+        tool_call_count,
+        has_tool_calls: tool_call_count > 0,
         ..Default::default()
     };
     if extra.get("type").and_then(Value::as_str) != Some("say") {
@@ -341,16 +363,24 @@ pub(super) fn extract_amp_tokens(extra: &Value, role: &str) -> ExtractedTokenUsa
         .as_deref()
         .map(|model| normalize_model(model).provider);
     let tool_call_count = extra
-        .get("content")
-        .and_then(Value::as_array)
-        .map_or(0, |blocks| {
-            u32::try_from(
-                blocks
-                    .iter()
-                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
-                    .count(),
-            )
-            .unwrap_or(u32::MAX)
+        .pointer("/cass/tool_call_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok())
+        .unwrap_or_else(|| {
+            extra
+                .get("content")
+                .and_then(Value::as_array)
+                .map_or(0, |blocks| {
+                    u32::try_from(
+                        blocks
+                            .iter()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("tool_use")
+                            })
+                            .count(),
+                    )
+                    .unwrap_or(u32::MAX)
+                })
         });
     let mut usage = ExtractedTokenUsage {
         model_name,
@@ -641,12 +671,52 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
     let provider = model_name
         .as_deref()
         .map(|name| normalize_model(name).provider);
+    let tool_call_count = extra
+        .pointer("/cass/tool_call_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok())
+        .unwrap_or_else(|| {
+            let entry_type = extra.get("type").and_then(Value::as_str);
+            let payload = extra.get("payload");
+            let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
+            if matches!(
+                (entry_type, payload_type),
+                (
+                    Some("response_item"),
+                    Some("function_call" | "custom_tool_call")
+                ) | (Some("event_msg"), Some("tool_call"))
+            ) || matches!(entry_type, Some("function_call" | "custom_tool_call"))
+            {
+                1
+            } else {
+                payload
+                    .and_then(|p| p.get("content"))
+                    .or_else(|| extra.get("content"))
+                    .and_then(Value::as_array)
+                    .map_or(0, |blocks| {
+                        u32::try_from(
+                            blocks
+                                .iter()
+                                .filter(|block| {
+                                    matches!(
+                                        block.get("type").and_then(Value::as_str),
+                                        Some("tool_use" | "function_call" | "tool_call")
+                                    )
+                                })
+                                .count(),
+                        )
+                        .unwrap_or(u32::MAX)
+                    })
+            }
+        });
 
     ExtractedTokenUsage {
         model_name,
         provider,
         input_tokens,
         output_tokens,
+        has_tool_calls: tool_call_count > 0,
+        tool_call_count,
         data_source,
         ..Default::default()
     }
@@ -669,9 +739,33 @@ fn extract_gemini_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
     let provider = model_name
         .as_deref()
         .map(|name| normalize_model(name).provider);
+    let tool_call_count = extra
+        .pointer("/cass/tool_call_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok())
+        .unwrap_or_else(|| {
+            extra
+                .get("toolCalls")
+                .and_then(Value::as_array)
+                .map_or(0, |calls| {
+                    u32::try_from(
+                        calls
+                            .iter()
+                            .filter(|call| {
+                                call.get("name")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|name| !name.trim().is_empty())
+                            })
+                            .count(),
+                    )
+                    .unwrap_or(u32::MAX)
+                })
+        });
     let mut extracted = ExtractedTokenUsage {
         model_name,
         provider,
+        has_tool_calls: tool_call_count > 0,
+        tool_call_count,
         ..Default::default()
     };
     if role != "assistant" {
@@ -966,9 +1060,22 @@ pub fn extract_tokens_for_agent(
             let read = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
             let input_tokens = read("input_tokens");
             let output_tokens = read("output_tokens");
+            let tool_call_count = extra
+                .pointer("/cass/tool_call_count")
+                .and_then(Value::as_u64)
+                .and_then(|count| u32::try_from(count).ok())
+                .unwrap_or_else(|| {
+                    let is_tool_call = extra.pointer("/message/type").and_then(Value::as_str)
+                        == Some("ToolCall")
+                        || extra.pointer("/event/type").and_then(Value::as_str)
+                            == Some("tool.call");
+                    u32::from(is_tool_call)
+                });
             ExtractedTokenUsage {
                 input_tokens,
                 output_tokens,
+                has_tool_calls: tool_call_count > 0,
+                tool_call_count,
                 data_source: if input_tokens.is_some() || output_tokens.is_some() {
                     TokenDataSource::Api
                 } else {
@@ -1003,6 +1110,26 @@ pub fn extract_tokens_for_agent(
             let output_tokens = read("output");
             let cache_read_tokens = read("cacheRead");
             let cache_creation_tokens = read("cacheWrite");
+            let tool_call_count = extra
+                .pointer("/cass/tool_call_count")
+                .and_then(Value::as_u64)
+                .and_then(|count| u32::try_from(count).ok())
+                .unwrap_or_else(|| {
+                    extra
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .map_or(0, |blocks| {
+                            u32::try_from(
+                                blocks
+                                    .iter()
+                                    .filter(|b| {
+                                        b.get("type").and_then(Value::as_str) == Some("toolCall")
+                                    })
+                                    .count(),
+                            )
+                            .unwrap_or(u32::MAX)
+                        })
+                });
             let has_api_data = input_tokens.is_some() || output_tokens.is_some();
             ExtractedTokenUsage {
                 model_name,
@@ -1011,6 +1138,8 @@ pub fn extract_tokens_for_agent(
                 output_tokens,
                 cache_read_tokens,
                 cache_creation_tokens,
+                has_tool_calls: tool_call_count > 0,
+                tool_call_count,
                 data_source: if has_api_data {
                     TokenDataSource::Api
                 } else {
@@ -1057,18 +1186,26 @@ pub fn extract_tokens_for_agent(
             let read = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
             let input_tokens = read("input");
             let output_tokens = read("output");
-            let tool_call_count = u32::try_from(
-                extra
-                    .pointer("/message/content")
-                    .and_then(Value::as_array)
-                    .map_or(0, |blocks| {
-                        blocks
-                            .iter()
-                            .filter(|b| b.get("type").and_then(Value::as_str) == Some("toolCall"))
-                            .count()
-                    }),
-            )
-            .unwrap_or(u32::MAX);
+            let tool_call_count = extra
+                .pointer("/cass/tool_call_count")
+                .and_then(Value::as_u64)
+                .and_then(|count| u32::try_from(count).ok())
+                .unwrap_or_else(|| {
+                    u32::try_from(
+                        extra
+                            .pointer("/message/content")
+                            .and_then(Value::as_array)
+                            .map_or(0, |blocks| {
+                                blocks
+                                    .iter()
+                                    .filter(|b| {
+                                        b.get("type").and_then(Value::as_str) == Some("toolCall")
+                                    })
+                                    .count()
+                            }),
+                    )
+                    .unwrap_or(u32::MAX)
+                });
             let has_api_data = input_tokens.is_some() || output_tokens.is_some();
             ExtractedTokenUsage {
                 model_name,
@@ -1151,7 +1288,7 @@ pub fn extract_tokens_for_agent(
         }
         "cursor" | "factory" | "antigravity" | "grok" | "goose" | "vibe" | "clawdbot"
         | "codebuff" | "copilot_cli" | "hermes" | "devin" | "chatgpt" | "kiro" | "muse"
-        | "openhands" => {
+        | "openhands" | "aider" | "grok_bot" => {
             let model_name = extra
                 .get("model")
                 .or_else(|| extra.pointer("/cass/model"))
@@ -1183,13 +1320,43 @@ pub fn extract_tokens_for_agent(
                         .as_deref()
                         .map(|name| normalize_model(name).provider)
                 });
-            let tool_call_count = u32::try_from(
-                extra
-                    .pointer("/cass/tool_call_count")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            )
-            .unwrap_or(u32::MAX);
+            let tool_call_count = extra
+                .pointer("/cass/tool_call_count")
+                .and_then(Value::as_u64)
+                .and_then(|count| u32::try_from(count).ok())
+                .unwrap_or_else(|| {
+                    if extra.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call")
+                        || (role == "tool" && extra.get("agy_type").is_some())
+                    {
+                        1
+                    } else if extra.get("role").and_then(Value::as_str) == Some("assistant") {
+                        extra
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .map_or(0, |calls| {
+                                u32::try_from(
+                                    calls
+                                        .iter()
+                                        .filter(|call| {
+                                            call.as_object().is_some_and(|obj| {
+                                                matches!(
+                                                    obj.get("type"),
+                                                    None | Some(Value::Null)
+                                                ) || obj.get("type").and_then(Value::as_str)
+                                                    == Some("function")
+                                            }) && call
+                                                .pointer("/function/name")
+                                                .and_then(Value::as_str)
+                                                .is_some_and(|name| !name.trim().is_empty())
+                                        })
+                                        .count(),
+                                )
+                                .unwrap_or(u32::MAX)
+                            })
+                    } else {
+                        0
+                    }
+                });
             ExtractedTokenUsage {
                 model_name,
                 provider,
@@ -1742,6 +1909,62 @@ mod tests {
                 "google",
                 1_u32,
             ),
+            (
+                "antigravity",
+                serde_json::json!({"model": "gemini-2.5-pro", "cass": {"tool_call_count": 1}}),
+                "gemini-2.5-pro",
+                "google",
+                1_u32,
+            ),
+            (
+                "grok",
+                serde_json::json!({"_meta": {"modelId": "claude-sonnet-4-5"}, "cass": {"tool_call_count": 2}}),
+                "claude-sonnet-4-5",
+                "anthropic",
+                2_u32,
+            ),
+            (
+                "vibe",
+                serde_json::json!({"role": "assistant", "model": "mistral-large-latest", "tool_calls": [{"function": {"name": "bash"}}, {"function": {"name": "read_file"}}]}),
+                "mistral-large-latest",
+                "mistral",
+                2_u32,
+            ),
+            (
+                "clawdbot",
+                serde_json::json!({"model": "claude-sonnet-4-5", "cass": {"tool_call_count": 1}}),
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_u32,
+            ),
+            (
+                "factory",
+                serde_json::json!({"model": "claude-opus-4-6", "cass": {"tool_call_count": 2}}),
+                "claude-opus-4-6",
+                "anthropic",
+                2_u32,
+            ),
+            (
+                "codebuff",
+                serde_json::json!({"model": "claude-sonnet-4-5", "cass": {"tool_call_count": 1}}),
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_u32,
+            ),
+            (
+                "aider",
+                serde_json::json!({"model": "claude-sonnet-4-5", "cass": {"tool_call_count": 1}}),
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_u32,
+            ),
+            (
+                "grok_bot",
+                serde_json::json!({"model": "grok-3", "cass": {"tool_call_count": 1}}),
+                "grok-3",
+                "xai",
+                1_u32,
+            ),
         ] {
             let usage = extract_tokens_for_agent(slug, &extra, "Assistant reply", "assistant");
             assert_eq!(usage.model_name.as_deref(), Some(expected_model), "{slug}");
@@ -1749,5 +1972,95 @@ mod tests {
             assert!(usage.has_tool_calls, "{slug}");
             assert_eq!(usage.tool_call_count, expected_tools, "{slug}");
         }
+    }
+
+    #[test]
+    fn extract_tokens_for_agent_counts_tool_calls_for_codex_gemini_kimi_and_prime_agent() {
+        let codex_raw = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "shell",
+                "arguments": "{\"cmd\":[\"ls\"]}"
+            },
+            "token_usage": {
+                "input_tokens": 100,
+                "output_tokens": 25
+            }
+        });
+        let codex_usage =
+            extract_tokens_for_agent("codex", &codex_raw, "[Tool: shell]", "assistant");
+        assert_eq!(codex_usage.data_source, TokenDataSource::Api);
+        assert_eq!(codex_usage.input_tokens, Some(100));
+        assert_eq!(codex_usage.output_tokens, Some(25));
+        assert!(codex_usage.has_tool_calls);
+        assert_eq!(codex_usage.tool_call_count, 1);
+
+        let gemini_raw = serde_json::json!({
+            "model": "gemini-2.5-pro",
+            "tokens": {
+                "input": 200,
+                "output": 80
+            },
+            "toolCalls": [
+                {"name": "read_file", "args": {"path": "src/lib.rs"}},
+                {"name": "run_shell_command", "args": {"command": "cargo test"}}
+            ]
+        });
+        let gemini_usage =
+            extract_tokens_for_agent("gemini", &gemini_raw, "Running checks", "assistant");
+        assert_eq!(gemini_usage.data_source, TokenDataSource::Api);
+        assert_eq!(gemini_usage.model_name.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(gemini_usage.provider.as_deref(), Some("google"));
+        assert!(gemini_usage.has_tool_calls);
+        assert_eq!(gemini_usage.tool_call_count, 2);
+
+        let kimi_raw = serde_json::json!({
+            "events": [
+                {
+                    "type": "StatusUpdate",
+                    "payload": {
+                        "token_usage": {
+                            "input_other": 150,
+                            "output": 60
+                        }
+                    }
+                },
+                {
+                    "type": "ToolCall",
+                    "payload": {
+                        "name": "ReadFile"
+                    }
+                }
+            ]
+        });
+        let kimi_usage = extract_tokens_for_agent("kimi", &kimi_raw, "Read file", "assistant");
+        assert_eq!(kimi_usage.data_source, TokenDataSource::Api);
+        assert_eq!(kimi_usage.input_tokens, Some(150));
+        assert_eq!(kimi_usage.output_tokens, Some(60));
+        assert!(kimi_usage.has_tool_calls);
+        assert_eq!(kimi_usage.tool_call_count, 1);
+
+        let prime_raw = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "usage": {
+                "input": 90,
+                "output": 30
+            },
+            "content": [
+                {"type": "text", "text": "Checking"},
+                {"type": "toolCall", "name": "bash", "arguments": {"cmd": "pwd"}}
+            ]
+        });
+        let prime_usage =
+            extract_tokens_for_agent("prime_agent", &prime_raw, "Checking", "assistant");
+        assert_eq!(prime_usage.data_source, TokenDataSource::Api);
+        assert_eq!(
+            prime_usage.model_name.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(prime_usage.provider.as_deref(), Some("anthropic"));
+        assert!(prime_usage.has_tool_calls);
+        assert_eq!(prime_usage.tool_call_count, 1);
     }
 }

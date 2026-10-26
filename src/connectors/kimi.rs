@@ -34,7 +34,10 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
+use super::utils::{
+    dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+    unwrap_skill_invocations,
+};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -623,7 +626,7 @@ fn parse_kimi_session_reader(
                 let content =
                     payload.map_or_else(|| "[Tool: unknown]".to_string(), extract_tool_call_text);
 
-                let invocations = payload.map_or_else(Vec::new, |p| {
+                let mut invocations = payload.map_or_else(Vec::new, |p| {
                     let tool_name = p
                         .get("name")
                         .or_else(|| p.get("toolName"))
@@ -641,6 +644,7 @@ fn parse_kimi_session_reader(
                             .cloned(),
                     }]
                 });
+                unwrap_skill_invocations(&mut invocations);
 
                 messages.push(NormalizedMessage {
                     idx: 0,
@@ -1039,13 +1043,14 @@ fn parse_kimi_code_session_reader(
                             .and_then(Value::as_str)
                             .map(String::from);
                         let content = extract_kimi_code_tool_call_text(event);
-                        let invocation = crate::types::NormalizedInvocation {
+                        let mut invocations = vec![crate::types::NormalizedInvocation {
                             kind: "tool".to_string(),
                             name: tool_name.to_string(),
                             raw_name: None,
                             call_id: call_id.clone(),
                             arguments: event.get("args").cloned(),
-                        };
+                        }];
+                        unwrap_skill_invocations(&mut invocations);
                         if let Some(id) = call_id {
                             call_index_by_id.insert(id, messages.len());
                         }
@@ -1056,7 +1061,7 @@ fn parse_kimi_code_session_reader(
                             created_at: created,
                             content,
                             extra: val,
-                            invocations: vec![invocation],
+                            invocations,
                             snippets: Vec::new(),
                         });
                     }

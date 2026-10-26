@@ -37,6 +37,7 @@ use super::scan::{
 };
 use super::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    unwrap_skill_invocations,
 };
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
@@ -1007,6 +1008,7 @@ fn parse_goose_content_json(json_str: &str) -> (String, Vec<NormalizedInvocation
         }
     }
 
+    unwrap_skill_invocations(&mut invocations);
     (text_pieces.join("\n\n"), invocations)
 }
 

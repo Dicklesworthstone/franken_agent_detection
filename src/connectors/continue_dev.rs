@@ -17,7 +17,9 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
 use super::token_extraction::{ExtractedTokenUsage, TokenDataSource, normalize_model};
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{
+    dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, unwrap_skill_invocations,
+};
 use super::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks, file_modified_since, franken_detection_for_connector,
@@ -625,6 +627,7 @@ fn parse_session_reader(path: &Path, reader: impl Read) -> Result<Option<Normali
                 }
             }
         }
+        unwrap_skill_invocations(&mut invocations);
         let mut models = Vec::new();
         for model in item.prompt_logs {
             if !models.contains(&model) {

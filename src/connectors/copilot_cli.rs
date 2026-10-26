@@ -417,6 +417,16 @@ impl CopilotCliConnector {
                 continue;
             }
 
+            let mut extra = event;
+            if !invocations.is_empty()
+                && let Some(obj) = extra.as_object_mut()
+            {
+                obj.insert(
+                    "cass".to_string(),
+                    serde_json::json!({ "tool_call_count": invocations.len() }),
+                );
+            }
+
             messages.push(NormalizedMessage {
                 idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
                 role: role.clone(),
@@ -427,7 +437,7 @@ impl CopilotCliConnector {
                 }),
                 created_at: ts,
                 content,
-                extra: event,
+                extra,
                 invocations,
                 snippets: Vec::new(),
             });
@@ -538,6 +548,16 @@ impl CopilotCliConnector {
                 continue;
             }
 
+            let mut extra = event.clone();
+            if !invocations.is_empty()
+                && let Some(obj) = extra.as_object_mut()
+            {
+                obj.insert(
+                    "cass".to_string(),
+                    serde_json::json!({ "tool_call_count": invocations.len() }),
+                );
+            }
+
             messages.push(NormalizedMessage {
                 idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
                 role: role.clone(),
@@ -548,7 +568,7 @@ impl CopilotCliConnector {
                 }),
                 created_at: ts,
                 content,
-                extra: event.clone(),
+                extra,
                 invocations,
                 snippets: Vec::new(),
             });

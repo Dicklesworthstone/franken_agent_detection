@@ -14,7 +14,7 @@ use super::scan::{
 };
 use super::utils::{
     MAX_SCAN_FILE_BYTES, env_path_nonempty, excluded_scan_paths_from_env,
-    is_injected_context_message, path_is_excluded,
+    is_injected_context_message, path_is_excluded, unwrap_skill_invocations,
 };
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
@@ -791,6 +791,7 @@ fn normalize_gemini_message_content(
             }
         }
     }
+    unwrap_skill_invocations(&mut invocations);
     (content, invocations)
 }
 

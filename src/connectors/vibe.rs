@@ -22,7 +22,9 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{
+    dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, unwrap_skill_invocations,
+};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -290,6 +292,7 @@ impl VibeConnector {
                 });
             }
         }
+        unwrap_skill_invocations(&mut invocations);
         (content, invocations)
     }
 

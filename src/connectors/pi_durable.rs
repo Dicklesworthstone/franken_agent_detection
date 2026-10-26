@@ -56,7 +56,10 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
+use super::utils::{
+    dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+    unwrap_skill_invocations,
+};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -963,7 +966,7 @@ fn message_text(message: &Value) -> String {
 }
 
 fn tool_invocations(message: &Value) -> Vec<NormalizedInvocation> {
-    message
+    let mut invocations: Vec<_> = message
         .get("content")
         .and_then(Value::as_array)
         .map(|blocks| {
@@ -983,7 +986,9 @@ fn tool_invocations(message: &Value) -> Vec<NormalizedInvocation> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    unwrap_skill_invocations(&mut invocations);
+    invocations
 }
 
 /// Working directory recorded for a conversation: its `pi.agent` `cwd`, else

@@ -85,6 +85,7 @@ use super::scan::{
 };
 use super::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    unwrap_skill_invocations,
 };
 use super::{Connector, file_modified_since, franken_detection_for_connector};
 use crate::types::{
@@ -440,7 +441,7 @@ fn parse_tool_calls(event: &Value) -> Vec<NormalizedInvocation> {
     let Some(calls) = event.get("tool_calls").and_then(Value::as_array) else {
         return Vec::new();
     };
-    calls
+    let mut invocations: Vec<_> = calls
         .iter()
         .filter_map(|call| {
             let name = call
@@ -468,7 +469,9 @@ fn parse_tool_calls(event: &Value) -> Vec<NormalizedInvocation> {
                 arguments,
             })
         })
-        .collect()
+        .collect();
+    unwrap_skill_invocations(&mut invocations);
+    invocations
 }
 
 /// Flatten a prompt/text value that is usually a string but tolerated as

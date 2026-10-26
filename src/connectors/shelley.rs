@@ -45,7 +45,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
-use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{
+    env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, unwrap_skill_invocations,
+};
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -1326,6 +1328,7 @@ fn project_message(row: &MsgRow, tool_names: &mut HashMap<String, String>) -> Pr
                 )
             });
         render_blocks(&llm.content, 0, tool_names, row, &mut rendered);
+        unwrap_skill_invocations(&mut rendered.invocations);
     }
 
     let distilled = user_data_truthy(ud, "distilled");

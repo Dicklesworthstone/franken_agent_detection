@@ -36,7 +36,9 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{
+    dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, unwrap_skill_invocations,
+};
 use super::{Connector, franken_detection_for_connector, parse_timestamp};
 use crate::expand_leading_tilde;
 use crate::types::{
@@ -409,6 +411,7 @@ fn prime_invocations(content: &Value) -> Vec<NormalizedInvocation> {
             arguments: block.get("arguments").map(bounded_json),
         });
     }
+    unwrap_skill_invocations(&mut invocations);
     invocations
 }
 
@@ -648,6 +651,12 @@ fn parse_session_reader(
                         }
                         if let Some(usage) = message.get("usage") {
                             extra.insert("usage".into(), bounded_json(usage));
+                        }
+                        if !invocations.is_empty() {
+                            extra.insert(
+                                "cass".into(),
+                                json!({"tool_call_count": invocations.len()}),
+                            );
                         }
                         messages.push(NormalizedMessage {
                             idx: 0,

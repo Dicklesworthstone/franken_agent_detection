@@ -80,6 +80,7 @@ use super::scan::{
 };
 use super::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    unwrap_skill_invocations,
 };
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
@@ -486,7 +487,8 @@ fn parse_tool_calls(tool_calls: Option<&Value>, step_type: &str) -> Vec<Normaliz
         }];
     };
 
-    arr.iter()
+    let arr = arr
+        .iter()
         .map(|tc| {
             let name = tc
                 .get("name")
@@ -522,7 +524,10 @@ fn parse_tool_calls(tool_calls: Option<&Value>, step_type: &str) -> Vec<Normaliz
                 arguments,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let mut invocations = arr;
+    unwrap_skill_invocations(&mut invocations);
+    invocations
 }
 
 /// Build a [`NormalizedMessage`] (idx assigned later by `reindex_messages`).
@@ -631,6 +636,12 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
                 extra.insert("agy_type".to_string(), Value::String(step_type.to_string()));
                 if let Some(t) = thinking {
                     extra.insert("thinking".to_string(), Value::String(t));
+                }
+                if !invocations.is_empty() {
+                    extra.insert(
+                        "cass".to_string(),
+                        serde_json::json!({ "tool_call_count": invocations.len() }),
+                    );
                 }
                 let author = step_type.to_ascii_lowercase();
                 Some(message(

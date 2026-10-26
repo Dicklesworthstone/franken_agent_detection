@@ -25,7 +25,10 @@ use walkdir::WalkDir;
 
 use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
+use super::utils::{
+    dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+    unwrap_skill_invocations,
+};
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
     parse_timestamp,
@@ -922,6 +925,7 @@ fn normalize_qwen_record(record: Value, compact: bool) -> Option<NormalizedMessa
     if content.trim().is_empty() && record.get("usageMetadata").is_none() {
         return None;
     }
+    unwrap_skill_invocations(&mut invocations);
     let created_at = record.get("timestamp").and_then(parse_timestamp);
     let extra = if compact {
         compact_qwen_record(&record, invocations.len())

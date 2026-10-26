@@ -57,7 +57,8 @@ use super::scan::{
     SourceScanHooks,
 };
 use super::utils::{
-    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    read_capped, unwrap_skill_invocations,
 };
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
@@ -431,6 +432,10 @@ impl MessageBuilder {
         if let Some(kind) = update.get("kind").and_then(Value::as_str) {
             extra.insert("tool_kind".to_string(), Value::String(kind.to_string()));
         }
+        extra.insert(
+            "cass".to_string(),
+            serde_json::json!({ "tool_call_count": 1 }),
+        );
         self.messages.push(NormalizedMessage {
             idx: 0,
             role: "tool".to_string(),
@@ -489,6 +494,9 @@ impl MessageBuilder {
     fn finish(mut self) -> Vec<NormalizedMessage> {
         self.messages
             .retain(|m| !m.content.trim().is_empty() || !m.invocations.is_empty());
+        for msg in &mut self.messages {
+            unwrap_skill_invocations(&mut msg.invocations);
+        }
         reindex_messages(&mut self.messages);
         self.messages
     }

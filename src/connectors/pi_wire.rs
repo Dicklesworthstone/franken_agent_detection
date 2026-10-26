@@ -29,6 +29,7 @@
 use super::jsonl::JsonlLines;
 use super::utils::{
     dedupe_path_key, excluded_scan_paths_from_env, open_capped_reader, path_is_excluded,
+    unwrap_skill_invocations,
 };
 use crate::types::{NormalizedConversation, NormalizedMessage};
 use anyhow::Result;
@@ -557,7 +558,7 @@ fn resolve_model_states(
 
 /// Extract structured tool invocations from an assistant content array.
 fn tool_invocations(content: Option<&Value>) -> Vec<crate::types::NormalizedInvocation> {
-    content
+    let mut invocations: Vec<_> = content
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -575,7 +576,9 @@ fn tool_invocations(content: Option<&Value>) -> Vec<crate::types::NormalizedInvo
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    unwrap_skill_invocations(&mut invocations);
+    invocations
 }
 
 /// What one tree entry contributes as a normalized message, before

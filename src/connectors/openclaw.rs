@@ -42,7 +42,7 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{excluded_scan_paths_from_env, path_is_excluded, unwrap_skill_invocations};
 use super::{Connector, file_modified_since, flatten_content, parse_timestamp};
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -753,7 +753,7 @@ impl SessionEventAccumulator {
                     (other, None) => other,
                 };
 
-                let invocations = msg
+                let mut invocations = msg
                     .get("content")
                     .and_then(|c| c.as_array())
                     .map(|arr| {
@@ -784,6 +784,7 @@ impl SessionEventAccumulator {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                unwrap_skill_invocations(&mut invocations);
 
                 let idx = i64::try_from(self.messages.len()).unwrap_or(i64::MAX);
                 let author = msg.get("model").and_then(|v| v.as_str()).map(String::from);

@@ -44,7 +44,8 @@ use super::scan::{
     SourceScanHooks,
 };
 use super::utils::{
-    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    read_capped, unwrap_skill_invocations,
 };
 use super::{
     Connector, file_modified_since, flatten_content, franken_detection_for_connector,
@@ -524,6 +525,14 @@ fn parse_conversation(
                     "cass".to_string(),
                     serde_json::json!({ "tool_call_count": 1 }),
                 );
+                let mut invocations = vec![NormalizedInvocation {
+                    kind: "tool".to_string(),
+                    name: tool_name,
+                    raw_name: None,
+                    call_id,
+                    arguments,
+                }];
+                unwrap_skill_invocations(&mut invocations);
                 messages.push(NormalizedMessage {
                     idx: 0,
                     role: "assistant".to_string(),
@@ -531,13 +540,7 @@ fn parse_conversation(
                     created_at: created,
                     content,
                     extra: Value::Object(action_extra),
-                    invocations: vec![NormalizedInvocation {
-                        kind: "tool".to_string(),
-                        name: tool_name,
-                        raw_name: None,
-                        call_id,
-                        arguments,
-                    }],
+                    invocations,
                     snippets: Vec::new(),
                 });
             }

@@ -57,7 +57,7 @@ use super::scan::{
 #[cfg(feature = "devin")]
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 #[cfg(feature = "devin")]
-use super::utils::{env_path_nonempty, path_is_excluded};
+use super::utils::{env_path_nonempty, path_is_excluded, unwrap_skill_invocations};
 #[cfg(feature = "devin")]
 use crate::types::{NormalizedInvocation, NormalizedMessage};
 
@@ -521,6 +521,7 @@ pub(crate) fn message_from_chat_message(
                     arguments,
                 });
             }
+            unwrap_skill_invocations(&mut invocations);
             let thinking = object
                 .get("thinking")
                 .and_then(|t| t.get("thinking"))

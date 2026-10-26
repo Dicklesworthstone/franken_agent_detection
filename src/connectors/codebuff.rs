@@ -15,7 +15,10 @@ use serde_json::{Value, json};
 use walkdir::WalkDir;
 
 use super::scan::{SourceCompletion, SourceScanHooks};
-use super::utils::{env_var_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped};
+use super::utils::{
+    env_var_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+    unwrap_skill_invocations,
+};
 use super::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot,
     file_modified_since, franken_detection_for_connector, parse_timestamp,
@@ -298,13 +301,14 @@ fn parse_session(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
             .map(|blocks| {
                 render_blocks(
                     blocks
-                        .as_array()
-                        .context("message blocks must be an array")?,
+                    .as_array()
+                    .context("message blocks must be an array")?,
                     &mut invocations,
                 )
             })
             .transpose()?
             .unwrap_or_default();
+        unwrap_skill_invocations(&mut invocations);
         let content = if block_text.is_empty() || block_text == base {
             base.to_owned()
         } else if base.is_empty() {
@@ -321,6 +325,9 @@ fn parse_session(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
         }
         extra["codebuff_message_id"] = json!(id);
         extra["codebuff_created_at_source"] = json!(created_at_source);
+        if !invocations.is_empty() {
+            extra["cass"] = json!({"tool_call_count": invocations.len()});
+        }
         messages.push(NormalizedMessage {
             idx: i64::try_from(idx).context("too many shared CLI messages")?,
             role: role.into(),

@@ -285,13 +285,24 @@ impl ClawdbotConnector {
                 (other, None) => other,
             };
 
+            let role = role.to_string();
+            let mut extra = val;
+            if !invocations.is_empty()
+                && let Some(obj) = extra.as_object_mut()
+            {
+                obj.insert(
+                    "cass".to_string(),
+                    serde_json::json!({ "tool_call_count": invocations.len() }),
+                );
+            }
+
             messages.push(NormalizedMessage {
                 idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
-                role: role.to_string(),
+                role,
                 author: None,
                 created_at: created,
                 content,
-                extra: val,
+                extra,
                 invocations,
                 snippets: Vec::new(),
             });

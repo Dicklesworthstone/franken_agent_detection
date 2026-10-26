@@ -32,7 +32,9 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
+use super::utils::{
+    env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded, unwrap_skill_invocations,
+};
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -524,7 +526,8 @@ fn parse_tool_calls(json_str: Option<&str>) -> Vec<NormalizedInvocation> {
         return Vec::new();
     };
 
-    arr.into_iter()
+    let mut invocations: Vec<_> = arr
+        .into_iter()
         .filter_map(|obj| {
             let name = obj.get("name")?.as_str()?.to_string();
             let arguments = obj.get("arguments").cloned();
@@ -536,7 +539,9 @@ fn parse_tool_calls(json_str: Option<&str>) -> Vec<NormalizedInvocation> {
                 arguments,
             })
         })
-        .collect()
+        .collect();
+    unwrap_skill_invocations(&mut invocations);
+    invocations
 }
 
 #[cfg(test)]
