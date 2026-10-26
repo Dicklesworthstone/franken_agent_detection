@@ -175,8 +175,17 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "windsurf",
 ];
 
-fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
-    match slug {
+/// Resolve any known connector slug, alias, or emitted conversation `agent_slug`
+/// (including qualified `openclaw/<agent>` slugs) to its canonical entry in
+/// `KNOWN_CONNECTORS`.
+#[must_use]
+pub fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
+    let trimmed = slug.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
         "aider" | "aider-cli" => Some("aider"),
         "amp" | "amp-cli" => Some("amp"),
         "antigravity" | "agy" | "antigravity-cli" | "antigravity-ide" => Some("antigravity"),
@@ -188,14 +197,16 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "cline" => Some("cline"),
         "codebuff" | "freebuff" | "manicode" | "codebuff-lineage" => Some("codebuff"),
         "codex" | "codex-cli" => Some("codex"),
-        "continue" | "continue-dev" => Some("continue"),
+        "continue" | "continue-dev" | "continue_dev" => Some("continue"),
         "copilot_cli" | "copilot-cli" | "gh-copilot" => Some("copilot_cli"),
         "crush" | "charm-crush" => Some("crush"),
         "cursor" => Some("cursor"),
         "devin" | "devin-cli" => Some("devin"),
         "factory" | "factory-droid" => Some("factory"),
         "gemini" | "gemini-cli" => Some("gemini"),
-        "github-copilot" | "copilot" => Some("github-copilot"),
+        "github-copilot" | "github_copilot" | "copilot" | "copilot_vscode" | "copilot-vscode" => {
+            Some("github-copilot")
+        }
         "goose" | "goose-ai" => Some("goose"),
         "grok" | "grok-cli" | "grok-build" | "xai-grok" => Some("grok"),
         "grok_bot" | "grok-bot" => Some("grok_bot"),
@@ -203,11 +214,14 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
         "kiro" | "kiro-cli" | "kirocli" => Some("kiro"),
         "muse" | "muse-code" | "muse_code" | "musecode" | "meta-muse" => Some("muse"),
-        "omp" | "oh-my-pi" => Some("omp"),
+        "omp" | "oh-my-pi" | "oh_my_pi" => Some("omp"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
+        s if s.starts_with("openclaw/") && !s["openclaw/".len()..].trim().is_empty() => {
+            Some("openclaw")
+        }
         "openhands" | "open-hands" => Some("openhands"),
-        "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
+        "pi_agent" | "pi-agent" | "piagent" | "pi_mono" | "pi-mono" => Some("pi_agent"),
         "pi_durable" | "pi-durable" | "pidurable" => Some("pi_durable"),
         "prime_agent" | "prime-agent" | "primeagent" => Some("prime_agent"),
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
@@ -2401,11 +2415,17 @@ mod tests {
         for (emitted, canonical) in [
             ("claude_code", "claude"),
             ("copilot", "github-copilot"),
+            ("copilot_vscode", "github-copilot"),
             ("copilot_cli", "copilot_cli"),
             ("continue", "continue"),
+            ("continue_dev", "continue"),
+            ("openclaw/main", "openclaw"),
+            ("openclaw/coder", "openclaw"),
             ("pi_agent", "pi_agent"),
+            ("pi_mono", "pi_agent"),
             ("pi_durable", "pi_durable"),
             ("omp", "omp"),
+            ("oh_my_pi", "omp"),
             ("prime_agent", "prime_agent"),
             ("grok_bot", "grok_bot"),
         ] {
@@ -2415,13 +2435,15 @@ mod tests {
                 "{emitted}"
             );
         }
-        let report = detect_installed_agents(&AgentDetectOptions {
-            only_connectors: Some(vec!["claude_code".into()]),
-            include_undetected: true,
-            root_overrides: Vec::new(),
-        })
-        .expect("claude_code resolves");
-        assert_eq!(report.installed_agents[0].slug, "claude");
+        for (query, expected_slug) in [("claude_code", "claude"), ("openclaw/main", "openclaw")] {
+            let report = detect_installed_agents(&AgentDetectOptions {
+                only_connectors: Some(vec![query.into()]),
+                include_undetected: true,
+                root_overrides: Vec::new(),
+            })
+            .expect("emitted slug resolves");
+            assert_eq!(report.installed_agents[0].slug, expected_slug);
+        }
     }
 
     #[test]

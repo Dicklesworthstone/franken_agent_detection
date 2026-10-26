@@ -134,15 +134,17 @@ and `NormalizedMessage`s (`role`, `author`, `content`, `created_at`, structured
 tool and skill `invocations` with `skill`/`Skill`/`load_skill`/`use_skill`
 wrappers normalized via `unwrap_skill_invocations`, and the raw provider record
 in `extra`). All 34 connector types (including `MuseConnector`) and scan
-helpers (`ScanProgressTick`, `unwrap_skill_invocations`, `percent_decode_utf8`)
-are re-exported at the crate root. Connector-derived annotations live under
-`extra.cass` (for example branch and context membership for Pi sessions, or
-`cass.tool_call_count` across tool-using turns). `extract_tokens_for_agent`
-turns a message's `extra` into exact API token usage where the agent records it
-(and an estimate otherwise) while preserving model, provider (`anthropic`,
-`openai`, `google`, `mistral`, `xai`, `moonshot`, `deepseek`, or explicit
-provider metadata), and `tool_call_count` / `has_tool_calls` across all 34
-connectors (including qualified `openclaw/<agent>` multi-agent slugs).
+helpers (`canonical_connector_slug`, `ScanProgressTick`,
+`unwrap_skill_invocations`, `percent_decode_utf8`) are re-exported at the crate
+root. Connector-derived annotations live under `extra.cass` (for example branch
+and context membership for Pi sessions, or `cass.tool_call_count` across
+tool-using turns). `extract_tokens_for_agent` turns a message's `extra` into
+exact API token usage where the agent records it (and an estimate otherwise)
+while preserving model, provider (`anthropic`, `openai`, `google`, `mistral`,
+`xai`, `moonshot`, `deepseek`, or explicit provider metadata), and
+`tool_call_count` / `has_tool_calls` across all 34 connectors (including
+qualified `openclaw/<agent>` multi-agent slugs and all canonical connector
+aliases).
 
 Claude Code session files of **32 MiB or larger** retain compact metadata in
 `extra.cass` instead of duplicating the full raw record. Reply identifiers are
@@ -170,7 +172,7 @@ Beyond `scan`:
 | `scan_with_callback` / `supports_streaming_scan` | Emit conversations incrementally instead of materializing the corpus (supported by all 34 connectors) |
 | `scan_with_source_boundaries` / `supports_source_boundaries` | Resumable ingestion: a pre-parse skip predicate and a per-source completion event (with required sidecars such as SQLite WALs), supported by 29 single-source connectors |
 | `ScanRoot::remote` + `Origin` + `with_mirrored_source_path` | Scan synced copies of remote machines across all 30 store-based connectors (`ScanRoot::mirrored_store`), keeping host provenance |
-| `ScanRoot::with_rewrite` (`apply_workspace_rewrite`) | Rewrite remote workspace prefixes (`from -> to`) and record `metadata.cass.workspace_original` across all 34 connectors |
+| `ScanRoot::with_rewrite` / `with_agent_rewrite` / `with_mapping` (`apply_workspace_rewrite`) | Rewrite remote workspace prefixes (`from -> to`, optionally scoped to canonical agent slugs/aliases) and record `metadata.cass.workspace_original` across all 34 connectors |
 | `ScanContext::with_progress_tick` (`progress_tick`) | Host stall-watchdog liveness callback (`cass#373 Variant A`), invoked per scanned source/session across all 34 connectors |
 | `CASS_EXCLUDE_PATHS` | Comma/newline-separated files or directories that all 34 connectors skip before opening or parsing them. Entries match whole path components; relative, `..` and symlinked spellings of an existing directory match too. Exact Codex JSONL exclusions cover both the plain and compressed (`.jsonl.zst`) representation |
 

@@ -65,6 +65,19 @@ window is since `v0.3.11` (2026-10-14).
 
 ### Added
 
+- **Public `canonical_connector_slug`, alias-aware `PathMapping` / `ScanRoot` agent-scoped workspace rewrites, and 34-connector emitted-slug conformance (`franken_agent_detection-kj8`, `franken_agent_detection-ztf`, `franken_agent_detection-jx2`):**
+  exposed `canonical_connector_slug` at the crate root in `src/lib.rs` (handling case/whitespace
+  normalization, qualified `openclaw/<agent>` slugs, and `copilot_vscode`, `copilot-vscode`,
+  `github_copilot`, `continue_dev`, `oh_my_pi`, `pi_mono`, and `pi-mono` aliases), wired canonical
+  alias resolution into `extract_tokens_for_agent` (`src/connectors/token_extraction.rs`) and
+  `agent_name_matches_filter` (`src/types.rs`) so `PathMapping::applies_to_agent`,
+  `PathTrie::lookup`, and `ScanRoot::apply_workspace_rewrite` match across canonical aliases
+  (`"claude"` <-> `"claude_code"`, `"github-copilot"` <-> `"copilot"` <-> `"copilot_vscode"`,
+  `"openclaw"` <-> `"openclaw/<agent>"`, `"codebuff"` <-> `"freebuff"` / `"manicode"`) while
+  preserving sub-agent specificity when `allowed` contains `'/'`, added `ScanRoot::with_agent_rewrite`
+  and `ScanRoot::with_mapping` builder methods in `src/connectors/scan.rs`, and extended
+  `all_compiled_connectors_produce_schema_conformant_conversations` to verify emitted `agent_slug`
+  registry resolution and agent-scoped workspace rewrites across all 34 compiled connectors.
 - **Qualified `openclaw/<agent>` token extraction, Kimi/DeepSeek model attribution, and end-to-end conformance (`franken_agent_detection-sih`, `franken_agent_detection-eo6`, `franken_agent_detection-d4i`):**
   fixed `extract_tokens_for_agent` in `src/connectors/token_extraction.rs` to match qualified
   `openclaw/<agent>` slugs (such as `"openclaw/main"`) emitted by `OpenClawConnector` alongside

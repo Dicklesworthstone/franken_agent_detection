@@ -1077,7 +1077,8 @@ pub fn extract_tokens_for_agent(
     content: &str,
     role: &str,
 ) -> ExtractedTokenUsage {
-    let extracted = match agent_slug {
+    let resolved_slug = crate::canonical_connector_slug(agent_slug).unwrap_or(agent_slug);
+    let extracted = match resolved_slug {
         "claude_code" | "claude" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
         "gemini" => extract_gemini_tokens(extra, role),

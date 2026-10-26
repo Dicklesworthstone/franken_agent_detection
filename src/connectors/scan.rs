@@ -85,6 +85,28 @@ impl ScanRoot {
         self
     }
 
+    /// Add an agent-scoped workspace rewrite rule.
+    #[must_use]
+    pub fn with_agent_rewrite(
+        mut self,
+        src_prefix: impl Into<String>,
+        dst_prefix: impl Into<String>,
+        agents: Vec<String>,
+    ) -> Self {
+        self.workspace_rewrites
+            .push(PathMapping::with_agents(src_prefix, dst_prefix, agents));
+        self.rewrite_trie = OnceCell::new();
+        self
+    }
+
+    /// Add a pre-constructed [`PathMapping`] workspace rewrite rule.
+    #[must_use]
+    pub fn with_mapping(mut self, mapping: PathMapping) -> Self {
+        self.workspace_rewrites.push(mapping);
+        self.rewrite_trie = OnceCell::new();
+        self
+    }
+
     /// Return the same root metadata pointed at a derived source path.
     #[must_use]
     pub fn with_path(&self, path: PathBuf) -> Self {

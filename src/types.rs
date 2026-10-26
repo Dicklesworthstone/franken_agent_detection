@@ -242,8 +242,25 @@ impl Default for Origin {
 
 #[cfg(feature = "connectors")]
 pub(crate) fn agent_name_matches_filter(allowed: &str, actual: &str) -> bool {
-    let normalize = |value: &str| value.trim().to_ascii_lowercase().replace('-', "_");
-    normalize(allowed) == normalize(actual)
+    let norm_allowed = allowed.trim().to_ascii_lowercase();
+    let norm_actual = actual.trim().to_ascii_lowercase();
+    if norm_allowed.replace('-', "_") == norm_actual.replace('-', "_") {
+        return true;
+    }
+    // Preserve sub-agent specificity when the filter explicitly qualifies a
+    // sub-agent (e.g. `allowed = "openclaw/main"` must not match
+    // `actual = "openclaw/coder"`), while allowing connector-level filters
+    // (`allowed = "openclaw"`) to match any `actual = "openclaw/<agent>"`.
+    if norm_allowed.contains('/') {
+        return false;
+    }
+    match (
+        crate::canonical_connector_slug(&norm_allowed),
+        crate::canonical_connector_slug(&norm_actual),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// A single path mapping rule for rewriting paths.

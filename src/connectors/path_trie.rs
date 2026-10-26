@@ -259,6 +259,69 @@ mod tests {
             trie.lookup("/remote/other/project", Some("claude-code")),
             "/local/underscore/project"
         );
+        // Canonical connector slug ("claude") also matches emitted "claude_code".
+        assert_eq!(
+            trie.lookup("/remote/other/project", Some("claude")),
+            "/local/underscore/project"
+        );
+    }
+
+    #[test]
+    fn path_trie_agent_filter_matches_canonical_connector_aliases_and_openclaw_subagents() {
+        let mut trie = PathTrie::new();
+        trie.insert(
+            "/remote/openclaw",
+            "/local/openclaw",
+            Some(vec!["openclaw".to_string()]),
+        );
+        trie.insert(
+            "/remote/openclaw-main",
+            "/local/openclaw-main",
+            Some(vec!["openclaw/main".to_string()]),
+        );
+        trie.insert(
+            "/remote/copilot",
+            "/local/copilot",
+            Some(vec!["github-copilot".to_string()]),
+        );
+        trie.insert(
+            "/remote/codebuff",
+            "/local/codebuff",
+            Some(vec!["freebuff".to_string()]),
+        );
+
+        // Connector-level "openclaw" matches qualified "openclaw/<agent>" slugs.
+        assert_eq!(
+            trie.lookup("/remote/openclaw/proj", Some("openclaw/main")),
+            "/local/openclaw/proj"
+        );
+        assert_eq!(
+            trie.lookup("/remote/openclaw/proj", Some("openclaw/coder")),
+            "/local/openclaw/proj"
+        );
+        // Subagent-qualified "openclaw/main" matches only "openclaw/main", not "openclaw/coder".
+        assert_eq!(
+            trie.lookup("/remote/openclaw-main/proj", Some("openclaw/main")),
+            "/local/openclaw-main/proj"
+        );
+        assert_eq!(
+            trie.lookup("/remote/openclaw-main/proj", Some("openclaw/coder")),
+            "/remote/openclaw-main/proj"
+        );
+        // "github-copilot" matches emitted "copilot" and "copilot_vscode".
+        assert_eq!(
+            trie.lookup("/remote/copilot/proj", Some("copilot")),
+            "/local/copilot/proj"
+        );
+        assert_eq!(
+            trie.lookup("/remote/copilot/proj", Some("copilot_vscode")),
+            "/local/copilot/proj"
+        );
+        // Product alias "freebuff" matches emitted "codebuff".
+        assert_eq!(
+            trie.lookup("/remote/codebuff/proj", Some("codebuff")),
+            "/local/codebuff/proj"
+        );
     }
 
     #[test]

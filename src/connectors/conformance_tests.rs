@@ -324,6 +324,14 @@ mod conformance {
             tick();
 
             assert_eq!(percent_decode_utf8("hello%20world"), "hello world");
+            assert_eq!(
+                crate::canonical_connector_slug("openclaw/main"),
+                Some("openclaw")
+            );
+            assert_eq!(
+                crate::canonical_connector_slug("claude_code"),
+                Some("claude")
+            );
             let mut invocations = vec![NormalizedInvocation {
                 kind: "tool".to_string(),
                 name: "Skill".to_string(),
@@ -1422,9 +1430,55 @@ mod conformance {
                         Some(orig_ws),
                         "{slug}: connector did not record /cass/workspace_original after rewrite"
                     );
+
+                    // Agent-scoped rewrite using the factory/canonical slug must also match
+                    // the connector's emitted `conv.agent_slug` (including `claude` ->
+                    // `claude_code`, `openclaw` -> `openclaw/main`, `copilot` -> `copilot`),
+                    // while an unrelated agent filter must NOT rewrite.
+                    let agent_scoped_roots = ctx
+                        .scan_roots
+                        .iter()
+                        .cloned()
+                        .map(|r| {
+                            r.with_agent_rewrite(
+                                orig_ws,
+                                "/wrong-agent-workspace",
+                                vec!["windsurf".to_string()],
+                            )
+                            .with_agent_rewrite(
+                                orig_ws,
+                                "/agent-scoped-rewritten-workspace",
+                                vec![slug.to_string()],
+                            )
+                        })
+                        .collect();
+                    let agent_rewrite_ctx = ScanContext::with_roots(
+                        ctx.data_dir.clone(),
+                        agent_scoped_roots,
+                        ctx.since_ts,
+                    );
+                    let agent_rewritten_convs =
+                        factory().scan(&agent_rewrite_ctx).unwrap_or_else(|err| {
+                            // ubs:ignore[rust.ownership.panic-macro] — Preserve connector slug and agent-scoped rewrite scan error in conformance test.
+                            panic!("{slug}: agent-scoped workspace rewrite scan failed: {err}")
+                        });
+                    assert_eq!(
+                        agent_rewritten_convs[0].workspace.as_deref(),
+                        Some(std::path::Path::new("/agent-scoped-rewritten-workspace")),
+                        "{slug}: connector did not apply agent-scoped ScanRoot::with_agent_rewrite for emitted slug {}",
+                        convs[0].agent_slug
+                    );
                 }
 
+                let expected_canonical = crate::canonical_connector_slug(slug)
+                    .expect("factory slug must resolve in canonical_connector_slug");
                 for conv in &convs {
+                    assert_eq!(
+                        crate::canonical_connector_slug(&conv.agent_slug),
+                        Some(expected_canonical),
+                        "{slug}: emitted conv.agent_slug '{}' must resolve to canonical '{expected_canonical}'",
+                        conv.agent_slug
+                    );
                     for msg in &conv.messages {
                         let usage = crate::connectors::extract_tokens_for_agent(
                             &conv.agent_slug,
