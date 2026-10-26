@@ -27,7 +27,7 @@ use super::utils::{
 };
 use super::{
     Connector, extract_invocations_from_content_blocks, flatten_content,
-    franken_detection_for_connector, parse_timestamp,
+    franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
 };
 use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
@@ -685,6 +685,14 @@ fn scan_codex_with_hooks(
 
                                         let content_text = format!("[Tool: {tool_name}]");
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        let mut invocations = vec![NormalizedInvocation {
+                                            kind: "tool".to_string(),
+                                            name: tool_name,
+                                            raw_name: None,
+                                            call_id,
+                                            arguments,
+                                        }];
+                                        unwrap_skill_invocations(&mut invocations);
                                         messages.push(NormalizedMessage {
                                             idx: 0,
                                             role: "assistant".to_string(),
@@ -696,13 +704,7 @@ fn scan_codex_with_hooks(
                                             } else {
                                                 val
                                             },
-                                            invocations: vec![NormalizedInvocation {
-                                                kind: "tool".to_string(),
-                                                name: tool_name,
-                                                raw_name: None,
-                                                call_id,
-                                                arguments,
-                                            }],
+                                            invocations,
                                             snippets: Vec::new(),
                                         });
                                     }
@@ -763,10 +765,11 @@ fn scan_codex_with_hooks(
                                                 payload.get("turn_id").and_then(Value::as_str),
                                             );
                                         }
-                                        let invocations = payload.get("content").map_or_else(
+                                        let mut invocations = payload.get("content").map_or_else(
                                             Vec::new,
                                             extract_invocations_from_content_blocks,
                                         );
+                                        unwrap_skill_invocations(&mut invocations);
 
                                         messages.push(NormalizedMessage {
                                             idx: 0,
@@ -873,6 +876,14 @@ fn scan_codex_with_hooks(
 
                                         let content_text = format!("[Tool: {tool_name}]");
                                         update_time_bounds(&mut started_at, &mut ended_at, created);
+                                        let mut invocations = vec![NormalizedInvocation {
+                                            kind: "tool".to_string(),
+                                            name: tool_name,
+                                            raw_name: None,
+                                            call_id,
+                                            arguments,
+                                        }];
+                                        unwrap_skill_invocations(&mut invocations);
                                         messages.push(NormalizedMessage {
                                             idx: 0,
                                             role: "assistant".to_string(),
@@ -884,13 +895,7 @@ fn scan_codex_with_hooks(
                                             } else {
                                                 val
                                             },
-                                            invocations: vec![NormalizedInvocation {
-                                                kind: "tool".to_string(),
-                                                name: tool_name,
-                                                raw_name: None,
-                                                call_id,
-                                                arguments,
-                                            }],
+                                            invocations,
                                             snippets: Vec::new(),
                                         });
                                     }
@@ -964,6 +969,11 @@ fn scan_codex_with_hooks(
                         let created = item.get("timestamp").and_then(parse_timestamp);
                         update_time_bounds(&mut started_at, &mut ended_at, created);
 
+                        let mut invocations = item
+                            .get("content")
+                            .map_or_else(Vec::new, extract_invocations_from_content_blocks);
+                        unwrap_skill_invocations(&mut invocations);
+
                         messages.push(NormalizedMessage {
                             idx: 0,
                             role: role.to_string(),
@@ -975,9 +985,7 @@ fn scan_codex_with_hooks(
                             } else {
                                 item.clone()
                             },
-                            invocations: item
-                                .get("content")
-                                .map_or_else(Vec::new, extract_invocations_from_content_blocks),
+                            invocations,
                             snippets: Vec::new(),
                         });
                     }

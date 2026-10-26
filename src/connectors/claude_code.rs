@@ -17,7 +17,7 @@ use super::utils::{
 };
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
-    franken_detection_for_connector, parse_timestamp,
+    franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -874,8 +874,9 @@ fn scan_claude_with_readers<R: BufRead>(
                         .and_then(|m| m.get("model"))
                         .and_then(|v| v.as_str())
                         .map(String::from);
-                    let invocations =
+                    let mut invocations =
                         content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
+                    unwrap_skill_invocations(&mut invocations);
 
                     messages.push(NormalizedMessage {
                         idx: 0,
@@ -974,6 +975,10 @@ fn scan_claude_with_readers<R: BufRead>(
                             continue;
                         }
 
+                        let mut invocations = content_val
+                            .map_or_else(Vec::new, extract_invocations_from_content_blocks);
+                        unwrap_skill_invocations(&mut invocations);
+
                         messages.push(NormalizedMessage {
                             idx: 0,
                             role: role.to_string(),
@@ -985,8 +990,7 @@ fn scan_claude_with_readers<R: BufRead>(
                             } else {
                                 item.clone()
                             },
-                            invocations: content_val
-                                .map_or_else(Vec::new, extract_invocations_from_content_blocks),
+                            invocations,
                             snippets: Vec::new(),
                         });
                     }

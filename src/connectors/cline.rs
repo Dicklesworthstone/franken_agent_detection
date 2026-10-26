@@ -9,7 +9,8 @@ use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanR
 use super::utils::{excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
-    franken_detection_for_connector, parse_timestamp, utils::dedupe_path_key,
+    franken_detection_for_connector, parse_timestamp, unwrap_skill_invocations,
+    utils::dedupe_path_key,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -920,7 +921,8 @@ fn sdk_message(
     } else {
         raw_role
     };
-    let invocations = extract_invocations_from_content_blocks(blocks);
+    let mut invocations = extract_invocations_from_content_blocks(blocks);
+    unwrap_skill_invocations(&mut invocations);
     let mut extra = compact_sdk_extra(record, manifest, session_id, role, invocations.len());
     if raw_role == "user" && has_legacy_resume_warning(blocks) {
         extra["cass"]["legacy_resume_marker"] = Value::Bool(true);
@@ -1119,6 +1121,10 @@ fn parse_legacy_session(file: &Path) -> Option<NormalizedConversation> {
                 extra["cass"]["token_usage"] = usage;
             }
 
+            let mut invocations =
+                content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
+            unwrap_skill_invocations(&mut invocations);
+
             messages.push(NormalizedMessage {
                 idx: i64::try_from(messages.len()).unwrap_or(i64::MAX), // preserve original order for stable sorting
                 role: role.to_string(),
@@ -1126,8 +1132,7 @@ fn parse_legacy_session(file: &Path) -> Option<NormalizedConversation> {
                 created_at: created,
                 content,
                 extra,
-                invocations: content_val
-                    .map_or_else(Vec::new, extract_invocations_from_content_blocks),
+                invocations,
                 snippets: Vec::new(),
             });
         }
