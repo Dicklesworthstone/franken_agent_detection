@@ -651,35 +651,36 @@ pub fn extract_invocations_from_content_blocks(
     invocations
 }
 
-/// Amp-specific wrapper tools that should be unwrapped to their inner name.
-const AMP_SKILL_WRAPPERS: &[(&str, &str)] = &[
-    // (tool_name, input_key_for_real_name)
-    ("skill", "name"),
-    ("load_skill", "name"),
+/// Skill-wrapper tools across agents (Amp `skill`/`load_skill`, Claude Code `Skill`, etc.)
+/// that should be unwrapped to their inner skill name.
+const SKILL_WRAPPERS: &[(&str, &[&str])] = &[
+    // (tool_name, candidate_input_keys_for_real_name)
+    ("skill", &["name", "skill"]),
+    ("Skill", &["skill", "name"]),
+    ("load_skill", &["name", "skill"]),
+    ("use_skill", &["name", "skill"]),
 ];
 
-/// Unwrap Amp skill-wrapper invocations in place.
+/// Unwrap skill-wrapper invocations in place.
 ///
-/// Tools like `skill` and `load_skill` are Amp-specific wrappers whose real
-/// name lives inside the `input` object. This rewrites matching invocations
-/// to `kind: "skill"` with the inner name, preserving `raw_name` for
+/// Tools like `skill`, `Skill`, `load_skill`, and `use_skill` are wrappers whose real
+/// skill name lives inside the `input` / `arguments` object (`name` or `skill`). This rewrites
+/// matching invocations to `kind: "skill"` with the inner name, preserving `raw_name` for
 /// traceability. Non-matching invocations are left unchanged.
 pub fn unwrap_skill_invocations(invocations: &mut [crate::types::NormalizedInvocation]) {
     for inv in invocations.iter_mut() {
-        if let Some((_, key)) = AMP_SKILL_WRAPPERS
-            .iter()
-            .find(|(name, _)| *name == inv.name)
+        if let Some((_, keys)) = SKILL_WRAPPERS.iter().find(|(name, _)| *name == inv.name)
+            && let Some(inner_name) = inv.arguments.as_ref().and_then(|args| {
+                keys.iter()
+                    .find_map(|key| args.get(*key).and_then(|v| v.as_str()))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
         {
-            if let Some(inner_name) = inv
-                .arguments
-                .as_ref()
-                .and_then(|a| a.get(*key))
-                .and_then(|v| v.as_str())
-            {
-                inv.raw_name = Some(inv.name.clone());
-                inv.name = inner_name.to_string();
-                inv.kind = "skill".to_string();
-            }
+            let inner_name = inner_name.to_string();
+            inv.raw_name = Some(inv.name.clone());
+            inv.name = inner_name;
+            inv.kind = "skill".to_string();
         }
     }
 }

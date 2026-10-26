@@ -260,6 +260,82 @@ mod conformance {
             }
         }
 
+        #[test]
+        fn crate_root_reexports_all_connector_types_and_helpers() {
+            use crate::{
+                AiderConnector, AmpConnector, AntigravityConnector, ClaudeCodeConnector,
+                ClawdbotConnector, ClineConnector, CodexConnector, Connector, ContinueConnector,
+                CopilotCliConnector, CopilotConnector, DevinConnector, FactoryConnector,
+                GeminiConnector, GrokConnector, KimiConnector, KiroConnector, MuseConnector,
+                NormalizedInvocation, OmpConnector, OpenClawConnector, OpenHandsConnector,
+                PiAgentConnector, PiDurableConnector, PrimeAgentConnector, QwenConnector,
+                ScanProgressTick, VibeConnector, percent_decode_utf8, unwrap_skill_invocations,
+            };
+
+            let core_connectors: Vec<Box<dyn Connector>> = vec![
+                Box::new(AiderConnector::new()),
+                Box::new(AmpConnector::new()),
+                Box::new(AntigravityConnector::new()),
+                Box::new(ClaudeCodeConnector::new()),
+                Box::new(ClawdbotConnector::new()),
+                Box::new(ClineConnector::new()),
+                Box::new(CodexConnector::new()),
+                Box::new(ContinueConnector::new()),
+                Box::new(CopilotConnector::new()),
+                Box::new(CopilotCliConnector::new()),
+                Box::new(DevinConnector::new()),
+                Box::new(FactoryConnector::new()),
+                Box::new(GeminiConnector::new()),
+                Box::new(GrokConnector::new()),
+                Box::new(KimiConnector::new()),
+                Box::new(KiroConnector::new()),
+                Box::new(MuseConnector::new()),
+                Box::new(OmpConnector::new()),
+                Box::new(OpenClawConnector::new()),
+                Box::new(OpenHandsConnector::new()),
+                Box::new(PiAgentConnector::new()),
+                Box::new(PiDurableConnector::new()),
+                Box::new(PrimeAgentConnector::new()),
+                Box::new(QwenConnector::new()),
+                Box::new(VibeConnector::new()),
+            ];
+            assert_eq!(core_connectors.len(), 25);
+
+            #[cfg(feature = "chatgpt")]
+            let _ = crate::ChatGptConnector::new();
+            #[cfg(feature = "codebuff")]
+            let _ = crate::CodebuffConnector::new();
+            #[cfg(feature = "crush")]
+            let _ = crate::CrushConnector::new();
+            #[cfg(feature = "cursor")]
+            let _ = crate::CursorConnector::new();
+            #[cfg(feature = "goose")]
+            let _ = crate::GooseConnector::new();
+            #[cfg(feature = "grok-bot")]
+            let _ = crate::GrokBotConnector::new();
+            #[cfg(feature = "hermes")]
+            let _ = crate::HermesConnector::new();
+            #[cfg(feature = "opencode")]
+            let _ = crate::OpenCodeConnector::new();
+            #[cfg(feature = "shelley")]
+            let _ = crate::ShelleyConnector::new();
+
+            let tick: ScanProgressTick = std::sync::Arc::new(|| {});
+            tick();
+
+            assert_eq!(percent_decode_utf8("hello%20world"), "hello world");
+            let mut invocations = vec![NormalizedInvocation {
+                kind: "tool".to_string(),
+                name: "Skill".to_string(),
+                raw_name: None,
+                call_id: Some("call_1".to_string()),
+                arguments: Some(json!({"skill": "verify"})),
+            }];
+            unwrap_skill_invocations(&mut invocations);
+            assert_eq!(invocations[0].kind, "skill");
+            assert_eq!(invocations[0].name, "verify");
+        }
+
         // Run with --no-default-features --features all-connectors. Using
         // --all-features would hide a missing edge in the aggregate feature.
         #[cfg(feature = "all-connectors")]
@@ -1346,6 +1422,35 @@ mod conformance {
                         Some(orig_ws),
                         "{slug}: connector did not record /cass/workspace_original after rewrite"
                     );
+                }
+
+                for conv in &convs {
+                    for msg in &conv.messages {
+                        let usage = crate::connectors::extract_tokens_for_agent(
+                            &conv.agent_slug,
+                            &msg.extra,
+                            &msg.content,
+                            &msg.role,
+                        );
+                        assert_eq!(
+                            usage.has_tool_calls,
+                            usage.tool_call_count > 0,
+                            "{slug}: has_tool_calls must match tool_call_count > 0"
+                        );
+                        if !msg.content.trim().is_empty() {
+                            match msg.role.as_str() {
+                                "user" => assert!(
+                                    usage.input_tokens.is_some(),
+                                    "{slug}: non-empty user message must yield input_tokens"
+                                ),
+                                "assistant" => assert!(
+                                    usage.output_tokens.is_some() || usage.input_tokens.is_some(),
+                                    "{slug}: non-empty assistant message must yield token counts"
+                                ),
+                                _ => {}
+                            }
+                        }
+                    }
                 }
             }
         }

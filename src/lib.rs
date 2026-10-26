@@ -65,19 +65,20 @@ pub use connectors::shelley::ShelleyConnector;
 pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenDataSource};
 #[cfg(feature = "connectors")]
 pub use connectors::{
-    Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot,
-    SourceCompletion, SourceScanHooks, WorkspaceCache, aider::AiderConnector, amp::AmpConnector,
-    antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
+    Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanProgressTick,
+    ScanRoot, SourceCompletion, SourceScanHooks, WorkspaceCache, aider::AiderConnector,
+    amp::AmpConnector, antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
     clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
     continue_dev::ContinueConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
     devin::DevinConnector, estimate_tokens_from_content, extract_claude_code_tokens,
     extract_codex_tokens, extract_invocations_from_content_blocks, extract_tokens_for_agent,
     factory::FactoryConnector, file_modified_since, flatten_content,
     franken_detection_for_connector, gemini::GeminiConnector, get_connector_factories,
-    grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector, normalize_model,
-    omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
-    pi_agent::PiAgentConnector, pi_durable::PiDurableConnector, prime_agent::PrimeAgentConnector,
-    qwen::QwenConnector, token_extraction, vibe::VibeConnector,
+    grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector, muse::MuseConnector,
+    normalize_model, omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
+    parse_timestamp, percent_decode_utf8, pi_agent::PiAgentConnector,
+    pi_durable::PiDurableConnector, prime_agent::PrimeAgentConnector, qwen::QwenConnector,
+    token_extraction, unwrap_skill_invocations, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};

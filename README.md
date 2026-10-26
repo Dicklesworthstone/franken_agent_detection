@@ -131,15 +131,17 @@ fn main() -> anyhow::Result<()> {
 Every connector produces `NormalizedConversation`s: `agent_slug`,
 `external_id`, `title`, `workspace`, `source_path`, timestamps, `metadata`,
 and `NormalizedMessage`s (`role`, `author`, `content`, `created_at`, structured
-tool and skill `invocations` with `skill`/`load_skill` wrappers normalized via
-`unwrap_skill_invocations`, and the raw provider record in `extra`).
-Connector-derived annotations live under `extra.cass` (for example branch and
-context membership for Pi sessions, or `cass.tool_call_count` across tool-using
-turns). `extract_tokens_for_agent` turns a message's `extra` into exact API
-token usage where the agent records it (and an estimate otherwise) while
-preserving model, provider (`anthropic`, `openai`, `google`, `mistral`, `xai`,
-or explicit provider metadata), and `tool_call_count` / `has_tool_calls`
-across all 34 connectors.
+tool and skill `invocations` with `skill`/`Skill`/`load_skill`/`use_skill`
+wrappers normalized via `unwrap_skill_invocations`, and the raw provider record
+in `extra`). All 34 connector types (including `MuseConnector`) and scan
+helpers (`ScanProgressTick`, `unwrap_skill_invocations`, `percent_decode_utf8`)
+are re-exported at the crate root. Connector-derived annotations live under
+`extra.cass` (for example branch and context membership for Pi sessions, or
+`cass.tool_call_count` across tool-using turns). `extract_tokens_for_agent`
+turns a message's `extra` into exact API token usage where the agent records it
+(and an estimate otherwise) while preserving model, provider (`anthropic`,
+`openai`, `google`, `mistral`, `xai`, or explicit provider metadata), and
+`tool_call_count` / `has_tool_calls` across all 34 connectors.
 
 Claude Code session files of **32 MiB or larger** retain compact metadata in
 `extra.cass` instead of duplicating the full raw record. Reply identifiers are

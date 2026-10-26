@@ -65,6 +65,17 @@ window is since `v0.3.11` (2026-10-14).
 
 ### Added
 
+- **Crate-root public API re-exports, Aider and Grok Bot model/invocation extraction, and 34-connector token conformance gate (`franken_agent_detection-08h`, `franken_agent_detection-3zd`, `franken_agent_detection-u80`):**
+  re-exported `MuseConnector`, `ScanProgressTick`, `unwrap_skill_invocations`, and
+  `percent_decode_utf8` at the crate root (and `ScanProgressTick` in `src/connectors/mod.rs`),
+  extended `unwrap_skill_invocations` to unwrap `Skill` and `use_skill` wrappers alongside `skill`
+  and `load_skill`, enhanced `AiderConnector` to parse `Main model:` / `Models:` preamble lines,
+  `#### ` prompt headings, and slash-command `NormalizedInvocation` records (`/run`, `/test`,
+  `/git`, `/lint`, `/web`, `/skill`) with `cass.tool_call_count`, enhanced `GrokBotConnector` to
+  extract `model` and `tool_calls` `NormalizedInvocation` records with `cass.tool_call_count` while
+  preserving its chat-only allowlist invariants, and extended
+  `all_compiled_connectors_produce_schema_conformant_conversations` to validate
+  `extract_tokens_for_agent` across all 34 compiled connectors.
 - **34-connector `extract_tokens_for_agent` tool-call/model/provider parity and `unwrap_skill_invocations` (`franken_agent_detection-woj`):**
   wired `cass.tool_call_count`, `tool_call_count` / `has_tool_calls` extraction in
   `extract_tokens_for_agent`, and `unwrap_skill_invocations` across all 34 connectors

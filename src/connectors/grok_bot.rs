@@ -14,12 +14,15 @@ use serde_json::{Value, json};
 
 use super::utils::{
     dedupe_path_key, env_var_nonempty, excluded_scan_paths_from_env, path_is_excluded, read_capped,
+    unwrap_skill_invocations,
 };
 use super::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks, file_modified_since, franken_detection_for_connector,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 const SLUG: &str = "grok_bot";
 const REPLICA_PREFIX: &str = "sand.client.slice.account.";
@@ -161,6 +164,58 @@ fn replica_key(path: &Path) -> Option<String> {
     Some(key)
 }
 
+fn extract_entry_invocations(entry: &Value) -> Vec<NormalizedInvocation> {
+    let mut invocations = Vec::new();
+    let Some(calls) = entry
+        .get("tool_calls")
+        .or_else(|| entry.get("toolCalls"))
+        .or_else(|| entry.pointer("/message/tool_calls"))
+        .or_else(|| entry.pointer("/message/toolCalls"))
+        .and_then(Value::as_array)
+    else {
+        return invocations;
+    };
+    for call in calls {
+        let Some(name) = call
+            .pointer("/function/name")
+            .or_else(|| call.get("name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let call_id = call
+            .get("id")
+            .or_else(|| call.get("call_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let arguments = call
+            .pointer("/function/arguments")
+            .or_else(|| call.get("arguments"))
+            .or_else(|| call.get("input"))
+            .and_then(|val| match val {
+                Value::Null => None,
+                Value::String(raw) => serde_json::from_str::<Value>(raw)
+                    .ok()
+                    .or_else(|| Some(Value::String(raw.clone()))),
+                other => Some(other.clone()),
+            });
+        invocations.push(NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: name.to_string(),
+            raw_name: None,
+            call_id,
+            arguments,
+        });
+    }
+    unwrap_skill_invocations(&mut invocations);
+    invocations
+}
+
+#[allow(clippy::too_many_lines)]
 fn parse_replica(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConversation>> {
     let key = replica_key(&source.source_path).context("not a Grok Bot transcript replica key")?;
     let raw =
@@ -176,6 +231,7 @@ fn parse_replica(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
         .context("Grok Bot replica value.entries must be an array")?;
     let mut messages = Vec::new();
     let mut missing_entry_id_count = 0_usize;
+    let mut conversation_model: Option<String> = None;
     for entry in entries {
         let kind = entry.get("kind").and_then(Value::as_str);
         let (role, content) = match kind {
@@ -220,6 +276,22 @@ fn parse_replica(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
         if let Some(request) = entry.get("requestId").and_then(Value::as_str) {
             extra["request_id"] = json!(request);
         }
+        if let Some(model) = entry
+            .get("model")
+            .or_else(|| entry.pointer("/message/model"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            extra["model"] = json!(model);
+            if conversation_model.is_none() {
+                conversation_model = Some(model.to_string());
+            }
+        }
+        let invocations = extract_entry_invocations(entry);
+        if !invocations.is_empty() {
+            extra["cass"] = json!({"tool_call_count": invocations.len()});
+        }
         messages.push(NormalizedMessage {
             idx: i64::try_from(messages.len()).context("too many Grok Bot messages")?,
             role: role.to_string(),
@@ -228,7 +300,7 @@ fn parse_replica(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
             content: content.to_string(),
             extra,
             snippets: Vec::new(),
-            invocations: Vec::new(),
+            invocations,
         });
     }
     if messages.is_empty() {
@@ -236,6 +308,15 @@ fn parse_replica(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
             bail!("Grok Bot replica has {missing_entry_id_count} chat entries without native IDs");
         }
         return Ok(None);
+    }
+    let mut metadata = json!({
+        "history_kind": "rolling_agent_transcript", "history_complete": false,
+        "chat_only": true, "observed_entry_cap": 200, "source_entry_count": entries.len(),
+        "schema_version": 1, "source_id": source.origin.source_id,
+        "missing_entry_id_count": missing_entry_id_count,
+    });
+    if let Some(model) = conversation_model {
+        metadata["model"] = json!(model);
     }
     Ok(Some(NormalizedConversation {
         agent_slug: SLUG.to_string(),
@@ -245,12 +326,7 @@ fn parse_replica(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
         source_path: source.source_path.clone(),
         started_at: messages.iter().filter_map(|m| m.created_at).min(),
         ended_at: messages.iter().filter_map(|m| m.created_at).max(),
-        metadata: json!({
-            "history_kind": "rolling_agent_transcript", "history_complete": false,
-            "chat_only": true, "observed_entry_cap": 200, "source_entry_count": entries.len(),
-            "schema_version": 1, "source_id": source.origin.source_id,
-            "missing_entry_id_count": missing_entry_id_count,
-        }),
+        metadata,
         messages,
     }))
 }
@@ -726,5 +802,69 @@ mod tests {
                 .unwrap();
             assert_ne!(other_conversation.external_id, first.external_id);
         }
+    }
+
+    #[test]
+    fn grok_bot_extracts_model_and_structured_invocations() {
+        let temp = TempDir::new().unwrap();
+        let path = write_sample(temp.path());
+        fs::write(
+            &path,
+            json!({
+                "schemaVersion": 1,
+                "value": {
+                    "entries": [
+                        {
+                            "kind": "message",
+                            "id": "msg-1",
+                            "role": "assistant",
+                            "model": "grok-3",
+                            "content": "Running skill and tool.",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "function": {
+                                        "name": "skill",
+                                        "arguments": "{\"name\":\"verify\"}"
+                                    }
+                                },
+                                {
+                                    "id": "call_2",
+                                    "name": "web_search",
+                                    "arguments": {"query": "rust"}
+                                }
+                            ]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let conversations = GrokBotConnector::new().scan(&context(&path, None)).unwrap();
+        assert_eq!(conversations.len(), 1);
+        let conv = &conversations[0];
+        assert_eq!(conv.metadata["model"], "grok-3");
+        let msg = &conv.messages[0];
+        assert_eq!(msg.extra["model"], "grok-3");
+        assert_eq!(msg.extra["cass"]["tool_call_count"], 2);
+        assert_eq!(msg.invocations.len(), 2);
+        assert_eq!(msg.invocations[0].kind, "skill");
+        assert_eq!(msg.invocations[0].name, "verify");
+        assert_eq!(msg.invocations[0].raw_name.as_deref(), Some("skill"));
+        assert_eq!(msg.invocations[1].kind, "tool");
+        assert_eq!(msg.invocations[1].name, "web_search");
+
+        let usage = crate::connectors::extract_tokens_for_agent(
+            "grok_bot",
+            &msg.extra,
+            &msg.content,
+            &msg.role,
+        );
+        assert_eq!(usage.tool_call_count, 2);
+        assert!(usage.has_tool_calls);
+        assert_eq!(usage.model_name.as_deref(), Some("grok-3"));
+        assert_eq!(usage.provider.as_deref(), Some("xai"));
     }
 }

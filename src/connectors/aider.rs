@@ -17,9 +17,13 @@ use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
 };
-use super::utils::{excluded_scan_paths_from_env, path_is_excluded, read_capped};
+use super::utils::{
+    excluded_scan_paths_from_env, path_is_excluded, read_capped, unwrap_skill_invocations,
+};
 use super::{Connector, file_modified_since, franken_detection_for_connector};
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct AiderConnector;
 
@@ -79,6 +83,155 @@ impl AiderConnector {
         files
     }
 
+    fn extract_model_from_line(line: &str) -> Option<String> {
+        let trimmed = line.trim_start().trim_start_matches('>').trim_start();
+        let rest = trimmed
+            .strip_prefix("Main model:")
+            .or_else(|| trimmed.strip_prefix("Models:"))?;
+        let model = rest
+            .trim_start()
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .next()?
+            .trim();
+        (!model.is_empty()).then(|| model.to_string())
+    }
+
+    fn extract_invocations(role: &str, content: &str) -> Vec<NormalizedInvocation> {
+        let mut invocations = Vec::new();
+        let mut in_code_block = false;
+
+        for line in content.lines() {
+            let trimmed_start = line.trim_start();
+            if trimmed_start.starts_with("```") {
+                in_code_block = !in_code_block;
+                continue;
+            }
+            if in_code_block {
+                continue;
+            }
+            let trimmed = trimmed_start.trim_end();
+            if role == "user" {
+                if let Some(cmd) = trimmed
+                    .strip_prefix("/run ")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: "run".to_string(),
+                        raw_name: Some("/run".to_string()),
+                        call_id: None,
+                        arguments: Some(json!({"command": cmd})),
+                    });
+                } else if let Some(cmd) = trimmed
+                    .strip_prefix("/test ")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: "test".to_string(),
+                        raw_name: Some("/test".to_string()),
+                        call_id: None,
+                        arguments: Some(json!({"command": cmd})),
+                    });
+                } else if let Some(args) = trimmed
+                    .strip_prefix("/git ")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: "git".to_string(),
+                        raw_name: Some("/git".to_string()),
+                        call_id: None,
+                        arguments: Some(json!({"args": args})),
+                    });
+                } else if trimmed == "/lint" || trimmed.starts_with("/lint ") {
+                    let args = trimmed.strip_prefix("/lint").unwrap_or("").trim();
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: "lint".to_string(),
+                        raw_name: Some("/lint".to_string()),
+                        call_id: None,
+                        arguments: (!args.is_empty()).then(|| json!({"args": args})),
+                    });
+                } else if let Some(url) = trimmed
+                    .strip_prefix("/web ")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: "web".to_string(),
+                        raw_name: Some("/web".to_string()),
+                        call_id: None,
+                        arguments: Some(json!({"url": url})),
+                    });
+                } else if let Some(skill) = trimmed
+                    .strip_prefix("/skill ")
+                    .or_else(|| trimmed.strip_prefix("/load_skill "))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: "skill".to_string(),
+                        raw_name: None,
+                        call_id: None,
+                        arguments: Some(json!({"name": skill})),
+                    });
+                }
+            } else if let Some(cmd) = trimmed
+                .strip_prefix("Running ")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                invocations.push(NormalizedInvocation {
+                    kind: "tool".to_string(),
+                    name: "run".to_string(),
+                    raw_name: None,
+                    call_id: None,
+                    arguments: Some(json!({"command": cmd})),
+                });
+            }
+        }
+
+        unwrap_skill_invocations(&mut invocations);
+        invocations
+    }
+
+    fn build_message(
+        idx: i64,
+        role: &str,
+        content: String,
+        active_model: Option<&str>,
+    ) -> NormalizedMessage {
+        let invocations = Self::extract_invocations(role, &content);
+        let mut extra = serde_json::Map::new();
+        if role == "assistant"
+            && let Some(model) = active_model
+        {
+            extra.insert("model".to_string(), json!(model));
+        }
+        if !invocations.is_empty() {
+            extra.insert(
+                "cass".to_string(),
+                json!({"tool_call_count": invocations.len()}),
+            );
+        }
+        NormalizedMessage {
+            idx,
+            role: role.to_string(),
+            author: Some(role.to_string()),
+            created_at: None,
+            content,
+            extra: serde_json::Value::Object(extra),
+            invocations,
+            snippets: Vec::new(),
+        }
+    }
+
     #[allow(clippy::unused_self)]
     fn parse_chat_history(&self, path: &Path) -> Result<NormalizedConversation> {
         // History files accumulate for years; enforce the project's 100MB
@@ -99,51 +252,58 @@ impl AiderConnector {
         let mut current_role = "system";
         let mut current_content = String::new();
         let mut msg_idx: i64 = 0;
+        let mut active_model: Option<String> = None;
+        let mut in_code_block = false;
 
         for line in content.lines() {
-            if line.trim().starts_with('>') {
+            if let Some(model) = Self::extract_model_from_line(line) {
+                active_model = Some(model);
+            }
+            let trimmed_start = line.trim_start();
+            let is_quote_user = !in_code_block && line.trim().starts_with('>');
+            let is_heading_user = !in_code_block && trimmed_start.starts_with("#### ");
+
+            if is_quote_user || is_heading_user {
                 // Only push previous content if switching from non-user role
                 if current_role != "user" && !current_content.trim().is_empty() {
-                    messages.push(NormalizedMessage {
-                        idx: msg_idx,
-                        role: current_role.to_string(),
-                        author: Some(current_role.to_string()),
-                        created_at: None,
-                        content: current_content.trim().to_string(),
-                        extra: json!({}),
-                        invocations: Vec::new(),
-                        snippets: Vec::new(),
-                    });
+                    messages.push(Self::build_message(
+                        msg_idx,
+                        current_role,
+                        current_content.trim().to_string(),
+                        active_model.as_deref(),
+                    ));
                     msg_idx += 1;
                     current_content.clear();
                 }
                 current_role = "user";
 
-                // Only strip the prefix "> " (or ">") but preserve other whitespace
+                // Only strip the prefix "> " / ">" or "#### " but preserve other whitespace
                 // to maintain indentation (e.g. for code blocks in prompts).
-                let trimmed_start = line.trim_start();
-                let stripped = trimmed_start
-                    .strip_prefix("> ")
-                    .or_else(|| trimmed_start.strip_prefix('>'))
-                    .unwrap_or(trimmed_start);
+                let stripped = if is_heading_user {
+                    trimmed_start.strip_prefix("#### ").unwrap_or(trimmed_start)
+                } else {
+                    trimmed_start
+                        .strip_prefix("> ")
+                        .or_else(|| trimmed_start.strip_prefix('>'))
+                        .unwrap_or(trimmed_start)
+                };
                 current_content.push_str(stripped.trim_end());
             } else {
-                if current_role == "user" && !line.trim().is_empty() && !line.starts_with('>') {
+                if current_role == "user" && !line.trim().is_empty() {
                     if !current_content.trim().is_empty() {
-                        messages.push(NormalizedMessage {
-                            idx: msg_idx,
-                            role: "user".to_string(),
-                            author: Some("user".to_string()),
-                            created_at: None,
-                            content: current_content.trim().to_string(),
-                            extra: json!({}),
-                            invocations: Vec::new(),
-                            snippets: Vec::new(),
-                        });
+                        messages.push(Self::build_message(
+                            msg_idx,
+                            "user",
+                            current_content.trim().to_string(),
+                            active_model.as_deref(),
+                        ));
                         msg_idx += 1;
                         current_content.clear();
                     }
                     current_role = "assistant";
+                }
+                if trimmed_start.starts_with("```") {
+                    in_code_block = !in_code_block;
                 }
                 current_content.push_str(line);
             }
@@ -151,16 +311,12 @@ impl AiderConnector {
         }
 
         if !current_content.trim().is_empty() {
-            messages.push(NormalizedMessage {
-                idx: msg_idx,
-                role: current_role.to_string(),
-                author: Some(current_role.to_string()),
-                created_at: None,
-                content: current_content.trim().to_string(),
-                extra: json!({}),
-                invocations: Vec::new(),
-                snippets: Vec::new(),
-            });
+            messages.push(Self::build_message(
+                msg_idx,
+                current_role,
+                current_content.trim().to_string(),
+                active_model.as_deref(),
+            ));
         }
 
         let mtime = fs::metadata(path)?.modified()?;
@@ -172,21 +328,22 @@ impl AiderConnector {
         )
         .unwrap_or(i64::MAX);
 
+        let metadata = active_model.map_or_else(|| json!({}), |model| json!({"model": model}));
+        let title_dir = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+
         Ok(NormalizedConversation {
             agent_slug: "aider".to_string(),
             external_id: Some(path.to_string_lossy().to_string()),
-            title: Some(format!(
-                "Aider Chat: {}",
-                path.parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-            )),
+            title: Some(format!("Aider Chat: {title_dir}")),
             workspace: path.parent().map(std::path::Path::to_path_buf),
             source_path: path.to_path_buf(),
             started_at: Some(ts),
             ended_at: Some(ts),
-            metadata: json!({}),
+            metadata,
             messages,
         })
     }
@@ -940,5 +1097,63 @@ mod tests {
             conv.messages.len() >= 2,
             "should extract user and assistant messages"
         );
+    }
+
+    #[test]
+    fn parse_chat_history_extracts_model_headings_and_slash_invocations() {
+        let dir = TempDir::new().unwrap();
+        let history_file = dir.path().join(".aider.chat.history.md");
+        let content = "\
+# aider chat started at 2025-02-01 10:15:30
+Main model: claude-3-7-sonnet-20250219 with diff edit format
+#### /run cargo test --lib
+#### /skill github-prs
+Running cargo test --lib
+All tests passed!
+";
+        fs::write(&history_file, content).unwrap();
+
+        let connector = AiderConnector::new();
+        let conv = connector.parse_chat_history(&history_file).unwrap();
+
+        assert_eq!(conv.metadata["model"], "claude-3-7-sonnet-20250219");
+        assert_eq!(conv.messages.len(), 3);
+        assert_eq!(conv.messages[0].role, "system");
+
+        let user_msg = &conv.messages[1];
+        assert_eq!(user_msg.role, "user");
+        assert_eq!(user_msg.invocations.len(), 2);
+        assert_eq!(user_msg.invocations[0].kind, "tool");
+        assert_eq!(user_msg.invocations[0].name, "run");
+        assert_eq!(user_msg.invocations[0].raw_name.as_deref(), Some("/run"));
+        assert_eq!(
+            user_msg.invocations[0].arguments,
+            Some(json!({"command": "cargo test --lib"}))
+        );
+        assert_eq!(user_msg.invocations[1].kind, "skill");
+        assert_eq!(user_msg.invocations[1].name, "github-prs");
+        assert_eq!(user_msg.invocations[1].raw_name.as_deref(), Some("skill"));
+        assert_eq!(user_msg.extra["cass"]["tool_call_count"], 2);
+
+        let asst_msg = &conv.messages[2];
+        assert_eq!(asst_msg.role, "assistant");
+        assert_eq!(asst_msg.extra["model"], "claude-3-7-sonnet-20250219");
+        assert_eq!(asst_msg.invocations.len(), 1);
+        assert_eq!(asst_msg.invocations[0].name, "run");
+        assert_eq!(asst_msg.extra["cass"]["tool_call_count"], 1);
+
+        let usage = crate::connectors::extract_tokens_for_agent(
+            "aider",
+            &asst_msg.extra,
+            &asst_msg.content,
+            &asst_msg.role,
+        );
+        assert_eq!(usage.tool_call_count, 1);
+        assert!(usage.has_tool_calls);
+        assert_eq!(
+            usage.model_name.as_deref(),
+            Some("claude-3-7-sonnet-20250219")
+        );
+        assert_eq!(usage.provider.as_deref(), Some("anthropic"));
     }
 }
