@@ -8,34 +8,42 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Repository: <https://github.com/Dicklesworthstone/franken_agent_detection>
 Crate: <https://crates.io/crates/franken-agent-detection>
 
-> **Release vs. tag:** The latest release in this changelog is `v0.3.11`
-> (2026-10-14); `v0.3.10` is tagged in git (2026-10-11), and
-> [`v0.3.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.9)
-> (2026-10-11) and [`v0.3.8`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.8)
-> have published GitHub Release pages. `v0.3.1` through `v0.3.7` are git tags
-> and crates.io versions without GitHub Release pages.
-> Earlier GitHub Releases exist for
-> [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4),
-> [`v0.1.5`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.5),
-> [`v0.1.6`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.6),
-> [`v0.1.7`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7),
+> **Release vs. tag** (checked 2026-11-03 against GitHub Releases, git tags, and crates.io): the latest
+> release in this changelog is `v0.3.11` (2026-11-03). `v0.3.10` is a git tag and crates.io version
+> (2026-10-11) without a GitHub Release page. GitHub Release pages exist for
+> [`v0.3.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.9),
+> [`v0.3.8`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.8),
+> [`v0.3.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.3),
+> [`v0.3.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.1),
+> [`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0),
+> [`v0.2.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.4),
+> [`v0.2.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.3),
+> [`v0.2.2`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.2),
+> [`v0.2.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.1),
+> [`v0.2.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.0),
+> [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10),
 > [`v0.1.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9),
-> and [`v0.1.10`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10)
-> (published 2026-08-16). `v0.1.1`, `v0.1.2`, and `v0.1.3` are git tags;
-> they do **not** have GitHub Release pages — do not invent them. `v0.1.2` was
-> never published to crates.io. `v0.1.0` was never published (crates.io
-> rejected wildcard dependency versions). There is no `v0.1.8` tag or Release.
+> [`v0.1.7`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7),
+> [`v0.1.6`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.6),
+> [`v0.1.5`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.5), and
+> [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4).
+> `v0.3.2` and `v0.3.4` through `v0.3.7` are git tags and crates.io versions without
+> GitHub Release pages. `v0.1.1`, `v0.1.2`, and `v0.1.3` are git tags without GitHub
+> Release pages; do not invent them. crates.io has every version from `0.2.0` through
+> `0.3.10`, plus `0.1.0`, `0.1.1`, `0.1.3`, `0.1.7`, `0.1.8`, and `0.1.10`; `0.1.2`,
+> `0.1.4`, `0.1.5`, `0.1.6`, and `0.1.9` were never published there. `0.1.0` and `0.1.8`
+> have no git tag, and there is no `v0.1.8` GitHub Release.
 
 Scope window: 2026-02-15 through HEAD
 [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
 (2026-08-19) for the historical reconstruction below. The current Unreleased
-window is since `v0.3.11` (2026-10-14).
+window is since `v0.3.11` (2026-11-03).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| `v0.3.11` | Release | 2026-10-14 | Continue IDE/CLI connector, Cline SDK sessions, Qwen subagents, Copilot/Amp/Crush usage, Vibe native turns, 15-provider remote mirror discovery (`CASS #520`), 18-provider `CASS_EXCLUDE_PATHS` + per-source boundary hooks, Pi/OMP env-override symmetry, and 34-connector schema/metamorphic conformance laws. |
+| `v0.3.11` | Release | 2026-11-03 | Public `canonical_connector_slug` with alias-aware agent rewrites, 34-connector token, model and invocation attribution with conformance gates, Continue IDE/CLI connector, Cline SDK sessions, Qwen subagents, Copilot/Amp/Crush usage, Vibe native turns, 15-provider remote mirror discovery (`CASS #520`), 18-provider `CASS_EXCLUDE_PATHS` + per-source boundary hooks, Pi/OMP env-override symmetry, and 34-connector schema/metamorphic conformance laws. |
 | `v0.3.10` | Git tag / crates.io | 2026-10-11 | `sqlite_sync::shutdown_driver()` for clean Windows runtime exit (`CASS #519`) and full error chains on OpenCode SQLite read warnings. |
 | [`v0.3.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.9) | GitHub Release | 2026-10-11 | Qwen native JSONL, Cline native tasks + usage, Gemini/Kimi usage, Claude 32 MiB reply IDs, pre-parse `CASS_EXCLUDE_PATHS` validation, shared `JsonlLines` I/O discard, and custom root detection overrides. |
 | [`v0.3.8`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.8) | GitHub Release | 2026-10-08 | `CASS_EXCLUDE_PATHS` matches relative, `..`, and symlink-alias spellings (`cass 0f1k0`). |
@@ -43,9 +51,9 @@ window is since `v0.3.11` (2026-10-14).
 | `v0.3.6` | Git tag / crates.io | 2026-10-07 | Compressed Codex rollouts (`.jsonl.zst` via `codex-zstd`, `cass #513`) and case-insensitive rollout extension matching. |
 | `v0.3.5` | Git tag / crates.io | 2026-10-05 | Codebuff / Freebuff continues past individual unparseable transcripts and reports failure counts (`cass #511`). |
 | `v0.3.4` | Git tag / crates.io | 2026-10-05 | Codebuff / Freebuff native locale time-of-day timestamps fall back to message-ID epoch ms (`cass #511`). |
-| `v0.3.3` | Git tag / crates.io | 2026-09-28 | OpenCode 2.x `session_v2`/`session_message` indexing (`cass #504`) and OpenClaw zstd-compressed SQLite events (`GH #25`). |
+| [`v0.3.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.3) | GitHub Release | 2026-09-28 | OpenCode 2.x `session_v2`/`session_message` indexing (`cass #504`) and OpenClaw zstd-compressed SQLite events (`GH #25`). |
 | `v0.3.2` | Git tag / crates.io | 2026-09-26 | Configurable Codex rollout admission byte budget (`set_codex_rollout_byte_budget`). |
-| `v0.3.1` | Git tag / crates.io | 2026-09-25 | Claude Code mid-turn queued prompts (`cass #500`), Codex/Pi `CASS_EXCLUDE_PATHS`, streaming 100 MiB read caps, and Codex primary source integrity. |
+| [`v0.3.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.1) | GitHub Release | 2026-09-25 | Claude Code mid-turn queued prompts (`cass #500`), Codex/Pi `CASS_EXCLUDE_PATHS`, streaming 100 MiB read caps, and Codex primary source integrity. |
 | [`v0.3.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0) | GitHub Release | 2026-09-16 | Shared Codebuff / Freebuff history, SQLite 0.4.1 and Asupersync 0.5 migration, unwind-safe read transactions, and bounded crate contents. |
 | [`v0.2.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.4) | GitHub Release | 2026-09-10 | Copilot CLI workspace restoration, explicit Cursor workspace attribution, exact Prime watch roots, and Grok Bot desktop replicas. |
 | [`v0.2.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.2.3) | GitHub Release | 2026-09-07 | Devin CLI connector; Antigravity IDE store, Claude `CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME` detection, muse/goose/hermes/crush scan scoping, Codex token usage, Claude tool results, Cursor/OpenCode dedupe, 100MB scan cap everywhere. |
@@ -57,11 +65,13 @@ window is since `v0.3.11` (2026-10-14).
 | [`v0.1.7`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.7) | GitHub Release | 2026-05-17 | See Release page; not reconstructed as a wave in this file. |
 | [`v0.1.4`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.4)–[`v0.1.6`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.6) | GitHub Releases | 2026-05-16 | See Release pages; not reconstructed as waves in this file. |
 | `v0.1.3` / `v0.1.2` / `v0.1.1` | Git tags (not GitHub Releases) | 2026-03-22 / 2026-03-02 / 2026-02-22 | Tag-only; no Release pages. |
-| `v0.1.0` | Unpublished | 2026-02-15 | crates.io rejected wildcard dependency versions. |
+| `v0.1.0` | crates.io only (no git tag) | 2026-02-16 | Initial public release: synchronous `detect_installed_agents()` probes and the JSON `InstalledAgentDetectionReport` for 9 detection-only connectors. |
 
 ---
 
 ## [Unreleased]
+
+## [0.3.11] -- 2026-11-03
 
 ### Added
 
@@ -180,34 +190,6 @@ window is since `v0.3.11` (2026-10-14).
   cover `grok`, `goose`, `vibe`, `clawdbot`, `codebuff`, `copilot_cli`, `hermes`, `devin`,
   and `chatgpt`.
 
-### Fixed
-
-- **Codex `progress_tick` ordering for oversized rollout admission and snapshot integrity (`franken_agent_detection-88y`):**
-  removed the pre-open `ctx.tick()` before `RolloutReader::open` in `CodexConnector` (relying on
-  `RolloutReader::open` passing `ctx.progress_tick` into `Records::next_record()` after
-  `admit_rollout_len` and `file.metadata()` snapshot capture) and placed `ctx.tick()` after
-  `read_capped(&file)` on the legacy `.json` rollout branch.
-- **Shelley 0-based `sequence_id` conformance and `--all-features` Clippy cleanliness (`franken_agent_detection-da4`):**
-  aligned Shelley's conformance test fixture with real Shelley 0-based `sequence_id`
-  ordering and resolved all `--all-features --all-targets` Clippy `-D warnings` lints.
-- **`JsonlLines` mid-read I/O safety and 100% `read_capped` enforcement (`franken_agent_detection-s85`, `franken_agent_detection-hvi`):**
-  wired `JsonlLines` and `open_capped_reader` into `goose`, `antigravity`, `cursor`,
-  `copilot_cli`, `pi_wire` (`pi_agent` and `omp`), and `copilot_vscode` (`NativeFormat::AppendLog`)
-  JSONL parsers so corrupt UTF-8 lines (`0xFF`) are skipped while mid-stream I/O errors discard
-  incomplete transcripts cleanly, and replaced all remaining unbounded `fs::read_to_string`
-  sidecar/JSON reads (`openhands`, `kimi`, `kiro`, `factory`, `grok`, `qwen`, `copilot_vscode`)
-  with `read_capped`.
-- **Preserved `metadata.cass.workspace_original` in `ScanRoot::apply_workspace_rewrite` (`franken_agent_detection-7uj`):**
-  added `ScanRoot::apply_workspace_rewrite(&self, conv: &mut NormalizedConversation)` in
-  `src/connectors/scan.rs` and wired it into `cursor` (both SQLite Composer and Agent
-  transcripts), `continue_dev`, `openhands`, and `copilot` so connector-side workspace
-  rewrites record the pre-rewrite path in `metadata.cass.workspace_original` for downstream
-  CASS indexing.
-
-## [0.3.11] -- 2026-10-14
-
-### Added
-
 - **Continue connector (`continue`, [`b1caca2`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/b1caca2)):**
   reads Continue IDE and CLI session snapshots from `~/.continue/sessions/<sessionId>.json`
   and `CONTINUE_GLOBAL_DIR/sessions`. Preserves ordered text, reasoning, tool calls, tool
@@ -243,6 +225,28 @@ window is since `v0.3.11` (2026-10-14).
   registered connector factories.
 
 ### Fixed
+
+- **Codex `progress_tick` ordering for oversized rollout admission and snapshot integrity (`franken_agent_detection-88y`):**
+  removed the pre-open `ctx.tick()` before `RolloutReader::open` in `CodexConnector` (relying on
+  `RolloutReader::open` passing `ctx.progress_tick` into `Records::next_record()` after
+  `admit_rollout_len` and `file.metadata()` snapshot capture) and placed `ctx.tick()` after
+  `read_capped(&file)` on the legacy `.json` rollout branch.
+- **Shelley 0-based `sequence_id` conformance and `--all-features` Clippy cleanliness (`franken_agent_detection-da4`):**
+  aligned Shelley's conformance test fixture with real Shelley 0-based `sequence_id`
+  ordering and resolved all `--all-features --all-targets` Clippy `-D warnings` lints.
+- **`JsonlLines` mid-read I/O safety and 100% `read_capped` enforcement (`franken_agent_detection-s85`, `franken_agent_detection-hvi`):**
+  wired `JsonlLines` and `open_capped_reader` into `goose`, `antigravity`, `cursor`,
+  `copilot_cli`, `pi_wire` (`pi_agent` and `omp`), and `copilot_vscode` (`NativeFormat::AppendLog`)
+  JSONL parsers so corrupt UTF-8 lines (`0xFF`) are skipped while mid-stream I/O errors discard
+  incomplete transcripts cleanly, and replaced all remaining unbounded `fs::read_to_string`
+  sidecar/JSON reads (`openhands`, `kimi`, `kiro`, `factory`, `grok`, `qwen`, `copilot_vscode`)
+  with `read_capped`.
+- **Preserved `metadata.cass.workspace_original` in `ScanRoot::apply_workspace_rewrite` (`franken_agent_detection-7uj`):**
+  added `ScanRoot::apply_workspace_rewrite(&self, conv: &mut NormalizedConversation)` in
+  `src/connectors/scan.rs` and wired it into `cursor` (both SQLite Composer and Agent
+  transcripts), `continue_dev`, `openhands`, and `copilot` so connector-side workspace
+  rewrites record the pre-rewrite path in `metadata.cass.workspace_original` for downstream
+  CASS indexing.
 
 - **Remote mirror store discovery (`ScanRoot::with_mirrored_source_path`, CASS #520,
   [`b0cabe3`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/b0cabe3)..[`b67dad4`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/b67dad4)):**
@@ -1219,7 +1223,7 @@ Git tag: [`v0.1.2`](https://github.com/Dicklesworthstone/franken_agent_detection
 
 ## [0.1.1] -- 2026-02-22
 
-Git tag: [`v0.1.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.1). First successful crates.io publish (v0.1.0 was rejected due to wildcard dependency versions).
+Git tag: [`v0.1.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.1). First git-tagged release.
 
 ### Connector infrastructure
 
@@ -1270,7 +1274,7 @@ Git tag: [`v0.1.1`](https://github.com/Dicklesworthstone/franken_agent_detection
 
 ## [0.1.0] -- 2026-02-15
 
-Initial public release. No git tag. Not published to crates.io (rejected due to wildcard dependency versions; superseded by v0.1.1).
+Initial public release. No git tag. Published to crates.io on 2026-02-16 (UTC).
 
 ### Core detection API
 
@@ -1321,7 +1325,7 @@ Initial public release. No git tag. Not published to crates.io (rejected due to 
 > listed above in the Release-vs-tag note. They are not reconstructed as
 > capability-wave sections in this file.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_agent_detection/compare/v0.3.11...HEAD
 [0.3.0]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.0
 [0.1.10]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.10
 [0.1.9]: https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.1.9
