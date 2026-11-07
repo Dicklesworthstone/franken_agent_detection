@@ -492,7 +492,7 @@ impl OpenClawConnector {
                 continue;
             }
             let agent_directory = Self::agent_directory_from_db_path(db);
-            match sqlite_store::extract_from_sqlite(db, &agent_directory, ctx.since_ts) {
+            match sqlite_store::extract_from_sqlite(db, &agent_directory) {
                 Ok(db_convs) => {
                     tracing::debug!(
                         agent = %agent_directory,
@@ -925,7 +925,6 @@ mod sqlite_store {
     pub(super) fn extract_from_sqlite(
         db_path: &Path,
         agent_directory: &str,
-        since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
         let AdmittedStore {
             conn,
@@ -941,10 +940,11 @@ mod sqlite_store {
              FROM transcript_events WHERE session_id = ?1 ORDER BY seq ASC"
         };
         conn.read_transaction(|conn| -> Result<Vec<NormalizedConversation>> {
-            // Session-level freshness: include a session when ANY event is at
-            // or after the cutoff, then return ALL of its events so the
-            // conversation stays complete. `created_at` units are normalized
-            // in Rust (parse_timestamp banding), not assumed in SQL.
+            // Filesystem freshness selected this store before opening it.
+            // Provider activity timestamps can predate a newly committed
+            // append, so they cannot prove a session unchanged. Return every
+            // complete session and let the host reconcile it idempotently.
+            // Normalize activity units for metadata only, not admission.
             let sessions: Vec<(String, i64)> = conn.query_map_collect(
                 "SELECT session_id, MAX(created_at) FROM transcript_events \
                  GROUP BY session_id ORDER BY session_id",
@@ -955,12 +955,6 @@ mod sqlite_store {
             let mut convs = Vec::new();
             for (session_id, last_raw) in sessions {
                 let last_at = parse_timestamp(&Value::from(last_raw));
-                if let (Some(since), Some(last)) = (since_ts, last_at) {
-                    if last < since.saturating_sub(1_000) {
-                        continue;
-                    }
-                }
-
                 let (acc, last_seq) = read_session_events(conn, events_sql, &session_id, db_path)?;
 
                 if acc.messages.is_empty() {
@@ -980,9 +974,9 @@ mod sqlite_store {
                     "session_id": session_id,
                     "cwd": acc.session_cwd,
                     "agent_directory": agent_directory,
-                    // Incremental checkpoint for downstream freshness probes:
-                    // (session_id, last_event_seq, last_event_at) advance
-                    // monotonically as the Gateway appends transcript rows.
+                    // Session observations for provenance. Activity time is
+                    // not a transaction commit clock and cannot establish
+                    // whether the provider source is unchanged.
                     "last_event_seq": last_seq,
                     "last_event_at": last_at,
                 });
@@ -1934,37 +1928,84 @@ mod tests {
         }
 
         #[test]
-        fn incremental_scan_surfaces_new_sqlite_event_without_jsonl() {
-            // The issue's minimal confirmation: a new transcript event in the
-            // SQLite store becomes discoverable on an incremental scan even
-            // when no active-session JSONL exists at all.
+        fn incremental_scan_reconciles_changed_sqlite_stores_with_historical_activity() {
             let tmp = TempDir::new().unwrap();
             let agent_dir = tmp.path().join(".openclaw/agents/alice");
             let db = create_agent_db(&agent_dir);
             seed_session(&db, "sess-1");
+            seed_session(&db, "older-history");
 
-            let since = Some(1_750_000_000_000);
+            let cutoff = 1_750_000_000_000_u64;
+            let set_modified = |millis| {
+                fs::File::options()
+                    .write(true)
+                    .open(&db)
+                    .unwrap()
+                    .set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis),
+                    )
+                    .unwrap();
+            };
+            let snapshot = || {
+                (
+                    fs::read(&db).unwrap(),
+                    fs::metadata(&db).unwrap().modified().unwrap(),
+                )
+            };
+            set_modified(cutoff - 10_000);
             let connector = OpenClawConnector::new();
             let ctx = ScanContext::with_roots(
                 tmp.path().to_path_buf(),
                 vec![crate::connectors::ScanRoot::local(tmp.path().to_path_buf())],
-                since,
+                Some(i64::try_from(cutoff).unwrap()),
             );
+            let unchanged = snapshot();
+            assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
             assert!(connector.scan(&ctx).unwrap().is_empty());
+            assert_eq!(snapshot(), unchanged, "unchanged stores remain untouched");
 
             insert_event(
                 &db,
                 "sess-1",
                 4,
-                r#"{"type":"message","id":"m3","message":{"role":"user","content":[{"type":"text","text":"post-cutoff follow-up"}]}}"#,
-                1_760_000_000_000,
+                r#"{"type":"message","id":"m3","message":{"role":"user","content":[{"type":"text","text":"newly committed historical follow-up"}]}}"#,
+                1_700_000_003_000,
             );
+            set_modified(cutoff + 10_000);
 
+            let changed = snapshot();
+            let sources = connector.discover_source_files(&ctx).unwrap();
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].source_path, db);
             let convs = connector.scan(&ctx).unwrap();
-            assert_eq!(convs.len(), 1);
-            // The whole session is returned, not just the fresh event.
-            assert_eq!(convs[0].messages.len(), 3);
-            assert_eq!(convs[0].ended_at, Some(1_760_000_000_000));
+            assert_eq!(convs.len(), 2, "every session in the changed store survives");
+            let appended = convs
+                .iter()
+                .find(|conv| conv.external_id.as_deref() == Some("alice/sess-1"))
+                .unwrap();
+            assert_eq!(appended.messages.len(), 3);
+            assert_eq!(appended.messages[0].content, "Hello from sqlite");
+            assert_eq!(
+                appended.messages[2].content,
+                "newly committed historical follow-up"
+            );
+            assert_eq!(appended.ended_at, Some(1_700_000_003_000));
+            let older = convs
+                .iter()
+                .find(|conv| conv.external_id.as_deref() == Some("alice/older-history"))
+                .unwrap();
+            assert_eq!(older.messages.len(), 2);
+            assert!(convs.iter().all(|conv| {
+                conv.source_path == db
+                    && conv.metadata["last_event_at"].as_i64().unwrap()
+                        < i64::try_from(cutoff).unwrap()
+            }));
+            assert_eq!(
+                serde_json::to_value(connector.scan(&ctx).unwrap()).unwrap(),
+                serde_json::to_value(&convs).unwrap(),
+                "repeated scans preserve deterministic complete history"
+            );
+            assert_eq!(snapshot(), changed, "reading must not mutate the provider");
         }
 
         /// Current `OpenClaw` schema: `event_json` is nullable and large
