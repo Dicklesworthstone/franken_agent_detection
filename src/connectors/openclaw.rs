@@ -285,6 +285,11 @@ impl OpenClawConnector {
             .to_string()
     }
 
+    /// Resolve aliases once per agent directory without widening its scope.
+    fn agent_directory_key(path: &Path) -> PathBuf {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
     fn agent_slug_for_directory(agent_dir: &str) -> String {
         if agent_dir == "openclaw" {
             "openclaw".to_string()
@@ -330,11 +335,16 @@ impl OpenClawConnector {
             }
         } else {
             for root in &ctx.scan_roots {
-                roots.extend(
+                // Mirror identity names the semantic agents root even when a
+                // contents-only copy has an opaque local directory name.
+                let paths = if let Some(agents) =
+                    root.mirrored_store(&[".openclaw", "agents"])
+                {
+                    Self::find_agent_session_dirs_at(&agents)
+                } else {
                     Self::roots_from_scan_path(&root.path)
-                        .into_iter()
-                        .map(|path| root.with_path(path)),
-                );
+                };
+                roots.extend(paths.into_iter().map(|path| root.with_path(path)));
             }
         }
 
@@ -464,11 +474,14 @@ impl OpenClawConnector {
             }
         } else {
             for root in &ctx.scan_roots {
-                roots.extend(
+                let paths = if let Some(agents) =
+                    root.mirrored_store(&[".openclaw", "agents"])
+                {
+                    Self::find_agent_db_paths_at(&agents)
+                } else {
                     Self::sqlite_roots_from_scan_path(&root.path)
-                        .into_iter()
-                        .map(|path| root.with_path(path)),
-                );
+                };
+                roots.extend(paths.into_iter().map(|path| root.with_path(path)));
             }
         }
 
@@ -478,13 +491,14 @@ impl OpenClawConnector {
     }
 
     /// Scan every discovered SQLite store, appending conversations to `convs`
-    /// and returning the `(agent_directory, session_id)` pairs it produced so
-    /// the legacy JSONL pass can skip already-covered sessions.
+    /// and returning the `(physical_agent_directory, session_id)` pairs it
+    /// produced. A native store may suppress only its own migration leftovers,
+    /// never another mirror with the same agent and session names.
     #[cfg(feature = "openclaw-sqlite")]
     fn scan_sqlite_stores(
         ctx: &ScanContext,
         convs: &mut Vec<NormalizedConversation>,
-    ) -> std::collections::HashSet<(String, String)> {
+    ) -> std::collections::HashSet<(PathBuf, String)> {
         let mut seen = std::collections::HashSet::new();
         for root in Self::sqlite_source_roots(ctx) {
             let db = &root.path;
@@ -492,6 +506,13 @@ impl OpenClawConnector {
                 continue;
             }
             let agent_directory = Self::agent_directory_from_db_path(db);
+            // Only the documented per-agent layout identifies a sibling
+            // sessions directory. Bare database selections cannot claim one.
+            let migration_agent_directory = db
+                .parent()
+                .filter(|parent| parent.file_name().is_some_and(|name| name == "agent"))
+                .and_then(Path::parent)
+                .map(Self::agent_directory_key);
             match sqlite_store::extract_from_sqlite(db, &agent_directory) {
                 Ok(db_convs) => {
                     tracing::debug!(
@@ -501,9 +522,11 @@ impl OpenClawConnector {
                         "openclaw: scanned sqlite transcript store"
                     );
                     for conv in db_convs {
-                        if let Some(sid) = conv.metadata.get("session_id").and_then(|v| v.as_str())
-                        {
-                            seen.insert((agent_directory.clone(), sid.to_string()));
+                        if let (Some(directory), Some(sid)) = (
+                            migration_agent_directory.as_ref(),
+                            conv.metadata.get("session_id").and_then(|v| v.as_str()),
+                        ) {
+                            seen.insert((directory.clone(), sid.to_string()));
                         }
                         convs.push(conv);
                     }
@@ -1020,7 +1043,7 @@ impl Connector for OpenClawConnector {
         #[cfg(feature = "openclaw-sqlite")]
         let sqlite_sessions = Self::scan_sqlite_stores(ctx, &mut convs);
         #[cfg(not(feature = "openclaw-sqlite"))]
-        let sqlite_sessions: std::collections::HashSet<(String, String)> =
+        let sqlite_sessions: std::collections::HashSet<(PathBuf, String)> =
             std::collections::HashSet::new();
 
         let roots: Vec<PathBuf> = Self::source_roots(ctx)
@@ -1043,6 +1066,11 @@ impl Connector for OpenClawConnector {
 
             let agent_directory = Self::agent_directory_from_sessions_root(&root);
             let agent_slug = Self::agent_slug_for_directory(&agent_directory);
+            let migration_agent_directory = if sqlite_sessions.is_empty() {
+                None
+            } else {
+                root.parent().map(Self::agent_directory_key)
+            };
             let mut agent_file_count = 0usize;
             let mut agent_session_count = 0usize;
             let mut agent_error_count = 0usize;
@@ -1065,7 +1093,9 @@ impl Connector for OpenClawConnector {
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or_default();
-                    if sqlite_sessions.contains(&(agent_directory.clone(), stem.to_string())) {
+                    if migration_agent_directory.as_ref().is_some_and(|directory| {
+                        sqlite_sessions.contains(&(directory.clone(), stem.to_string()))
+                    }) {
                         tracing::debug!(
                             agent = %agent_directory,
                             path = %file.display(),
@@ -1221,6 +1251,277 @@ mod tests {
             vec![super::super::ScanRoot::local(root.to_path_buf())],
             None,
         )
+    }
+
+    const MIRROR_AGENT_LAYOUTS: [(&str, &str); 6] = [
+        ("~/.openclaw", ".openclaw/agents"),
+        ("~/.openclaw/", ".openclaw/agents"),
+        ("~/.openclaw/", "agents"),
+        ("~/.openclaw/agents", "agents"),
+        ("~/.openclaw/agents/", "agents"),
+        ("~/.openclaw/agents/", ""),
+    ];
+
+    fn mirrored_test_root(container: &Path, source: &str) -> ScanRoot {
+        ScanRoot::remote(
+            container.to_path_buf(),
+            crate::types::Origin::remote_with_host("laptop", "user@laptop"),
+            Some(crate::types::Platform::Linux),
+        )
+        .with_mirrored_source_path(source)
+        .with_rewrite("/work", "/local/work")
+    }
+
+    fn source_snapshot(paths: &[PathBuf]) -> Vec<Option<(Vec<u8>, std::time::SystemTime)>> {
+        paths
+            .iter()
+            .map(|path| match fs::read(path) {
+                Ok(bytes) => Some((bytes, fs::metadata(path).unwrap().modified().unwrap())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("cannot snapshot {}: {error}", path.display()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mirrored_agents_roots_preserve_jsonl_scope_and_provenance() {
+        for (source, relative_agents) in MIRROR_AGENT_LAYOUTS {
+            let temp = TempDir::new().unwrap();
+            let container = temp.path().join("opaque_selected");
+            let sessions = container.join(relative_agents).join("alice/sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let selected = write_minimal_openclaw_session(
+                &sessions,
+                "selected.jsonl",
+                "/work/project",
+                "selected mirrored history",
+            );
+            let other_sessions = temp.path().join("unselected/agents/alice/sessions");
+            fs::create_dir_all(&other_sessions).unwrap();
+            let other = write_minimal_openclaw_session(
+                &other_sessions,
+                "other.jsonl",
+                "/other",
+                "unselected mirrored history",
+            );
+            // A resolved mirror must not be unioned with structural siblings.
+            let decoy = container.join("openclaw-agent.sqlite");
+            fs::write(&decoy, b"unselected native sibling").unwrap();
+            let paths = [selected.clone(), other, decoy];
+            let before = source_snapshot(&paths);
+            let root = mirrored_test_root(&container, source);
+            let ctx = ScanContext::with_roots(
+                temp.path().join("state"),
+                vec![root.clone(), root.clone()],
+                None,
+            );
+            let derived = OpenClawConnector::source_roots(&ctx);
+            assert_eq!(derived.len(), 1, "{source} -> {relative_agents}");
+            assert_eq!(derived[0].path, sessions);
+            assert_eq!(derived[0].origin, root.origin);
+            assert_eq!(derived[0].platform, root.platform);
+            assert!(derived[0].mirrored_source_path.is_none());
+            assert_eq!(
+                derived[0].rewrite_workspace("/work/project", Some("openclaw/alice")),
+                "/local/work/project"
+            );
+            let connector = OpenClawConnector::new();
+            let sources = connector.discover_source_files(&ctx).unwrap();
+            assert_eq!(sources.len(), 1, "{source} -> {relative_agents}");
+            assert_eq!(sources[0].source_path, selected);
+            assert_eq!(sources[0].role, DiscoveredSourceRole::PrimarySessionLog);
+            assert_eq!(sources[0].origin, root.origin);
+            assert_eq!(sources[0].platform, root.platform);
+            let conversations = connector.scan(&ctx).unwrap();
+            assert_eq!(conversations.len(), 1);
+            assert_eq!(conversations[0].source_path, selected);
+            assert_eq!(conversations[0].agent_slug, "openclaw/alice");
+            assert_eq!(
+                conversations[0].external_id.as_deref(),
+                Some("alice/selected")
+            );
+            assert_eq!(
+                conversations[0].messages[0].content,
+                "selected mirrored history"
+            );
+            assert_eq!(
+                serde_json::to_value(connector.scan(&ctx).unwrap()).unwrap(),
+                serde_json::to_value(&conversations).unwrap()
+            );
+            assert_eq!(source_snapshot(&paths), before);
+        }
+    }
+
+    #[test]
+    fn opaque_mirrors_require_owned_identity_and_keep_empty_selection_empty() {
+        let temp = TempDir::new().unwrap();
+        let container = temp.path().join("opaque");
+        let sessions = container.join("agents/alice/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let selected = write_minimal_openclaw_session(
+            &sessions,
+            "selected.jsonl",
+            "/work",
+            "must remain unselected",
+        );
+        let db = container.join("agents/alice/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, b"unselected native store").unwrap();
+        let before = source_snapshot(&[selected.clone(), db.clone()]);
+        let connector = OpenClawConnector::new();
+        for source in [
+            "~/agents",
+            "~/.other/agents",
+            "~/.openclaw-backup/agents",
+            "~/.openclaw/agents-extra",
+            "~/.openclaw/agents/../agents",
+            "~/.openclaw/./agents",
+            "~/.openclaw/\nagents",
+            "~/.openclaw/agents/alice",
+        ] {
+            let root = mirrored_test_root(&container, source);
+            let ctx = ScanContext::with_roots(temp.path().join("state"), vec![root], None);
+            assert!(connector.discover_source_files(&ctx).unwrap().is_empty(), "{source}");
+            assert!(connector.scan(&ctx).unwrap().is_empty(), "{source}");
+        }
+        for root in [
+            ScanRoot::local(container.clone())
+                .with_mirrored_source_path("~/.openclaw/agents"),
+            ScanRoot::remote(
+                container.clone(),
+                crate::types::Origin::remote("laptop"),
+                None,
+            ),
+            mirrored_test_root(&temp.path().join("missing"), "~/.openclaw/agents"),
+        ] {
+            let ctx = ScanContext::with_roots(temp.path().join("state"), vec![root], None);
+            assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
+            assert!(connector.scan(&ctx).unwrap().is_empty());
+        }
+        assert_eq!(source_snapshot(&[selected, db]), before);
+
+        let empty_container = temp.path().join("openclaw_empty_mirror");
+        fs::create_dir_all(empty_container.join("agents")).unwrap();
+        let decoy_sessions = empty_container.join("sessions");
+        fs::create_dir_all(&decoy_sessions).unwrap();
+        let decoy = write_minimal_openclaw_session(
+            &decoy_sessions,
+            "decoy.jsonl",
+            "/other",
+            "outside selected agents",
+        );
+        let native_decoy = empty_container.join("openclaw-agent.sqlite");
+        fs::write(&native_decoy, b"outside selected agents").unwrap();
+        let paths = [decoy, native_decoy];
+        let before = source_snapshot(&paths);
+        let ctx = ScanContext::with_roots(
+            temp.path().join("state"),
+            vec![mirrored_test_root(&empty_container, "~/.openclaw/agents")],
+            None,
+        );
+        assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
+        assert!(connector.scan(&ctx).unwrap().is_empty());
+        assert_eq!(source_snapshot(&paths), before);
+    }
+
+    #[test]
+    fn selected_jsonl_file_does_not_expand_from_mirror_metadata() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join(".openclaw/agents/alice/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let selected = write_minimal_openclaw_session(&sessions, "a.jsonl", "/a", "selected");
+        let sibling = write_minimal_openclaw_session(&sessions, "b.jsonl", "/b", "sibling");
+        let db = sessions.parent().unwrap().join("agent/openclaw-agent.sqlite");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, b"unselected native sibling").unwrap();
+        let paths = [selected.clone(), sibling, db];
+        let before = source_snapshot(&paths);
+        let ctx = ScanContext::with_roots(
+            temp.path().join("state"),
+            vec![mirrored_test_root(&selected, "~/.openclaw/agents")],
+            None,
+        );
+        let connector = OpenClawConnector::new();
+        let sources = connector.discover_source_files(&ctx).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_path, selected);
+        let conversations = connector.scan(&ctx).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].source_path, selected);
+        assert_eq!(conversations[0].messages[0].content, "selected");
+        assert_eq!(source_snapshot(&paths), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opaque_agent_mirrors_reject_boundary_and_inferred_directory_links() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let real = temp.path().join("real");
+        let sessions = real.join("agents/alice/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let source = write_minimal_openclaw_session(
+            &sessions,
+            "outside.jsonl",
+            "/outside",
+            "outside selected boundary",
+        );
+        let boundary = temp.path().join("linked_boundary");
+        symlink(&real, &boundary).unwrap();
+        let inferred = temp.path().join("opaque");
+        fs::create_dir_all(&inferred).unwrap();
+        symlink(real.join("agents"), inferred.join("agents")).unwrap();
+        let paths = [source];
+        let before = source_snapshot(&paths);
+        let connector = OpenClawConnector::new();
+        for container in [&boundary, &inferred] {
+            let ctx = ScanContext::with_roots(
+                temp.path().join("state"),
+                vec![mirrored_test_root(container, "~/.openclaw/agents")],
+                None,
+            );
+            assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
+            assert!(connector.scan(&ctx).unwrap().is_empty());
+        }
+        assert_eq!(source_snapshot(&paths), before);
+    }
+
+    #[test]
+    fn per_agent_contents_mirror_keeps_existing_jsonl_structure() {
+        let temp = TempDir::new().unwrap();
+        let container = temp.path().join("openclaw_agent_contents");
+        let sessions = container.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let file = write_minimal_openclaw_session(
+            &sessions,
+            "existing.jsonl",
+            "/work/project",
+            "existing structural history",
+        );
+        let root = mirrored_test_root(&container, "~/.openclaw/agents/alice/");
+        assert!(root.mirrored_store(&[".openclaw", "agents"]).is_none());
+        let mut structural = root.clone();
+        structural.mirrored_source_path = None;
+        let connector = OpenClawConnector::new();
+        let before = source_snapshot(&[file.clone()]);
+        let expected = connector
+            .scan(&ScanContext::with_roots(
+                temp.path().join("state"),
+                vec![structural],
+                None,
+            ))
+            .unwrap();
+        assert_eq!(expected.len(), 1);
+        let ctx = ScanContext::with_roots(temp.path().join("state"), vec![root], None);
+        let sources = connector.discover_source_files(&ctx).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_path, file);
+        assert_eq!(
+            serde_json::to_value(connector.scan(&ctx).unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert_eq!(source_snapshot(&[file]), before);
     }
 
     #[test]
@@ -1854,6 +2155,218 @@ mod tests {
                 r#"{"type":"message","id":"m2","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"},{"type":"toolCall","id":"tc1","name":"exec","arguments":{}}],"model":"claude-opus-4-5"}}"#,
                 1_700_000_002_000,
             );
+        }
+
+        fn database_bundle_paths(database: &Path) -> Vec<PathBuf> {
+            ["", "-wal", "-shm"]
+                .into_iter()
+                .map(|suffix| {
+                    let mut name = database.as_os_str().to_os_string();
+                    name.push(suffix);
+                    PathBuf::from(name)
+                })
+                .collect()
+        }
+
+        #[test]
+        fn mirrored_native_agents_roots_preserve_scope_and_provenance() {
+            for (source, relative_agents) in MIRROR_AGENT_LAYOUTS {
+                let temp = TempDir::new().unwrap();
+                let container = temp.path().join("opaque_selected");
+                let agent_dir = container.join(relative_agents).join("alice");
+                let db = create_agent_db(&agent_dir);
+                seed_session(&db, "shared");
+                let decoy = container.join("openclaw-agent.sqlite");
+                fs::write(&decoy, b"unselected native sibling").unwrap();
+                let mut paths = database_bundle_paths(&db);
+                paths.push(decoy);
+                let before = source_snapshot(&paths);
+                let root = mirrored_test_root(&container, source);
+                let ctx = ScanContext::with_roots(
+                    temp.path().join("state"),
+                    vec![root.clone(), root.clone()],
+                    None,
+                );
+                let roots = OpenClawConnector::sqlite_source_roots(&ctx);
+                assert_eq!(roots.len(), 1, "{source} -> {relative_agents}");
+                assert_eq!(roots[0].path, db);
+                assert_eq!(roots[0].origin, root.origin);
+                assert_eq!(roots[0].platform, root.platform);
+                assert!(roots[0].mirrored_source_path.is_none());
+                assert_eq!(
+                    roots[0].rewrite_workspace("/work/project", Some("openclaw/alice")),
+                    "/local/work/project"
+                );
+                let connector = OpenClawConnector::new();
+                let discovered = connector.discover_source_files(&ctx).unwrap();
+                assert_eq!(discovered.len(), 1);
+                assert_eq!(discovered[0].source_path, db);
+                assert_eq!(discovered[0].role, DiscoveredSourceRole::SqliteDatabase);
+                assert_eq!(discovered[0].origin, root.origin);
+                assert_eq!(discovered[0].platform, root.platform);
+                let conversations = connector.scan(&ctx).unwrap();
+                assert_eq!(conversations.len(), 1);
+                assert_eq!(conversations[0].source_path, db);
+                assert_eq!(conversations[0].agent_slug, "openclaw/alice");
+                assert_eq!(conversations[0].external_id.as_deref(), Some("alice/shared"));
+                assert_eq!(conversations[0].messages.len(), 2);
+                assert_eq!(conversations[0].metadata["storage"], "sqlite");
+                assert_eq!(
+                    serde_json::to_value(connector.scan(&ctx).unwrap()).unwrap(),
+                    serde_json::to_value(&conversations).unwrap()
+                );
+                crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
+                assert_eq!(source_snapshot(&paths), before);
+            }
+        }
+
+        #[test]
+        fn native_migration_suppression_stays_with_its_physical_agent_directory() {
+            for recognized_schema in [true, false] {
+                let temp = TempDir::new().unwrap();
+                let first = temp.path().join("opaque_a");
+                let second = temp.path().join("opaque_b");
+                let first_agent = first.join("agents/alice");
+                let first_sessions = first_agent.join("sessions");
+                let second_sessions = second.join("agents/alice/sessions");
+                fs::create_dir_all(&first_sessions).unwrap();
+                fs::create_dir_all(&second_sessions).unwrap();
+                let duplicate = write_minimal_openclaw_session(
+                    &first_sessions,
+                    "shared.jsonl",
+                    "/work",
+                    "same-directory migration leftover",
+                );
+                let unique = write_minimal_openclaw_session(
+                    &first_sessions,
+                    "legacy-only.jsonl",
+                    "/work",
+                    "unmatched first-mirror history",
+                );
+                let other = write_minimal_openclaw_session(
+                    &second_sessions,
+                    "shared.jsonl",
+                    "/work",
+                    "same ID in another physical mirror",
+                );
+                let db = create_agent_db(&first_agent);
+                seed_session(&db, "shared");
+                if !recognized_schema {
+                    let writer = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+                    writer
+                        .execute("ALTER TABLE transcript_events RENAME TO unrelated_events")
+                        .unwrap();
+                    drop(writer);
+                }
+                let mut paths = database_bundle_paths(&db);
+                paths.extend([duplicate.clone(), unique.clone(), other.clone()]);
+                let before = source_snapshot(&paths);
+                let root_a = mirrored_test_root(&first, "~/.openclaw/agents");
+                let mut root_b = mirrored_test_root(&second, "~/.openclaw/agents");
+                root_b.origin = crate::types::Origin::remote_with_host("other", "user@other");
+                let ctx = ScanContext::with_roots(
+                    temp.path().join("state"),
+                    vec![root_b.clone(), root_a.clone(), root_a],
+                    None,
+                );
+                let connector = OpenClawConnector::new();
+                let discovered = connector.discover_source_files(&ctx).unwrap();
+                assert_eq!(discovered.len(), 4, "declare native and legacy source bytes");
+                let second_source = discovered
+                    .iter()
+                    .find(|source| source.source_path == other)
+                    .unwrap();
+                assert_eq!(second_source.origin, root_b.origin);
+                let conversations = connector.scan(&ctx).unwrap();
+                assert_eq!(conversations.len(), 3);
+                let mut actual: Vec<_> = conversations
+                    .iter()
+                    .map(|conversation| conversation.source_path.clone())
+                    .collect();
+                actual.sort();
+                let authoritative = if recognized_schema { db.clone() } else { duplicate.clone() };
+                let mut expected = vec![authoritative, unique, other.clone()];
+                expected.sort();
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    conversations
+                        .iter()
+                        .filter(|conversation| {
+                            conversation.external_id.as_deref() == Some("alice/shared")
+                        })
+                        .count(),
+                    2,
+                    "equal external IDs in different physical mirrors are separate history"
+                );
+                let other_conversation = conversations
+                    .iter()
+                    .find(|conversation| conversation.source_path == other)
+                    .unwrap();
+                assert_eq!(
+                    other_conversation.messages[0].content,
+                    "same ID in another physical mirror"
+                );
+                assert_eq!(
+                    serde_json::to_value(connector.scan(&ctx).unwrap()).unwrap(),
+                    serde_json::to_value(&conversations).unwrap()
+                );
+                assert_eq!(source_snapshot(&paths), before);
+            }
+        }
+
+        #[test]
+        fn per_agent_contents_mirrors_keep_existing_native_structural_fallbacks() {
+            for (source, relative_db) in [
+                ("~/.openclaw/agents/alice/", "agent/openclaw-agent.sqlite"),
+                ("~/.openclaw/agents/alice/agent/", "openclaw-agent.sqlite"),
+            ] {
+                let temp = TempDir::new().unwrap();
+                let container = temp.path().join("opaque_contents");
+                let db = container.join(relative_db);
+                fs::create_dir_all(db.parent().unwrap()).unwrap();
+                let writer = Connection::open(db.to_string_lossy().as_ref()).unwrap();
+                writer
+                    .execute(
+                        "CREATE TABLE transcript_events (
+                            session_id TEXT NOT NULL,
+                            seq INTEGER NOT NULL,
+                            event_json TEXT NOT NULL,
+                            created_at INTEGER NOT NULL,
+                            PRIMARY KEY (session_id, seq)
+                        )",
+                    )
+                    .unwrap();
+                drop(writer);
+                seed_session(&db, "structural");
+                let root = mirrored_test_root(&container, source);
+                assert!(root.mirrored_store(&[".openclaw", "agents"]).is_none());
+                let mut structural = root.clone();
+                structural.mirrored_source_path = None;
+                let connector = OpenClawConnector::new();
+                let paths = database_bundle_paths(&db);
+                let before = source_snapshot(&paths);
+                let expected = connector
+                    .scan(&ScanContext::with_roots(
+                        temp.path().join("state"),
+                        vec![structural],
+                        None,
+                    ))
+                    .unwrap();
+                assert_eq!(expected.len(), 1);
+                let ctx = ScanContext::with_roots(
+                    temp.path().join("state"),
+                    vec![root],
+                    None,
+                );
+                let discovered = connector.discover_source_files(&ctx).unwrap();
+                assert_eq!(discovered.len(), 1);
+                assert_eq!(discovered[0].source_path, db);
+                assert_eq!(
+                    serde_json::to_value(connector.scan(&ctx).unwrap()).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                assert_eq!(source_snapshot(&paths), before);
+            }
         }
 
         #[test]
