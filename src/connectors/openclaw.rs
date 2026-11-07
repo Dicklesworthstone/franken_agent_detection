@@ -250,7 +250,13 @@ impl OpenClawConnector {
         if let Some(explicit) = Self::session_root_from_candidate(path)
             && Self::looks_like_openclaw_storage(&explicit)
         {
-            roots.push(explicit);
+            // Preserve a selected file as the traversal boundary. Its parent
+            // supplies agent/session identity later, never sibling admission.
+            roots.push(if path.is_file() {
+                path.to_path_buf()
+            } else {
+                explicit
+            });
         }
 
         let embedded_agents = path.join(".openclaw").join("agents");
@@ -356,13 +362,17 @@ impl OpenClawConnector {
             }
         }
 
+        let mut seen_files = std::collections::HashSet::new();
         for mut root in Self::source_roots(ctx) {
+            let files = Self::session_files(&root.path);
             if root.path.is_file() {
                 let parent = root.path.parent().unwrap_or(&root.path).to_path_buf();
                 root = root.with_path(parent);
             }
-            for file in Self::session_files(&root.path) {
-                if !file_modified_since(&file, ctx.since_ts) {
+            for file in files {
+                if !seen_files.insert(super::utils::dedupe_path_key(&file))
+                    || !file_modified_since(&file, ctx.since_ts)
+                {
                     continue;
                 }
                 out.push(
@@ -1029,15 +1039,16 @@ impl Connector for OpenClawConnector {
         }
 
         let mut scanned_agents = 0usize;
+        let mut seen_files = std::collections::HashSet::new();
 
         for mut root in roots {
+            let files = Self::session_files(&root);
             if root.is_file() {
                 root = root.parent().unwrap_or(&root).to_path_buf();
             }
 
             let agent_directory = Self::agent_directory_from_sessions_root(&root);
             let agent_slug = Self::agent_slug_for_directory(&agent_directory);
-            let files = Self::session_files(&root);
             let mut agent_file_count = 0usize;
             let mut agent_session_count = 0usize;
             let mut agent_error_count = 0usize;
@@ -1047,6 +1058,9 @@ impl Connector for OpenClawConnector {
                 "openclaw: scanning agent directory"
             );
             'sources: for file in files {
+                if !seen_files.insert(super::utils::dedupe_path_key(&file)) {
+                    continue;
+                }
                 agent_file_count += 1;
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
@@ -1621,6 +1635,145 @@ mod tests {
 
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].agent_slug, "openclaw/alice");
+    }
+
+    #[test]
+    fn explicit_jsonl_file_keeps_its_scope_and_identity() {
+        for (agent, slug, external_id) in [
+            ("openclaw", "openclaw", "selected"),
+            ("alice", "openclaw/alice", "alice/selected"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let sessions = tmp
+                .path()
+                .join(".openclaw/agents")
+                .join(agent)
+                .join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let selected =
+                write_minimal_openclaw_session(&sessions, "selected.jsonl", "/project", "selected");
+            let sibling =
+                write_minimal_openclaw_session(&sessions, "sibling.jsonl", "/other", "unselected");
+            let before: Vec<_> = [&selected, &sibling]
+                .into_iter()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        fs::read(path).unwrap(),
+                        fs::metadata(path).unwrap().modified().unwrap(),
+                    )
+                })
+                .collect();
+            let root = ScanRoot::remote(
+                selected.clone(),
+                crate::types::Origin::remote("laptop"),
+                Some(crate::types::Platform::Linux),
+            );
+            let directory_root = root.with_path(sessions.clone());
+            let ctx = ScanContext::with_roots(tmp.path().to_path_buf(), vec![root], None);
+            let connector = OpenClawConnector::new();
+
+            let discovered = connector.discover_source_files(&ctx).unwrap();
+            assert_eq!(
+                discovered,
+                vec![
+                    DiscoveredSourceFile::new(
+                        "openclaw",
+                        &directory_root,
+                        selected.clone(),
+                        DiscoveredSourceRole::PrimarySessionLog,
+                        true,
+                    )
+                    .with_fs_metadata()
+                ],
+                "an explicit file must not discover its sibling"
+            );
+            let conversations = connector.scan(&ctx).unwrap();
+            assert_eq!(conversations.len(), 1, "agent {agent}");
+            assert_eq!(conversations[0].source_path, selected);
+            assert_eq!(conversations[0].agent_slug, slug);
+            assert_eq!(conversations[0].external_id.as_deref(), Some(external_id));
+            assert_eq!(conversations[0].messages[0].content, "selected");
+
+            let directory_ctx =
+                ScanContext::with_roots(tmp.path().to_path_buf(), vec![directory_root], None);
+            let directory_conversations = connector.scan(&directory_ctx).unwrap();
+            assert_eq!(directory_conversations.len(), 2);
+            let same_session = directory_conversations
+                .iter()
+                .find(|conversation| conversation.source_path == selected)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&conversations[0]).unwrap(),
+                serde_json::to_value(same_session).unwrap(),
+                "file and directory selection must preserve conversation identity"
+            );
+            let default_conversations = connector
+                .scan(&ScanContext::local_default(sessions, None))
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(default_conversations).unwrap(),
+                serde_json::to_value(directory_conversations).unwrap()
+            );
+            for (path, bytes, modified) in before {
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_jsonl_selections_are_deterministic_and_deduplicated() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/alice/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let first = write_minimal_openclaw_session(&sessions, "a.jsonl", "/a", "first");
+        let second = write_minimal_openclaw_session(&sessions, "b.jsonl", "/b", "second");
+        let sibling = write_minimal_openclaw_session(&sessions, "c.jsonl", "/c", "sibling");
+        let connector = OpenClawConnector::new();
+
+        for (roots, expected) in [
+            (
+                vec![second.clone(), first.clone(), second.clone()],
+                vec![first.clone(), second.clone()],
+            ),
+            (vec![first.clone(), sessions], vec![first, second, sibling]),
+        ] {
+            let ctx = ScanContext::with_roots(
+                tmp.path().to_path_buf(),
+                roots.into_iter().map(ScanRoot::local).collect(),
+                None,
+            );
+            let discovered: Vec<_> = connector
+                .discover_source_files(&ctx)
+                .unwrap()
+                .into_iter()
+                .map(|source| source.source_path)
+                .collect();
+            assert_eq!(discovered, expected);
+            let scanned: Vec<_> = connector
+                .scan(&ctx)
+                .unwrap()
+                .into_iter()
+                .map(|conversation| conversation.source_path)
+                .collect();
+            assert_eq!(scanned, expected);
+        }
+    }
+
+    #[test]
+    fn explicit_non_jsonl_file_does_not_expand_to_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".openclaw/agents/alice/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        write_minimal_openclaw_session(&sessions, "sibling.jsonl", "/other", "unselected");
+        let metadata = sessions.join("sessions.json");
+        fs::write(&metadata, "{}").unwrap();
+
+        let connector = OpenClawConnector::new();
+        let ctx = ctx_with_root(&metadata);
+        assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
+        assert!(connector.scan(&ctx).unwrap().is_empty());
     }
 
     #[test]
