@@ -522,7 +522,7 @@ impl ChatGptConnector {
                 }
             });
 
-            for (_, _, msg) in msg_nodes {
+            for (_, node_id, msg) in msg_nodes {
                 // Get role
                 let role = msg
                     .get("author")
@@ -543,7 +543,20 @@ impl ChatGptConnector {
                 {
                     parts
                         .iter()
-                        .filter_map(|p| p.as_str())
+                        .filter_map(|part| {
+                            if let Some(text) = part.as_str() {
+                                return Some(text);
+                            }
+                            // Voice transcripts are text; asset pointers and
+                            // other structured payloads are not, even when
+                            // they happen to contain a `text` field.
+                            if part.get("content_type").and_then(Value::as_str)
+                                != Some("audio_transcription")
+                            {
+                                return None;
+                            }
+                            part.get("text").and_then(Value::as_str)
+                        })
                         .collect::<Vec<_>>()
                         .join("\n")
                 } else if let Some(text) = content_val
@@ -589,13 +602,29 @@ impl ChatGptConnector {
                     .and_then(|v| v.as_str())
                     .map(String::from);
 
+                // Positions shift when previously unsupported messages become
+                // readable. Preserve provider identity so archive consumers can
+                // reconcile the full snapshot without treating idx as identity.
+                let mut extra = msg.clone();
+                if let Some(object) = extra.as_object_mut() {
+                    let native_id = msg
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .unwrap_or(&node_id);
+                    object.insert(
+                        "chatgpt_message_id".to_string(),
+                        Value::String(native_id.to_owned()),
+                    );
+                }
+
                 messages.push(NormalizedMessage {
                     idx: messages.len() as i64,
                     role: role.to_string(),
                     author: model,
                     created_at,
                     content: content_str,
-                    extra: msg.clone(),
+                    extra,
                     invocations: Vec::new(),
                     snippets: Vec::new(),
                 });
@@ -642,13 +671,26 @@ impl ChatGptConnector {
                     (None, None) => None,
                 };
 
+                let mut extra = item.clone();
+                if let Some(native_id) = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    && let Some(object) = extra.as_object_mut()
+                {
+                    object.insert(
+                        "chatgpt_message_id".to_string(),
+                        Value::String(native_id.to_owned()),
+                    );
+                }
+
                 messages.push(NormalizedMessage {
                     idx: messages.len() as i64,
                     role: role.to_string(),
                     author: None,
                     created_at,
                     content: content.to_string(),
-                    extra: item.clone(),
+                    extra,
                     invocations: Vec::new(),
                     snippets: Vec::new(),
                 });
@@ -1065,6 +1107,132 @@ mod tests {
         assert_eq!(conv.messages[1].role, "assistant");
         assert!(conv.messages[1].content.contains("How can I help"));
         assert_eq!(conv.messages[1].author, Some("gpt-4".to_string()));
+    }
+
+    #[test]
+    fn parse_mapping_reads_voice_transcriptions_in_part_order() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("voice.json");
+        let conversation = json!({
+            "id": "voice-conversation",
+            "mapping": {
+                "voice-in": {"message": {
+                    "id": "native-voice-in",
+                    "author": {"role": "user"},
+                    "create_time": 1700000000.25,
+                    "content": {"content_type": "multimodal_text", "parts": [
+                        {"content_type": "real_time_user_audio_video_asset_pointer",
+                         "text": "asset metadata is not speech"},
+                        {"content_type": "audio_transcription", "text": "¿Dónde está la impresora?", "direction": "in"}
+                    ]}
+                }},
+                "voice-out": {"message": {
+                    "author": {"role": "assistant"},
+                    "create_time": 1700000001.5,
+                    "metadata": {"model_slug": "gpt-4o"},
+                    "content": {"content_type": "multimodal_text", "parts": [
+                        {"content_type": "audio_transcription", "text": "Check the Wi-Fi setting first.", "direction": "out"},
+                        {"content_type": "audio_asset_pointer", "text": "not a transcript"}
+                    ]}
+                }},
+                "mixed": {"message": {
+                    "author": {"role": "user"},
+                    "create_time": 1700000002.0,
+                    "content": {"parts": [
+                        "Before.",
+                        {"content_type": "audio_transcription", "text": "Spoken middle."},
+                        {"content_type": "image_asset_pointer", "text": "not image text"},
+                        "After.",
+                        {"content_type": "audio_transcription", "text": 42},
+                        {"content_type": "audio_transcription"},
+                        {"text": "untyped object"}, null, 7
+                    ]}
+                }},
+                "assets-only": {"message": {
+                    "author": {"role": "user"},
+                    "create_time": 1700000003.0,
+                    "content": {"parts": [
+                        {"content_type": "image_asset_pointer", "text": "ignore this"},
+                        {"content_type": "video_asset_pointer", "text": "ignore this too"},
+                        {"content_type": "audio_transcription", "text": "  \n\t"}
+                    ]}
+                }}
+            }
+        });
+        fs::write(&path, conversation.to_string()).unwrap();
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        let parsed = connector
+            .parse_conversation_file(&path, None, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(parsed.messages[0].content, "¿Dónde está la impresora?");
+        assert_eq!(parsed.messages[0].role, "user");
+        assert_eq!(parsed.messages[1].content, "Check the Wi-Fi setting first.");
+        assert_eq!(parsed.messages[1].role, "assistant");
+        assert_eq!(parsed.messages[1].author.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            parsed.messages[2].content,
+            "Before.\nSpoken middle.\nAfter."
+        );
+        assert_eq!(parsed.started_at, Some(1_700_000_000_250));
+        assert_eq!(parsed.ended_at, Some(1_700_000_002_000));
+        assert_eq!(
+            parsed.messages[0].extra["chatgpt_message_id"],
+            "native-voice-in"
+        );
+        assert_eq!(parsed.messages[0].extra["id"], "native-voice-in");
+        assert_eq!(parsed.messages[1].extra["chatgpt_message_id"], "voice-out");
+    }
+
+    #[test]
+    fn parse_preserves_message_identity_when_filtered_positions_shift() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("snapshot.json");
+        let mut conversation = json!({
+            "id": "mutable-snapshot",
+            "mapping": {
+                "earlier": {"message": {
+                    "author": {"role": "user"},
+                    "create_time": 1700000000.0,
+                    "content": {"parts": []}
+                }},
+                "later": {"message": {
+                    "id": "native-later",
+                    "author": {"role": "assistant"},
+                    "create_time": 1700000001.0,
+                    "content": {"parts": ["Existing reply"]}
+                }}
+            }
+        });
+        let connector = ChatGptConnector {
+            encryption_key: None,
+        };
+        fs::write(&path, conversation.to_string()).unwrap();
+        let before = connector
+            .parse_conversation_file(&path, None, false)
+            .unwrap()
+            .unwrap();
+        conversation["mapping"]["earlier"]["message"]["content"]["parts"] =
+            json!([{"content_type": "audio_transcription", "text": "Recovered prompt"}]);
+        fs::write(&path, conversation.to_string()).unwrap();
+        let after = connector
+            .parse_conversation_file(&path, None, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.messages.len(), 1);
+        assert_eq!(after.messages.len(), 2);
+        assert_eq!(before.messages[0].idx, 0);
+        assert_eq!(after.messages[1].idx, 1);
+        assert_eq!(
+            before.messages[0].extra["chatgpt_message_id"],
+            "native-later"
+        );
+        assert_eq!(before.messages[0].extra, after.messages[1].extra);
+        assert_eq!(after.messages[0].extra["chatgpt_message_id"], "earlier");
     }
 
     #[test]
