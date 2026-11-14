@@ -71,12 +71,13 @@ fn excluded_scan_paths_from(value: &str, cwd: Option<&Path>) -> anyhow::Result<V
                 written.display()
             )
         })?;
-        let resolved = resolve_existing_ancestor(&absolute).with_context(|| {
-            format!(
-                "cannot resolve CASS_EXCLUDE_PATHS entry '{}'",
-                written.display()
-            )
-        })?;
+        let resolved = resolve_existing_ancestor(&absolute, ExistingPathKind::Filesystem)
+            .with_context(|| {
+                format!(
+                    "cannot resolve CASS_EXCLUDE_PATHS entry '{}'",
+                    written.display()
+                )
+            })?;
         push(resolved);
         push(absolute);
         push(written);
@@ -95,10 +96,19 @@ fn absolute_path(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     absolute.is_absolute().then_some(absolute)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExistingPathKind {
+    Filesystem,
+    VirtualSource,
+}
+
 /// Canonicalize the nearest existing ancestor of `path` and re-append the
 /// missing remainder, folding `.` and `..` only after the existing part is
 /// resolved (a symlink followed by `..` names the target's parent).
-fn resolve_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
+///
+/// Source identities may append a session ID to a regular database file. That
+/// virtual suffix is opaque, while policy entries must remain filesystem paths.
+fn resolve_existing_ancestor(path: &Path, kind: ExistingPathKind) -> std::io::Result<PathBuf> {
     use std::path::Component;
     for ancestor in path.ancestors() {
         match std::fs::canonicalize(ancestor) {
@@ -109,6 +119,15 @@ fn resolve_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
                         "exclusion path is not under its own ancestor",
                     )
                 })?;
+                if kind == ExistingPathKind::VirtualSource
+                    && !remainder.as_os_str().is_empty()
+                    && std::fs::metadata(&resolved_ancestor)?.is_file()
+                {
+                    // A virtual session identifier is not filesystem traversal.
+                    // Keep even `..` under the canonical database so an alias
+                    // cannot escape an exclusion of the backing file.
+                    return Ok(resolved_ancestor.join(remainder));
+                }
                 let mut resolved = PathBuf::new();
                 for component in resolved_ancestor.join(remainder).components() {
                     match component {
@@ -121,7 +140,10 @@ fn resolve_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
                 }
                 return Ok(resolved);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || (kind == ExistingPathKind::VirtualSource
+                        && error.kind() == std::io::ErrorKind::NotADirectory) => {}
             Err(error) => return Err(error),
         }
     }
@@ -158,7 +180,7 @@ pub(crate) fn path_is_excluded(path: &Path, excluded_paths: &[PathBuf]) -> bool 
     let Some(absolute) = absolute_path(path, cwd.as_deref()) else {
         return true;
     };
-    resolve_existing_ancestor(&absolute).map_or(true, |resolved| {
+    resolve_existing_ancestor(&absolute, ExistingPathKind::VirtualSource).map_or(true, |resolved| {
         excluded_paths
             .iter()
             .any(|excluded| resolved.starts_with(excluded))
@@ -443,6 +465,89 @@ mod exclusion_tests {
             &gone.display().to_string(),
             dir.path(),
             &dir.path().join("projects/open/b.jsonl")
+        ));
+    }
+
+    #[test]
+    fn virtual_database_sources_only_match_related_exclusions() {
+        let dir = tree();
+        let root = dir.path();
+        let databases = [
+            "opencode/opencode.db",
+            "devin/cli/sessions.db",
+            "goose/sessions.db",
+            "hermes/state.db",
+        ];
+        for database in databases {
+            let db = root.join(database);
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            std::fs::write(&db, "database fixture").unwrap();
+            let source = db.join("ses_example");
+            for unrelated in [root.join("projects/secret"), root.join("missing-private")] {
+                assert!(
+                    !excludes(unrelated.to_str().unwrap(), root, &source),
+                    "unrelated {unrelated:?} must not exclude virtual source {source:?}"
+                );
+            }
+            for related in [&db, db.parent().unwrap()] {
+                assert!(excludes(related.to_str().unwrap(), root, &source));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_policy_entries_cannot_have_children_under_regular_files() {
+        let dir = tree();
+        let invalid = dir.path().join("projects/secret/a.jsonl/child");
+        let policy = format!(
+            "{},{}",
+            dir.path().join("sessions").display(),
+            invalid.display()
+        );
+        assert!(excluded_scan_paths_from(&policy, Some(dir.path())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn virtual_database_sources_resolve_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tree();
+        let root = dir.path();
+        let db = root.join("projects/secret/opencode.db");
+        std::fs::write(&db, "database fixture").unwrap();
+        let file_alias = root.join("database-alias");
+        let directory_alias = root.join("directory-alias");
+        symlink(&db, &file_alias).unwrap();
+        symlink(db.parent().unwrap(), &directory_alias).unwrap();
+        for source in [
+            file_alias.join("ses_example"),
+            directory_alias.join("opencode.db/ses_example"),
+            // Session identifiers are opaque: even a `..` suffix must not
+            // escape an exclusion of the physical file behind an alias.
+            file_alias.join(".."),
+        ] {
+            for excluded in [&db, db.parent().unwrap(), &file_alias, &directory_alias] {
+                assert!(
+                    excludes(excluded.to_str().unwrap(), root, &source),
+                    "{excluded:?} must exclude virtual source {source:?}"
+                );
+            }
+            assert!(!excludes("projects/open", root, &source));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_virtual_sources_still_fail_closed() {
+        let dir = tree();
+        let alias = dir.path().join("loop");
+        std::os::unix::fs::symlink(&alias, &alias).unwrap();
+        assert!(excludes(
+            "projects/open",
+            dir.path(),
+            &alias.join("ses_example")
         ));
     }
 
