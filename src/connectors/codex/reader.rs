@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use super::super::jsonl::recover_jsonl_suffix;
 use super::super::utils::MAX_SCAN_FILE_BYTES;
 
 const PROGRESS_LINE_STRIDE: usize = 1024;
@@ -274,6 +275,7 @@ struct Records<'a, R> {
     line: String,
     line_number: usize,
     bytes_read: u64,
+    recovered: Option<(usize, std::vec::IntoIter<Value>)>,
     progress_tick: Option<&'a (dyn Fn() + Send + Sync)>,
 }
 
@@ -284,11 +286,18 @@ impl<'a, R: BufRead> Records<'a, R> {
             line: String::new(),
             line_number: 0,
             bytes_read: 0,
+            recovered: None,
             progress_tick,
         }
     }
 
     fn next_record(&mut self) -> Result<Option<(usize, Value)>> {
+        if let Some((index, records)) = &mut self.recovered {
+            if let Some(value) = records.next() {
+                return Ok(Some((*index, value)));
+            }
+            self.recovered = None;
+        }
         loop {
             if self.line_number % PROGRESS_LINE_STRIDE == 0 {
                 if let Some(tick) = self.progress_tick {
@@ -313,20 +322,36 @@ impl<'a, R: BufRead> Records<'a, R> {
             }
             match serde_json::from_str(text) {
                 Ok(value) => return Ok(Some((index, value))),
-                Err(error) if !terminated && error.is_eof() => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "unfinished Codex JSONL record at line {}; retry this source",
-                            self.line_number
-                        ),
-                    )
-                    .into());
+                Err(error) => {
+                    // Diagnostics use the exact physical bytes excluding the
+                    // line terminator. Do not trim whitespace or a BOM out of
+                    // recovery's budget, even though ordinary parsing accepts
+                    // those at the start of an intact record.
+                    let physical_line = self
+                        .line
+                        .strip_suffix('\n')
+                        .map_or(self.line.as_str(), |line| {
+                            line.strip_suffix('\r').unwrap_or(line)
+                        });
+                    let mut recovered = recover_jsonl_suffix(physical_line).records.into_iter();
+                    if let Some(value) = recovered.next() {
+                        self.recovered = Some((index, recovered));
+                        return Ok(Some((index, value)));
+                    }
+                    if !terminated && error.is_eof() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "unfinished Codex JSONL record at line {}; retry this source",
+                                self.line_number
+                            ),
+                        )
+                        .into());
+                    }
+                    // Keep the existing malformed-historical-record policy.
+                    // Only an unfinished final record or read failure aborts.
+                    // Never include potentially private record text in errors.
                 }
-                // Keep the existing malformed-historical-record policy. Only
-                // an unfinished final record or an actual read failure aborts.
-                // Never include the record's potentially private text in errors.
-                Err(_) => {}
             }
         }
     }
@@ -367,6 +392,71 @@ mod tests {
         );
         assert!(records.next_record().unwrap().is_none());
         assert_eq!(records.bytes_read, bytes.len() as u64);
+    }
+
+    #[test]
+    fn recovered_records_keep_the_same_physical_index_and_complete_eof() {
+        let first = serde_json::json!({"type":"response_item", "timestamp":1,
+            "payload":{"type":"message", "role":"user", "content":"first recovered"}});
+        let second = serde_json::json!({"type":"response_item", "timestamp":2,
+            "payload":{"type":"function_call_output", "call_id":"call_1", "output":"second recovered"}});
+        for ending in ["", "\r\n"] {
+            let body = format!("{{\"before\":true}}\n{{\"content\":\"torn{first}{second}{ending}");
+            let ticks = AtomicUsize::new(0);
+            let tick = || {
+                ticks.fetch_add(1, Ordering::Relaxed);
+            };
+            let mut records = Records::new(Cursor::new(&body), Some(&tick));
+            assert_eq!(
+                records.next_record().unwrap(),
+                Some((0, serde_json::json!({"before":true})))
+            );
+            assert_eq!(records.next_record().unwrap(), Some((1, first.clone())));
+            assert_eq!(records.next_record().unwrap(), Some((1, second.clone())));
+            assert!(records.next_record().unwrap().is_none());
+            assert_eq!(records.bytes_read, body.len() as u64);
+            assert_eq!(ticks.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn nested_message_in_unfinished_outer_record_still_fails_at_eof() {
+        let body = r#"{"payload":{"role":"user","content":"nested phantom"}"#;
+        let mut records = Records::new(Cursor::new(body), None);
+        let error = records.next_record().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(!error.to_string().contains("nested phantom"));
+    }
+
+    #[test]
+    fn recovery_budget_counts_whitespace_but_excludes_the_line_terminator() {
+        use super::super::super::jsonl::MAX_JSONL_RECOVERY_LINE_BYTES;
+
+        let record = r#"{"role":"user","content":"complete"}"#;
+        let body = format!(
+            "{}torn{record}\r\n{{\"next\":true}}\n",
+            " ".repeat(MAX_JSONL_RECOVERY_LINE_BYTES)
+        );
+        let mut records = Records::new(Cursor::new(&body), None);
+        assert_eq!(
+            records.next_record().unwrap(),
+            Some((1, serde_json::json!({"next":true})))
+        );
+        assert!(records.next_record().unwrap().is_none());
+
+        let body = format!(
+            "{}{record}\r\n",
+            "x".repeat(MAX_JSONL_RECOVERY_LINE_BYTES - record.len())
+        );
+        let mut records = Records::new(Cursor::new(&body), None);
+        assert_eq!(
+            records.next_record().unwrap(),
+            Some((0, serde_json::from_str(record).unwrap()))
+        );
+        assert!(records.next_record().unwrap().is_none());
     }
 
     #[test]

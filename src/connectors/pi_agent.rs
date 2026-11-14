@@ -1072,6 +1072,90 @@ mod tests {
     }
 
     #[test]
+    fn scan_recovers_complete_tool_result_after_torn_thinking_signature() {
+        let header = r#"{"type":"session","version":3,"id":"00000000-0000-4000-8000-0000000000aa","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/repro"}"#;
+        let first = r#"{"type":"message","id":"a0000001","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"alpha marker one"}],"timestamp":1767225601000}}"#;
+        let torn = r#"{"type":"message","id":"a0000002","parentId":"a0000001","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"delta marker thinking","thinkingSignature":"sigsigsigsig"#;
+        let tool = r#"{"type":"message","id":"a0000003","parentId":"a0000002","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":[{"type":"text","text":"bravo marker two"}],"details":{},"isError":false,"timestamp":1767225603000}}"#;
+        let last = r#"{"type":"message","id":"a0000004","parentId":"a0000003","timestamp":"2026-01-01T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"charlie marker three"}],"timestamp":1767225604000}}"#;
+        let mut results = Vec::new();
+        for prefix in ["", torn] {
+            let dir = TempDir::new().unwrap();
+            let storage = create_pi_agent_storage(&dir);
+            let body = format!("{header}\n{first}\n{prefix}{tool}\n{last}\n");
+            let path = storage.join("sessions/2026-01-01T00-00-00_recovery.jsonl");
+            fs::write(&path, &body).unwrap();
+            let conversations = PiAgentConnector::new()
+                .scan(&ScanContext::local_default(storage, None))
+                .unwrap();
+            assert_eq!(conversations.len(), 1);
+            let conversation = &conversations[0];
+            assert_eq!(conversation.messages.len(), 3);
+            assert_eq!(conversation.messages[0].content, "alpha marker one");
+            assert_eq!(conversation.messages[1].content, "bravo marker two");
+            assert_eq!(conversation.messages[1].role, "tool");
+            assert_eq!(conversation.messages[1].extra["id"], "a0000003");
+            assert_eq!(conversation.messages[1].extra["cass"]["source_line"], 3);
+            assert_eq!(conversation.messages[2].content, "charlie marker three");
+            assert_eq!(conversation.messages[2].extra["cass"]["source_line"], 4);
+            assert_eq!(fs::read_to_string(&path).unwrap(), body);
+            results.push(
+                conversation
+                    .messages
+                    .iter()
+                    .map(|message| {
+                        (
+                            message.idx,
+                            message.role.clone(),
+                            message.content.clone(),
+                            message.created_at,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(results[0], results[1], "torn and control sessions agree");
+    }
+
+    #[test]
+    fn scan_recovers_multiple_records_with_physical_lines_and_model_provenance() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_pi_agent_storage(&dir);
+        let path = storage.join("sessions/2026-01-01T00-00-00_multiple.jsonl");
+        let body = concat!(
+            "{\"type\":\"session\",\"id\":\"multiple\",\"cwd\":\"/tmp/repro\"}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n",
+            "{\"type\":\"message\",\"message\":{\"content\":\"cut signature",
+            "{\"type\":\"message\",\"id\":\"tool1\",\"parentId\":\"u1\",\"message\":{\"role\":\"toolResult\",\"content\":\"recovered result\"}}",
+            "{\"type\":\"message\",\"id\":\"u2\",\"parentId\":\"tool1\",\"message\":{\"role\":\"user\",\"content\":\"recovered user turn\"}}",
+            "{\"type\":\"model_change\",\"id\":\"m1\",\"parentId\":\"u2\",\"modelId\":\"recovered-model\",\"provider\":\"test-provider\"}\n",
+            "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"m1\",\"message\":{\"role\":\"assistant\",\"content\":\"last\"}}",
+        );
+        fs::write(&path, body).unwrap();
+        let conversations = PiAgentConnector::new()
+            .scan(&ScanContext::local_default(storage, None))
+            .unwrap();
+        assert_eq!(conversations.len(), 1);
+        let conversation = &conversations[0];
+        assert_eq!(conversation.messages.len(), 4);
+        assert_eq!(conversation.messages[1].content, "recovered result");
+        assert_eq!(conversation.messages[2].content, "recovered user turn");
+        assert_eq!(conversation.messages[1].extra["cass"]["source_line"], 3);
+        assert_eq!(conversation.messages[2].extra["cass"]["source_line"], 3);
+        assert_eq!(conversation.messages[3].extra["cass"]["source_line"], 4);
+        assert_eq!(
+            conversation.messages[3].author.as_deref(),
+            Some("recovered-model")
+        );
+        assert_eq!(
+            conversation.messages[3].extra["cass"]["provider"],
+            "test-provider"
+        );
+        assert_eq!(conversation.metadata["tree"]["total_entry_count"], 5);
+        assert_eq!(fs::read_to_string(path).unwrap(), body);
+    }
+
+    #[test]
     fn scan_skips_empty_lines() {
         let dir = TempDir::new().unwrap();
         let storage = create_pi_agent_storage(&dir);

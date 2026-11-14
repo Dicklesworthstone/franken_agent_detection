@@ -26,6 +26,7 @@
 //! - `model_change` entries carry a bare `model` field (pi-mono writes
 //!   `provider` + `modelId`); either spelling updates the tracked model.
 
+use super::jsonl::parse_jsonl_line;
 use super::utils::{dedupe_path_key, excluded_scan_paths_from_env, path_is_excluded, read_capped};
 use crate::types::{NormalizedConversation, NormalizedMessage};
 use anyhow::Result;
@@ -862,14 +863,13 @@ fn parse_session_records<'a>(
     let mut labels: HashMap<String, String> = HashMap::new();
     let mut header_leaf: Option<String> = None;
 
-    for (line_idx, line) in records.into_iter().enumerate() {
-        let line = line.trim_start_matches('\u{feff}');
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(val) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    // Preserve the physical source position when a torn line contains several
+    // complete entries. Their tree/file order is independent of that position.
+    for (line_idx, val) in records
+        .into_iter()
+        .enumerate()
+        .flat_map(|(line_idx, line)| parse_jsonl_line(line).map(move |val| (line_idx, val)))
+    {
         let this_index = file_index;
         file_index += 1;
 

@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
-use super::jsonl::JsonlLines;
+use super::jsonl::{JsonlLines, parse_jsonl_line};
 use super::scan::{
     DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
     SourceScanHooks,
@@ -712,25 +712,21 @@ fn scan_claude_with_readers<R: BufRead>(
                     }
                 };
 
-                for line_res in JsonlLines::new(reader) {
-                    let line = match line_res {
-                        Ok(line) => line,
+                for value_res in JsonlLines::new(reader).flat_map(|line_res| {
+                    let (records, error) = match line_res {
+                        Ok(line) => (Some(parse_jsonl_line(&line)), None),
+                        Err(error) => (None, Some(error)),
+                    };
+                    records.into_iter().flatten().map(Ok).chain(error.map(Err))
+                }) {
+                    let val = match value_res {
+                        Ok(val) => val,
                         Err(error) => {
                             read_failures.record(&path, "read", error);
                             // Never emit or certify an incompletely read source.
                             continue 'sources;
                         }
                     };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    // Strip a UTF-8 BOM so the first record (often
-                    // session_meta or the first prompt) is not silently lost.
-                    let line = line.trim_start_matches('\u{feff}');
-                    let Ok(val) = serde_json::from_str::<Value>(line) else {
-                        continue;
-                    };
-
                     if workspace.is_none() {
                         workspace = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
                     }
@@ -2386,6 +2382,35 @@ mod tests {
         // Should still extract the valid line
         assert_eq!(convs[0].messages.len(), 1);
         assert_eq!(convs[0].messages[0].content, "Valid message");
+    }
+
+    #[test]
+    fn scan_recovers_complete_turns_and_tool_results_after_torn_jsonl_prefix() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let path = claude_dir.join("session.jsonl");
+        let content = concat!(
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"signature\":\"torn",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"recovered tool result\"}]}}",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"recovered reply\"}}\n",
+            "{\"message\":{\"role\":\"user\",\"content\":\"nested phantom\"}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"last\"}}\n",
+        );
+        fs::write(&path, content).unwrap();
+        let conversations = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir, None))
+            .unwrap();
+        assert_eq!(conversations.len(), 1);
+        let messages = &conversations[0].messages;
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].content, "first");
+        assert_eq!(messages[1].role, "tool");
+        assert_eq!(messages[1].content, "recovered tool result");
+        assert_eq!(messages[1].extra["tool_use_id"], "call_1");
+        assert_eq!(messages[2].content, "recovered reply");
+        assert_eq!(messages[3].content, "last");
+        assert_eq!(fs::read_to_string(path).unwrap(), content);
     }
 
     #[test]
