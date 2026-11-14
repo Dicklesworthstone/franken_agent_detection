@@ -26,10 +26,10 @@
 //! - `model_change` entries carry a bare `model` field (pi-mono writes
 //!   `provider` + `modelId`); either spelling updates the tracked model.
 
-use super::jsonl::JsonlLines;
+use super::jsonl::{JsonlLines, parse_jsonl_line};
 use super::utils::{
     dedupe_path_key, excluded_scan_paths_from_env, open_capped_reader, path_is_excluded,
-    unwrap_skill_invocations,
+    read_capped, unwrap_skill_invocations,
 };
 use crate::types::{NormalizedConversation, NormalizedMessage};
 use anyhow::Result;
@@ -883,7 +883,7 @@ fn parse_session_records<S: AsRef<str>>(
     let mut labels: HashMap<String, String> = HashMap::new();
     let mut header_leaf: Option<String> = None;
 
-    for (line_idx, line_res) in records.into_iter().enumerate() {
+for (line_idx, line_res) in records.into_iter().enumerate() {
         let line = match line_res {
             Ok(line) => line,
             Err(e) => {
@@ -899,9 +899,9 @@ fn parse_session_records<S: AsRef<str>>(
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(val) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+        // Preserve the physical source position when a torn line contains several
+        // complete entries. Their tree/file order is independent of that position.
+        for val in parse_jsonl_line(line) {
         let this_index = file_index;
         file_index += 1;
 
@@ -990,6 +990,7 @@ fn parse_session_records<S: AsRef<str>>(
             file_index: this_index,
             parent: None,
         });
+        }
     }
 
     let tree = WireTree::build(

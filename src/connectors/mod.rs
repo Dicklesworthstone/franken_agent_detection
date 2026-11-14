@@ -31,7 +31,7 @@ pub mod grok;
 pub mod grok_bot;
 #[cfg(feature = "hermes")]
 pub mod hermes;
-pub(crate) mod jsonl;
+pub mod jsonl;
 pub mod kimi;
 pub mod kiro;
 pub mod muse;
