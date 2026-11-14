@@ -71,6 +71,14 @@ window is since `v0.3.11` (2026-11-03).
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve virtual conversation source paths beneath database files when checking
+  exclusions (`CASS #554`). Unrelated exclusions no longer suppress these
+  sources; database and parent-directory exclusions still follow symlinks.
+  Virtual session identifiers stay beneath their backing file, while malformed
+  filesystem policy entries and unresolvable sources continue to fail closed.
+
 ## [0.3.11] -- 2026-11-03
 
 ### Added
