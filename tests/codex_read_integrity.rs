@@ -247,3 +247,198 @@ fn malformed_historical_lines_bom_and_complete_eof_remain_supported() {
     assert_eq!(conversations[0].messages[1].content, "last");
     assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
 }
+
+#[test]
+fn host_tail_recovery_preserves_complete_history_on_all_routes_and_later_appends() {
+    let tail = record("completed later");
+    let split = tail.len() / 2;
+    let bytes = format!("{}\n{}", record("retained complete turn"), &tail[..split]);
+    let (_root, path, ctx) = fixture(bytes.as_bytes());
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let connector = CodexConnector::new().with_incomplete_tail_recovery(|source| {
+        source
+            .file_name()
+            .is_some_and(|name| name == "rollout-integrity.jsonl")
+    });
+
+    for _ in 0..2 {
+        for route in 0..3 {
+            let mut conversations = Vec::new();
+            let mut completed = 0;
+            match route {
+                0 => conversations = connector.scan(&ctx).unwrap(),
+                1 => connector
+                    .scan_with_callback(&ctx, &mut |conversation| {
+                        conversations.push(conversation);
+                        Ok(())
+                    })
+                    .unwrap(),
+                _ => {
+                    let mut complete = |done: &SourceCompletion| {
+                        assert_eq!(done.source.source_path, path);
+                        assert_eq!(done.conversations_emitted, 1);
+                        completed += 1;
+                        Ok(())
+                    };
+                    let mut hooks = SourceScanHooks {
+                        should_scan_source: None,
+                        on_source_complete: Some(&mut complete),
+                    };
+                    connector
+                        .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+                            conversations.push(conversation);
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            }
+            assert_eq!(conversations.len(), 1, "route {route}");
+            assert_eq!(conversations[0].messages.len(), 1, "route {route}");
+            assert_eq!(
+                conversations[0].messages[0].content,
+                "retained complete turn"
+            );
+            assert_eq!(conversations[0].source_path, path);
+            assert_eq!(completed, usize::from(route == 2));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+        // The opt-in is local to this connector. Other scanners and a host's
+        // negative activity decision must retain the strict retry contract.
+        assert_rejected(&ctx, io::ErrorKind::UnexpectedEof);
+        assert_kind(
+            &CodexConnector::new()
+                .with_incomplete_tail_recovery(|_| false)
+                .scan(&ctx)
+                .unwrap_err(),
+            io::ErrorKind::UnexpectedEof,
+        );
+    }
+
+    let mut writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writer.write_all(&tail.as_bytes()[split..]).unwrap();
+    writeln!(writer).unwrap();
+    drop(writer);
+    let completed = std::fs::read(&path).unwrap();
+    let conversations = connector.scan(&ctx).unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].messages.len(), 2);
+    assert_eq!(conversations[0].messages[1].content, "completed later");
+    assert_eq!(std::fs::read(&path).unwrap(), completed);
+}
+
+#[test]
+fn host_tail_recovery_preserves_empty_history_without_inventing_output() {
+    let bytes = b"{\"type\":\"session_meta\",\"payload\":{}}\n{\"type\":";
+    let (_root, path, ctx) = fixture(bytes);
+    let connector = CodexConnector::new().with_incomplete_tail_recovery(|_| true);
+    // Keep the existing zero-output boundary contract: recovery must not
+    // fabricate a completion that normal metadata-only histories do not emit.
+    let mut complete =
+        |_: &SourceCompletion| panic!("a zero-output source must not invent a completion");
+    let mut hooks = SourceScanHooks {
+        should_scan_source: None,
+        on_source_complete: Some(&mut complete),
+    };
+    connector
+        .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| {
+            panic!("an incomplete first message must not create a conversation")
+        })
+        .unwrap();
+    assert!(connector.scan(&ctx).unwrap().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_rejected(&ctx, io::ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn host_tail_policy_does_not_relax_utf8_or_run_for_complete_records() {
+    let connector = CodexConnector::new().with_incomplete_tail_recovery(|_| {
+        panic!("only an incomplete final JSON record may ask for recovery")
+    });
+    for bytes in [
+        format!("{}\nnot-json\n", record("complete")).into_bytes(),
+        record("complete without newline").into_bytes(),
+    ] {
+        let (_root, _path, ctx) = fixture(&bytes);
+        assert_eq!(connector.scan(&ctx).unwrap()[0].messages.len(), 1);
+    }
+    for suffix in [&b"\xff\n"[..], &b"\xf0\x9f"[..]] {
+        let mut bytes = format!("{}\n", record("complete")).into_bytes();
+        bytes.extend_from_slice(suffix);
+        let (_root, _path, ctx) = fixture(&bytes);
+        assert_kind(
+            &connector.scan(&ctx).unwrap_err(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+}
+
+#[test]
+fn approved_tail_recovery_still_validates_the_final_source_snapshot() {
+    fn append(path: &std::path::Path) -> bool {
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(path).unwrap(),
+            "}}"
+        )
+        .unwrap();
+        true
+    }
+    fn truncate(path: &std::path::Path) -> bool {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        true
+    }
+    fn replace(path: &std::path::Path) -> bool {
+        std::fs::rename(path, path.with_extension("retained")).unwrap();
+        std::fs::write(path, record("replacement")).unwrap();
+        true
+    }
+
+    for recovery in [append, truncate, replace] {
+        let bytes = format!("{}\n{{\"type\":", record("complete"));
+        let (_root, _path, ctx) = fixture(bytes.as_bytes());
+        let mut complete = |_: &SourceCompletion| panic!("a changed source cannot complete");
+        let mut hooks = SourceScanHooks {
+            should_scan_source: None,
+            on_source_complete: Some(&mut complete),
+        };
+        let error = CodexConnector::new()
+            .with_incomplete_tail_recovery(recovery)
+            .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| {
+                panic!("a changed source cannot emit")
+            })
+            .unwrap_err();
+        assert_kind(&error, io::ErrorKind::Interrupted);
+    }
+}
+
+#[test]
+#[cfg(feature = "codex-zstd")]
+fn compressed_rollouts_never_use_plain_jsonl_tail_recovery() {
+    let connector = CodexConnector::new().with_incomplete_tail_recovery(|_| {
+        panic!("a compressed source cannot ask for plain JSONL recovery")
+    });
+    let bytes = format!("{}\n{{\"type\":", record("complete"));
+    let (_root, plain, mut ctx) = fixture(b"");
+    let path = plain.with_extension("jsonl.zst");
+    ctx.scan_roots = vec![ScanRoot::local(path.clone())];
+    let frame = zstd::stream::encode_all(bytes.as_bytes(), 0).unwrap();
+    for content in [&frame[..], &frame[..frame.len() - 1]] {
+        std::fs::write(&path, content).unwrap();
+        assert_kind(
+            &connector.scan(&ctx).unwrap_err(),
+            io::ErrorKind::UnexpectedEof,
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), content);
+    }
+}

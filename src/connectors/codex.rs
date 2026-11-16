@@ -33,7 +33,9 @@ use crate::types::{
     DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
 };
 
-pub struct CodexConnector;
+pub struct CodexConnector {
+    incomplete_tail_recovery: Option<fn(&Path) -> bool>,
+}
 
 const LARGE_SESSION_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -144,7 +146,24 @@ impl Default for CodexConnector {
 impl CodexConnector {
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self {
+            incomplete_tail_recovery: None,
+        }
+    }
+
+    /// Let the host decide whether an incomplete final JSONL record belongs to
+    /// an inactive source whose complete records may be retained.
+    ///
+    /// The predicate is called only when parsing encounters an unterminated
+    /// final JSON record in a plain rollout. A host should check source activity
+    /// at that time; `true` skips that record while preserving all read-budget,
+    /// UTF-8, I/O and snapshot checks. Compressed rollouts remain strict. The
+    /// default connector rejects incomplete tails, and this policy affects only
+    /// this connector instance, never another concurrent scan.
+    #[must_use]
+    pub const fn with_incomplete_tail_recovery(mut self, recovery: fn(&Path) -> bool) -> Self {
+        self.incomplete_tail_recovery = Some(recovery);
+        self
     }
 
     fn is_under_codex_dir(path: &Path) -> bool {
@@ -510,15 +529,22 @@ fn tool_output_text(payload: &Value) -> String {
 
 fn scan_codex_with_callback(
     ctx: &ScanContext,
+    incomplete_tail_recovery: Option<fn(&Path) -> bool>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    scan_codex_with_hooks(ctx, &mut SourceScanHooks::default(), on_conversation)
+    scan_codex_with_hooks(
+        ctx,
+        &mut SourceScanHooks::default(),
+        incomplete_tail_recovery,
+        on_conversation,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
 fn scan_codex_with_hooks(
     ctx: &ScanContext,
     hooks: &mut SourceScanHooks<'_>,
+    incomplete_tail_recovery: Option<fn(&Path) -> bool>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
     let excluded_paths = CodexScanExclusions::from_env()?;
@@ -636,7 +662,8 @@ fn scan_codex_with_hooks(
                     &file,
                     format == RolloutFormat::CompressedJsonl,
                     ctx.progress_tick.as_deref(),
-                )?;
+                )?
+                .with_incomplete_tail_recovery(incomplete_tail_recovery);
 
                 // Accumulate privately until the complete opened snapshot is validated.
                 while let Some((line_idx, val)) = reader.next_record()? {
@@ -1037,7 +1064,7 @@ impl Connector for CodexConnector {
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
-        scan_codex_with_callback(ctx, &mut |conv| {
+        scan_codex_with_callback(ctx, self.incomplete_tail_recovery, &mut |conv| {
             convs.push(conv);
             Ok(())
         })?;
@@ -1057,7 +1084,7 @@ impl Connector for CodexConnector {
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        scan_codex_with_callback(ctx, on_conversation)
+        scan_codex_with_callback(ctx, self.incomplete_tail_recovery, on_conversation)
     }
 
     fn supports_source_boundaries(&self) -> bool {
@@ -1070,7 +1097,7 @@ impl Connector for CodexConnector {
         hooks: &mut SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        scan_codex_with_hooks(ctx, hooks, on_conversation)
+        scan_codex_with_hooks(ctx, hooks, self.incomplete_tail_recovery, on_conversation)
     }
 }
 
@@ -1090,14 +1117,13 @@ mod tests {
     #[test]
     fn new_creates_connector() {
         let connector = CodexConnector::new();
-        // Just verify it doesn't panic - struct has no fields
-        let _ = connector;
+        assert!(connector.incomplete_tail_recovery.is_none());
     }
 
     #[test]
     fn default_creates_connector() {
-        let connector = CodexConnector;
-        let _ = connector;
+        let connector = CodexConnector::default();
+        assert!(connector.incomplete_tail_recovery.is_none());
     }
 
     // =====================================================
