@@ -14,6 +14,7 @@ use super::super::jsonl::recover_jsonl_suffix;
 use super::super::utils::MAX_SCAN_FILE_BYTES;
 
 const PROGRESS_LINE_STRIDE: usize = 1024;
+type IncompleteTailRecovery<'a> = (&'a Path, fn(&Path) -> bool);
 
 /// Largest Codex rollout the primary reader admits. The reader streams records
 /// through a length-bounded handle, so this is an admission budget, not a
@@ -112,6 +113,16 @@ impl<'a> RolloutReader<'a> {
             self.finished = true;
         }
         Ok(record)
+    }
+
+    pub(super) fn with_incomplete_tail_recovery(
+        mut self,
+        recovery: Option<fn(&Path) -> bool>,
+    ) -> Self {
+        if !self.compressed {
+            self.records.incomplete_tail_recovery = recovery.map(|policy| (self.path, policy));
+        }
+        self
     }
 
     fn validate_snapshot(&self) -> Result<()> {
@@ -277,6 +288,7 @@ struct Records<'a, R> {
     bytes_read: u64,
     recovered: Option<(usize, std::vec::IntoIter<Value>)>,
     progress_tick: Option<&'a (dyn Fn() + Send + Sync)>,
+    incomplete_tail_recovery: Option<IncompleteTailRecovery<'a>>,
 }
 
 impl<'a, R: BufRead> Records<'a, R> {
@@ -288,6 +300,7 @@ impl<'a, R: BufRead> Records<'a, R> {
             bytes_read: 0,
             recovered: None,
             progress_tick,
+            incomplete_tail_recovery: None,
         }
     }
 
@@ -339,6 +352,19 @@ impl<'a, R: BufRead> Records<'a, R> {
                         return Ok(Some((index, value)));
                     }
                     if !terminated && error.is_eof() {
+                        if let Some((path, policy)) = self.incomplete_tail_recovery
+                            && policy(path)
+                        {
+                            tracing::warn!(
+                                source_path = %path.display(),
+                                line_no = self.line_number,
+                                reason = "host_approved_incomplete_tail",
+                                "codex rollout has an incomplete final record; retaining complete records by host policy",
+                            );
+                            // Reach real EOF so a subsequent read failure
+                            // and the outer snapshot checks still apply.
+                            continue;
+                        }
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             format!(
@@ -502,6 +528,40 @@ mod tests {
             error.downcast_ref::<io::Error>().unwrap().kind(),
             io::ErrorKind::Other
         );
+    }
+
+    #[test]
+    fn approved_incomplete_record_still_propagates_a_later_read_error() {
+        struct FailsAfterEof {
+            input: Cursor<Vec<u8>>,
+            observed_eof: bool,
+        }
+        impl Read for FailsAfterEof {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.observed_eof {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "injected read failure after tail approval",
+                    ));
+                }
+                let count = self.input.read(buffer)?;
+                self.observed_eof = count == 0;
+                Ok(count)
+            }
+        }
+        let input = FailsAfterEof {
+            input: Cursor::new(b"{}\n{\"type\":".to_vec()),
+            observed_eof: false,
+        };
+        let mut records = Records::new(BufReader::new(input), None);
+        records.incomplete_tail_recovery = Some((Path::new("rollout-test.jsonl"), |_| true));
+        assert!(records.next_record().unwrap().is_some());
+        let error = records.next_record().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(format!("{error:#}").contains("injected read failure after tail approval"));
     }
 
     #[test]
