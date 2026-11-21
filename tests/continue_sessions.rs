@@ -557,14 +557,15 @@ fn continue_incremental_filter_matches_discovery_and_boundaries() {
 #[test]
 fn continue_source_callbacks_observe_skip_then_delivery_then_completion() {
     let fixture = TempDir::new().unwrap();
+    let root = fs::canonicalize(fixture.path()).unwrap();
     let good = write_session(
-        fixture.path(),
+        &root,
         "good",
         json!([{"message":{"role":"user","content":"hello"}}]),
     );
-    fs::write(fixture.path().join("skipped.json"), "not JSON").unwrap();
+    fs::write(root.join("skipped.json"), "not JSON").unwrap();
     let events = RefCell::new(Vec::new());
-    let ctx = context(&[fixture.path().to_path_buf()]);
+    let ctx = context(&[root]);
     let connector = ContinueConnector::new();
     let sources = connector.discover_source_files(&ctx).unwrap();
     let mut should_scan = |source: &franken_agent_detection::DiscoveredSourceFile| {

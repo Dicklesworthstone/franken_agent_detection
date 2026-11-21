@@ -19,13 +19,15 @@ const CHILD_SINCE: &str = "FAD_AIDER_SCOPE_SINCE";
 const HISTORY: &str = ".aider.chat.history.md";
 
 struct Fixture {
-    root: TempDir,
+    _root: TempDir,
+    root: PathBuf,
     files: Vec<PathBuf>,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let root = TempDir::new().unwrap();
+        let tempdir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tempdir.path()).unwrap();
         let files = [
             "home",
             "home/project",
@@ -44,7 +46,7 @@ impl Fixture {
         ]
         .into_iter()
         .map(|directory| {
-            let parent = root.path().join(directory);
+            let parent = root.join(directory);
             std::fs::create_dir_all(&parent).unwrap();
             let path = parent.join(HISTORY);
             std::fs::write(
@@ -55,8 +57,12 @@ impl Fixture {
             path
         })
         .collect();
-        std::fs::write(root.path().join("marked-state/agent_search.db"), []).unwrap();
-        Self { root, files }
+        std::fs::write(root.join("marked-state/agent_search.db"), []).unwrap();
+        Self {
+            _root: tempdir,
+            root,
+            files,
+        }
     }
 
     fn run(
@@ -80,17 +86,17 @@ impl Fixture {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "aider_scope_child", "--nocapture"])
-            .current_dir(self.root.path().join("cwd"))
-            .env("HOME", self.root.path().join("home"))
-            .env("USERPROFILE", self.root.path().join("home"))
-            .env(CHILD_ROOT, self.root.path())
+            .current_dir(self.root.join("cwd"))
+            .env("HOME", self.root.join("home"))
+            .env("USERPROFILE", self.root.join("home"))
+            .env(CHILD_ROOT, &self.root)
             .env(CHILD_DATA, data_dir)
             .env(CHILD_ROOTS, serde_json::to_string(explicit_roots).unwrap())
             .env(CHILD_EXPECTED, serde_json::to_string(expected).unwrap())
             .env(CHILD_SINCE, serde_json::to_string(&since_ts).unwrap())
             .env_remove("CASS_AIDER_DATA_ROOT");
         if let Some(override_root) = override_root {
-            command.env("CASS_AIDER_DATA_ROOT", self.root.path().join(override_root));
+            command.env("CASS_AIDER_DATA_ROOT", self.root.join(override_root));
         }
         let output = command.output().unwrap();
         assert!(

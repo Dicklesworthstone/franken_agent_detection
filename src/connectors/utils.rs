@@ -110,6 +110,25 @@ enum ExistingPathKind {
 /// virtual suffix is opaque, while policy entries must remain filesystem paths.
 fn resolve_existing_ancestor(path: &Path, kind: ExistingPathKind) -> std::io::Result<PathBuf> {
     use std::path::Component;
+    if kind == ExistingPathKind::VirtualSource {
+        // On macOS/BSD, libc::realpath (used by std::fs::canonicalize) expands a
+        // symlink to a regular file and then lexically pops the file off when
+        // followed by `..`, escaping an exclusion on the backing file. Kernel
+        // metadata(2) never traverses `..` past a regular file, so resolve an
+        // existing backing-file ancestor before canonicalizing the full path.
+        for ancestor in path.ancestors().skip(1) {
+            if std::fs::metadata(ancestor).is_ok_and(|meta| meta.is_file()) {
+                let resolved_ancestor = std::fs::canonicalize(ancestor)?;
+                let remainder = path.strip_prefix(ancestor).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "exclusion path is not under its own ancestor",
+                    )
+                })?;
+                return Ok(resolved_ancestor.join(remainder));
+            }
+        }
+    }
     for ancestor in path.ancestors() {
         match std::fs::canonicalize(ancestor) {
             Ok(resolved_ancestor) => {

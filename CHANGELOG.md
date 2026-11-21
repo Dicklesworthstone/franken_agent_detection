@@ -112,6 +112,10 @@ window is since `v0.4.0` (2026-11-21).
   `CASS_EXCLUDE_PATHS`. Unrelated exclusions no longer suppress database-backed
   sessions, database and parent-directory exclusions follow symlinks, and
   malformed policy entries or unresolvable sources continue to fail closed.
+  Also closed a macOS/BSD `libc::realpath` bypass where `<file-symlink>/..`
+  could pop the backing file off before `resolve_existing_ancestor` checked file
+  ancestors, and canonicalized `TempDir` test roots for macOS `/var` -> `/private/var`
+  parity.
 - **ChatGPT voice transcript indexing and stable message identity (`CASS #552`, [`55c7c70`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/55c7c703d1ae4f03aa2dcf2a2e283f3c346f9c06), [`c405a93`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/c405a930355ec659b1a41bfdb92f5a68dfffd271)):**
   indexed `audio_transcription` parts in original part order alongside plain
   strings while ignoring media asset pointers and malformed values, and exported

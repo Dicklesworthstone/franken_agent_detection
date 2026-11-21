@@ -15,11 +15,16 @@ const CHILD_ROOT: &str = "FAD_QWEN_DETECT_ROOT";
 const CHILD_EXPECTED: &str = "FAD_QWEN_DETECT_EXPECTED";
 const CHILD_SCOPE: &str = "FAD_QWEN_DETECT_SCOPE";
 
-struct Fixture(TempDir);
+struct Fixture {
+    _dir: TempDir,
+    root: PathBuf,
+}
 
 impl Fixture {
     fn new() -> Self {
-        let fixture = Self(TempDir::new().unwrap());
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let fixture = Self { _dir: dir, root };
         for base in [
             "home/.qwen",
             "configured",
@@ -36,7 +41,7 @@ impl Fixture {
     }
 
     fn path(&self, relative: &str) -> PathBuf {
-        self.0.path().join(relative)
+        self.root.join(relative)
     }
 
     fn run(&self, env: &[(&str, OsString)], expected_base: Option<&str>, scope: Option<&str>) {
@@ -54,10 +59,10 @@ impl Fixture {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "qwen_detection_child", "--nocapture"])
-            .current_dir(self.0.path())
+            .current_dir(&self.root)
             .env("HOME", self.path("home"))
             .env("USERPROFILE", self.path("home"))
-            .env(CHILD_ROOT, self.0.path())
+            .env(CHILD_ROOT, &self.root)
             .env(CHILD_EXPECTED, std::env::join_paths(&expected).unwrap())
             .env_remove(CHILD_SCOPE)
             .env_remove("QWEN_RUNTIME_DIR")

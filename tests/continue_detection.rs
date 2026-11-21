@@ -21,16 +21,18 @@ const SCOPE: &str = "FAD_CONTINUE_DETECTION_SCOPE";
 const SESSION: &str = r#"{"sessionId":"env-session","title":"Saved Continue history","workspaceDirectory":"/project","history":[{"message":{"role":"user","content":"native prompt"}},{"message":{"role":"assistant","content":"native reply","usage":{"prompt_tokens":10,"completion_tokens":5}}}]}"#;
 
 struct Fixture {
-    directory: TempDir,
+    _directory: TempDir,
+    root: PathBuf,
     files: Vec<(PathBuf, SystemTime)>,
 }
 
 impl Fixture {
     fn new() -> Self {
         let directory = TempDir::new().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
         let mut files = Vec::new();
-        for root in ["home/.continue", "work profile", "selected", "~/literal"] {
-            let sessions = directory.path().join(root).join("sessions");
+        for subdir in ["home/.continue", "work profile", "selected", "~/literal"] {
+            let sessions = root.join(subdir).join("sessions");
             fs::create_dir_all(&sessions).unwrap();
             let file = sessions.join("env-session.json");
             fs::write(&file, SESSION).unwrap();
@@ -39,22 +41,26 @@ impl Fixture {
                 fs::metadata(file).unwrap().modified().unwrap(),
             ));
         }
-        fs::write(directory.path().join("not-a-directory"), "unrelated").unwrap();
-        Self { directory, files }
+        fs::write(root.join("not-a-directory"), "unrelated").unwrap();
+        Self {
+            _directory: directory,
+            root,
+            files,
+        }
     }
 
     fn path(&self, path: &str) -> PathBuf {
-        self.directory.path().join(path)
+        self.root.join(path)
     }
 
     fn run(&self, configured: Option<&OsStr>, expected: Option<&str>, scope: Option<&str>) {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "continue_detection_child", "--nocapture"])
-            .current_dir(self.directory.path())
+            .current_dir(&self.root)
             .env("HOME", self.path("home"))
             .env("USERPROFILE", self.path("home"))
-            .env(CHILD, self.directory.path())
+            .env(CHILD, &self.root)
             .env_remove("CONTINUE_GLOBAL_DIR")
             .env_remove(EXPECTED)
             .env_remove(SCOPE);
