@@ -237,20 +237,12 @@ fn exact_history_file_does_not_expand_to_sibling_projects() {
 
 #[test]
 fn missing_exact_history_file_stays_scoped() {
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
     let missing = fixture.root.join("selected/.aider.chat.history.md");
     std::fs::remove_file(&missing).unwrap();
     // Retain the nested project's history, which the previous parent expansion
     // incorrectly emitted in place of the requested missing file.
-    let fixture = Fixture {
-        files: fixture
-            .files
-            .into_iter()
-            .filter(|path| path != &missing)
-            .collect(),
-        _root: fixture._root,
-        root: fixture.root,
-    };
+    fixture.files.retain(|path| path != &missing);
     fixture.run("selected/.aider.chat.history.md", None, &[], &[], None);
 }
 

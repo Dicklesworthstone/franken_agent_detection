@@ -737,10 +737,9 @@ fn exclusion_policy_child() {
     if invalid {
         for (slug, factory) in get_connector_factories() {
             let connector = factory();
-            let expect_streaming = slug != "devin" || cfg!(feature = "devin");
             assert_eq!(
                 connector.supports_streaming_scan(),
-                expect_streaming,
+                slug != "devin" || cfg!(feature = "devin"),
                 "unexpected streaming scan capability for connector {slug}"
             );
             let factory_case = Case {
