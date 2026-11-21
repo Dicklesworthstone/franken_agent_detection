@@ -3,8 +3,8 @@
 //! ## Native VS Code chat-session storage (the primary history)
 //!
 //! VS Code's own chat store holds the bulk of Copilot Chat history and is
-//! workspace-scoped (issue #16). It is handled by the
-//! [`copilot_vscode`](super::copilot_vscode) module and covers, per product
+//! workspace-scoped (issue #16). It is handled by the internal
+//! `copilot_vscode` module and covers, per product
 //! root (`Code`, `Code - Insiders`, `VSCodium`) on Linux/macOS/Windows:
 //! - `User/workspaceStorage/<id>/chatSessions/*.json|*.jsonl`
 //! - `User/globalStorage/emptyWindowChatSessions/*.json|*.jsonl`

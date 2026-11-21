@@ -15,8 +15,8 @@
 //! ## Types
 //!
 //! The [`types`] module contains normalized types for representing agent conversations:
-//! - [`DetectionResult`](types::DetectionResult) — always available
-//! - [`NormalizedConversation`], [`NormalizedMessage`], [`NormalizedSnippet`]
+//! - [`DetectionResult`] — always available
+//! - `NormalizedConversation`, `NormalizedMessage`, `NormalizedSnippet`
 //!   — available with the `connectors` feature
 
 #![forbid(unsafe_code)]

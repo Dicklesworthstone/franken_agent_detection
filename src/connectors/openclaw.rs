@@ -3,15 +3,15 @@
 //! `OpenClaw` has two storage generations:
 //!
 //! **Legacy (pre-v2026.8.1)** stores JSONL sessions at:
-//! - ~/.openclaw/agents/<agent-name>/sessions/*.jsonl
+//! - `~/.openclaw/agents/<agent-name>/sessions/*.jsonl`
 //!
 //! Each line has a `type` discriminator: "session", "message", "`model_change`",
 //! "`thinking_level_change`", "custom". Messages are wrapped:
-//! {"type":"message","id":"...","message":{"role":"user","content":[...],...}}
+//! `{"type":"message","id":"...","message":{"role":"user","content":[...],...}}`
 //!
 //! **`OpenClaw` 2.0 (v2026.8.1+)** migrates active transcripts into a per-agent
 //! SQLite store at:
-//! - ~/.openclaw/agents/<agent-name>/agent/openclaw-agent.sqlite
+//! - `~/.openclaw/agents/<agent-name>/agent/openclaw-agent.sqlite`
 //!
 //! The `transcript_events(session_id, seq, event_json, created_at)` table holds
 //! one legacy-shaped transcript entry per row (the same "session"/"message"
@@ -341,17 +341,18 @@ impl OpenClawConnector {
             for root in &ctx.scan_roots {
                 let mirrored_agents = root.mirrored_store(&[".openclaw", "agents"]);
                 let mirrored_sessions = root.mirrored_store(&[".openclaw", "sessions"]);
-                let mut candidates = Vec::new();
-                if mirrored_agents.is_none() && mirrored_sessions.is_none() {
-                    candidates = Self::roots_from_scan_path(&root.path);
+                let candidates = if mirrored_agents.is_none() && mirrored_sessions.is_none() {
+                    Self::roots_from_scan_path(&root.path)
                 } else {
+                    let mut candidates = Vec::new();
                     if let Some(agents) = mirrored_agents {
                         candidates.extend(Self::find_agent_session_dirs_at(&agents));
                     }
                     if let Some(sessions) = mirrored_sessions {
                         candidates.push(sessions);
                     }
-                }
+                    candidates
+                };
                 roots.extend(candidates.into_iter().map(|path| root.with_path(path)));
             }
         }
@@ -495,13 +496,10 @@ impl OpenClawConnector {
             }
         } else {
             for root in &ctx.scan_roots {
-                let paths = if let Some(agents) =
-                    root.mirrored_store(&[".openclaw", "agents"])
-                {
-                    Self::find_agent_db_paths_at(&agents)
-                } else {
-                    Self::sqlite_roots_from_scan_path(&root.path)
-                };
+                let paths = root.mirrored_store(&[".openclaw", "agents"]).map_or_else(
+                    || Self::sqlite_roots_from_scan_path(&root.path),
+                    |agents| Self::find_agent_db_paths_at(&agents),
+                );
                 roots.extend(paths.into_iter().map(|path| root.with_path(path)));
             }
         }
@@ -1508,12 +1506,14 @@ mod tests {
         ] {
             let root = mirrored_test_root(&container, source);
             let ctx = ScanContext::with_roots(temp.path().join("state"), vec![root], None);
-            assert!(connector.discover_source_files(&ctx).unwrap().is_empty(), "{source}");
+            assert!(
+                connector.discover_source_files(&ctx).unwrap().is_empty(),
+                "{source}"
+            );
             assert!(connector.scan(&ctx).unwrap().is_empty(), "{source}");
         }
         for root in [
-            ScanRoot::local(container.clone())
-                .with_mirrored_source_path("~/.openclaw/agents"),
+            ScanRoot::local(container.clone()).with_mirrored_source_path("~/.openclaw/agents"),
             ScanRoot::remote(
                 container.clone(),
                 crate::types::Origin::remote("laptop"),
@@ -1558,7 +1558,10 @@ mod tests {
         fs::create_dir_all(&sessions).unwrap();
         let selected = write_minimal_openclaw_session(&sessions, "a.jsonl", "/a", "selected");
         let sibling = write_minimal_openclaw_session(&sessions, "b.jsonl", "/b", "sibling");
-        let db = sessions.parent().unwrap().join("agent/openclaw-agent.sqlite");
+        let db = sessions
+            .parent()
+            .unwrap()
+            .join("agent/openclaw-agent.sqlite");
         fs::create_dir_all(db.parent().unwrap()).unwrap();
         fs::write(&db, b"unselected native sibling").unwrap();
         let paths = [selected.clone(), sibling, db];
@@ -1631,7 +1634,7 @@ mod tests {
         let mut structural = root.clone();
         structural.mirrored_source_path = None;
         let connector = OpenClawConnector::new();
-        let before = source_snapshot(&[file.clone()]);
+        let before = source_snapshot(std::slice::from_ref(&file));
         let expected = connector
             .scan(&ScanContext::with_roots(
                 temp.path().join("state"),
@@ -2488,7 +2491,10 @@ mod tests {
                 assert_eq!(conversations.len(), 1);
                 assert_eq!(conversations[0].source_path, db);
                 assert_eq!(conversations[0].agent_slug, "openclaw/alice");
-                assert_eq!(conversations[0].external_id.as_deref(), Some("alice/shared"));
+                assert_eq!(
+                    conversations[0].external_id.as_deref(),
+                    Some("alice/shared")
+                );
                 assert_eq!(conversations[0].messages.len(), 2);
                 assert_eq!(conversations[0].metadata["storage"], "sqlite");
                 assert_eq!(
@@ -2551,7 +2557,11 @@ mod tests {
                 );
                 let connector = OpenClawConnector::new();
                 let discovered = connector.discover_source_files(&ctx).unwrap();
-                assert_eq!(discovered.len(), 4, "declare native and legacy source bytes");
+                assert_eq!(
+                    discovered.len(),
+                    4,
+                    "declare native and legacy source bytes"
+                );
                 let second_source = discovered
                     .iter()
                     .find(|source| source.source_path == other)
@@ -2564,7 +2574,11 @@ mod tests {
                     .map(|conversation| conversation.source_path.clone())
                     .collect();
                 actual.sort();
-                let authoritative = if recognized_schema { db.clone() } else { duplicate.clone() };
+                let authoritative = if recognized_schema {
+                    db.clone()
+                } else {
+                    duplicate.clone()
+                };
                 let mut expected = vec![authoritative, unique, other.clone()];
                 expected.sort();
                 assert_eq!(actual, expected);
@@ -2633,11 +2647,7 @@ mod tests {
                     ))
                     .unwrap();
                 assert_eq!(expected.len(), 1);
-                let ctx = ScanContext::with_roots(
-                    temp.path().join("state"),
-                    vec![root],
-                    None,
-                );
+                let ctx = ScanContext::with_roots(temp.path().join("state"), vec![root], None);
                 let discovered = connector.discover_source_files(&ctx).unwrap();
                 assert_eq!(discovered.len(), 1);
                 assert_eq!(discovered[0].source_path, db);
@@ -2734,9 +2744,7 @@ mod tests {
                     .write(true)
                     .open(&db)
                     .unwrap()
-                    .set_modified(
-                        std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis),
-                    )
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis))
                     .unwrap();
             };
             let snapshot = || {
@@ -2771,7 +2779,11 @@ mod tests {
             assert_eq!(sources.len(), 1);
             assert_eq!(sources[0].source_path, db);
             let convs = connector.scan(&ctx).unwrap();
-            assert_eq!(convs.len(), 2, "every session in the changed store survives");
+            assert_eq!(
+                convs.len(),
+                2,
+                "every session in the changed store survives"
+            );
             let appended = convs
                 .iter()
                 .find(|conv| conv.external_id.as_deref() == Some("alice/sess-1"))

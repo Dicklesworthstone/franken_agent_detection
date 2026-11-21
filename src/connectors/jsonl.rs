@@ -198,10 +198,11 @@ pub fn recover_jsonl_suffix(line: &str) -> JsonlRecovery {
 /// Call [`recover_jsonl_suffix`] directly after a parse error when diagnostic
 /// details about discarded bytes or recovery limits are needed.
 pub fn parse_jsonl_line(line: &str) -> impl Iterator<Item = Value> + use<> {
-    let (intact, recovered) = match serde_json::from_str(line.trim_start_matches('\u{feff}')) {
-        Ok(value) => (Some(value), Vec::new()),
-        Err(_) => (None, recover_jsonl_suffix(line).records),
-    };
+    let (intact, recovered) = serde_json::from_str(line.trim_start_matches('\u{feff}'))
+        .map_or_else(
+            |_| (None, recover_jsonl_suffix(line).records),
+            |value| (Some(value), Vec::new()),
+        );
     intact.into_iter().chain(recovered)
 }
 
@@ -381,9 +382,9 @@ mod tests {
     fn intact_records_keep_the_original_json_parser_semantics() {
         for line in [
             r#"{"wrapper":{"role":"user","content":"nested"}}"#,
-            r#"[1,2,3]"#,
-            r#"null"#,
-            r#"42"#,
+            r"[1,2,3]",
+            r"null",
+            r"42",
             r#""string""#,
         ] {
             let expected: Value = serde_json::from_str(line).unwrap();

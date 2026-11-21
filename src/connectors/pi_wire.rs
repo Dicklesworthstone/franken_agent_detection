@@ -29,7 +29,7 @@
 use super::jsonl::{JsonlLines, parse_jsonl_line};
 use super::utils::{
     dedupe_path_key, excluded_scan_paths_from_env, open_capped_reader, path_is_excluded,
-    read_capped, unwrap_skill_invocations,
+    unwrap_skill_invocations,
 };
 use crate::types::{NormalizedConversation, NormalizedMessage};
 use anyhow::Result;
@@ -883,7 +883,7 @@ fn parse_session_records<S: AsRef<str>>(
     let mut labels: HashMap<String, String> = HashMap::new();
     let mut header_leaf: Option<String> = None;
 
-for (line_idx, line_res) in records.into_iter().enumerate() {
+    for (line_idx, line_res) in records.into_iter().enumerate() {
         let line = match line_res {
             Ok(line) => line,
             Err(e) => {
@@ -902,94 +902,94 @@ for (line_idx, line_res) in records.into_iter().enumerate() {
         // Preserve the physical source position when a torn line contains several
         // complete entries. Their tree/file order is independent of that position.
         for val in parse_jsonl_line(line) {
-        let this_index = file_index;
-        file_index += 1;
+            let this_index = file_index;
+            file_index += 1;
 
-        match val.get("type").and_then(Value::as_str).unwrap_or("") {
-            "session" => {
-                // Session header: metadata only, not part of the tree.
-                session_id = val.get("id").and_then(Value::as_str).map(String::from);
-                session_cwd = val.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-                provider = val
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-                model_id = val.get("modelId").and_then(Value::as_str).map(String::from);
-                header_title = val
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .filter(|t| !t.is_empty());
-                session_version = val.get("version").cloned();
-                // Fork/clone ancestry. Keep the parent's file name (pi file
-                // names embed the session UUID) rather than its absolute path.
-                // pi_agent_rust names the active leaf explicitly.
-                header_leaf = val.get("leafId").and_then(Value::as_str).map(String::from);
-                parent_session = val
-                    .get("parentSession")
-                    .or_else(|| val.get("branchedFrom"))
-                    .and_then(Value::as_str)
-                    .filter(|p| !p.is_empty())
-                    .map(|parent| {
-                        Path::new(parent)
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or(parent)
-                            .to_string()
-                    });
-                if let Some(ts_val) = val.get("timestamp") {
-                    header_ts = super::parse_timestamp(ts_val);
-                }
-                continue;
-            }
-            "title" => {
-                // omp writes standalone title lines; prefer the most recent
-                // non-empty one over the session-header title.
-                if let Some(title) = val
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .filter(|t| !t.is_empty())
-                {
-                    title_entry = Some(title);
-                }
-            }
-            "session_info" => {
-                // User-defined display name (`/name`, `--name`); the latest
-                // entry wins, as in pi's session selector.
-                session_name = val
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|n| !n.is_empty())
-                    .map(str::to_string);
-            }
-            "label" => {
-                if let Some(target) = val.get("targetId").and_then(Value::as_str) {
-                    match val
-                        .get("label")
+            match val.get("type").and_then(Value::as_str).unwrap_or("") {
+                "session" => {
+                    // Session header: metadata only, not part of the tree.
+                    session_id = val.get("id").and_then(Value::as_str).map(String::from);
+                    session_cwd = val.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+                    provider = val
+                        .get("provider")
                         .and_then(Value::as_str)
-                        .filter(|l| !l.is_empty())
+                        .map(String::from);
+                    model_id = val.get("modelId").and_then(Value::as_str).map(String::from);
+                    header_title = val
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .filter(|t| !t.is_empty());
+                    session_version = val.get("version").cloned();
+                    // Fork/clone ancestry. Keep the parent's file name (pi file
+                    // names embed the session UUID) rather than its absolute path.
+                    // pi_agent_rust names the active leaf explicitly.
+                    header_leaf = val.get("leafId").and_then(Value::as_str).map(String::from);
+                    parent_session = val
+                        .get("parentSession")
+                        .or_else(|| val.get("branchedFrom"))
+                        .and_then(Value::as_str)
+                        .filter(|p| !p.is_empty())
+                        .map(|parent| {
+                            Path::new(parent)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(parent)
+                                .to_string()
+                        });
+                    if let Some(ts_val) = val.get("timestamp") {
+                        header_ts = super::parse_timestamp(ts_val);
+                    }
+                    continue;
+                }
+                "title" => {
+                    // omp writes standalone title lines; prefer the most recent
+                    // non-empty one over the session-header title.
+                    if let Some(title) = val
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .filter(|t| !t.is_empty())
                     {
-                        Some(label) => {
-                            labels.insert(target.to_string(), label.to_string());
-                        }
-                        None => {
-                            labels.remove(target);
+                        title_entry = Some(title);
+                    }
+                }
+                "session_info" => {
+                    // User-defined display name (`/name`, `--name`); the latest
+                    // entry wins, as in pi's session selector.
+                    session_name = val
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty())
+                        .map(str::to_string);
+                }
+                "label" => {
+                    if let Some(target) = val.get("targetId").and_then(Value::as_str) {
+                        match val
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .filter(|l| !l.is_empty())
+                        {
+                            Some(label) => {
+                                labels.insert(target.to_string(), label.to_string());
+                            }
+                            None => {
+                                labels.remove(target);
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
-        }
 
-        entries.push(WireEntry {
-            id: val.get("id").and_then(Value::as_str).map(String::from),
-            value: val,
-            line: line_idx + 1,
-            file_index: this_index,
-            parent: None,
-        });
+            entries.push(WireEntry {
+                id: val.get("id").and_then(Value::as_str).map(String::from),
+                value: val,
+                line: line_idx + 1,
+                file_index: this_index,
+                parent: None,
+            });
         }
     }
 

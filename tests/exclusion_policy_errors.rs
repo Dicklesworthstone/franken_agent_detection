@@ -728,10 +728,17 @@ fn exclusion_policy_child() {
     if invalid {
         for (slug, factory) in get_connector_factories() {
             let connector = factory();
-            assert!(
-                connector.supports_streaming_scan(),
-                "connector {slug} must support streaming scan"
-            );
+            if slug != "devin" || cfg!(feature = "devin") {
+                assert!(
+                    connector.supports_streaming_scan(),
+                    "connector {slug} must support streaming scan"
+                );
+            } else {
+                assert!(
+                    !connector.supports_streaming_scan(),
+                    "detection-only connector {slug} must not report streaming scan without feature \"devin\""
+                );
+            }
             let factory_case = Case {
                 provider: slug,
                 connector,
