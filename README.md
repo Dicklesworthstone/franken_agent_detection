@@ -476,14 +476,14 @@ For detection only:
 
 ```toml
 [dependencies]
-franken-agent-detection = "0.3"                                          # detection
+franken-agent-detection = "0.4"                                          # detection
 ```
 
 For the full parsing layer:
 
 ```toml
 [dependencies]
-franken-agent-detection = { version = "0.3", features = ["all-connectors"] } # parsing
+franken-agent-detection = { version = "0.4", features = ["all-connectors"] } # parsing
 ```
 
 From source:
@@ -491,15 +491,15 @@ From source:
 ```bash
 git clone https://github.com/Dicklesworthstone/franken_agent_detection
 cd franken_agent_detection
-cargo test --locked --all-features
+cargo test --all-features
 ```
 
 ### Toolchain & MSRV
 
-- **Default detection-only build (`default = []`, `rust-version = "1.85"`)**: uses standard Rust 2024 edition syntax with zero optional dependencies.
-- **Non-SQLite connector features (`connectors`, `codex-zstd`, `chatgpt`)**: use Rust `1.88+` `let`-chains.
-- **SQLite-backed connector features** (`cursor`, `opencode`, `goose`, `hermes`, `crush`, `devin`, `shelley`, `openclaw-sqlite`, `pi-sqlite`, `pi-durable`, `all-connectors`): depend on `frankensqlite` and `asupersync`, which require the repository's pinned `rust-toolchain.toml` (`nightly-2026-08-31` or newer).
-- **Repository `.cargo/config.toml`**: sets `rustflags = ["-Z", "threads=4"]` for the pinned nightly toolchain; pass `RUSTFLAGS=""` if building non-SQLite feature slices with a stable compiler inside a checkout of this repository.
+- **Default detection-only build (`default = []`, `rust-version = "1.85"`)**: uses standard Rust 2024 edition syntax with zero optional dependencies (verified with `cargo +1.85 check --lib --no-default-features`).
+- **Non-SQLite connector features (`connectors`, `codex-zstd`, `chatgpt`, `codebuff`, `grok-bot`)**: use Rust `1.88+` `let`-chains (verified with `cargo +1.88.0 check --lib --no-default-features --features connectors,codex-zstd,chatgpt,codebuff,grok-bot`).
+- **SQLite-backed connector features** (`cursor`, `opencode`, `goose`, `hermes`, `crush`, `devin`, `shelley`, `openclaw-sqlite`, `pi-sqlite`, `pi-durable`, `all-connectors`): depend on `frankensqlite` (`0.5.1`) and `asupersync` (`0.6.2`). Verified on the repository's pinned `rust-toolchain.toml` (`nightly-2026-08-31`) as well as stable Rust `1.99.1` (`RUSTFLAGS="" cargo +1.99.1 test --lib --all-features`).
+- **Repository `.cargo/config.toml`**: sets `rustflags = ["-Z", "threads=4"]` for the pinned nightly toolchain; pass `RUSTFLAGS=""` if building with a stable compiler inside a checkout of this repository.
 
 ## Troubleshooting
 

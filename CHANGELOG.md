@@ -8,9 +8,11 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Repository: <https://github.com/Dicklesworthstone/franken_agent_detection>
 Crate: <https://crates.io/crates/franken-agent-detection>
 
-> **Release vs. tag** (checked 2026-11-03 against GitHub Releases, git tags, and crates.io): the latest
-> release in this changelog is `v0.3.11` (2026-11-03). `v0.3.10` is a git tag and crates.io version
+> **Release vs. tag** (checked 2026-11-21 against GitHub Releases, git tags, and crates.io): the latest
+> release in this changelog is `v0.4.0` (2026-11-21). `v0.3.10` is a git tag and crates.io version
 > (2026-10-11) without a GitHub Release page. GitHub Release pages exist for
+> [`v0.4.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.4.0),
+> [`v0.3.11`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.11),
 > [`v0.3.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.9),
 > [`v0.3.8`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.8),
 > [`v0.3.3`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.3),
@@ -30,20 +32,21 @@ Crate: <https://crates.io/crates/franken-agent-detection>
 > `v0.3.2` and `v0.3.4` through `v0.3.7` are git tags and crates.io versions without
 > GitHub Release pages. `v0.1.1`, `v0.1.2`, and `v0.1.3` are git tags without GitHub
 > Release pages; do not invent them. crates.io has every version from `0.2.0` through
-> `0.3.10`, plus `0.1.0`, `0.1.1`, `0.1.3`, `0.1.7`, `0.1.8`, and `0.1.10`; `0.1.2`,
+> `0.4.0`, plus `0.1.0`, `0.1.1`, `0.1.3`, `0.1.7`, `0.1.8`, and `0.1.10`; `0.1.2`,
 > `0.1.4`, `0.1.5`, `0.1.6`, and `0.1.9` were never published there. `0.1.0` and `0.1.8`
 > have no git tag, and there is no `v0.1.8` GitHub Release.
 
 Scope window: 2026-02-15 through HEAD
 [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
 (2026-08-19) for the historical reconstruction below. The current Unreleased
-window is since `v0.3.11` (2026-11-03).
+window is since `v0.4.0` (2026-11-21).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| `v0.3.11` | Release | 2026-11-03 | Public `canonical_connector_slug` with alias-aware agent rewrites, 34-connector token, model and invocation attribution with conformance gates, Continue IDE/CLI connector, Cline SDK sessions, Qwen subagents, Copilot/Amp/Crush usage, Vibe native turns, 15-provider remote mirror discovery (`CASS #520`), 18-provider `CASS_EXCLUDE_PATHS` + per-source boundary hooks, Pi/OMP env-override symmetry, and 34-connector schema/metamorphic conformance laws. |
+| [`v0.4.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.4.0) | GitHub Release | 2026-11-21 | Host-approved Codex abandoned-tail recovery (`CodexConnector::with_incomplete_tail_recovery`, `CASS #560`), bounded torn-prefix JSONL suffix recovery (`pub mod connectors::jsonl`, `CASS #553`), database-backed virtual session exclusion resolution (`CASS #554`), ChatGPT `audio_transcription` voice indexing with stable `chatgpt_message_id` (`CASS #552`), OpenClaw selected-file scope, source-freshness native reconciliation, and per-store migration isolation (`CASS #350/#543`), lockstep `frankensqlite` `0.5.1` + `asupersync` `0.6.2` upgrade, and strict Clippy/rustdoc/feature-matrix cleanup. |
+| [`v0.3.11`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.11) | GitHub Release | 2026-11-03 | Public `canonical_connector_slug` with alias-aware agent rewrites, 34-connector token, model and invocation attribution with conformance gates, Continue IDE/CLI connector, Cline SDK sessions, Qwen subagents, Copilot/Amp/Crush usage, Vibe native turns, 15-provider remote mirror discovery (`CASS #520`), 18-provider `CASS_EXCLUDE_PATHS` + per-source boundary hooks, Pi/OMP env-override symmetry, and 34-connector schema/metamorphic conformance laws. |
 | `v0.3.10` | Git tag / crates.io | 2026-10-11 | `sqlite_sync::shutdown_driver()` for clean Windows runtime exit (`CASS #519`) and full error chains on OpenCode SQLite read warnings. |
 | [`v0.3.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.9) | GitHub Release | 2026-10-11 | Qwen native JSONL, Cline native tasks + usage, Gemini/Kimi usage, Claude 32 MiB reply IDs, pre-parse `CASS_EXCLUDE_PATHS` validation, shared `JsonlLines` I/O discard, and custom root detection overrides. |
 | [`v0.3.8`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.8) | GitHub Release | 2026-10-08 | `CASS_EXCLUDE_PATHS` matches relative, `..`, and symlink-alias spellings (`cass 0f1k0`). |
@@ -71,13 +74,69 @@ window is since `v0.3.11` (2026-11-03).
 
 ## [Unreleased]
 
+## [0.4.0] -- 2026-11-21
+
+### Breaking Changes
+
+- **`CodexConnector` struct layout (`CASS #560`, [`83a0386`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/83a03860b2f7076d0bcb059d8234e080f52e18f6)):**
+  changed `CodexConnector` from a public unit struct (`pub struct CodexConnector;`)
+  to a struct carrying a private optional recovery policy field. Callers that
+  previously constructed `CodexConnector` with unit-struct literal syntax should
+  switch to `CodexConnector::new()` or `CodexConnector::default()`.
+- **SQLite / async runtime dependency lockstep ([`933f779`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/933f779)):**
+  upgraded optional `frankensqlite` (`fsqlite`) from `0.4.1` to `0.5.1` and
+  `asupersync` from `0.5.0` to `0.6.2` in lockstep (matching `fsqlite 0.5.1`'s
+  `asupersync ^0.6.2` dependency so ambient runtime context and type identity
+  remain unified with zero duplicate `asupersync` copies).
+
+### Added
+
+- **Host-approved Codex abandoned-tail recovery (`CASS #560`, [`830d972`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/830d9720d71372a2002a42d10431f2d75a0b16d0), [`83a0386`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/83a03860b2f7076d0bcb059d8234e080f52e18f6)):**
+  added `CodexConnector::with_incomplete_tail_recovery(fn(&Path) -> bool)` to
+  allow host-approved recovery of complete messages preceding an unterminated
+  final JSONL record in inactive plain Codex rollouts while preserving the strict
+  default, compressed-input rejection, byte budgets, UTF-8/I/O failures, and
+  final source snapshot checks.
+- **Public bounded torn-prefix JSONL recovery module (`CASS #553`, [`2437e71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/2437e719dee7770de93eeb7931342bfa8b404e92), [`1aa12c7`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/1aa12c75d2b6196eafc441fa1a58fad0b9ab9cc1)):**
+  exposed `connectors::jsonl` publicly (`pub mod jsonl`) with bounded torn-prefix
+  suffix recovery (`recover_jsonl_suffix`, `parse_jsonl_line`) and wired it across
+  Pi/OMP, Codex, and Claude Code ingestion so complete records appended after
+  damaged line prefixes are recovered with exact physical line coordinates and
+  discarded-byte accounting while intact-line parsing remains allocation-free.
+
 ### Fixed
 
-- Resolve virtual conversation source paths beneath database files when checking
-  exclusions (`CASS #554`). Unrelated exclusions no longer suppress these
-  sources; database and parent-directory exclusions still follow symlinks.
-  Virtual session identifiers stay beneath their backing file, while malformed
-  filesystem policy entries and unresolvable sources continue to fail closed.
+- **Database-backed virtual session exclusion resolution (`CASS #554`, [`c638a1d`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/c638a1d086b8cabbe0990a1011b0517a5895563b), [`7bb83aa`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/7bb83aa155ea2152230de17b00ad47b43ac206de)):**
+  resolved virtual conversation source paths beneath database files (such as
+  `opencode.db/<session-id>`) through their backing file when checking
+  `CASS_EXCLUDE_PATHS`. Unrelated exclusions no longer suppress database-backed
+  sessions, database and parent-directory exclusions follow symlinks, and
+  malformed policy entries or unresolvable sources continue to fail closed.
+- **ChatGPT voice transcript indexing and stable message identity (`CASS #552`, [`55c7c70`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/55c7c703d1ae4f03aa2dcf2a2e283f3c346f9c06), [`c405a93`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/c405a930355ec659b1a41bfdb92f5a68dfffd271)):**
+  indexed `audio_transcription` parts in original part order alongside plain
+  strings while ignoring media asset pointers and malformed values, and exported
+  `chatgpt_message_id` from the provider message ID (falling back to the mapping
+  node key) so archive consumers can reconcile snapshots even when message
+  positions shift.
+- **OpenClaw selected-file scope, native history reconciliation, and per-store migration isolation (`CASS #350/#543`, [`fd38acf`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/fd38acf24043792730b6cf4ead1ca182fc4ff69d), [`79991cf`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/79991cf0553eade0139fa463ee3f28ca33d64bde), [`fe90ef3`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/fe90ef344a185e86bf15eaffead2e5a7c51f64fe)):**
+  kept explicit JSONL selections scoped to the selected file through discovery
+  and streaming admission, reconciled complete historical sessions in changed
+  native SQLite stores using source freshness rather than provider event time,
+  and isolated native-over-legacy migration suppression to each canonical
+  physical agent directory.
+- **Strict Clippy, rustdoc, rustfmt, and non-`devin` feature-slice test alignment ([`2734ca4`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/2734ca4)):**
+  resolved pedantic/nursery Clippy findings and formatting drift in `jsonl.rs`,
+  `openclaw.rs`, and `pi_wire.rs`; fixed broken/private/HTML-tag rustdoc links
+  in `lib.rs`, `copilot.rs`, and `openclaw.rs` under `RUSTDOCFLAGS="-D warnings"`;
+  and aligned `tests/exclusion_policy_errors.rs` so non-SQLite feature slices
+  assert detection-only `DevinConnector` streaming behavior accurately while
+  keeping fail-closed exclusion checks enforced.
+- **Security audit & verified toolchain matrix:**
+  refreshed lockfile dependencies (`ctutils 0.4.8` resolving `RUSTSEC-2026-0385`,
+  zero `cargo audit` vulnerabilities) and empirically verified `rust-version = "1.85"`
+  for detection-only (`--no-default-features`), Rust `1.88.0` for non-SQLite
+  connector slices, and Rust `1.99.1` stable + `nightly-2026-08-31` for
+  `--all-features` (related to `#34`).
 
 ## [0.3.11] -- 2026-11-03
 
