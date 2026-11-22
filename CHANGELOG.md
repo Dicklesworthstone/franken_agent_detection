@@ -9,8 +9,9 @@ Repository: <https://github.com/Dicklesworthstone/franken_agent_detection>
 Crate: <https://crates.io/crates/franken-agent-detection>
 
 > **Release vs. tag** (checked 2026-11-21 against GitHub Releases, git tags, and crates.io): the latest
-> release in this changelog is `v0.4.0` (2026-11-21). `v0.3.10` is a git tag and crates.io version
+> release in this changelog is `v0.4.1` (2026-11-21). `v0.3.10` is a git tag and crates.io version
 > (2026-10-11) without a GitHub Release page. GitHub Release pages exist for
+> [`v0.4.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.4.1),
 > [`v0.4.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.4.0),
 > [`v0.3.11`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.11),
 > [`v0.3.9`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.9),
@@ -39,12 +40,13 @@ Crate: <https://crates.io/crates/franken-agent-detection>
 Scope window: 2026-02-15 through HEAD
 [`4f60c71`](https://github.com/Dicklesworthstone/franken_agent_detection/commit/4f60c71e8b2c6016ffd928b339ec6848b1466666)
 (2026-08-19) for the historical reconstruction below. The current Unreleased
-window is since `v0.4.0` (2026-11-21).
+window is since `v0.4.1` (2026-11-21).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.4.1`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.4.1) | GitHub Release | 2026-11-21 | Codebuff / Freebuff detection and default scans follow the native `FREEBUFF_CONFIG_DIR` store relocation. |
 | [`v0.4.0`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.4.0) | GitHub Release | 2026-11-21 | Host-approved Codex abandoned-tail recovery (`CodexConnector::with_incomplete_tail_recovery`, `CASS #560`), bounded torn-prefix JSONL suffix recovery (`pub mod connectors::jsonl`, `CASS #553`), database-backed virtual session exclusion resolution (`CASS #554`), ChatGPT `audio_transcription` voice indexing with stable `chatgpt_message_id` (`CASS #552`), OpenClaw selected-file scope, source-freshness native reconciliation, and per-store migration isolation (`CASS #350/#543`), lockstep `frankensqlite` `0.5.1` + `asupersync` `0.6.2` upgrade, and strict Clippy/rustdoc/feature-matrix cleanup. |
 | [`v0.3.11`](https://github.com/Dicklesworthstone/franken_agent_detection/releases/tag/v0.3.11) | GitHub Release | 2026-11-03 | Public `canonical_connector_slug` with alias-aware agent rewrites, 34-connector token, model and invocation attribution with conformance gates, Continue IDE/CLI connector, Cline SDK sessions, Qwen subagents, Copilot/Amp/Crush usage, Vibe native turns, 15-provider remote mirror discovery (`CASS #520`), 18-provider `CASS_EXCLUDE_PATHS` + per-source boundary hooks, Pi/OMP env-override symmetry, and 34-connector schema/metamorphic conformance laws. |
 | `v0.3.10` | Git tag / crates.io | 2026-10-11 | `sqlite_sync::shutdown_driver()` for clean Windows runtime exit (`CASS #519`) and full error chains on OpenCode SQLite read warnings. |
@@ -73,6 +75,29 @@ window is since `v0.4.0` (2026-11-21).
 ---
 
 ## [Unreleased]
+
+## [0.4.1] -- 2026-11-21
+
+### Fixed
+
+- **Codebuff / Freebuff: relocated stores are detected and scanned.** Both
+  published CLIs resolve their config root through `FREEBUFF_CONFIG_DIR` when it
+  is set (`cli/src/utils/config-dir.ts`), replacing `~/.config/manicode`.
+  Detection and `CodebuffConnector` default scans ignored it, so a relocated
+  history was reported as not installed and never read. Both now use
+  `<FREEBUFF_CONFIG_DIR>/projects`. An explicit `CASS_CODEBUFF_DATA_ROOT` still
+  takes precedence, a configured but missing directory does not fall back to
+  the default store, and relative or blank values are ignored because the CLI
+  refuses them. Covered by a unit test, a feature-independent detection probe
+  (`tests/custom_root_probes.rs`) and an end-to-end child-process scan
+  (`tests/codebuff_config_dir.rs`). This does not add a separate `freebuff`
+  slug: the chat files still carry no product marker (GH #21).
+
+### Added
+
+- `tests/perf_sqlite_scan.rs`: an ignored release-mode harness timing an
+  OpenCode SQLite store scan, alongside the existing Codex scan harness, for
+  dependency A/B comparisons.
 
 ## [0.4.0] -- 2026-11-21
 

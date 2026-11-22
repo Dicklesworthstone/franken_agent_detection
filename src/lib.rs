@@ -466,6 +466,20 @@ pub(crate) fn continue_env_global_dir() -> Option<PathBuf> {
     })
 }
 
+/// Codebuff / Freebuff's native config-directory override, shared by
+/// detection and ingestion. Both shipped binaries resolve their config root
+/// through `cli/src/utils/config-dir.ts`: a non-empty `FREEBUFF_CONFIG_DIR`
+/// replaces `~/.config/manicode` verbatim, and a relative value makes the CLI
+/// refuse to start, so it never holds history. Only absolute values apply.
+pub(crate) fn codebuff_env_config_dir() -> Option<PathBuf> {
+    codebuff_config_dir_from(std::env::var_os("FREEBUFF_CONFIG_DIR"))
+}
+
+fn codebuff_config_dir_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(raw?);
+    path.is_absolute().then_some(path)
+}
+
 #[allow(clippy::too_many_lines)]
 fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
     let read = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string());
@@ -473,14 +487,16 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
 
     match slug {
         "codebuff" => {
-            let root = read("CASS_CODEBUFF_DATA_ROOT")?;
-            if root.is_empty() {
-                return None;
+            if let Some(root) = read("CASS_CODEBUFF_DATA_ROOT").filter(|root| !root.is_empty()) {
+                return Some(vec![expand_leading_tilde(
+                    &root,
+                    dirs::home_dir().as_deref(),
+                )]);
             }
-            Some(vec![expand_leading_tilde(
-                &root,
-                dirs::home_dir().as_deref(),
-            )])
+            // The native override replaces the default store for both
+            // binaries; a configured but missing directory does not fall
+            // back to `~/.config/manicode`.
+            Some(vec![codebuff_env_config_dir()?.join("projects")])
         }
         "aider" => {
             let root = read("CASS_AIDER_DATA_ROOT")?;
@@ -1962,6 +1978,20 @@ mod tests {
         assert!(claude_env_override_roots(None).is_none());
         assert!(claude_env_override_roots(Some("")).is_none());
         assert!(claude_env_override_roots(Some("   ")).is_none());
+    }
+
+    #[test]
+    fn codebuff_config_dir_accepts_only_absolute_native_overrides() {
+        let absolute = std::env::temp_dir().join("freebuff-config");
+        assert_eq!(
+            codebuff_config_dir_from(Some(absolute.clone().into_os_string())),
+            Some(absolute)
+        );
+        // The CLI refuses relative and blank values, so they hold no history.
+        for ignored in ["", "   ", "relative/config", "~/.config/freebuff"] {
+            assert_eq!(codebuff_config_dir_from(Some(ignored.into())), None);
+        }
+        assert_eq!(codebuff_config_dir_from(None), None);
     }
 
     #[test]

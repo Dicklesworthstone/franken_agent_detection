@@ -88,6 +88,7 @@ Custom history stores use the same environment settings as their connectors:
 | Crush | `CRUSH_SQLITE_DB` | Prefers an existing explicit global database, with the default as fallback |
 | Goose | `GOOSE_SQLITE_DB`, `GOOSE_PATH_ROOT` | Resolves the database and JSONL sessions directory independently, including their default fallbacks |
 | Cursor | `CASS_CURSOR_PROJECTS_ROOT` | Replaces the Agent transcript root while retaining Composer detection |
+| Codebuff / Freebuff | `CASS_CODEBUFF_DATA_ROOT`, `FREEBUFF_CONFIG_DIR` | The host data root takes precedence; an absolute native config directory replaces `~/.config/manicode` (its `projects` store), and a configured but missing directory does not fall back. Relative values are ignored, as the CLI refuses them |
 
 These remain filesystem installation probes. A configured database path must
 be a file; detection does not open databases or validate their schemas. The

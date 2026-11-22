@@ -46,6 +46,7 @@ impl CodebuffConnector {
         }
         env_var_nonempty("CASS_CODEBUFF_DATA_ROOT")
             .map(|raw| crate::expand_leading_tilde(&raw, dirs::home_dir().as_deref()))
+            .or_else(|| crate::codebuff_env_config_dir().map(|dir| dir.join("projects")))
             .or_else(|| dirs::home_dir().map(|home| home.join(".config/manicode/projects")))
             .into_iter()
             .map(ScanRoot::local)

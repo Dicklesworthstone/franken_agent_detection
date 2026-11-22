@@ -15,7 +15,7 @@ use tempfile::TempDir;
 const CHILD_ROOT: &str = "FAD_ROOT_PROBE_TEST_ROOT";
 const CHILD_SLUG: &str = "FAD_ROOT_PROBE_TEST_SLUG";
 const CHILD_EXPECTED: &str = "FAD_ROOT_PROBE_TEST_EXPECTED";
-const VARIABLES: [&str; 12] = [
+const VARIABLES: [&str; 14] = [
     "GEMINI_HOME",
     "OPENCODE_STORAGE_ROOT",
     "OPENCODE_SQLITE_DB",
@@ -28,6 +28,8 @@ const VARIABLES: [&str; 12] = [
     "CASS_OMP_DATA_ROOT",
     "PI_CODING_AGENT_SESSION_DIR",
     "PI_CONFIG_DIR",
+    "CASS_CODEBUFF_DATA_ROOT",
+    "FREEBUFF_CONFIG_DIR",
 ];
 
 // Table columns: overrides, existing directories, existing files, expected roots.
@@ -141,6 +143,39 @@ fn custom_root_probe_child() {
     let scope = root.join("explicit-scope");
     assert_detected_roots(&slug, Some(&scope), &[scope.display().to_string()]);
     assert_detected_roots(&slug, Some(&root.join("missing-scope")), &[]);
+}
+
+#[test]
+fn codebuff_native_config_dir_relocates_the_shared_store() {
+    const DEFAULT: &str = "home/.config/manicode/projects";
+    run_cases(
+        "codebuff",
+        &[
+            (&[], &[DEFAULT], &[], &[DEFAULT]),
+            (
+                &[("FREEBUFF_CONFIG_DIR", "custom")],
+                &["custom/projects", DEFAULT],
+                &[],
+                &["custom/projects"],
+            ),
+            (&[("FREEBUFF_CONFIG_DIR", "absent")], &[DEFAULT], &[], &[]),
+            (
+                &[("FREEBUFF_CONFIG_DIR", " \t ")],
+                &["custom/projects", DEFAULT],
+                &[],
+                &[DEFAULT],
+            ),
+            (
+                &[
+                    ("CASS_CODEBUFF_DATA_ROOT", "host"),
+                    ("FREEBUFF_CONFIG_DIR", "custom"),
+                ],
+                &["host", "custom/projects", DEFAULT],
+                &[],
+                &["host"],
+            ),
+        ],
+    );
 }
 
 #[test]
