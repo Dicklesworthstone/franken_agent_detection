@@ -52,6 +52,7 @@ pub mod shelley;
 #[cfg(any(
     feature = "cursor",
     feature = "opencode",
+    feature = "zcode",
     feature = "goose",
     feature = "hermes",
     feature = "crush",
@@ -67,6 +68,8 @@ pub mod token_extraction;
 pub mod utils;
 pub mod vibe;
 pub mod workspace_cache;
+#[cfg(feature = "zcode")]
+pub mod zcode;
 
 #[cfg(test)]
 mod conformance_tests;
@@ -337,5 +340,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
     v.push(("hermes", || Box::new(hermes::HermesConnector::new())));
     #[cfg(feature = "shelley")]
     v.push(("shelley", || Box::new(shelley::ShelleyConnector::new())));
+    #[cfg(feature = "zcode")]
+    v.push(("zcode", || Box::new(zcode::ZCodeConnector::new())));
     v
 }

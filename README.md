@@ -84,6 +84,7 @@ Custom history stores use the same environment settings as their connectors:
 | Continue | `CONTINUE_GLOBAL_DIR` | Replaces the default `~/.continue` home; relative paths resolve against the process working directory, and `~` remains literal |
 | Kiro CLI v2 | `KIRO_HOME` | Replaces `~/.kiro`, including `sessions/cli`; a missing configured home does not select another profile |
 | OpenCode | `OPENCODE_STORAGE_ROOT`, `OPENCODE_SQLITE_DB` | Keeps legacy storage and SQLite independent, with default database candidates still available |
+| ZCode CLI / Desktop | `ZCODE_SESSION_DB_PATH`, `ZCODE_SESSION_DB`, `ZCODE_STORAGE_DIR` | Uses the first explicit database override, then `storage.sessionDbPath` in `cli/config.json`, then `cli/db/db.sqlite` under the storage directory; requires the `zcode` feature and a supported ZCode schema |
 | Hermes | `HERMES_SQLITE_DB`, `HERMES_HOME` | Prefers an existing explicit database, then `$HERMES_HOME/state.db`, then the default store |
 | Crush | `CRUSH_SQLITE_DB` | Prefers an existing explicit global database, with the default as fallback |
 | Goose | `GOOSE_SQLITE_DB`, `GOOSE_PATH_ROOT` | Resolves the database and JSONL sessions directory independently, including their default fallbacks |
@@ -96,6 +97,12 @@ requires its connector's feature. Explicit detector `root_overrides` stay
 restricted to the supplied paths. Reported roots are candidate locations;
 passing a database file as a scan context deliberately scopes applicable
 connectors to that file.
+
+ZCode is a schema-aware exception: detection requires its identity, session,
+message, part, session-entry and turn-usage tables with supported columns.
+Its default store is `~/.zcode/cli/db/db.sqlite`. An explicit missing override
+does not fall back to another profile. ZCode has no raw remote probe path,
+because its database also holds private runtime and application state.
 
 ## Connectors
 
@@ -372,6 +379,7 @@ traversal immediately, including when a source error was already deferred.
 | `connectors` | Connector framework and every connector that needs no extra dependencies |
 | `chatgpt` | ChatGPT desktop, including AES-GCM encrypted v2/v3 conversations |
 | `cursor`, `opencode`, `goose`, `hermes`, `crush`, `devin`, `shelley` | SQLite-backed stores for those agents |
+| `zcode` | Schema-aware ZCode CLI / Desktop SQLite transcripts |
 | `openclaw-sqlite` | OpenClaw 2 per-agent SQLite transcripts (zstd events included) |
 | `codex-zstd` | Codex rollouts compressed to `rollout-*.jsonl.zst` (Codex's `local_thread_store_compression`) |
 | `copilot-vscdb` | Legacy VS Code Copilot chat sessions in `state.vscdb` |
@@ -418,11 +426,24 @@ coherent snapshot and nothing is recovered or checkpointed.
 | `prime_agent` | Prime Agent | session JSONL |
 | `shelley` | Shelley | `shelley.db` |
 | `windsurf` | Windsurf | detection only |
+| `zcode` | ZCode CLI / Desktop | `~/.zcode/cli/db/db.sqlite` and explicit database overrides |
 
 Pi-family transcripts keep every branch of a session (abandoned branches stay
 searchable), and each message records whether it is on the active branch and
 in the active model context, with summaries, injected context and shell runs
 labeled by kind.
+
+ZCode reads the schema verified for CLI 0.17.1 / Desktop 3.18.2 in
+[CASS #573](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/573).
+It retains visible text, reasoning, tool calls/results and attachment metadata,
+filters injected or hidden messages and soft-deleted sessions, and honors
+`CASS_SKIP_SUBAGENTS`. Direct message usage is counted once; per-turn usage is
+a fallback only when that turn has no direct counters. Credentials, settings,
+runtime prompt snapshots, rollout logs and inline attachment data are excluded.
+Hosts must also exclude the physical database and its SQLite sidecars from raw
+mirroring, regardless of the provider label; `is_zcode_container` supports that
+check even when a newer transcript schema is not yet readable. OpenCode rejects
+ZCode containers instead of claiming their overlapping table names.
 
 ## Design goals
 

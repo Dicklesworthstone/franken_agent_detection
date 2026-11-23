@@ -75,6 +75,8 @@ chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
 cursor = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 # OpenCode: SQLite database access for v1.2+ opencode.db
 opencode = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
+# ZCode CLI/Desktop: schema-admitted session SQLite (cass #573).
+zcode = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 # Goose: SQLite database access for Goose sessions.db
 goose = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 # Hermes: SQLite database access for Hermes Agent state.db
@@ -133,6 +135,7 @@ all-connectors = [
     "cursor",
     "devin",
     "opencode",
+    "zcode",
     "goose",
     "grok-bot",
     "hermes",

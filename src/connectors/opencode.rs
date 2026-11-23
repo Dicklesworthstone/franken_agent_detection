@@ -332,7 +332,7 @@ impl OpenCodeConnector {
         let mut seen = HashSet::new();
 
         for root in Self::sqlite_source_roots(ctx) {
-            if !root.path.is_file() {
+            if !root.path.is_file() || is_zcode_container(&root.path) {
                 continue;
             }
             let canonical = std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone());
@@ -485,6 +485,14 @@ impl OpenCodeConnector {
 
         conn.execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
+
+        // ZCode shares the v1 table names but its runtime-only user rows and
+        // privacy policy are different. Never claim it as OpenCode, even when
+        // an override or exported fixture names the file `opencode.db`.
+        anyhow::ensure!(
+            !sqlite_table_exists(&conn, "zcode_database_identity")?,
+            "ZCode database is not an OpenCode transcript store"
+        );
 
         // OpenCode 2.0.x keeps its sessions in `session_v2` and their transcripts in
         // `session_message`, next to the 1.x `session`/`message`/`part` tables; a
@@ -1345,6 +1353,19 @@ fn normalize_opencode_timestamp(ts: Option<i64>) -> Option<i64> {
             raw
         }
     })
+}
+
+// Discovery must reject the mixed-content ZCode container before a host can
+// raw-mirror it under the otherwise permitted OpenCode provider policy.
+fn is_zcode_container(path: &Path) -> bool {
+    open_with_flags(
+        path.to_string_lossy().as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()
+    .and_then(|connection| sqlite_table_exists(&connection, "zcode_database_identity").ok())
+    // A failed probe cannot prove this container safe to raw-mirror.
+    .unwrap_or(true)
 }
 
 /// Whether `table` exists: `PRAGMA table_info` returns no rows for a missing table.
