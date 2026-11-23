@@ -1183,6 +1183,68 @@ fn extract_opencode_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
     extracted
 }
 
+/// ZCode records model-call counters on assistant messages. A turn's summary
+/// is attached by the connector only when that turn has no direct counters.
+/// User/tool rows and covered intermediate replies never add token estimates
+/// to those model-call totals. Reasoning is retained as a subset of output.
+fn extract_zcode_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
+    let tokens = extra
+        .pointer("/cass/token_usage")
+        .or_else(|| extra.get("tokens"));
+    let read = |path: &str| {
+        tokens
+            .and_then(|tokens| tokens.pointer(path))
+            .and_then(Value::as_i64)
+            .filter(|count| *count >= 0)
+    };
+    let model_name = extra
+        .get("modelId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let provider = extra
+        .get("providerId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            model_name
+                .as_deref()
+                .map(|model| normalize_model(model).provider)
+        });
+    let tool_call_count = u32::try_from(
+        extra
+            .pointer("/cass/tool_call_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    )
+    .unwrap_or(u32::MAX);
+    let mut usage = ExtractedTokenUsage {
+        model_name,
+        provider,
+        tool_call_count,
+        has_tool_calls: tool_call_count > 0,
+        ..Default::default()
+    };
+    if !matches!(role, "assistant" | "agent") {
+        usage.data_source = TokenDataSource::Suppressed;
+        return usage;
+    }
+    usage.input_tokens = read("/input");
+    usage.output_tokens = read("/output");
+    usage.thinking_tokens = read("/reasoning");
+    usage.cache_read_tokens = read("/cache/read");
+    usage.cache_creation_tokens = read("/cache/write");
+    if usage.has_token_data() {
+        usage.data_source = TokenDataSource::Api;
+    } else if extra
+        .pointer("/cass/usage_covered_by_turn")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        usage.data_source = TokenDataSource::Suppressed;
+    }
+    usage
+}
+
 /// Extract token usage from a message, dispatching by agent type.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -1196,6 +1258,7 @@ pub fn extract_tokens_for_agent(
     let extracted = match resolved_slug {
         "claude_code" | "claude" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
+        "zcode" => extract_zcode_tokens(extra, role),
         "gemini" => extract_gemini_tokens(extra, role),
         "qwen" => extract_qwen_tokens(extra, role),
         "cline" => extract_cline_tokens(extra, role),
@@ -1633,6 +1696,44 @@ pub fn extract_tokens_for_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zcode_tokens_accept_provider_and_canonical_agent_roles_without_double_counting() {
+        for extra in [
+            serde_json::json!({
+                "modelId": "example-model", "providerId": "personal:example",
+                "tokens": {"input": 10, "output": 3, "reasoning": 1, "cache": {"read": 2, "write": 4}}
+            }),
+            serde_json::json!({
+                "modelId": "example-model", "providerId": "personal:example",
+                "cass": {"token_usage": {"input": 10, "output": 3, "reasoning": 1,
+                    "cache": {"read": 2, "write": 4}}, "usage_covered_by_turn": true}
+            }),
+        ] {
+            for role in ["assistant", "agent"] {
+                let usage = extract_tokens_for_agent("zcode", &extra, "visible answer", role);
+                assert_eq!(usage.input_tokens, Some(10), "{role}");
+                assert_eq!(usage.output_tokens, Some(3), "{role}");
+                assert_eq!(usage.thinking_tokens, Some(1), "{role}");
+                assert_eq!(usage.cache_read_tokens, Some(2), "{role}");
+                assert_eq!(usage.cache_creation_tokens, Some(4), "{role}");
+                assert_eq!(usage.model_name.as_deref(), Some("example-model"));
+                assert_eq!(usage.provider.as_deref(), Some("personal:example"));
+                assert!(matches!(usage.data_source, TokenDataSource::Api));
+            }
+            for role in ["user", "tool"] {
+                let usage = extract_tokens_for_agent("zcode", &extra, "user prompt", role);
+                assert!(!usage.has_token_data());
+                assert!(matches!(usage.data_source, TokenDataSource::Suppressed));
+            }
+        }
+        for role in ["assistant", "agent"] {
+            let covered = serde_json::json!({"cass": {"usage_covered_by_turn": true}});
+            let usage = extract_tokens_for_agent("zcode", &covered, "intermediate answer", role);
+            assert!(!usage.has_token_data());
+            assert!(matches!(usage.data_source, TokenDataSource::Suppressed));
+        }
+    }
 
     #[test]
     fn normalize_model_claude_opus() {

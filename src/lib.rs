@@ -63,6 +63,8 @@ pub use connectors::opencode::OpenCodeConnector;
 pub use connectors::shelley::ShelleyConnector;
 #[cfg(feature = "connectors")]
 pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenDataSource};
+#[cfg(feature = "zcode")]
+pub use connectors::zcode::ZCodeConnector;
 #[cfg(feature = "connectors")]
 pub use connectors::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanProgressTick,
@@ -173,6 +175,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "shelley",
     "vibe",
     "windsurf",
+    "zcode",
 ];
 
 /// Resolve any known connector slug, alias, or emitted conversation `agent_slug`
@@ -228,6 +231,7 @@ pub fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "shelley" | "shelley-db" => Some("shelley"),
         "vibe" | "vibe-cli" => Some("vibe"),
         "windsurf" => Some("windsurf"),
+        "zcode" | "zcode-cli" | "zcode-desktop" => Some("zcode"),
         _ => None,
     }
 }
@@ -1187,6 +1191,9 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".local", "share", "muse"]);
             maybe_push(&mut out, &[".config", "muse"]);
         }
+        "zcode" => {
+            maybe_push(&mut out, &[".zcode", "cli", "db", "db.sqlite"]);
+        }
         "opencode" => {
             // The canonical v1.2+ SQLite database. Probed first so diagnostic
             // output surfaces the data file (not the sibling config directory)
@@ -1381,7 +1388,57 @@ fn shelley_detection_entry(roots: Option<&[PathBuf]>) -> InstalledAgentDetection
     }
 }
 
+/// ZCode requires its own schema signature, including when a caller supplies
+/// an explicit database path. A missing Cargo feature must not degrade this
+/// into path-existence-only detection of arbitrary SQLite stores.
+fn zcode_detection_entry(roots: Option<&[PathBuf]>) -> InstalledAgentDetectionEntry {
+    #[cfg(feature = "zcode")]
+    {
+        let candidates = roots.map_or_else(
+            || {
+                ZCodeConnector::configured_db_path()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            },
+            |roots| {
+                roots
+                    .iter()
+                    .flat_map(|root| ZCodeConnector::db_paths_for_root(root))
+                    .collect()
+            },
+        );
+        let mut seen = HashSet::new();
+        let root_paths = candidates
+            .into_iter()
+            .filter(|path| seen.insert(path.clone()) && connectors::zcode::is_zcode_database(path))
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        InstalledAgentDetectionEntry {
+            slug: "zcode".into(),
+            detected: !root_paths.is_empty(),
+            evidence: root_paths
+                .iter()
+                .map(|path| format!("ZCode schema: {path}"))
+                .collect(),
+            root_paths,
+        }
+    }
+    #[cfg(not(feature = "zcode"))]
+    {
+        let _ = roots;
+        InstalledAgentDetectionEntry {
+            slug: "zcode".into(),
+            detected: false,
+            root_paths: Vec::new(),
+            evidence: vec!["compiled without the `zcode` cargo feature".into()],
+        }
+    }
+}
+
 fn entry_from_detect(slug: &'static str) -> InstalledAgentDetectionEntry {
+    if slug == "zcode" {
+        return zcode_detection_entry(None);
+    }
     if slug == "shelley" {
         // Never path-existence-only for Shelley; CASS_SHELLEY_DB is handled
         // inside the schema-aware candidate expansion.
@@ -1395,6 +1452,9 @@ fn entry_from_detect(slug: &'static str) -> InstalledAgentDetectionEntry {
 }
 
 fn entry_from_override(slug: &'static str, roots: &[PathBuf]) -> InstalledAgentDetectionEntry {
+    if slug == "zcode" {
+        return zcode_detection_entry(Some(roots));
+    }
     if slug == "shelley" {
         return shelley_detection_entry(Some(roots));
     }
@@ -1468,6 +1528,8 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
         .map(|&slug| {
             let paths: Vec<String> = match slug {
                 "codebuff" => vec![tilde(&[".config", "manicode", "projects"])],
+                // Mixed-content store: never copy it as a raw remote source.
+                "zcode" => Vec::new(),
                 "aider" => vec![tilde(&[".aider.chat.history.md"]), tilde(&[".aider"])],
                 "amp" => vec![
                     tilde(&[".local", "share", "amp"]),
@@ -2521,7 +2583,7 @@ mod tests {
             // Shelley's arm is intentionally empty: no safe remote
             // export/sync of a live SQLite database exists yet (cass gh#415).
             assert!(
-                !paths.is_empty() || slug == "shelley" || slug == "pi_durable",
+                !paths.is_empty() || matches!(slug, "shelley" | "pi_durable" | "zcode"),
                 "connector {slug} has empty tilde paths"
             );
         }
@@ -2551,6 +2613,7 @@ mod tests {
                 ("grok_bot", cfg!(feature = "grok-bot")),
                 ("hermes", cfg!(feature = "hermes")),
                 ("opencode", cfg!(feature = "opencode")),
+                ("zcode", cfg!(feature = "zcode")),
                 ("shelley", cfg!(feature = "shelley")),
             ]);
             // Factory slugs are the connector-native names (e.g. `copilot`
