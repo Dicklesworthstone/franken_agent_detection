@@ -76,6 +76,27 @@ window is since `v0.4.1` (2026-11-21).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Antigravity: retain tool-only turns and per-step API usage (#37).** Integrate
+  [LPFchan's contributor fix](https://github.com/LPFchan/franken_agent_detection/commit/6ed8a2f4ba88475c8c197f8bf7303697620c3803):
+  planner responses retain structured tool calls, model IDs, and token counts
+  even without text; checkpoints retain compaction usage. The public
+  `extract_antigravity_tokens` helper and agent dispatcher preserve uncached
+  input, output, cache reads/writes, and reasoning counts independently,
+  including explicit zeroes and partial usage. Existing tool counts and skill
+  normalization remain intact.
+- **Antigravity: restore conversation metadata.** Titles come from annotation
+  protobuf text (including escaped UTF-8), then the summary database, then the
+  transcript. With a SQLite feature enabled, the read-only summary lookup also
+  restores workspaces and parent IDs; an initial system message supplies the
+  parent fallback. Annotation, summary, and WAL sources participate in
+  discovery and incremental freshness while honoring exclusions. The connector
+  uses the conservative streaming fallback for source boundaries so a newly
+  created metadata file cannot be hidden by an unchanged transcript receipt.
+  The integration uses the current FrankenSQLite bridge, tolerates nullable
+  metadata, and preserves remote file-URI authorities.
+
 ## [0.4.1] -- 2026-11-21
 
 ### Fixed

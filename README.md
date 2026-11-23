@@ -423,6 +423,18 @@ SQLite stores are read with [FrankenSQLite](https://crates.io/crates/fsqlite)
 opened read-only inside one read transaction, so a live WAL is seen as one
 coherent snapshot and nothing is recovered or checkpointed.
 
+Antigravity transcript usage, tool calls, annotation titles, and initial
+system-message parent IDs are available with `connectors`. Enabling any of the
+SQLite-backed features (including `all-connectors`) additionally reads
+`conversation_summaries.db` for workspaces, titles, and parent IDs. Annotation
+titles take precedence over summary titles; the first prompt remains the
+fallback. The connector discovers these metadata files and the summary WAL so
+mirrors and incremental scans can refresh when only metadata changes.
+Antigravity reports `supports_source_boundaries() == false`: the existing
+receipt format cannot track a metadata file that first appears after indexing.
+Its boundary API uses the streaming callback fallback, retaining `since_ts`
+filtering without reusing an incomplete transcript-only receipt.
+
 ### Coverage
 
 | Slug | Agent | Storage read |
