@@ -963,6 +963,121 @@ fn extract_qwen_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
     extracted
 }
 
+fn antigravity_tool_call_count(extra: &Value) -> u32 {
+    if let Some(count) = extra
+        .pointer("/cass/tool_call_count")
+        .and_then(Value::as_u64)
+    {
+        return u32::try_from(count).unwrap_or(u32::MAX);
+    }
+    if extra.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call") {
+        return 1;
+    }
+    let count = extra
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map_or(0, |calls| {
+            calls
+                .iter()
+                .filter(|call| {
+                    call.get("name")
+                        .or_else(|| call.get("tool_name"))
+                        .or_else(|| call.pointer("/function/name"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.trim().is_empty())
+                })
+                .count()
+        });
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// Extract token usage from an Antigravity message's raw or normalized `extra` data.
+///
+/// Antigravity's `input_tokens` are uncached input, independent of cache reads
+/// (which can exceed input). Preserve missing buckets and reported zeroes; do
+/// not infer an input/output split or add reasoning to the reported output.
+#[must_use]
+pub fn extract_antigravity_tokens(extra: &Value) -> ExtractedTokenUsage {
+    let read_text = |paths: &[&str]| {
+        paths.iter().find_map(|path| {
+            extra
+                .pointer(path)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(String::from)
+        })
+    };
+    // Keep the metadata fallbacks formerly provided by the generic extractor.
+    let model_name = read_text(&[
+        "/model",
+        "/cass/model",
+        "/message/model",
+        "/modelConfig/modelName",
+        "/modelInfo/modelName",
+        "/modelType",
+        "/modelID",
+        "/model_name",
+        "/_meta/modelId",
+        "/metadata/model_slug",
+        "/data/model",
+        "/payload/model",
+        "/session_state/model_info/model_id",
+    ]);
+    let provider = read_text(&[
+        "/provider",
+        "/provider_name",
+        "/message/provider",
+        "/modelInfo/provider",
+        "/cass/provider",
+    ])
+    .or_else(|| {
+        model_name
+            .as_deref()
+            .map(|name| normalize_model(name).provider)
+    });
+    let usage = extra
+        .get("usage")
+        .filter(|value| value.is_object())
+        .unwrap_or(extra);
+    let read = |key| {
+        usage
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|count| *count >= 0)
+    };
+    let input_tokens = read("input_tokens");
+    let output_tokens = read("output_tokens");
+    let cache_read_tokens = read("cache_read_tokens");
+    let cache_creation_tokens =
+        read("cache_write_tokens").or_else(|| read("cache_creation_tokens"));
+    let thinking_tokens = read("reasoning_tokens").or_else(|| read("thinking_tokens"));
+    let has_api_data = input_tokens.is_some()
+        || output_tokens.is_some()
+        || cache_read_tokens.is_some()
+        || cache_creation_tokens.is_some()
+        || thinking_tokens.is_some();
+
+    let tool_call_count = antigravity_tool_call_count(extra);
+    ExtractedTokenUsage {
+        model_name,
+        provider,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        thinking_tokens,
+        has_tool_calls: tool_call_count > 0,
+        tool_call_count,
+        data_source: if has_api_data {
+            TokenDataSource::Api
+        } else {
+            TokenDataSource::Estimated
+        },
+        ..Default::default()
+    }
+}
+
 /// Estimate tokens from content length for agents that do not provide token data.
 #[must_use]
 pub fn estimate_tokens_from_content(content: &str, role: &str) -> ExtractedTokenUsage {
@@ -1146,6 +1261,28 @@ pub fn extract_tokens_for_agent(
                 },
                 ..Default::default()
             }
+        }
+        "antigravity" => {
+            let mut usage = extract_antigravity_tokens(extra);
+            // Older normalized tool messages may only carry the step type.
+            // An explicit count, including zero, remains authoritative.
+            if usage.tool_call_count == 0
+                && extra
+                    .pointer("/cass/tool_call_count")
+                    .and_then(Value::as_u64)
+                    .is_none()
+                && role == "tool"
+                && extra.get("agy_type").is_some()
+            {
+                usage.tool_call_count = 1;
+                usage.has_tool_calls = true;
+            }
+            // A reasoning-only record is reported API usage even without an
+            // additive input/output breakdown. Do not replace it with an estimate.
+            if usage.data_source == TokenDataSource::Api {
+                return usage;
+            }
+            usage
         }
         // Prime Agent assistant messages carry a full usage block
         // (`input`/`output`/`cacheRead`/`cacheWrite`), which the connector
@@ -1356,9 +1493,9 @@ pub fn extract_tokens_for_agent(
                 }
             }
         }
-        "cursor" | "factory" | "antigravity" | "grok" | "goose" | "vibe" | "clawdbot"
-        | "codebuff" | "copilot_cli" | "hermes" | "devin" | "chatgpt" | "kiro" | "muse"
-        | "openhands" | "aider" | "grok_bot" => {
+        "cursor" | "factory" | "grok" | "goose" | "vibe" | "clawdbot" | "codebuff"
+        | "copilot_cli" | "hermes" | "devin" | "chatgpt" | "kiro" | "muse" | "openhands"
+        | "aider" | "grok_bot" => {
             let model_name = extra
                 .get("model")
                 .or_else(|| extra.pointer("/cass/model"))
@@ -2200,5 +2337,40 @@ mod tests {
         assert_eq!(kimi_usage.output_tokens, Some(45));
         assert!(kimi_usage.has_tool_calls);
         assert_eq!(kimi_usage.tool_call_count, 1);
+    }
+
+    #[test]
+    fn extract_antigravity_tokens_from_normalized_extra() {
+        let extra: Value = serde_json::json!({
+            "model": "gemini-4-neon-high",
+            "usage": {
+                "input_tokens": 2517,
+                "cache_read_tokens": 12725,
+                "output_tokens": 717
+            }
+        });
+        let usage = extract_tokens_for_agent("antigravity", &extra, "", "assistant");
+        assert_eq!(usage.model_name.as_deref(), Some("gemini-4-neon-high"));
+        assert_eq!(usage.provider.as_deref(), Some("google"));
+        assert_eq!(usage.input_tokens, Some(2517));
+        assert_eq!(usage.cache_read_tokens, Some(12725));
+        assert_eq!(usage.output_tokens, Some(717));
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+    }
+
+    #[test]
+    fn extract_antigravity_tokens_from_raw_checkpoint_record() {
+        let raw: Value = serde_json::json!({
+            "type": "CHECKPOINT",
+            "input_tokens": 6982,
+            "cache_read_tokens": 508_361,
+            "output_tokens": 5673
+        });
+        let usage = extract_antigravity_tokens(&raw);
+        assert_eq!(usage.model_name, None);
+        assert_eq!(usage.input_tokens, Some(6982));
+        assert_eq!(usage.cache_read_tokens, Some(508_361));
+        assert_eq!(usage.output_tokens, Some(5673));
+        assert_eq!(usage.data_source, TokenDataSource::Api);
     }
 }

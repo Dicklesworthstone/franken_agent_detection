@@ -1,0 +1,54 @@
+name: Antigravity 37 integration validation
+
+on:
+  push:
+    branches: [validation/antigravity-37]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: antigravity-37-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -Zthreads=1
+      RUST_TEST_THREADS: 2
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Resolve ignored lockfile
+        run: cargo generate-lockfile
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Detection-only tests
+        run: cargo test --locked --all-targets --no-default-features
+      - name: Connector-only Antigravity regressions
+        run: |
+          cargo test --locked --no-default-features --features connectors --lib antigravity
+          cargo test --locked --no-default-features --features connectors --test antigravity_token_usage --test antigravity_metadata
+      - name: Strict non-SQLite lint
+        run: cargo clippy --locked --all-targets --no-default-features --features connectors,codex-zstd,chatgpt -- -D warnings
+      - name: Strict all-feature lint
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: All-feature tests
+        run: cargo test --locked --all-targets --all-features
+      - name: Minimal SQLite feature
+        run: cargo check --locked --no-default-features --features pi-sqlite
+      - name: Package
+        run: cargo package --locked --allow-dirty

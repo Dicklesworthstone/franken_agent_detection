@@ -755,8 +755,14 @@ mod conformance {
                     "{slug}: scan_with_callback output differed from scan()"
                 );
 
-                let cross_source_connectors: &[&str] =
-                    &["cline", "copilot", "cursor", "opencode", "qwen"];
+                let cross_source_connectors: &[&str] = &[
+                    "antigravity",
+                    "cline",
+                    "copilot",
+                    "cursor",
+                    "opencode",
+                    "qwen",
+                ];
                 let expected_boundaries = !cross_source_connectors.contains(&slug);
                 assert_eq!(
                     connector.supports_source_boundaries(),
@@ -1312,8 +1318,14 @@ mod conformance {
                     "{slug}: scan_with_callback output differed from scan()"
                 );
 
-                let cross_source_connectors: &[&str] =
-                    &["cline", "copilot", "cursor", "opencode", "qwen"];
+                let cross_source_connectors: &[&str] = &[
+                    "antigravity",
+                    "cline",
+                    "copilot",
+                    "cursor",
+                    "opencode",
+                    "qwen",
+                ];
                 let expected_boundaries = !cross_source_connectors.contains(&slug);
                 assert_eq!(
                     connector.supports_source_boundaries(),
