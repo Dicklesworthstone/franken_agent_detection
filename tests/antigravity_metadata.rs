@@ -301,11 +301,56 @@ fn excluded_annotation_and_summary_wal_do_not_enter_metadata_or_sources() {
 }
 
 #[test]
+fn excluded_primary_suppresses_its_sidecars_and_excluded_full_cannot_trigger_refresh() {
+    let fixture = Fixture::new();
+    fixture.write_sidecars();
+    let full = fixture.transcript.with_file_name("transcript_full.jsonl");
+    std::fs::copy(&fixture.transcript, &full).unwrap();
+    for path in [
+        &fixture.transcript,
+        &fixture.annotation,
+        &fixture.summary,
+        &fixture.wal,
+    ] {
+        set_modified(path, 1_700_000_000_000);
+    }
+    set_modified(&full, 1_700_000_010_000);
+    for (case, excluded) in [("primary", &fixture.transcript), ("full", &full)] {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "antigravity_metadata_exclusion_child",
+                "--nocapture",
+            ])
+            .current_dir(fixture.root.path())
+            .env(CHILD_ROOT, fixture.root.path())
+            .env(CHILD_CASE, case)
+            .env("CASS_EXCLUDE_PATHS", excluded)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn antigravity_metadata_exclusion_child() {
     let Some(root) = std::env::var_os(CHILD_ROOT).map(PathBuf::from) else {
         return;
     };
     let case = std::env::var(CHILD_CASE).unwrap();
+    if matches!(case.as_str(), "primary" | "full") {
+        let since = (case == "full").then_some(1_700_000_005_000);
+        let ctx = context(&root, since);
+        let connector = AntigravityConnector::new();
+        assert!(connector.discover_source_files(&ctx).unwrap().is_empty());
+        assert!(connector.scan(&ctx).unwrap().is_empty());
+        return;
+    }
     let forbidden = match case.as_str() {
         "annotation" => vec![root.join("annotations").join(format!("{UUID}.pbtxt"))],
         "wal" => vec![

@@ -65,6 +65,7 @@
 //! best-effort message keyed off `source`, with the raw `type` kept in
 //! `extra.agy_type`. (See the agy version-compatibility guard work.)
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -75,6 +76,7 @@ use walkdir::WalkDir;
 
 use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+use super::token_extraction::{antigravity_tool_call_id, antigravity_tool_name};
 use super::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
     read_capped, unwrap_skill_invocations,
@@ -325,6 +327,45 @@ impl AntigravityConnector {
     /// target. The target may be the conversation directory itself, the `brain/`
     /// directory, or a base directory (`antigravity` or `antigravity-cli`).
     fn conversation_dirs(scan_target: &Path) -> Vec<PathBuf> {
+        // Hosts may target the exact path from a file-watcher event, including
+        // a removed annotation or a WAL removed during a checkpoint. Resolve
+        // known sidecars structurally, using directory scans' layout rules.
+        if !scan_target.is_dir() {
+            let name = scan_target.file_name().and_then(|name| name.to_str());
+            let parent = scan_target.parent();
+            let conversation = match name {
+                Some("transcript.jsonl" | "transcript_full.jsonl") => parent
+                    .filter(|logs| logs.file_name().is_some_and(|name| name == "logs"))
+                    .and_then(Path::parent)
+                    .filter(|dir| {
+                        dir.file_name()
+                            .is_some_and(|name| name == ".system_generated")
+                    })
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf),
+                Some("conversation_summaries.db" | "conversation_summaries.db-wal") => {
+                    return parent.map_or_else(Vec::new, |base| {
+                        Self::conversation_dirs(&base.join("brain"))
+                    });
+                }
+                _ if scan_target.extension().is_some_and(|ext| ext == "pbtxt")
+                    && parent.is_some_and(|dir| {
+                        dir.file_name().is_some_and(|name| name == "annotations")
+                    }) =>
+                {
+                    parent.and_then(Path::parent).and_then(|base| {
+                        scan_target
+                            .file_stem()
+                            .map(|id| base.join("brain").join(id))
+                    })
+                }
+                _ => None,
+            };
+            return conversation
+                .filter(|dir| Self::is_conversation_dir(dir))
+                .into_iter()
+                .collect();
+        }
         if Self::is_conversation_dir(scan_target) {
             return vec![scan_target.to_path_buf()];
         }
@@ -370,13 +411,16 @@ impl AntigravityConnector {
         conversation_dir: &Path,
         since_ts: Option<i64>,
         sidecars: &[DiscoveredSourceFile],
+        excluded_paths: &[PathBuf],
     ) -> bool {
         if since_ts.is_none() {
             return true;
         }
         let transcript_full = Self::transcript_full_path(conversation_dir);
         file_modified_since(&Self::transcript_path(conversation_dir), since_ts)
-            || (transcript_full.is_file() && file_modified_since(&transcript_full, since_ts))
+            || (transcript_full.is_file()
+                && !path_is_excluded(&transcript_full, excluded_paths)
+                && file_modified_since(&transcript_full, since_ts))
             || sidecars
                 .iter()
                 .any(|source| file_modified_since(&source.source_path, since_ts))
@@ -507,7 +551,7 @@ fn model_from_settings(settings: &str) -> Option<String> {
 /// `PLANNER_RESPONSE` records (e.g. `"gemini-4-neon-high"`). Fall back to
 /// `<USER_SETTINGS_CHANGE>` in `USER_INPUT` for older transcripts that omit
 /// per-step model fields.
-fn detect_model(records: &[Value]) -> Option<String> {
+fn detect_model(records: &[&Value]) -> Option<String> {
     for rec in records {
         if let Some(model) = rec
             .get("model")
@@ -573,31 +617,23 @@ fn parse_explicit_tool_calls(
     tool_calls: Option<&Value>,
     fallback_name: Option<&str>,
 ) -> Vec<NormalizedInvocation> {
-    let Some(arr) = tool_calls
-        .and_then(Value::as_array)
-        .filter(|a| !a.is_empty())
-    else {
+    let Some(arr) = tool_calls.and_then(Value::as_array) else {
         return Vec::new();
     };
-
-    let arr = arr
+    let mut seen_ids = HashSet::new();
+    let mut invocations: Vec<_> = arr
         .iter()
         .filter_map(|tc| {
-            let name = tc
-                .get("name")
-                .or_else(|| tc.get("tool_name"))
-                .or_else(|| tc.pointer("/function/name"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .or_else(|| fallback_name.map(String::from))?;
-            let call_id = tc
-                .get("id")
-                .or_else(|| tc.get("call_id"))
-                .or_else(|| tc.get("tool_call_id"))
-                .and_then(Value::as_str)
-                .map(String::from);
+            // Malformed array elements are not additional invocations. A
+            // legacy tool step with no usable entries gets one fallback below.
+            tc.as_object()?;
+            let call_id = antigravity_tool_call_id(tc);
+            let name = antigravity_tool_name(tc).or_else(|| call_id.and(fallback_name))?;
+            if let Some(id) = call_id
+                && !seen_ids.insert(id)
+            {
+                return None;
+            }
             let arguments = tc
                 .get("arguments")
                 .or_else(|| tc.get("args"))
@@ -605,7 +641,6 @@ fn parse_explicit_tool_calls(
                 .or_else(|| tc.pointer("/function/arguments"))
                 .cloned()
                 .map(|raw| match raw {
-                    // agy may store arguments as a JSON string; parse if possible.
                     Value::String(s) => {
                         serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s))
                     }
@@ -613,14 +648,13 @@ fn parse_explicit_tool_calls(
                 });
             Some(NormalizedInvocation {
                 kind: "tool".to_string(),
-                name,
+                name: name.to_string(),
                 raw_name: None,
-                call_id,
+                call_id: call_id.map(String::from),
                 arguments,
             })
         })
-        .collect::<Vec<_>>();
-    let mut invocations = arr;
+        .collect();
     unwrap_skill_invocations(&mut invocations);
     invocations
 }
@@ -644,28 +678,42 @@ fn parse_tool_calls(tool_calls: Option<&Value>, step_type: &str) -> Vec<Normaliz
     }
 }
 
+fn valid_conversation_uuid(candidate: &str) -> bool {
+    candidate.len() == 36
+        && candidate.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 /// Detect the parent conversation UUID of a spawned Antigravity subagent from
 /// its step-0 `SYSTEM_MESSAGE` (`[Message] ... sender=<uuid> ...`).
 fn detect_parent_from_records(ordered: &[&Value]) -> Option<String> {
     let first = ordered.first()?;
     if first.get("step_index").and_then(Value::as_i64) != Some(0)
         || first.get("type").and_then(Value::as_str) != Some("SYSTEM_MESSAGE")
+        || first.get("source").and_then(Value::as_str) != Some("SYSTEM")
     {
         return None;
     }
     let content = first.get("content").and_then(Value::as_str)?;
     for line in content.lines() {
-        if !line.contains("[Message]") {
+        let Some(header) = line.trim_start().strip_prefix("[Message]") else {
             continue;
-        }
-        if let Some((_, rest)) = line.split_once("sender=") {
-            let candidate = rest.split_whitespace().next().unwrap_or("").trim();
-            if !candidate.is_empty()
-                && candidate
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-            {
-                return Some(candidate.to_string());
+        };
+        // Only envelope fields identify the sender. Examples inside content
+        // (including notsender=) must not create a relationship.
+        for field in header.split_whitespace() {
+            if field.starts_with("content=") {
+                break;
+            }
+            if let Some(candidate) = field.strip_prefix("sender=") {
+                if valid_conversation_uuid(candidate) {
+                    return Some(candidate.to_string());
+                }
             }
         }
     }
@@ -681,7 +729,10 @@ fn annotation_title(base: &Path, uuid: &str, excluded_paths: &[PathBuf]) -> Opti
     let text = read_capped(&path).ok()??;
     for line in text.lines() {
         let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix("title:") else {
+        let Some(rest) = trimmed
+            .strip_prefix("title")
+            .and_then(|rest| rest.trim_start().strip_prefix(':'))
+        else {
             continue;
         };
         if let Some(title) = parse_pbtxt_string(rest.trim()) {
@@ -764,6 +815,8 @@ fn parse_pbtxt_string(input: &str) -> Option<String> {
 
 /// Minimal percent-decoding for `file://` URIs (no external dependency).
 #[cfg(any(
+    feature = "antigravity-sqlite",
+    feature = "zcode",
     feature = "cursor",
     feature = "opencode",
     feature = "goose",
@@ -806,6 +859,8 @@ fn percent_decode(input: &str) -> Option<String> {
 
 /// Parse a `file://` workspace URI (or plain path) into a local `PathBuf`.
 #[cfg(any(
+    feature = "antigravity-sqlite",
+    feature = "zcode",
     feature = "cursor",
     feature = "opencode",
     feature = "goose",
@@ -863,6 +918,8 @@ struct SummaryMetadata {
 /// Best-effort read of `workspace_uris`, `title`, and `parent_conversation_id`
 /// from `<base>/conversation_summaries.db`.
 #[cfg(any(
+    feature = "antigravity-sqlite",
+    feature = "zcode",
     feature = "cursor",
     feature = "opencode",
     feature = "goose",
@@ -894,26 +951,46 @@ fn summary_metadata(base: &Path, uuid: &str, excluded_paths: &[PathBuf]) -> Summ
     let Ok(conn) = open_with_flags(db_str, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return SummaryMetadata::default();
     };
-    let row = conn.query_row_map(
-        "SELECT workspace_uris, title, parent_conversation_id \
-         FROM conversation_summaries WHERE conversation_id = ?1",
-        frankensqlite::params![uuid],
-        |row| {
-            // Optional or malformed fields do not erase independent metadata.
-            Ok((
-                row.get_typed::<String>(0).ok(),
-                row.get_typed::<String>(1).ok(),
-                row.get_typed::<String>(2).ok(),
-            ))
-        },
-    );
+    let row = conn.read_transaction(|conn| {
+        // Inspect and read inside one snapshot: older schemas may omit an
+        // optional field, and a concurrent schema change must not mix versions.
+        let columns =
+            conn.query_map_collect("PRAGMA table_info(conversation_summaries)", &[], |row| {
+                row.get_typed::<String>(1)
+            })?;
+        let projection = ["workspace_uris", "title", "parent_conversation_id"]
+            .map(|name| {
+                if columns.iter().any(|column| column == name) {
+                    name
+                } else {
+                    "NULL"
+                }
+            })
+            .join(", ");
+        // The projection uses only the fixed allowlist above. IDs are bound.
+        conn.query_row_map(
+            &format!("SELECT {projection} FROM conversation_summaries WHERE conversation_id = ?1"),
+            frankensqlite::params![uuid],
+            |row| {
+                Ok((
+                    row.get_typed::<String>(0).ok(),
+                    row.get_typed::<String>(1).ok(),
+                    row.get_typed::<String>(2).ok(),
+                ))
+            },
+        )
+    });
     let Ok((workspace_uris, title, parent_id)) = row else {
         return SummaryMetadata::default();
     };
     let workspace = workspace_uris
         .as_deref()
-        .and_then(|uris| serde_json::from_str::<Vec<String>>(uris).ok())
-        .and_then(|uris| uris.into_iter().find_map(|uri| parse_workspace_uri(&uri)));
+        .and_then(|uris| serde_json::from_str::<Value>(uris).ok())
+        .and_then(|uris| {
+            uris.as_array()?
+                .iter()
+                .find_map(|uri| uri.as_str().and_then(parse_workspace_uri))
+        });
     let nonempty = |value: Option<String>| {
         value
             .map(|value| value.trim().to_string())
@@ -927,6 +1004,8 @@ fn summary_metadata(base: &Path, uuid: &str, excluded_paths: &[PathBuf]) -> Summ
 }
 
 #[cfg(not(any(
+    feature = "antigravity-sqlite",
+    feature = "zcode",
     feature = "cursor",
     feature = "opencode",
     feature = "goose",
@@ -1053,7 +1132,19 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
             // A MODEL step that is not a planner response is a tool action/result
             // (VIEW_FILE, EDIT_FILE, RUN_COMMAND, …, or an unknown future kind).
             if source == "MODEL" {
-                let invocations = parse_tool_calls(tool_calls, step_type);
+                let mut invocations = parse_tool_calls(tool_calls, step_type);
+                // Older results identify the call on the record itself.
+                if invocations.len() == 1 && invocations[0].call_id.is_none() {
+                    invocations[0].call_id = ["tool_call_id", "call_id"]
+                        .iter()
+                        .find_map(|key| {
+                            rec.get(key)
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|id| !id.is_empty())
+                        })
+                        .map(String::from);
+                }
                 let mut extra = Map::new();
                 extra.insert("agy_type".to_string(), Value::String(step_type.to_string()));
                 if let Some(t) = thinking {
@@ -1099,11 +1190,110 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
             }
         }
     }
+    .map(|mut msg| {
+        // CASS persists extra even when its internal message type lacks an
+        // invocations field. Explicit counts remain authoritative.
+        if let Some(calls) = tool_calls {
+            msg.extra["tool_calls"] = calls.clone();
+            msg.extra["cass"]["tool_call_count"] = Value::from(msg.invocations.len());
+        }
+        if let Some(index) = rec.get("step_index").and_then(Value::as_i64) {
+            msg.extra["step_index"] = Value::from(index);
+        }
+        for key in ["tool_call_id", "call_id"] {
+            if let Some(id) = rec.get(key) {
+                msg.extra[key] = id.clone();
+            }
+        }
+        msg
+    })
+}
+
+/// Results reference an earlier planner request without claiming another call.
+/// Each planner step is a separate request, even if a provider reuses call IDs
+/// after compaction. ID-less historical calls remain independent.
+fn reconcile_tool_invocations(messages: &mut [NormalizedMessage]) {
+    let mut requested_ids = HashSet::new();
+    for msg in messages {
+        if msg.role == "user" || msg.extra["agy_type"] == "CHECKPOINT" {
+            requested_ids.clear();
+        }
+        if msg.role == "assistant" {
+            requested_ids.extend(
+                msg.invocations
+                    .iter()
+                    .filter_map(|call| call.call_id.clone()),
+            );
+            continue;
+        }
+        if msg.role != "tool" || msg.invocations.is_empty() {
+            continue;
+        }
+        let mut referenced = Vec::new();
+        msg.invocations.retain(|invocation| {
+            let Some(id) = &invocation.call_id else {
+                return true;
+            };
+            if !requested_ids.contains(id) {
+                return true;
+            }
+            referenced.push(Value::String(id.clone()));
+            false
+        });
+        msg.extra["cass"]["tool_call_count"] = Value::from(msg.invocations.len());
+        if !referenced.is_empty() {
+            msg.extra["cass"]["referenced_tool_call_ids"] = Value::Array(referenced);
+        }
+    }
+}
+
+fn conversation_metadata(
+    model: Option<String>,
+    parent_conversation_id: Option<String>,
+    layout: Option<AntigravityLayout>,
+    base: Option<&Path>,
+) -> Value {
+    let mut metadata = Map::new();
+    metadata.insert("source".to_string(), Value::String(AGENT_SLUG.to_string()));
+    if let Some(model) = model {
+        metadata.insert("model".to_string(), Value::String(model));
+    }
+    if let Some(parent) = parent_conversation_id {
+        metadata.insert(
+            "parent_conversation_id".to_string(),
+            Value::String(
+                layout
+                    .unwrap_or(AntigravityLayout::Cli)
+                    .external_id(&parent),
+            ),
+        );
+        metadata.insert(
+            "raw_parent_conversation_id".to_string(),
+            Value::String(parent),
+        );
+    }
+    // Provenance: which store (IDE vs CLI) and which base directory this
+    // conversation was read from, so identical uuids across stores stay
+    // distinguishable downstream.
+    if let Some(layout) = layout {
+        metadata.insert(
+            "layout".to_string(),
+            Value::String(layout.metadata_value().to_string()),
+        );
+    }
+    if let Some(base) = base {
+        metadata.insert(
+            "data_root".to_string(),
+            Value::String(base.to_string_lossy().into_owned()),
+        );
+    }
+    Value::Object(metadata)
 }
 
 fn parse_conversation(
     conversation_dir: &Path,
     excluded_paths: &[PathBuf],
+    allow_sqlite: bool,
 ) -> Option<NormalizedConversation> {
     let transcript = AntigravityConnector::transcript_path(conversation_dir);
     let records = AntigravityConnector::read_transcript_records(&transcript);
@@ -1125,20 +1315,29 @@ fn parse_conversation(
     let external_id = uuid
         .as_deref()
         .map(|id| layout.unwrap_or(AntigravityLayout::Cli).external_id(id));
-    let model = detect_model(&records);
+    let model = detect_model(&ordered);
     let ann_title = base.and_then(|b| {
         uuid.as_deref()
             .and_then(|id| annotation_title(b, id, excluded_paths))
     });
     let summary = base
+        .filter(|_| allow_sqlite)
         .and_then(|b| {
             uuid.as_deref()
                 .map(|id| summary_metadata(b, id, excluded_paths))
         })
         .unwrap_or_default();
+    let admissible_parent = |parent: &String| {
+        valid_conversation_uuid(parent)
+            && !uuid
+                .as_deref()
+                .is_some_and(|id| parent.eq_ignore_ascii_case(id))
+    };
     let parent_conversation_id = summary
         .parent_conversation_id
-        .or_else(|| detect_parent_from_records(&ordered));
+        .filter(admissible_parent)
+        .or_else(|| detect_parent_from_records(&ordered))
+        .filter(admissible_parent);
 
     let mut messages: Vec<NormalizedMessage> = Vec::new();
     let mut started_at: Option<i64> = None;
@@ -1167,6 +1366,7 @@ fn parse_conversation(
         return None;
     }
 
+    reconcile_tool_invocations(&mut messages);
     reindex_messages(&mut messages);
 
     let title = ann_title.or(summary.title).or_else(|| {
@@ -1178,30 +1378,6 @@ fn parse_conversation(
             .map(|line| line.chars().take(100).collect::<String>())
     });
 
-    let mut metadata = Map::new();
-    metadata.insert("source".to_string(), Value::String(AGENT_SLUG.to_string()));
-    if let Some(model) = model {
-        metadata.insert("model".to_string(), Value::String(model));
-    }
-    if let Some(parent) = parent_conversation_id {
-        metadata.insert("parent_conversation_id".to_string(), Value::String(parent));
-    }
-    // Provenance: which store (IDE vs CLI) and which base directory this
-    // conversation was read from, so identical uuids across stores stay
-    // distinguishable downstream.
-    if let Some(layout) = layout {
-        metadata.insert(
-            "layout".to_string(),
-            Value::String(layout.metadata_value().to_string()),
-        );
-    }
-    if let Some(base) = base {
-        metadata.insert(
-            "data_root".to_string(),
-            Value::String(base.to_string_lossy().into_owned()),
-        );
-    }
-
     Some(NormalizedConversation {
         agent_slug: AGENT_SLUG.to_string(),
         external_id,
@@ -1210,7 +1386,7 @@ fn parse_conversation(
         source_path: transcript,
         started_at,
         ended_at,
-        metadata: Value::Object(metadata),
+        metadata: conversation_metadata(model, parent_conversation_id, layout, base),
         messages,
     })
 }
@@ -1224,7 +1400,7 @@ fn scan_antigravity_with_callback(
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for root in roots {
-        if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
+        if path_is_excluded(&root.path, &excluded_paths) {
             continue;
         }
         for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
@@ -1234,20 +1410,29 @@ fn scan_antigravity_with_callback(
             {
                 continue;
             }
+            let sidecars =
+                AntigravityConnector::metadata_sidecars(&conversation_dir, &root, &excluded_paths);
+            // A selected removed sidecar is itself change evidence. Its mtime
+            // no longer exists, so refresh the surviving transcript/metadata.
+            if root.path.exists()
+                && !AntigravityConnector::conversation_modified_since(
+                    &conversation_dir,
+                    ctx.since_ts,
+                    &sidecars,
+                    &excluded_paths,
+                )
+            {
+                continue;
+            }
+            // An unchanged broad root must not hide a later explicit sidecar
+            // deletion event for the same conversation.
             if !seen.insert(dedupe_path_key(&conversation_dir)) {
                 continue;
             }
-            let sidecars =
-                AntigravityConnector::metadata_sidecars(&conversation_dir, &root, &excluded_paths);
-            if !AntigravityConnector::conversation_modified_since(
-                &conversation_dir,
-                ctx.since_ts,
-                &sidecars,
-            ) {
-                continue;
-            }
             ctx.tick();
-            if let Some(mut conversation) = parse_conversation(&conversation_dir, &excluded_paths) {
+            if let Some(mut conversation) =
+                parse_conversation(&conversation_dir, &excluded_paths, root.origin.is_local())
+            {
                 root.apply_workspace_rewrite(&mut conversation);
                 on_conversation(conversation).with_context(|| {
                     format!(
@@ -1269,25 +1454,30 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for root in roots {
-        if !root.path.exists() || path_is_excluded(&root.path, &excluded_paths) {
+        if path_is_excluded(&root.path, &excluded_paths) {
             continue;
         }
         for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
-            if path_is_excluded(&conversation_dir, &excluded_paths) {
+            let transcript = AntigravityConnector::transcript_path(&conversation_dir);
+            if path_is_excluded(&conversation_dir, &excluded_paths)
+                || path_is_excluded(&transcript, &excluded_paths)
+            {
                 continue;
             }
             let sidecars =
                 AntigravityConnector::metadata_sidecars(&conversation_dir, &root, &excluded_paths);
-            if !AntigravityConnector::conversation_modified_since(
-                &conversation_dir,
-                ctx.since_ts,
-                &sidecars,
-            ) {
+            if root.path.exists()
+                && !AntigravityConnector::conversation_modified_since(
+                    &conversation_dir,
+                    ctx.since_ts,
+                    &sidecars,
+                    &excluded_paths,
+                )
+            {
                 continue;
             }
 
             // The transcript we actually parse — required for reconstruction.
-            let transcript = AntigravityConnector::transcript_path(&conversation_dir);
             if transcript.is_file()
                 && !path_is_excluded(&transcript, &excluded_paths)
                 && seen.insert(dedupe_path_key(&transcript))
@@ -2256,6 +2446,8 @@ mod tests {
     }
 
     #[cfg(any(
+        feature = "antigravity-sqlite",
+        feature = "zcode",
         feature = "cursor",
         feature = "opencode",
         feature = "goose",
@@ -2421,6 +2613,7 @@ mod tests {
     fn parent_fallback_requires_the_initial_system_step() {
         let mut record = serde_json::json!({
             "step_index": 0,
+            "source": "SYSTEM",
             "type": "SYSTEM_MESSAGE",
             "content": "[Message] sender=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee content=Work"
         });
@@ -2456,6 +2649,8 @@ mod tests {
     }
 
     #[cfg(any(
+        feature = "antigravity-sqlite",
+        feature = "zcode",
         feature = "cursor",
         feature = "opencode",
         feature = "goose",

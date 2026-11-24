@@ -74,6 +74,9 @@ connectors = [
 ]
 # ChatGPT: AES-256-GCM decryption for v2/v3 encrypted conversations
 chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
+# Antigravity: optional titles/workspaces/parents from conversation_summaries.db.
+# JSONL transcripts and annotation titles remain available with `connectors`.
+antigravity-sqlite = ["connectors", "dep:frankensqlite", "dep:asupersync"]
 # Cursor: SQLite database access for state.vscdb
 cursor = ["connectors", "dep:frankensqlite", "dep:urlencoding", "dep:asupersync"]
 # OpenCode: SQLite database access for v1.2+ opencode.db
@@ -132,6 +135,7 @@ pi-durable = ["connectors", "dep:frankensqlite", "dep:asupersync"]
 # All connectors enabled
 all-connectors = [
     "connectors",
+    "antigravity-sqlite",
     "codex-zstd",
     "chatgpt",
     "codebuff",

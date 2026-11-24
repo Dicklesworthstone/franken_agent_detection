@@ -417,6 +417,7 @@ traversal immediately, including when a source error was already deferred.
 |---|---|
 | `connectors` | Connector framework and every connector that needs no extra dependencies |
 | `chatgpt` | ChatGPT desktop, including AES-GCM encrypted v2/v3 conversations |
+| `antigravity-sqlite` | Optional Antigravity summary titles, workspaces, and parent identities |
 | `cursor`, `opencode`, `goose`, `hermes`, `crush`, `devin`, `shelley` | SQLite-backed stores for those agents |
 | `zcode` | Schema-aware ZCode CLI / Desktop SQLite transcripts |
 | `openclaw-sqlite` | OpenClaw 2 per-agent SQLite transcripts (zstd events included) |
@@ -432,8 +433,9 @@ opened read-only inside one read transaction, so a live WAL is seen as one
 coherent snapshot and nothing is recovered or checkpointed.
 
 Antigravity transcript usage, tool calls, annotation titles, and initial
-system-message parent IDs are available with `connectors`. Enabling any of the
-SQLite-backed features (including `all-connectors`) additionally reads
+system-message parent IDs are available with `connectors`. Enabling
+`antigravity-sqlite` or another SQLite-backed feature (including `zcode` or
+`all-connectors`) additionally reads local
 `conversation_summaries.db` for workspaces, titles, and parent IDs. Annotation
 titles take precedence over summary titles; the first prompt remains the
 fallback. The connector discovers these metadata files and the summary WAL so
@@ -442,6 +444,25 @@ Antigravity reports `supports_source_boundaries() == false`: the existing
 receipt format cannot track a metadata file that first appears after indexing.
 Its boundary API uses the streaming callback fallback, retaining `since_ts`
 filtering without reusing an incomplete transcript-only receipt.
+
+Antigravity retains each step's explicit model and four additive usage buckets:
+uncached input, output, cache reads, and cache writes. Reasoning is retained
+separately and is not added again to `total_tokens()`. A checkpoint without a
+model remains unassigned. Identified tool results reference their planner calls
+without claiming additional invocations; distinct planner steps and calls
+without IDs remain independent. Original `tool_calls` and step indices remain
+in message `extra` for hosts that do not store `NormalizedInvocation` directly.
+The explicit `extra.cass.tool_call_count`, including zero, controls accounting.
+
+Parent IDs use the conversation's identity namespace (`ide/<uuid>` for IDE
+stores and bare UUIDs for CLI/relocated stores), with the original parent saved
+as `metadata.raw_parent_conversation_id`. Corrupt summary parent IDs cannot
+override a valid initial system-message sender. Remote mirrors can use JSONL
+and annotation metadata; they never open the optional summary SQLite store.
+Exact transcript, annotation, summary DB, and WAL scan roots support targeted
+file events. A removed optional sidecar also refreshes its owner when selected
+as a scan root; timestamp-only base scans need a full scan or such an event to
+observe metadata deletions.
 
 ### Coverage
 

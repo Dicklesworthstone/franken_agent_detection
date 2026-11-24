@@ -1388,7 +1388,7 @@ fn shelley_detection_entry(roots: Option<&[PathBuf]>) -> InstalledAgentDetection
     }
 }
 
-/// ZCode requires its own schema signature, including when a caller supplies
+/// `ZCode` requires its own schema signature, including when a caller supplies
 /// an explicit database path. A missing Cargo feature must not degrade this
 /// into path-existence-only detection of arbitrary SQLite stores.
 fn zcode_detection_entry(roots: Option<&[PathBuf]>) -> InstalledAgentDetectionEntry {

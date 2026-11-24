@@ -963,6 +963,30 @@ fn extract_qwen_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
     extracted
 }
 
+/// The connector and raw-data extractor must agree on valid call identities.
+/// Empty or malformed aliases do not mask a later valid spelling.
+pub(super) fn antigravity_tool_name(call: &Value) -> Option<&str> {
+    ["/name", "/tool_name", "/function/name"]
+        .into_iter()
+        .find_map(|path| {
+            call.pointer(path)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+        })
+}
+
+pub(super) fn antigravity_tool_call_id(call: &Value) -> Option<&str> {
+    ["/id", "/call_id", "/tool_call_id"]
+        .into_iter()
+        .find_map(|path| {
+            call.pointer(path)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+        })
+}
+
 fn antigravity_tool_call_count(extra: &Value) -> u32 {
     if let Some(count) = extra
         .pointer("/cass/tool_call_count")
@@ -973,6 +997,7 @@ fn antigravity_tool_call_count(extra: &Value) -> u32 {
     if extra.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call") {
         return 1;
     }
+    let mut seen_ids = std::collections::HashSet::new();
     let count = extra
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -980,11 +1005,8 @@ fn antigravity_tool_call_count(extra: &Value) -> u32 {
             calls
                 .iter()
                 .filter(|call| {
-                    call.get("name")
-                        .or_else(|| call.get("tool_name"))
-                        .or_else(|| call.pointer("/function/name"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| !name.trim().is_empty())
+                    antigravity_tool_name(call).is_some()
+                        && antigravity_tool_call_id(call).is_none_or(|id| seen_ids.insert(id))
                 })
                 .count()
         });
@@ -1183,7 +1205,7 @@ fn extract_opencode_tokens(extra: &Value, role: &str) -> ExtractedTokenUsage {
     extracted
 }
 
-/// ZCode records model-call counters on assistant messages. A turn's summary
+/// `ZCode` records model-call counters on assistant messages. A turn's summary
 /// is attached by the connector only when that turn has no direct counters.
 /// User/tool rows and covered intermediate replies never add token estimates
 /// to those model-call totals. Reasoning is retained as a subset of output.

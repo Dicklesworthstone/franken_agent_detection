@@ -50,6 +50,7 @@ pub mod scan;
 #[cfg(feature = "shelley")]
 pub mod shelley;
 #[cfg(any(
+    feature = "antigravity-sqlite",
     feature = "cursor",
     feature = "opencode",
     feature = "zcode",
