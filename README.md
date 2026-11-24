@@ -463,6 +463,12 @@ The explicit `extra.cass.tool_call_count`, including zero, controls accounting.
 Empty checkpoints and settings-only user records still reset call ownership
 before display filtering, so recycled IDs in later turns remain independent.
 
+Tool argument aliases skip decoded null or blank placeholders before falling
+back to native `args`, `input`, or nested `function.arguments`. Meaningful
+higher-priority values retain precedence, including empty containers and opaque
+historical strings. With no usable alternative, the first placeholder remains;
+original `tool_calls` are preserved in message metadata.
+
 When `transcript.jsonl` is absent, Antigravity reads `transcript_full.jsonl` as
 the sole transcript source. Discovery and incremental freshness use that same
 selection. An existing primary remains authoritative, and excluding its path

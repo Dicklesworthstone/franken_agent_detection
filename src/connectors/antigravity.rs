@@ -1152,6 +1152,40 @@ fn attach_usage_and_model(rec: &Value, extra: &mut Map<String, Value>) -> bool {
     }
 }
 
+/// Skip absent argument placeholders without changing precedence for actual
+/// values, including opaque historical strings and explicit empty containers.
+fn tool_arguments(call: &Value) -> Option<Value> {
+    let mut placeholder = None;
+    for raw in [
+        call.get("arguments"),
+        call.get("args"),
+        call.get("input"),
+        call.pointer("/function/arguments"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let value = match raw {
+            Value::String(text) => {
+                serde_json::from_str::<Value>(text).unwrap_or_else(|_| raw.clone())
+            }
+            other => other.clone(),
+        };
+        let meaningful = match &value {
+            Value::Null => false,
+            Value::String(text) => !text.trim().is_empty(),
+            _ => true,
+        };
+        if meaningful {
+            return Some(value);
+        }
+        if placeholder.is_none() {
+            placeholder = Some(value);
+        }
+    }
+    placeholder
+}
+
 /// Parse structured `tool_calls` entries without synthesizing a fallback entry.
 fn parse_explicit_tool_calls(
     tool_calls: Option<&Value>,
@@ -1174,18 +1208,7 @@ fn parse_explicit_tool_calls(
             {
                 return None;
             }
-            let arguments = tc
-                .get("arguments")
-                .or_else(|| tc.get("args"))
-                .or_else(|| tc.get("input"))
-                .or_else(|| tc.pointer("/function/arguments"))
-                .cloned()
-                .map(|raw| match raw {
-                    Value::String(s) => {
-                        serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s))
-                    }
-                    other => other,
-                });
+            let arguments = tool_arguments(tc);
             Some(NormalizedInvocation {
                 kind: "tool".to_string(),
                 name: name.to_string(),
