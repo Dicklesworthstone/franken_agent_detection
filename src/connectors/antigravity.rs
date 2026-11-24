@@ -18,8 +18,9 @@
 //!   the durable source of truth but expensive to read.
 //! - `brain/<uuid>/.system_generated/logs/transcript.jsonl` — a **clean JSONL
 //!   transcript** of the same conversation. This is the connector's primary read
-//!   path: a simple, stable line-per-step JSON shape, no protobuf required. (A
-//!   fuller `transcript_full.jsonl` sits beside it.)
+//!   path: a simple, stable line-per-step JSON shape, no protobuf required. A
+//!   fuller `transcript_full.jsonl` sits beside it and is read when the primary
+//!   is absent; the two transcripts are never combined.
 //!
 //! The `<uuid>` keying `conversations/<uuid>.db` and `brain/<uuid>/` is the same
 //! id used by `agy --conversation <uuid>`.
@@ -244,10 +245,36 @@ impl AntigravityConnector {
             .join("transcript_full.jsonl")
     }
 
-    /// A conversation directory is recognized by the presence of its
-    /// `transcript.jsonl` (the primary read path).
+    /// Select one transcript authority for both discovery and normalization.
+    /// A full transcript can replace a genuinely absent primary, never an
+    /// excluded, unreadable, malformed, or otherwise unusable existing primary.
+    fn selected_transcript_path(
+        conversation_dir: &Path,
+        excluded_paths: &[PathBuf],
+    ) -> Option<PathBuf> {
+        let primary = Self::transcript_path(conversation_dir);
+        // An exclusion of the primary continues to suppress its duplicate
+        // transcript and all sidecars, even when the primary is absent.
+        if path_is_excluded(conversation_dir, excluded_paths)
+            || path_is_excluded(&primary, excluded_paths)
+        {
+            return None;
+        }
+        let selected = match fs::symlink_metadata(&primary) {
+            Ok(_) => primary.is_file().then_some(primary),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let full = Self::transcript_full_path(conversation_dir);
+                full.is_file().then_some(full)
+            }
+            Err(_) => None,
+        }?;
+        (!path_is_excluded(&selected, excluded_paths)).then_some(selected)
+    }
+
+    /// A conversation directory has either the primary transcript or a usable
+    /// full-only fallback, under the same authority rules as scanning.
     fn is_conversation_dir(path: &Path) -> bool {
-        Self::transcript_path(path).is_file()
+        Self::selected_transcript_path(path, &[]).is_some()
     }
 
     /// The `<uuid>` for a conversation directory (its directory name).
@@ -543,7 +570,7 @@ impl AntigravityConnector {
         }
 
         let mut out = Vec::new();
-        // The transcript sits at <conv>/.system_generated/logs/transcript.jsonl,
+        // A transcript sits at <conv>/.system_generated/logs/transcript*.jsonl,
         // so the conversation dir is three levels above the file. From the
         // base directory it is at depth 5; the cap is set higher so a scan
         // root one or two levels above (e.g. ~ or ~/.gemini, as remote mirrors
@@ -555,7 +582,12 @@ impl AntigravityConnector {
             .into_iter()
             .flatten()
         {
-            if !entry.file_type().is_file() || entry.file_name() != "transcript.jsonl" {
+            if !entry.file_type().is_file()
+                || !matches!(
+                    entry.file_name().to_str(),
+                    Some("transcript.jsonl" | "transcript_full.jsonl")
+                )
+            {
                 continue;
             }
             let path = entry.path();
@@ -581,6 +613,7 @@ impl AntigravityConnector {
     /// than `since_ts`.
     fn conversation_modified_since(
         conversation_dir: &Path,
+        transcript: &Path,
         since_ts: Option<i64>,
         sidecars: &[DiscoveredSourceFile],
         excluded_paths: &[PathBuf],
@@ -589,8 +622,11 @@ impl AntigravityConnector {
             return true;
         }
         let transcript_full = Self::transcript_full_path(conversation_dir);
-        file_modified_since(&Self::transcript_path(conversation_dir), since_ts)
-            || (transcript_full.is_file()
+        file_modified_since(transcript, since_ts)
+            // Keep mirroring changes to an optional full sibling without
+            // changing which transcript supplies the normalized conversation.
+            || (transcript_full.as_path() != transcript
+                && transcript_full.is_file()
                 && !path_is_excluded(&transcript_full, excluded_paths)
                 && file_modified_since(&transcript_full, since_ts))
             || sidecars
@@ -1417,38 +1453,34 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
 /// Results reference an earlier planner request without claiming another call.
 /// Each planner step is a separate request, even if a provider reuses call IDs
 /// after compaction. ID-less historical calls remain independent.
-fn reconcile_tool_invocations(messages: &mut [NormalizedMessage]) {
-    let mut requested_ids = HashSet::new();
-    for msg in messages {
-        if msg.role == "user" || msg.extra["agy_type"] == "CHECKPOINT" {
-            requested_ids.clear();
+/// The caller resets ownership at raw turn/compaction boundaries, including
+/// records that are filtered out of the normalized display messages.
+fn reconcile_tool_invocations(msg: &mut NormalizedMessage, requested_ids: &mut HashSet<String>) {
+    if msg.role == "assistant" {
+        requested_ids.extend(
+            msg.invocations
+                .iter()
+                .filter_map(|call| call.call_id.clone()),
+        );
+        return;
+    }
+    if msg.role != "tool" || msg.invocations.is_empty() {
+        return;
+    }
+    let mut referenced = Vec::new();
+    msg.invocations.retain(|invocation| {
+        let Some(id) = &invocation.call_id else {
+            return true;
+        };
+        if !requested_ids.contains(id) {
+            return true;
         }
-        if msg.role == "assistant" {
-            requested_ids.extend(
-                msg.invocations
-                    .iter()
-                    .filter_map(|call| call.call_id.clone()),
-            );
-            continue;
-        }
-        if msg.role != "tool" || msg.invocations.is_empty() {
-            continue;
-        }
-        let mut referenced = Vec::new();
-        msg.invocations.retain(|invocation| {
-            let Some(id) = &invocation.call_id else {
-                return true;
-            };
-            if !requested_ids.contains(id) {
-                return true;
-            }
-            referenced.push(Value::String(id.clone()));
-            false
-        });
-        msg.extra["cass"]["tool_call_count"] = Value::from(msg.invocations.len());
-        if !referenced.is_empty() {
-            msg.extra["cass"]["referenced_tool_call_ids"] = Value::Array(referenced);
-        }
+        referenced.push(Value::String(id.clone()));
+        false
+    });
+    msg.extra["cass"]["tool_call_count"] = Value::from(msg.invocations.len());
+    if !referenced.is_empty() {
+        msg.extra["cass"]["referenced_tool_call_ids"] = Value::Array(referenced);
     }
 }
 
@@ -1497,11 +1529,11 @@ fn conversation_metadata(
 
 fn parse_conversation(
     conversation_dir: &Path,
+    transcript: &Path,
     excluded_paths: &[PathBuf],
     source: &AntigravitySourceRoot,
 ) -> Option<NormalizedConversation> {
-    let transcript = AntigravityConnector::transcript_path(conversation_dir);
-    let records = AntigravityConnector::read_transcript_records(&transcript);
+    let records = AntigravityConnector::read_transcript_records(transcript);
     if records.is_empty() {
         return None;
     }
@@ -1550,15 +1582,25 @@ fn parse_conversation(
         .filter(admissible_parent);
 
     let mut messages: Vec<NormalizedMessage> = Vec::new();
+    let mut requested_ids = HashSet::new();
     let mut started_at: Option<i64> = None;
     let mut ended_at: Option<i64> = None;
 
     for rec in ordered {
+        // Empty checkpoints and settings-only user records still delimit call
+        // identities even when record_to_message emits no display message.
+        if matches!(
+            rec.get("type").and_then(Value::as_str),
+            Some("USER_INPUT" | "CHECKPOINT")
+        ) {
+            requested_ids.clear();
+        }
         if let Some(ts) = rec.get("created_at").and_then(parse_timestamp) {
             started_at = Some(started_at.map_or(ts, |cur| cur.min(ts)));
             ended_at = Some(ended_at.map_or(ts, |cur| cur.max(ts)));
         }
-        if let Some(msg) = record_to_message(rec) {
+        if let Some(mut msg) = record_to_message(rec) {
+            reconcile_tool_invocations(&mut msg, &mut requested_ids);
             messages.push(msg);
         }
     }
@@ -1576,7 +1618,6 @@ fn parse_conversation(
         return None;
     }
 
-    reconcile_tool_invocations(&mut messages);
     reindex_messages(&mut messages);
 
     let title = ann_title.or(summary.title).or_else(|| {
@@ -1593,7 +1634,7 @@ fn parse_conversation(
         external_id,
         title,
         workspace: summary.workspace,
-        source_path: transcript,
+        source_path: transcript.to_path_buf(),
         started_at,
         ended_at,
         metadata: conversation_metadata(model, parent_conversation_id, layout, base),
@@ -1615,12 +1656,11 @@ fn scan_antigravity_with_callback(
             continue;
         }
         for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
-            let transcript = AntigravityConnector::transcript_path(&conversation_dir);
-            if path_is_excluded(&conversation_dir, &excluded_paths)
-                || path_is_excluded(&transcript, &excluded_paths)
-            {
+            let Some(transcript) =
+                AntigravityConnector::selected_transcript_path(&conversation_dir, &excluded_paths)
+            else {
                 continue;
-            }
+            };
             let sidecars = AntigravityConnector::metadata_sidecars(
                 &conversation_dir,
                 root,
@@ -1632,6 +1672,7 @@ fn scan_antigravity_with_callback(
             if root.path.exists()
                 && !AntigravityConnector::conversation_modified_since(
                     &conversation_dir,
+                    &transcript,
                     ctx.since_ts,
                     &sidecars,
                     &excluded_paths,
@@ -1646,7 +1687,7 @@ fn scan_antigravity_with_callback(
             }
             ctx.tick();
             if let Some(mut conversation) =
-                parse_conversation(&conversation_dir, &excluded_paths, &source)
+                parse_conversation(&conversation_dir, &transcript, &excluded_paths, &source)
             {
                 root.apply_workspace_rewrite(&mut conversation);
                 on_conversation(conversation).with_context(|| {
@@ -1674,12 +1715,11 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
             continue;
         }
         for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
-            let transcript = AntigravityConnector::transcript_path(&conversation_dir);
-            if path_is_excluded(&conversation_dir, &excluded_paths)
-                || path_is_excluded(&transcript, &excluded_paths)
-            {
+            let Some(transcript) =
+                AntigravityConnector::selected_transcript_path(&conversation_dir, &excluded_paths)
+            else {
                 continue;
-            }
+            };
             let base = source.metadata_base(&conversation_dir);
             let sidecars = AntigravityConnector::metadata_sidecars(
                 &conversation_dir,
@@ -1690,6 +1730,7 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
             if root.path.exists()
                 && !AntigravityConnector::conversation_modified_since(
                     &conversation_dir,
+                    &transcript,
                     ctx.since_ts,
                     &sidecars,
                     &excluded_paths,

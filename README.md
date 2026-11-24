@@ -453,6 +453,13 @@ without claiming additional invocations; distinct planner steps and calls
 without IDs remain independent. Original `tool_calls` and step indices remain
 in message `extra` for hosts that do not store `NormalizedInvocation` directly.
 The explicit `extra.cass.tool_call_count`, including zero, controls accounting.
+Empty checkpoints and settings-only user records still reset call ownership
+before display filtering, so recycled IDs in later turns remain independent.
+
+When `transcript.jsonl` is absent, Antigravity reads `transcript_full.jsonl` as
+the sole transcript source. Discovery and incremental freshness use that same
+selection. An existing primary remains authoritative, and excluding its path
+also excludes the duplicate full transcript. The two files are never combined.
 
 Parent IDs use the conversation's identity namespace (`ide/<uuid>` for IDE
 stores and bare UUIDs for CLI/relocated stores), with the original parent saved
