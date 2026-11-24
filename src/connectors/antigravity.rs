@@ -68,7 +68,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -79,8 +79,8 @@ use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::token_extraction::{antigravity_tool_call_id, antigravity_tool_name};
 use super::utils::{
-    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
-    read_capped, unwrap_skill_invocations,
+    MAX_SCAN_FILE_BYTES, dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env,
+    path_is_excluded, read_capped, unwrap_skill_invocations,
 };
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
@@ -833,9 +833,11 @@ impl AntigravityConnector {
     /// and individual malformed/non-UTF-8 lines (skipped + logged, never fatal),
     /// while discarding incomplete transcripts on mid-stream I/O errors.
     fn read_transcript_records(transcript: &Path) -> io::Result<Vec<Value>> {
-        // Transcripts accumulate; enforce the project's 100MB scan cap.
-        if let Ok(meta) = fs::metadata(transcript)
-            && meta.len() > 100 * 1024 * 1024
+        let file = fs::File::open(transcript)?;
+        // Inspect the opened source, not a pathname that could be replaced.
+        // Metadata is an optimization; the reader also enforces the byte cap.
+        if let Ok(meta) = file.metadata()
+            && meta.len() > MAX_SCAN_FILE_BYTES
         {
             tracing::warn!(
                 transcript = %transcript.display(),
@@ -844,16 +846,29 @@ impl AntigravityConnector {
             );
             return Ok(Vec::new());
         }
-        let file = fs::File::open(transcript)?;
-        Self::read_transcript_records_from(transcript, BufReader::new(file))
+        Self::read_transcript_records_from(transcript, file)
     }
 
     fn read_transcript_records_from(
         transcript: &Path,
-        reader: impl BufRead,
+        reader: impl Read,
     ) -> io::Result<Vec<Value>> {
+        Self::read_transcript_records_with_limit(transcript, reader, MAX_SCAN_FILE_BYTES)
+    }
+
+    fn read_transcript_records_with_limit(
+        transcript: &Path,
+        reader: impl Read,
+        limit: u64,
+    ) -> io::Result<Vec<Value>> {
+        let probe_limit = limit
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read limit overflow"))?;
+        // Limit the underlying reads before buffering can prefetch extra bytes.
+        // One probe byte distinguishes an exact-limit source from overflow.
+        let mut limited = reader.take(probe_limit);
         let mut records = Vec::new();
-        for (lineno, line_res) in JsonlLines::new(reader).enumerate() {
+        for (lineno, line_res) in JsonlLines::new(BufReader::new(&mut limited)).enumerate() {
             let line = match line_res {
                 Ok(line) => line,
                 Err(err) => {
@@ -879,6 +894,16 @@ impl AntigravityConnector {
                     "antigravity: skipping malformed transcript line"
                 ),
             }
+        }
+        if limited.limit() == 0 {
+            // EOF caused by the byte budget is not a complete transcript.
+            // Discard every parsed record, including any valid prefix.
+            tracing::warn!(
+                transcript = %transcript.display(),
+                limit_bytes = limit,
+                "antigravity: transcript exceeds the scan size cap during read; skipping"
+            );
+            return Ok(Vec::new());
         }
         Ok(records)
     }
@@ -3227,5 +3252,200 @@ mod tests {
                 assert_eq!(parse_workspace_uri(uri), None, "{uri}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod transcript_read_budget_tests {
+    use std::fs;
+    use std::io::{self, Cursor, Read, Seek, Write};
+    use std::path::Path;
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::AntigravityConnector;
+
+    const FIRST: &[u8] =
+        b"{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"valid prefix\"}\n";
+
+    fn parse(reader: impl Read, limit: u64) -> io::Result<Vec<Value>> {
+        AntigravityConnector::read_transcript_records_with_limit(
+            Path::new("synthetic/transcript.jsonl"),
+            reader,
+            limit,
+        )
+    }
+
+    fn byte_count(bytes: &[u8]) -> u64 {
+        u64::try_from(bytes.len()).unwrap()
+    }
+
+    #[test]
+    fn exact_budget_accepts_bom_crlf_and_an_unterminated_final_record() {
+        let first = json!({
+            "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "content": "Inspect the café fixture.",
+        });
+        let second = json!({
+            "step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "model": "gemini-4-neon-high", "input_tokens": 0,
+            "tool_calls": [{"id": "read-1", "name": "read_file"}],
+        });
+        let bytes = format!("\u{feff}{first}\r\n{second}").into_bytes();
+        let mut reader = Cursor::new(bytes.as_slice());
+        assert_eq!(
+            parse(&mut reader, byte_count(&bytes)).unwrap(),
+            vec![first, second],
+        );
+        assert_eq!(reader.position(), byte_count(&bytes));
+    }
+
+    #[test]
+    fn zero_budget_reads_at_most_one_byte_and_overflow_reads_nothing() {
+        for bytes in [&b""[..], &b"xmore bytes"[..]] {
+            let mut reader = Cursor::new(bytes);
+            assert!(parse(&mut reader, 0).unwrap().is_empty());
+            assert_eq!(reader.position(), u64::try_from(bytes.len().min(1)).unwrap());
+        }
+        let mut reader = Cursor::new(FIRST);
+        let error = parse(&mut reader, u64::MAX).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(reader.position(), 0);
+    }
+
+    #[test]
+    fn oversized_probe_discards_the_valid_prefix_even_for_corrupt_utf8() {
+        for suffix in [&b"{}\n"[..], &b"\xff\n"[..], "é\n".as_bytes()] {
+            let mut bytes = FIRST.to_vec();
+            bytes.extend_from_slice(suffix);
+            let mut reader = Cursor::new(bytes.as_slice());
+            assert!(parse(&mut reader, byte_count(FIRST)).unwrap().is_empty());
+            assert_eq!(reader.position(), byte_count(FIRST) + 1);
+        }
+
+        // The probe can finish valid JSON too; syntax is not proof of EOF.
+        let bytes = b"{\"step_index\":0,\"content\":\"complete\"}";
+        let mut reader = Cursor::new(bytes.as_slice());
+        assert!(parse(&mut reader, byte_count(bytes) - 1).unwrap().is_empty());
+        assert_eq!(reader.position(), byte_count(bytes));
+    }
+
+    #[test]
+    fn endless_long_lines_and_short_records_stop_after_one_probe_byte() {
+        struct Endless {
+            pattern: &'static [u8],
+            bytes_read: usize,
+            allowed: usize,
+        }
+
+        impl Read for Endless {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                // Fail deterministically if buffering bypasses the cap.
+                assert!(self.bytes_read + buffer.len() <= self.allowed);
+                for byte in buffer.iter_mut() {
+                    *byte = self.pattern[self.bytes_read % self.pattern.len()];
+                    self.bytes_read += 1;
+                }
+                Ok(buffer.len())
+            }
+        }
+
+        for pattern in [&b"x"[..], &b"{}\n"[..]] {
+            let mut reader = Endless {
+                pattern,
+                bytes_read: 0,
+                allowed: 65,
+            };
+            assert!(parse(&mut reader, 64).unwrap().is_empty());
+            assert_eq!(reader.bytes_read, 65);
+        }
+    }
+
+    #[test]
+    fn malformed_and_corrupt_lines_preserve_later_records_within_budget() {
+        let second = json!({
+            "step_index": 2, "source": "SYSTEM", "type": "CHECKPOINT",
+            "input_tokens": 3, "cache_read_tokens": 100, "output_tokens": 5,
+        });
+        let mut bytes = FIRST.to_vec();
+        bytes.extend_from_slice(b"{malformed JSON}\n\xff\n");
+        bytes.extend_from_slice(second.to_string().as_bytes());
+        let records = parse(bytes.as_slice(), byte_count(&bytes)).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["content"], "valid prefix");
+        assert_eq!(records[1], second);
+    }
+
+    #[test]
+    fn real_errors_including_interrupted_stop_once_without_a_partial_result() {
+        struct Failing {
+            prefix: Cursor<Vec<u8>>,
+            kind: io::ErrorKind,
+            failures: usize,
+        }
+
+        impl Read for Failing {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if buffer.is_empty() {
+                    return Ok(0);
+                }
+                if self.prefix.position() < byte_count(self.prefix.get_ref()) {
+                    return self.prefix.read(buffer);
+                }
+                self.failures += 1;
+                assert_eq!(self.failures, 1, "reader failures must not be retried");
+                Err(io::Error::new(self.kind, "synthetic source failure"))
+            }
+        }
+
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::Interrupted,
+        ] {
+            for unfinished_line in [false, true] {
+                let mut prefix = FIRST.to_vec();
+                if unfinished_line {
+                    prefix.extend_from_slice(b"{\"content\":\"unfinished");
+                }
+                for spare_bytes in [0, 32] {
+                    let limit = byte_count(&prefix) + spare_bytes;
+                    let mut reader = Failing {
+                        prefix: Cursor::new(prefix.clone()),
+                        kind,
+                        failures: 0,
+                    };
+                    let error = parse(&mut reader, limit).unwrap_err();
+                    assert_eq!(error.kind(), kind);
+                    assert_eq!(error.to_string(), "synthetic source failure");
+                    assert_eq!(reader.failures, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_growing_after_metadata_stays_bounded_and_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("transcript.jsonl");
+        fs::write(&path, FIRST).unwrap();
+        let mut reader = fs::File::open(&path).unwrap();
+        let limit = reader.metadata().unwrap().len();
+
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writer
+            .write_all(b"{\"step_index\":1,\"content\":\"appended after metadata\"}\n")
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let before = fs::read(&path).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert!(parse(&mut reader, limit).unwrap().is_empty());
+        assert_eq!(reader.stream_position().unwrap(), limit + 1);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
     }
 }

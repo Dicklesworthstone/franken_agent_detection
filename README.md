@@ -474,6 +474,12 @@ error with a failure count. Collecting scans return an error instead of a partia
 vector, and conversation-callback errors stop immediately. Empty, malformed,
 oversized, and optional-metadata skips retain their existing behavior.
 
+Antigravity enforces the 100 MiB transcript limit while reading the opened file,
+with at most one extra probe byte. Files that grow after metadata is checked
+remain bounded. An oversized read discards the entire transcript instead of
+emitting a partial conversation; corrupt-line recovery within the budget remains
+available.
+
 Parent IDs use the conversation's identity namespace (`ide/<uuid>` for IDE
 stores and bare UUIDs for CLI/relocated stores), with the original parent saved
 as `metadata.raw_parent_conversation_id`. Corrupt summary parent IDs cannot
