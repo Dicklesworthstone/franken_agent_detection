@@ -99,10 +99,24 @@ fn full_only_transcripts_scan_from_local_directories_and_exact_events() {
     let annotation = base.join("annotations").join(format!("{CHILD}.pbtxt"));
     write(&annotation, "title: \"Preserved full-only conversation\"\n");
     let before = fs::read(&full).unwrap();
-    for root in [temp.path(), &base, &brain, &conversation, &full, &absent_primary, &annotation] {
+    for root in [
+        temp.path(),
+        &base,
+        &brain,
+        &conversation,
+        &full,
+        &absent_primary,
+        &annotation,
+    ] {
         let normalized = assert_selected(&context(root, None), &full, &format!("ide/{CHILD}"));
-        assert_eq!(normalized.title.as_deref(), Some("Preserved full-only conversation"));
-        assert_eq!(normalized.metadata["parent_conversation_id"], format!("ide/{PARENT}"));
+        assert_eq!(
+            normalized.title.as_deref(),
+            Some("Preserved full-only conversation")
+        );
+        assert_eq!(
+            normalized.metadata["parent_conversation_id"],
+            format!("ide/{PARENT}")
+        );
     }
     let ctx = ScanContext::local_default(base, None);
     let collecting = assert_selected(&ctx, &full, &format!("ide/{CHILD}"));
@@ -113,7 +127,10 @@ fn full_only_transcripts_scan_from_local_directories_and_exact_events() {
             Ok(())
         })
         .unwrap();
-    assert_eq!(serde_json::to_value(streamed).unwrap(), serde_json::to_value([collecting]).unwrap());
+    assert_eq!(
+        serde_json::to_value(streamed).unwrap(),
+        serde_json::to_value([collecting]).unwrap()
+    );
     assert_eq!(fs::read(full).unwrap(), before);
     assert!(!absent_primary.exists());
 }
@@ -124,16 +141,31 @@ fn primary_remains_authoritative_and_the_two_transcripts_are_never_combined() {
     let full = full_at(&temp.path().join("brain").join(CHILD));
     let primary = full.with_file_name("transcript.jsonl");
     write(&primary, TRANSCRIPT);
-    write(&full, &TRANSCRIPT.replace("The synthetic fixture is valid.", "The backup must not replace the primary."));
+    write(
+        &full,
+        &TRANSCRIPT.replace(
+            "The synthetic fixture is valid.",
+            "The backup must not replace the primary.",
+        ),
+    );
     modified(&primary, OLD);
     modified(&full, NEW);
     for root in [temp.path(), &primary, &full] {
         let ctx = context(root, Some(SINCE));
         let normalized = assert_selected(&ctx, &primary, CHILD);
-        assert_eq!(normalized.messages.last().unwrap().content, "The synthetic fixture is valid.");
-        let sources = AntigravityConnector::new().discover_source_files(&ctx).unwrap();
+        assert_eq!(
+            normalized.messages.last().unwrap().content,
+            "The synthetic fixture is valid."
+        );
+        let sources = AntigravityConnector::new()
+            .discover_source_files(&ctx)
+            .unwrap();
         assert_eq!(sources.len(), 2);
-        assert!(sources.iter().any(|file| file.source_path == full && !file.required_for_reconstruction));
+        assert!(
+            sources
+                .iter()
+                .any(|file| file.source_path == full && !file.required_for_reconstruction)
+        );
     }
     let overlap = ScanContext::with_roots(
         temp.path().to_path_buf(),
@@ -151,7 +183,10 @@ fn full_only_freshness_and_authority_changes_follow_the_selected_source() {
     let temp = TempDir::new().unwrap();
     let full = full_at(&temp.path().join("brain").join(CHILD));
     let primary = full.with_file_name("transcript.jsonl");
-    let annotation = temp.path().join("annotations").join(format!("{CHILD}.pbtxt"));
+    let annotation = temp
+        .path()
+        .join("annotations")
+        .join(format!("{CHILD}.pbtxt"));
     let connector = AntigravityConnector::new();
     let ctx = context(temp.path(), Some(SINCE));
     modified(&full, OLD);
@@ -163,11 +198,17 @@ fn full_only_freshness_and_authority_changes_follow_the_selected_source() {
     modified(&full, OLD);
     write(&annotation, "title: \"Only the metadata changed\"\n");
     modified(&annotation, NEW);
-    assert_eq!(assert_selected(&ctx, &full, CHILD).title.as_deref(), Some("Only the metadata changed"));
+    assert_eq!(
+        assert_selected(&ctx, &full, CHILD).title.as_deref(),
+        Some("Only the metadata changed")
+    );
 
     fs::remove_file(&annotation).unwrap();
     let deleted_annotation = assert_selected(&context(&annotation, Some(SINCE)), &full, CHILD);
-    assert_eq!(deleted_annotation.title.as_deref(), Some("Inspect the parser fixture and verify it twice."));
+    assert_eq!(
+        deleted_annotation.title.as_deref(),
+        Some("Inspect the parser fixture and verify it twice.")
+    );
     assert!(connector.scan(&ctx).unwrap().is_empty());
 
     write(&primary, TRANSCRIPT);
@@ -189,7 +230,11 @@ fn full_only_qualified_mirrors_preserve_ids_at_each_copy_depth() {
                     "brain" => "brain",
                     _ => CHILD,
                 };
-                let selected = if contents_only { container.clone() } else { container.join(basename) };
+                let selected = if contents_only {
+                    container.clone()
+                } else {
+                    container.join(basename)
+                };
                 let conversation = match scope {
                     "base" => selected.join("brain").join(CHILD),
                     "brain" => selected.join(CHILD),
@@ -201,19 +246,36 @@ fn full_only_qualified_mirrors_preserve_ids_at_each_copy_depth() {
                     "brain" => "/brain".to_string(),
                     _ => format!("/brain/{CHILD}"),
                 };
-                let source = format!("~/.gemini/{product}{suffix}{}", if contents_only { "/" } else { "" });
+                let source = format!(
+                    "~/.gemini/{product}{suffix}{}",
+                    if contents_only { "/" } else { "" }
+                );
                 let prefix = if product == "antigravity" { "ide/" } else { "" };
                 for path in [&container, &full] {
                     let ctx = ScanContext::with_roots(
                         path.to_path_buf(),
-                        vec![ScanRoot::remote(path.to_path_buf(), Origin::remote("synthetic-host"), None)
-                            .with_mirrored_source_path(&source)],
+                        vec![
+                            ScanRoot::remote(
+                                path.to_path_buf(),
+                                Origin::remote("synthetic-host"),
+                                None,
+                            )
+                            .with_mirrored_source_path(&source),
+                        ],
                         None,
                     );
                     let normalized = assert_selected(&ctx, &full, &format!("{prefix}{CHILD}"));
-                    assert_eq!(normalized.metadata["parent_conversation_id"], format!("{prefix}{PARENT}"));
-                    assert!(AntigravityConnector::new().discover_source_files(&ctx).unwrap().iter()
-                        .all(|file| file.origin == Origin::remote("synthetic-host")));
+                    assert_eq!(
+                        normalized.metadata["parent_conversation_id"],
+                        format!("{prefix}{PARENT}")
+                    );
+                    assert!(
+                        AntigravityConnector::new()
+                            .discover_source_files(&ctx)
+                            .unwrap()
+                            .iter()
+                            .all(|file| file.origin == Origin::remote("synthetic-host"))
+                    );
                 }
             }
         }
@@ -225,19 +287,32 @@ fn full_only_shared_mirrors_keep_both_product_histories() {
     for contents_only in [false, true] {
         let temp = TempDir::new().unwrap();
         let container = temp.path().join("opaque_transport");
-        let gemini = if contents_only { container.clone() } else { container.join(".gemini") };
+        let gemini = if contents_only {
+            container.clone()
+        } else {
+            container.join(".gemini")
+        };
         for product in ["antigravity", "antigravity-cli"] {
             full_at(&gemini.join(product).join("brain").join(CHILD));
         }
         let ctx = ScanContext::with_roots(
             container.clone(),
-            vec![ScanRoot::remote(container, Origin::remote("synthetic-host"), None)
-                .with_mirrored_source_path(if contents_only { "~/.gemini/" } else { "~/.gemini" })],
+            vec![
+                ScanRoot::remote(container, Origin::remote("synthetic-host"), None)
+                    .with_mirrored_source_path(if contents_only {
+                        "~/.gemini/"
+                    } else {
+                        "~/.gemini"
+                    }),
+            ],
             None,
         );
         let connector = AntigravityConnector::new();
         let conversations = connector.scan(&ctx).unwrap();
-        let mut identities: Vec<_> = conversations.iter().map(|c| c.external_id.as_deref().unwrap()).collect();
+        let mut identities: Vec<_> = conversations
+            .iter()
+            .map(|c| c.external_id.as_deref().unwrap())
+            .collect();
         identities.sort_unstable();
         assert_eq!(identities, [CHILD, &format!("ide/{CHILD}")]);
         let files = connector.discover_source_files(&ctx).unwrap();
@@ -255,17 +330,35 @@ fn an_existing_unusable_primary_does_not_authorize_full_fallback() {
         match kind {
             "empty" => write(&primary, ""),
             "malformed" => write(&primary, "{unfinished\n"),
-            "oversized" => fs::File::create(&primary).unwrap().set_len(100 * 1024 * 1024 + 1).unwrap(),
+            "oversized" => fs::File::create(&primary)
+                .unwrap()
+                .set_len(100 * 1024 * 1024 + 1)
+                .unwrap(),
             _ => fs::create_dir(&primary).unwrap(),
         }
-        assert!(AntigravityConnector::new().scan(&context(temp.path(), None)).unwrap().is_empty(), "{kind}");
+        assert!(
+            AntigravityConnector::new()
+                .scan(&context(temp.path(), None))
+                .unwrap()
+                .is_empty(),
+            "{kind}"
+        );
     }
     #[cfg(unix)]
     {
         let temp = TempDir::new().unwrap();
         let full = full_at(&temp.path().join("brain").join(CHILD));
-        std::os::unix::fs::symlink(temp.path().join("missing"), full.with_file_name("transcript.jsonl")).unwrap();
-        assert!(AntigravityConnector::new().scan(&context(temp.path(), None)).unwrap().is_empty());
+        std::os::unix::fs::symlink(
+            temp.path().join("missing"),
+            full.with_file_name("transcript.jsonl"),
+        )
+        .unwrap();
+        assert!(
+            AntigravityConnector::new()
+                .scan(&context(temp.path(), None))
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -281,14 +374,23 @@ fn exclusions_cannot_be_bypassed_through_the_full_transcript() {
         ("unrelated", temp.path().join("not-selected")),
     ] {
         let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "transcript_source_exclusion_child", "--nocapture"])
+            .args([
+                "--exact",
+                "transcript_source_exclusion_child",
+                "--nocapture",
+            ])
             .current_dir(temp.path())
             .env(CHILD_ROOT, temp.path())
             .env(CHILD_CASE, case)
             .env("CASS_EXCLUDE_PATHS", excluded)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{case}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -300,7 +402,10 @@ fn transcript_source_exclusion_child() {
     let ctx = context(&root, None);
     let connector = AntigravityConnector::new();
     if std::env::var(CHILD_CASE).unwrap() == "unrelated" {
-        let full = root.join("brain").join(CHILD).join(".system_generated/logs/transcript_full.jsonl");
+        let full = root
+            .join("brain")
+            .join(CHILD)
+            .join(".system_generated/logs/transcript_full.jsonl");
         assert_selected(&ctx, &full, CHILD);
     } else {
         assert!(connector.scan(&ctx).unwrap().is_empty());

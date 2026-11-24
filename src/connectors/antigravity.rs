@@ -231,19 +231,27 @@ impl AntigravitySourceRoot {
         let Some(base) = self.metadata_base(conversation_dir) else {
             return false;
         };
-        if let Some(uuid) = self
+        let uuid = self
             .conversation_uuid
             .clone()
-            .or_else(|| AntigravityConnector::conversation_uuid(conversation_dir))
+            .or_else(|| AntigravityConnector::conversation_uuid(conversation_dir));
+        if let Some(uuid) = uuid.as_deref()
             && matches(&base.join("annotations").join(format!("{uuid}.pbtxt")))
         {
             return true;
         }
-        let db = base.join("conversation_summaries.db");
-        let wal = db.with_extension("db-wal");
-        !path_is_excluded(&db, excluded_paths)
-            && !path_is_excluded(&wal, excluded_paths)
-            && (matches(&db) || matches(&wal))
+        [
+            Some(base.join("conversation_summaries.db")),
+            uuid.map(|uuid| base.join("conversations").join(format!("{uuid}.db"))),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|db| {
+            let wal = db.with_extension("db-wal");
+            !path_is_excluded(&db, excluded_paths)
+                && !path_is_excluded(&wal, excluded_paths)
+                && (matches(&db) || matches(&wal))
+        })
     }
 }
 
@@ -392,6 +400,24 @@ impl AntigravityConnector {
         db.is_file().then_some(db)
     }
 
+    /// Resolve a durable database or WAL watcher path without opening it.
+    /// Requiring the conversations directory prevents unrelated SQLite events
+    /// from widening into an Antigravity store.
+    fn durable_database_event(path: &Path) -> Option<(&Path, &str)> {
+        let conversations = path.parent()?;
+        if conversations.file_name()? != "conversations" {
+            return None;
+        }
+        let name = path.file_name()?.to_str()?;
+        let id = name
+            .strip_suffix(".db-wal")
+            .or_else(|| name.strip_suffix(".db"))?;
+        if matches!(id, "" | "." | "..") {
+            return None;
+        }
+        Some((conversations.parent()?, id))
+    }
+
     /// The sibling `annotations/<uuid>.pbtxt` title sidecar, when present.
     fn sibling_annotation_path(conversation_dir: &Path, base: Option<&Path>) -> Option<PathBuf> {
         let uuid = Self::conversation_uuid(conversation_dir)?;
@@ -407,8 +433,9 @@ impl AntigravityConnector {
         db.is_file().then_some(db)
     }
 
-    /// Snapshot metadata sources for discovery and incremental freshness.
-    /// The summary database and WAL form one read unit.
+    /// Snapshot sidecar sources for discovery and incremental freshness.
+    /// Each SQLite database and WAL form one unit for copying and exclusions.
+    /// Durable per-conversation artifacts are only statted, never opened.
     fn metadata_sidecars(
         conversation_dir: &Path,
         root: &ScanRoot,
@@ -421,7 +448,13 @@ impl AntigravityConnector {
         {
             paths.push((annotation, DiscoveredSourceRole::MetadataSidecar));
         }
-        if let Some(db) = Self::sibling_summaries_db_path(base) {
+        for db in [
+            Self::sibling_db_path(conversation_dir, base),
+            Self::sibling_summaries_db_path(base),
+        ]
+        .into_iter()
+        .flatten()
+        {
             let wal = db.with_extension("db-wal");
             if !path_is_excluded(&db, excluded_paths) && !path_is_excluded(&wal, excluded_paths) {
                 paths.push((db, DiscoveredSourceRole::SqliteDatabase));
@@ -582,7 +615,14 @@ impl AntigravityConnector {
                     .then(|| annotations.parent())
                     .flatten()
             }
-            _ => return None,
+            _ => {
+                let (base, uuid) = Self::durable_database_event(&root.path)?;
+                if !plain_directory(root.path.parent()?) {
+                    return None;
+                }
+                event_uuid = Some(uuid);
+                Some(base)
+            }
         };
         if let Some(base) = base
             && (!plain_directory(base) || !plain_directory(&base.join("brain")))
@@ -712,7 +752,8 @@ impl AntigravityConnector {
                             .map(|id| base.join("brain").join(id))
                     })
                 }
-                _ => None,
+                _ => Self::durable_database_event(scan_target)
+                    .map(|(base, id)| base.join("brain").join(id)),
             };
             return conversation
                 .filter(|dir| Self::is_conversation_dir(dir))
@@ -1879,12 +1920,8 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let conversation_dir = &selected.conversation_dir;
         let transcript = &selected.transcript;
         let base = source.metadata_base(conversation_dir);
-        let sidecars = AntigravityConnector::metadata_sidecars(
-            conversation_dir,
-            root,
-            base,
-            &excluded_paths,
-        );
+        let sidecars =
+            AntigravityConnector::metadata_sidecars(conversation_dir, root, base, &excluded_paths);
         if !selected.modified_since(ctx.since_ts, &sidecars, &excluded_paths) {
             continue;
         }
@@ -1924,23 +1961,7 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
             );
         }
 
-        // The durable per-conversation SQLite database — the canonical source
-        // of truth worth mirroring, though we read the transcript instead.
-        if let Some(db) = AntigravityConnector::sibling_db_path(conversation_dir, base) {
-            if !path_is_excluded(&db, &excluded_paths) && seen.insert(dedupe_path_key(&db)) {
-                out.push(
-                    DiscoveredSourceFile::new(
-                        AGENT_SLUG,
-                        root,
-                        db,
-                        DiscoveredSourceRole::SqliteDatabase,
-                        false,
-                    )
-                    .with_fs_metadata(),
-                );
-            }
-        }
-
+        // Includes the durable database/WAL pair without reading its payload.
         // Shared summary sources are deduplicated across conversations.
         for sidecar in sidecars {
             if seen.insert(dedupe_path_key(&sidecar.source_path)) {

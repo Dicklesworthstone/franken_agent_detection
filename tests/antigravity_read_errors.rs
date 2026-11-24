@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use franken_agent_detection::{
-    AntigravityConnector, Connector, DiscoveredSourceFile, ScanContext, ScanRoot,
-    SourceCompletion, SourceScanHooks,
+    AntigravityConnector, Connector, DiscoveredSourceFile, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -131,7 +131,10 @@ fn missing_selected_sources_keep_healthy_streaming_and_return_the_first_error() 
         let connector = AntigravityConnector::new();
         let mut emitted = Vec::new();
         let mut callback = |conversation: franken_agent_detection::NormalizedConversation| {
-            assert_eq!(conversation.messages[0].content, "Healthy synthetic prompt 2.");
+            assert_eq!(
+                conversation.messages[0].content,
+                "Healthy synthetic prompt 2."
+            );
             emitted.push(conversation.source_path);
             Ok(())
         };
@@ -160,7 +163,11 @@ fn missing_selected_sources_keep_healthy_streaming_and_return_the_first_error() 
         };
         assert_io_kind(&error, io::ErrorKind::NotFound);
         assert!(format!("{error:#}").contains(fixture.files[0].to_str().unwrap()));
-        assert!(error.to_string().contains("2 Antigravity transcript source(s)"));
+        assert!(
+            error
+                .to_string()
+                .contains("2 Antigravity transcript source(s)")
+        );
         assert_eq!(emitted, fixture.files[2..]);
         assert_eq!(ticks.load(Ordering::SeqCst), 3);
 

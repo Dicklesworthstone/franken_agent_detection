@@ -440,6 +440,13 @@ system-message parent IDs are available with `connectors`. Enabling
 titles take precedence over summary titles; the first prompt remains the
 fallback. The connector discovers these metadata files and the summary WAL so
 mirrors and incremental scans can refresh when only metadata changes.
+The durable `conversations/<uuid>.db` and its existing `-wal` are also discovered
+as one archival pair. A DB-only or WAL-only update refreshes that conversation;
+exact DB/WAL file events also handle deletion. Excluding either member excludes
+the pair. These durable files are never opened or decoded, and transcripts remain
+the normalized source. Brain-only and conversation-only mirrors do not acquire
+durable files outside their copied scope.
+
 Antigravity reports `supports_source_boundaries() == false`: the existing
 receipt format cannot track a metadata file that first appears after indexing.
 Its boundary API uses the streaming callback fallback, retaining `since_ts`
@@ -472,7 +479,7 @@ stores and bare UUIDs for CLI/relocated stores), with the original parent saved
 as `metadata.raw_parent_conversation_id`. Corrupt summary parent IDs cannot
 override a valid initial system-message sender. Remote mirrors can use JSONL
 and annotation metadata; they never open the optional summary SQLite store.
-Exact transcript, annotation, summary DB, and WAL scan roots support targeted
+Exact transcript, annotation, summary DB/WAL, and durable DB/WAL roots support targeted
 file events. A removed optional sidecar also refreshes its owner when selected
 as a scan root; timestamp-only base scans need a full scan or such an event to
 observe metadata deletions.

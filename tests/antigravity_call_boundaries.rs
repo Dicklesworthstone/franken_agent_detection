@@ -12,9 +12,9 @@ use tempfile::TempDir;
 
 fn scan(records: &[Value]) -> NormalizedConversation {
     let directory = TempDir::new().unwrap();
-    let path = directory.path().join(
-        "brain/11111111-2222-4333-8444-555555555555/.system_generated/logs/transcript.jsonl",
-    );
+    let path = directory
+        .path()
+        .join("brain/11111111-2222-4333-8444-555555555555/.system_generated/logs/transcript.jsonl");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         path,
@@ -58,7 +58,10 @@ fn assert_call_counts(conversation: &NormalizedConversation, expected: &[u32]) {
     assert_eq!(conversation.messages.len(), expected.len());
     for (index, (message, expected)) in conversation.messages.iter().zip(expected).enumerate() {
         assert_eq!(message.idx, i64::try_from(index).unwrap());
-        assert_eq!(message.invocations.len(), usize::try_from(*expected).unwrap());
+        assert_eq!(
+            message.invocations.len(),
+            usize::try_from(*expected).unwrap()
+        );
         let usage = extract_tokens_for_agent(
             "antigravity",
             &message.extra,
@@ -113,7 +116,12 @@ fn settings_only_user_input_resets_call_ownership_without_creating_messages() {
         result(6),
     ]);
     assert_call_counts(&conversation, &[1, 0, 1, 1, 0]);
-    assert!(conversation.messages.iter().all(|message| message.role != "user"));
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .all(|message| message.role != "user")
+    );
     assert_eq!(
         conversation.messages[4].extra["cass"]["referenced_tool_call_ids"],
         json!(["turn-local-read"])

@@ -93,7 +93,10 @@ fn qualified_mirror_identity_and_provenance_win_over_an_overlapping_broad_root()
         .scan(&context(temp.path(), vec![specific.clone()], None))
         .unwrap()
         .remove(0);
-    assert_eq!(selected.external_id.as_deref(), Some(format!("ide/{CHILD}").as_str()));
+    assert_eq!(
+        selected.external_id.as_deref(),
+        Some(format!("ide/{CHILD}").as_str())
+    );
 
     for roots in [
         vec![broad.clone(), specific.clone()],
@@ -101,10 +104,20 @@ fn qualified_mirror_identity_and_provenance_win_over_an_overlapping_broad_root()
     ] {
         let ctx = context(temp.path(), roots, None);
         let conversations = connector.scan(&ctx).unwrap();
-        assert_eq!(conversations.len(), 2, "nonoverlapping broad-root history survives");
-        let child = conversations.iter().find(|c| c.source_path == primary).unwrap();
+        assert_eq!(
+            conversations.len(),
+            2,
+            "nonoverlapping broad-root history survives"
+        );
+        let child = conversations
+            .iter()
+            .find(|c| c.source_path == primary)
+            .unwrap();
         assert_eq!(child.external_id, selected.external_id);
-        assert_eq!(child.metadata["parent_conversation_id"], format!("ide/{PARENT}"));
+        assert_eq!(
+            child.metadata["parent_conversation_id"],
+            format!("ide/{PARENT}")
+        );
         assert_eq!(child.metadata["layout"], "ide");
         assert_eq!(child.title.as_deref(), Some("Selected IDE title"));
 
@@ -113,7 +126,10 @@ fn qualified_mirror_identity_and_provenance_win_over_an_overlapping_broad_root()
         let mut mapped = child.clone();
         mapped.workspace = Some(PathBuf::from("/synthetic/project"));
         ctx.apply_workspace_rewrite_for_path(&primary, &mut mapped);
-        assert_eq!(mapped.workspace.as_deref(), Some(Path::new("/selected/project")));
+        assert_eq!(
+            mapped.workspace.as_deref(),
+            Some(Path::new("/selected/project"))
+        );
 
         let sources = connector.discover_source_files(&ctx).unwrap();
         assert_eq!(sources.len(), 3, "two transcripts and one annotation");
@@ -171,7 +187,12 @@ fn broader_fresh_metadata_cannot_replay_or_enrich_a_narrow_brain_copy() {
 
     let selected = context(temp.path(), vec![narrow.clone()], Some(SINCE));
     assert!(connector.scan(&selected).unwrap().is_empty());
-    assert!(connector.discover_source_files(&selected).unwrap().is_empty());
+    assert!(
+        connector
+            .discover_source_files(&selected)
+            .unwrap()
+            .is_empty()
+    );
 
     for roots in [
         vec![broad.clone(), narrow.clone()],
@@ -180,13 +201,20 @@ fn broader_fresh_metadata_cannot_replay_or_enrich_a_narrow_brain_copy() {
         let full = context(temp.path(), roots.clone(), None);
         let conversations = connector.scan(&full).unwrap();
         assert_eq!(conversations.len(), 1);
-        assert_eq!(conversations[0].title.as_deref(), Some("Selected transcript"));
+        assert_eq!(
+            conversations[0].title.as_deref(),
+            Some("Selected transcript")
+        );
         assert_eq!(
             conversations[0].external_id.as_deref(),
             Some(format!("ide/{CHILD}").as_str())
         );
         let sources = connector.discover_source_files(&full).unwrap();
-        assert_eq!(sources.len(), 1, "outside metadata must not become a dependency");
+        assert_eq!(
+            sources.len(),
+            1,
+            "outside metadata must not become a dependency"
+        );
         assert_eq!(sources[0].source_path, primary);
 
         // Ownership must be selected before freshness filtering. Merely visiting
@@ -223,7 +251,10 @@ fn narrower_original_scope_wins_when_configured_and_resolved_paths_are_equal() {
         let full = context(temp.path(), roots.clone(), None);
         let conversations = connector.scan(&full).unwrap();
         assert_eq!(conversations.len(), 1);
-        assert_eq!(conversations[0].title.as_deref(), Some("Selected transcript"));
+        assert_eq!(
+            conversations[0].title.as_deref(),
+            Some("Selected transcript")
+        );
         assert!(conversations[0].metadata.get("data_root").is_none());
         let sources = connector.discover_source_files(&full).unwrap();
         assert_eq!(sources.len(), 1);
@@ -328,7 +359,10 @@ fn structural_metadata_events_do_not_replace_containing_root_provenance() {
         let ctx = context(temp.path(), roots, Some(SINCE));
         let conversations = connector.scan(&ctx).unwrap();
         assert_eq!(conversations.len(), 1);
-        assert_eq!(conversations[0].title.as_deref(), Some("Selected annotation"));
+        assert_eq!(
+            conversations[0].title.as_deref(),
+            Some("Selected annotation")
+        );
         let mut mapped = conversations[0].clone();
         mapped.workspace = Some(PathBuf::from("/synthetic/project"));
         ctx.apply_workspace_rewrite_for_path(&primary, &mut mapped);
