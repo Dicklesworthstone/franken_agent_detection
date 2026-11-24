@@ -79,8 +79,8 @@ use super::jsonl::JsonlLines;
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::token_extraction::{antigravity_tool_call_id, antigravity_tool_name};
 use super::utils::{
-    MAX_SCAN_FILE_BYTES, dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env,
-    path_is_excluded, read_capped, unwrap_skill_invocations,
+    MAX_SCAN_FILE_BYTES, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+    read_capped, unwrap_skill_invocations,
 };
 use super::{Connector, file_modified_since, franken_detection_for_connector, parse_timestamp};
 use crate::types::{
@@ -90,6 +90,77 @@ use crate::types::{
 
 /// Normalized agent slug emitted for every Antigravity conversation.
 const AGENT_SLUG: &str = "antigravity";
+
+/// Resolve physical source identity without rewriting emitted source paths.
+/// Cache existing parent directories across one scan: conversation siblings and
+/// shared sidecars should not each walk the same ancestor symlink chain.
+#[derive(Default)]
+struct AntigravityPathKeys {
+    directories: HashMap<PathBuf, PathBuf>,
+}
+
+impl AntigravityPathKeys {
+    fn key(&mut self, path: &Path) -> PathBuf {
+        let missing = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                // Keep the existing leaf-link behavior, including dangling links.
+                return fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            }
+            Ok(_) => false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(_) => return path.to_path_buf(),
+        };
+        let Some((parent, name)) = path.parent().zip(path.file_name()) else {
+            return fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        };
+        self.directory_key(parent, missing)
+            .map(|directory| directory.join(name))
+            .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    fn directory_key(&mut self, directory: &Path, allow_missing: bool) -> Option<PathBuf> {
+        use std::path::Component;
+
+        let mut ancestor = directory;
+        loop {
+            let mut resolved = if let Some(resolved) = self.directories.get(ancestor) {
+                resolved.clone()
+            } else {
+                // A single relative component has the working directory as parent.
+                let existing = if ancestor.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    ancestor
+                };
+                match fs::canonicalize(existing) {
+                    Ok(resolved) => {
+                        self.directories
+                            .insert(ancestor.to_path_buf(), resolved.clone());
+                        resolved
+                    }
+                    Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => {
+                        ancestor = ancestor.parent()?;
+                        continue;
+                    }
+                    // Do not guess past permissions, I/O errors, or symlink loops.
+                    Err(_) => return None,
+                }
+            };
+            // Only missing watcher paths may append an unresolved remainder.
+            // Resolve existing symlinks before folding any remaining "..".
+            for component in directory.strip_prefix(ancestor).ok()?.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    other => resolved.push(other.as_os_str()),
+                }
+            }
+            return Some(resolved);
+        }
+    }
+}
 
 /// Which Antigravity product wrote a store.
 ///
@@ -214,10 +285,11 @@ impl AntigravitySourceRoot {
         conversation_dir: &Path,
         path: &Path,
         excluded_paths: &[PathBuf],
+        path_keys: &mut AntigravityPathKeys,
     ) -> bool {
-        let key = dedupe_path_key(path);
-        let matches = |candidate: &Path| {
-            !path_is_excluded(candidate, excluded_paths) && dedupe_path_key(candidate) == key
+        let key = path_keys.key(path);
+        let mut matches = |candidate: &Path| {
+            !path_is_excluded(candidate, excluded_paths) && path_keys.key(candidate) == key
         };
         if [
             AntigravityConnector::transcript_path(conversation_dir),
@@ -270,6 +342,7 @@ impl AntigravityConversationSource<'_> {
         since_ts: Option<i64>,
         sidecars: &[DiscoveredSourceFile],
         excluded_paths: &[PathBuf],
+        path_keys: &mut AntigravityPathKeys,
     ) -> bool {
         AntigravityConnector::conversation_modified_since(
             &self.conversation_dir,
@@ -279,7 +352,7 @@ impl AntigravityConversationSource<'_> {
             excluded_paths,
         ) || self.removed_paths.iter().any(|path| {
             self.source
-                .owns_source_path(&self.conversation_dir, path, excluded_paths)
+                .owns_source_path(&self.conversation_dir, path, excluded_paths, path_keys)
         })
     }
 }
@@ -673,6 +746,7 @@ impl AntigravityConnector {
     fn conversation_sources<'a>(
         roots: &'a [AntigravitySourceRoot],
         excluded_paths: &[PathBuf],
+        path_keys: &mut AntigravityPathKeys,
     ) -> Vec<AntigravityConversationSource<'a>> {
         let mut positions: HashMap<PathBuf, usize> = HashMap::new();
         let mut conversations: Vec<AntigravityConversationSource<'a>> = Vec::new();
@@ -688,7 +762,7 @@ impl AntigravityConnector {
                 else {
                     continue;
                 };
-                let key = dedupe_path_key(&conversation_dir);
+                let key = path_keys.key(&conversation_dir);
                 let index = if let Some(&index) = positions.get(&key) {
                     let selected = &mut conversations[index];
                     if source.priority > selected.source.priority {
@@ -1873,11 +1947,14 @@ fn scan_antigravity_with_callback(
 ) -> Result<()> {
     let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = AntigravityConnector::source_roots(ctx);
+    let mut path_keys = AntigravityPathKeys::default();
     // Keep one original cause and a count, not a corpus-sized error list.
     let mut first_read_error: Option<anyhow::Error> = None;
     let mut read_failure_count = 0_usize;
 
-    for selected in AntigravityConnector::conversation_sources(&roots, &excluded_paths) {
+    for selected in
+        AntigravityConnector::conversation_sources(&roots, &excluded_paths, &mut path_keys)
+    {
         let source = selected.source;
         let root = &source.root;
         let conversation_dir = &selected.conversation_dir;
@@ -1887,7 +1964,7 @@ fn scan_antigravity_with_callback(
             source.metadata_base(conversation_dir),
             &excluded_paths,
         );
-        if !selected.modified_since(ctx.since_ts, &sidecars, &excluded_paths) {
+        if !selected.modified_since(ctx.since_ts, &sidecars, &excluded_paths, &mut path_keys) {
             continue;
         }
         ctx.tick();
@@ -1936,10 +2013,13 @@ fn scan_antigravity_with_callback(
 fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
     let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = AntigravityConnector::source_roots(ctx);
+    let mut path_keys = AntigravityPathKeys::default();
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-    for selected in AntigravityConnector::conversation_sources(&roots, &excluded_paths) {
+    for selected in
+        AntigravityConnector::conversation_sources(&roots, &excluded_paths, &mut path_keys)
+    {
         let source = selected.source;
         let root = &source.root;
         let conversation_dir = &selected.conversation_dir;
@@ -1947,14 +2027,14 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let base = source.metadata_base(conversation_dir);
         let sidecars =
             AntigravityConnector::metadata_sidecars(conversation_dir, root, base, &excluded_paths);
-        if !selected.modified_since(ctx.since_ts, &sidecars, &excluded_paths) {
+        if !selected.modified_since(ctx.since_ts, &sidecars, &excluded_paths, &mut path_keys) {
             continue;
         }
 
         // The transcript we actually parse — required for reconstruction.
         if transcript.is_file()
             && !path_is_excluded(transcript, &excluded_paths)
-            && seen.insert(dedupe_path_key(transcript))
+            && seen.insert(path_keys.key(transcript))
         {
             out.push(
                 DiscoveredSourceFile::new(
@@ -1972,7 +2052,7 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let transcript_full = AntigravityConnector::transcript_full_path(conversation_dir);
         if transcript_full.is_file()
             && !path_is_excluded(&transcript_full, &excluded_paths)
-            && seen.insert(dedupe_path_key(&transcript_full))
+            && seen.insert(path_keys.key(&transcript_full))
         {
             out.push(
                 DiscoveredSourceFile::new(
@@ -1989,7 +2069,7 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         // Includes the durable database/WAL pair without reading its payload.
         // Shared summary sources are deduplicated across conversations.
         for sidecar in sidecars {
-            if seen.insert(dedupe_path_key(&sidecar.source_path)) {
+            if seen.insert(path_keys.key(&sidecar.source_path)) {
                 out.push(sidecar);
             }
         }

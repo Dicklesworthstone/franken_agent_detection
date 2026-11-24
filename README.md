@@ -506,6 +506,12 @@ between qualified roots. Broad roots still contribute nonoverlapping histories.
 Metadata file events refresh only conversations whose selected scope owns that
 path, preserving the owner's identity, provenance, and workspace mappings.
 
+Ancestor directory aliases share one conversation owner and one discovered
+source identity. Antigravity caches canonical parent-directory identities for
+each scan while retaining the selected source's original paths and provenance.
+Deleted sidecar events use the same identity resolution and still require the
+selected owner's metadata scope and exclusion policy.
+
 ### Coverage
 
 | Slug | Agent | Storage read |
