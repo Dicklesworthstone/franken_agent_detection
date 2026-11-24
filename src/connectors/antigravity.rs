@@ -791,7 +791,7 @@ impl AntigravityConnector {
     /// Read a transcript file into per-step JSON records, tolerating blank lines
     /// and individual malformed/non-UTF-8 lines (skipped + logged, never fatal),
     /// while discarding incomplete transcripts on mid-stream I/O errors.
-    fn read_transcript_records(transcript: &Path) -> Vec<Value> {
+    fn read_transcript_records(transcript: &Path) -> io::Result<Vec<Value>> {
         // Transcripts accumulate; enforce the project's 100MB scan cap.
         if let Ok(meta) = fs::metadata(transcript)
             && meta.len() > 100 * 1024 * 1024
@@ -801,12 +801,10 @@ impl AntigravityConnector {
                 size_bytes = meta.len(),
                 "antigravity: transcript exceeds the scan size cap; skipping"
             );
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let Ok(file) = fs::File::open(transcript) else {
-            return Vec::new();
-        };
-        Self::read_transcript_records_from(transcript, BufReader::new(file)).unwrap_or_default()
+        let file = fs::File::open(transcript)?;
+        Self::read_transcript_records_from(transcript, BufReader::new(file))
     }
 
     fn read_transcript_records_from(
@@ -1693,10 +1691,10 @@ fn parse_conversation(
     transcript: &Path,
     excluded_paths: &[PathBuf],
     source: &AntigravitySourceRoot,
-) -> Option<NormalizedConversation> {
-    let records = AntigravityConnector::read_transcript_records(transcript);
+) -> io::Result<Option<NormalizedConversation>> {
+    let records = AntigravityConnector::read_transcript_records(transcript)?;
     if records.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Sort by step_index (gaps are expected; ties keep input order via stable sort).
@@ -1776,7 +1774,7 @@ fn parse_conversation(
             records = records.len(),
             "antigravity: transcript produced no messages (possible agy schema drift)"
         );
-        return None;
+        return Ok(None);
     }
 
     reindex_messages(&mut messages);
@@ -1790,7 +1788,7 @@ fn parse_conversation(
             .map(|line| line.chars().take(100).collect::<String>())
     });
 
-    Some(NormalizedConversation {
+    Ok(Some(NormalizedConversation {
         agent_slug: AGENT_SLUG.to_string(),
         external_id,
         title,
@@ -1800,7 +1798,7 @@ fn parse_conversation(
         ended_at,
         metadata: conversation_metadata(model, parent_conversation_id, layout, base),
         messages,
-    })
+    }))
 }
 
 fn scan_antigravity_with_callback(
@@ -1809,6 +1807,9 @@ fn scan_antigravity_with_callback(
 ) -> Result<()> {
     let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = AntigravityConnector::source_roots(ctx);
+    // Keep one original cause and a count, not a corpus-sized error list.
+    let mut first_read_error: Option<anyhow::Error> = None;
+    let mut read_failure_count = 0_usize;
 
     for selected in AntigravityConnector::conversation_sources(&roots, &excluded_paths) {
         let source = selected.source;
@@ -1824,23 +1825,46 @@ fn scan_antigravity_with_callback(
             continue;
         }
         ctx.tick();
-        if let Some(mut conversation) = parse_conversation(
+        match parse_conversation(
             conversation_dir,
             &selected.transcript,
             &excluded_paths,
             source,
         ) {
-            root.apply_workspace_rewrite(&mut conversation);
-            on_conversation(conversation).with_context(|| {
-                format!(
-                    "emit antigravity conversation {}",
-                    conversation_dir.display()
-                )
-            })?;
+            Ok(Some(mut conversation)) => {
+                root.apply_workspace_rewrite(&mut conversation);
+                // Sink errors stop immediately, even after a source failed.
+                on_conversation(conversation).with_context(|| {
+                    format!(
+                        "emit antigravity conversation {}",
+                        conversation_dir.display()
+                    )
+                })?;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                read_failure_count = read_failure_count.saturating_add(1);
+                tracing::warn!(
+                    transcript = %selected.transcript.display(),
+                    error = %error,
+                    "antigravity: skipping unreadable selected transcript"
+                );
+                if first_read_error.is_none() {
+                    first_read_error = Some(anyhow::Error::new(error).context(format!(
+                        "read antigravity transcript {}",
+                        selected.transcript.display()
+                    )));
+                }
+            }
         }
     }
 
-    Ok(())
+    match first_read_error {
+        Some(error) => Err(error.context(format!(
+            "failed to read {read_failure_count} Antigravity transcript source(s)"
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {

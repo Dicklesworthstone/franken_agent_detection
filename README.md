@@ -461,6 +461,12 @@ the sole transcript source. Discovery and incremental freshness use that same
 selection. An existing primary remains authoritative, and excluding its path
 also excludes the duplicate full transcript. The two files are never combined.
 
+Selected transcript open/read failures are reported to the scan caller. Healthy
+conversations still stream before the connector returns the first original I/O
+error with a failure count. Collecting scans return an error instead of a partial
+vector, and conversation-callback errors stop immediately. Empty, malformed,
+oversized, and optional-metadata skips retain their existing behavior.
+
 Parent IDs use the conversation's identity namespace (`ide/<uuid>` for IDE
 stores and bare UUIDs for CLI/relocated stores), with the original parent saved
 as `metadata.raw_parent_conversation_id`. Corrupt summary parent IDs cannot
