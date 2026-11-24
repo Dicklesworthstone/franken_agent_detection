@@ -152,6 +152,33 @@ impl AntigravityLayout {
     }
 }
 
+/// A safely resolved store keeps its product identity even when the transport
+/// copied only the store's contents and omitted the `.gemini` ancestor.
+struct AntigravitySourceRoot {
+    root: ScanRoot,
+    layout: Option<AntigravityLayout>,
+    conversation_uuid: Option<String>,
+    metadata: AntigravityMetadataScope,
+}
+
+enum AntigravityMetadataScope {
+    /// Ordinary filesystem roots can use the standard `brain/<uuid>` siblings.
+    Structural,
+    /// A mirror owns sidecars only when it copied the surrounding product base.
+    Mirrored(Option<PathBuf>),
+}
+
+impl AntigravitySourceRoot {
+    fn metadata_base<'a>(&'a self, conversation_dir: &'a Path) -> Option<&'a Path> {
+        match &self.metadata {
+            AntigravityMetadataScope::Structural => {
+                AntigravityConnector::base_of_conversation_dir(conversation_dir)
+            }
+            AntigravityMetadataScope::Mirrored(base) => base.as_deref(),
+        }
+    }
+}
+
 /// Connector for the Antigravity (`agy`) coding agent.
 pub struct AntigravityConnector;
 
@@ -193,7 +220,12 @@ impl AntigravityConnector {
     /// The `<base>` directory (`brain/`'s parent) for a `brain/<uuid>`
     /// conversation directory.
     fn base_of_conversation_dir(conversation_dir: &Path) -> Option<&Path> {
-        conversation_dir.parent()?.parent()
+        // A qualified mirror can contain only `<uuid>/`, with no surrounding
+        // store. Do not infer metadata outside that transport container.
+        conversation_dir
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "brain"))?
+            .parent()
     }
 
     /// Transcript path for a `brain/<uuid>` conversation directory.
@@ -230,24 +262,24 @@ impl AntigravityConnector {
     /// The sibling `conversations/<uuid>.db` for a `brain/<uuid>` directory, when
     /// the standard layout is intact (`<base>/brain/<uuid>` ↔
     /// `<base>/conversations/<uuid>.db`).
-    fn sibling_db_path(conversation_dir: &Path) -> Option<PathBuf> {
+    fn sibling_db_path(conversation_dir: &Path, base: Option<&Path>) -> Option<PathBuf> {
         let uuid = Self::conversation_uuid(conversation_dir)?;
-        let base = Self::base_of_conversation_dir(conversation_dir)?;
+        let base = base?;
         let db = base.join("conversations").join(format!("{uuid}.db"));
         db.is_file().then_some(db)
     }
 
     /// The sibling `annotations/<uuid>.pbtxt` title sidecar, when present.
-    fn sibling_annotation_path(conversation_dir: &Path) -> Option<PathBuf> {
+    fn sibling_annotation_path(conversation_dir: &Path, base: Option<&Path>) -> Option<PathBuf> {
         let uuid = Self::conversation_uuid(conversation_dir)?;
-        let base = Self::base_of_conversation_dir(conversation_dir)?;
+        let base = base?;
         let annotation = base.join("annotations").join(format!("{uuid}.pbtxt"));
         annotation.is_file().then_some(annotation)
     }
 
     /// The shared `<base>/conversation_summaries.db` summary database, when present.
-    fn sibling_summaries_db_path(conversation_dir: &Path) -> Option<PathBuf> {
-        let base = Self::base_of_conversation_dir(conversation_dir)?;
+    fn sibling_summaries_db_path(base: Option<&Path>) -> Option<PathBuf> {
+        let base = base?;
         let db = base.join("conversation_summaries.db");
         db.is_file().then_some(db)
     }
@@ -257,15 +289,16 @@ impl AntigravityConnector {
     fn metadata_sidecars(
         conversation_dir: &Path,
         root: &ScanRoot,
+        base: Option<&Path>,
         excluded_paths: &[PathBuf],
     ) -> Vec<DiscoveredSourceFile> {
         let mut paths = Vec::new();
-        if let Some(annotation) = Self::sibling_annotation_path(conversation_dir)
+        if let Some(annotation) = Self::sibling_annotation_path(conversation_dir, base)
             && !path_is_excluded(&annotation, excluded_paths)
         {
             paths.push((annotation, DiscoveredSourceRole::MetadataSidecar));
         }
-        if let Some(db) = Self::sibling_summaries_db_path(conversation_dir) {
+        if let Some(db) = Self::sibling_summaries_db_path(base) {
             let wal = db.with_extension("db-wal");
             if !path_is_excluded(&db, excluded_paths) && !path_is_excluded(&wal, excluded_paths) {
                 paths.push((db, DiscoveredSourceRole::SqliteDatabase));
@@ -282,8 +315,8 @@ impl AntigravityConnector {
             .collect()
     }
 
-    fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
-        let mut roots = if ctx.use_default_detection() {
+    fn source_roots(ctx: &ScanContext) -> Vec<AntigravitySourceRoot> {
+        let roots = if ctx.use_default_detection() {
             // Mirror the explicit-root acceptance: a default-detection
             // data_dir that itself looks like antigravity storage (a base
             // with a `brain/` tree, or the `brain/` dir itself) scopes the
@@ -304,23 +337,162 @@ impl AntigravityConnector {
                     .collect()
             }
         } else {
-            let mut explicit = Vec::new();
-            for root in &ctx.scan_roots {
-                if let Some(mirrored) = root
-                    .mirrored_store(&[".gemini", "antigravity", "brain"])
-                    .or_else(|| root.mirrored_store(&[".gemini", "antigravity-cli", "brain"]))
-                {
-                    explicit.push(root.with_path(mirrored));
-                } else {
-                    explicit.push(root.clone());
-                }
-            }
-            explicit
+            ctx.scan_roots.clone()
         };
 
-        roots.sort_by(|a, b| a.path.cmp(&b.path));
-        roots.dedup_by(|a, b| a.path == b.path);
-        roots
+        let mut resolved: Vec<_> = roots
+            .into_iter()
+            .flat_map(Self::resolve_source_root)
+            .collect();
+
+        resolved.sort_by(|a, b| a.root.path.cmp(&b.root.path));
+        resolved.dedup_by(|a, b| a.root.path == b.root.path);
+        resolved
+    }
+
+    fn resolve_source_root(root: ScanRoot) -> Vec<AntigravitySourceRoot> {
+        if root.origin.is_local() || root.mirrored_source_path.is_none() {
+            return vec![AntigravitySourceRoot {
+                root,
+                layout: None,
+                conversation_uuid: None,
+                metadata: AntigravityMetadataScope::Structural,
+            }];
+        }
+        let source = root.mirrored_source_path.as_deref().unwrap_or_default();
+        let Some(parts) = mirror_source_components(source) else {
+            return Vec::new();
+        };
+        let mut resolved = Vec::new();
+        for layout in [AntigravityLayout::Ide, AntigravityLayout::Cli] {
+            if let Some(mirrored) =
+                root.mirrored_store(&[".gemini", layout.base_dir_name(), "brain"])
+            {
+                // A shared `.gemini` mirror can own both products. Do not
+                // let the first successful resolution hide the other store.
+                let conversation_uuid = Self::is_conversation_dir(&mirrored)
+                    .then(|| mirror_conversation_uuid(&parts, layout))
+                    .flatten();
+                let base = mirror_includes_product_base(&parts, layout)
+                    .then(|| root.mirrored_store(&[".gemini", layout.base_dir_name()]))
+                    .flatten();
+                resolved.push(AntigravitySourceRoot {
+                    root: root.with_path(mirrored),
+                    layout: Some(layout),
+                    conversation_uuid,
+                    metadata: AntigravityMetadataScope::Mirrored(base),
+                });
+            }
+        }
+        if resolved.is_empty()
+            && let Some(event) = Self::resolve_mirror_event(&root, &parts)
+        {
+            resolved.push(event);
+        }
+        if resolved.is_empty()
+            && !parts.contains(&".gemini")
+            && match fs::symlink_metadata(&root.path) {
+                Ok(metadata) => metadata.is_dir() || metadata.is_file(),
+                Err(error) => error.kind() == io::ErrorKind::NotFound,
+            }
+        {
+            // Home/ancestor and unclassified mirrors retain bounded structural
+            // discovery. A provider-qualified source must resolve safely above.
+            resolved.push(AntigravitySourceRoot {
+                root,
+                layout: None,
+                conversation_uuid: None,
+                metadata: AntigravityMetadataScope::Structural,
+            });
+        }
+        // A declared mirror that fails safe resolution must not widen to the
+        // transport container and ingest unrelated sibling stores.
+        resolved
+    }
+
+    fn resolve_mirror_event(root: &ScanRoot, parts: &[&str]) -> Option<AntigravitySourceRoot> {
+        match fs::symlink_metadata(&root.path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return None,
+        }
+        let name = root.path.file_name()?.to_str()?;
+        let transcript_event = matches!(name, "transcript.jsonl" | "transcript_full.jsonl");
+        let mut event_uuid = None;
+        let base = match name {
+            "transcript.jsonl" | "transcript_full.jsonl" => {
+                let logs = root.path.parent()?;
+                let generated = logs.parent()?;
+                let conversation = generated.parent()?;
+                if logs.file_name()? != "logs" || generated.file_name()? != ".system_generated" {
+                    return None;
+                }
+                if ![logs, generated, conversation]
+                    .into_iter()
+                    .all(plain_directory)
+                {
+                    return None;
+                }
+                event_uuid = conversation
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|uuid| valid_conversation_uuid(uuid));
+                Self::base_of_conversation_dir(conversation)
+            }
+            "conversation_summaries.db" | "conversation_summaries.db-wal" => root.path.parent(),
+            _ if root
+                .path
+                .extension()
+                .is_some_and(|extension| extension == "pbtxt") =>
+            {
+                let annotations = root.path.parent()?;
+                (annotations.file_name()? == "annotations" && plain_directory(annotations))
+                    .then(|| annotations.parent())
+                    .flatten()
+            }
+            _ => return None,
+        };
+        if let Some(base) = base
+            && (!plain_directory(base) || !plain_directory(&base.join("brain")))
+        {
+            return None;
+        }
+        let layout = [AntigravityLayout::Ide, AntigravityLayout::Cli]
+            .into_iter()
+            .find(|layout| {
+                parts
+                    .windows(2)
+                    .any(|pair| pair == [".gemini", layout.base_dir_name()])
+                    || (parts.ends_with(&[".gemini"])
+                        && base.is_some_and(|base| {
+                            base.file_name()
+                                .is_some_and(|name| name == layout.base_dir_name())
+                        }))
+            })?;
+        let owns_base = mirror_includes_product_base(parts, layout);
+        let owns_brain = parts
+            .windows(3)
+            .any(|part| part == [".gemini", layout.base_dir_name(), "brain"]);
+        if !owns_base && (!transcript_event || !owns_brain) {
+            return None;
+        }
+        let conversation_uuid = mirror_conversation_uuid(parts, layout);
+        if let (Some(selected), Some(event)) = (conversation_uuid.as_deref(), event_uuid)
+            && !selected.eq_ignore_ascii_case(event)
+        {
+            return None;
+        }
+        // Exact watcher roots may retain original source identity. `with_path`
+        // deliberately clears it: hosts must retain that context if the local
+        // mirror path is opaque and cannot express the product identity itself.
+        Some(AntigravitySourceRoot {
+            root: root.clone(),
+            layout: Some(layout),
+            conversation_uuid,
+            metadata: AntigravityMetadataScope::Mirrored(
+                owns_base.then(|| base.map(Path::to_path_buf)).flatten(),
+            ),
+        })
     }
 
     /// Resolve every `brain/<uuid>` conversation directory reachable from a scan
@@ -481,6 +653,39 @@ impl AntigravityConnector {
         }
         Ok(records)
     }
+}
+
+fn plain_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+fn mirror_source_components(source: &str) -> Option<Vec<&str>> {
+    if source.chars().any(char::is_control) {
+        return None;
+    }
+    let parts: Vec<_> = source
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    (!parts.iter().any(|part| matches!(*part, "." | ".."))).then_some(parts)
+}
+
+fn mirror_includes_product_base(parts: &[&str], layout: AntigravityLayout) -> bool {
+    // A provider-owned subtree can itself have an application-like basename.
+    // It must never acquire the metadata scope of a complete product base.
+    !parts
+        .windows(3)
+        .any(|part| part == [".gemini", layout.base_dir_name(), "brain"])
+        && (parts.ends_with(&[".gemini"]) || parts.ends_with(&[".gemini", layout.base_dir_name()]))
+}
+
+fn mirror_conversation_uuid(parts: &[&str], layout: AntigravityLayout) -> Option<String> {
+    let store = [".gemini", layout.base_dir_name(), "brain"];
+    let index = parts.windows(store.len()).position(|part| part == store)?;
+    parts
+        .get(index + store.len())
+        .filter(|uuid| valid_conversation_uuid(uuid))
+        .map(|uuid| (*uuid).to_string())
 }
 
 /// Extract the inner text of every `<TAG>…</TAG>` block in `content`.
@@ -1293,7 +1498,7 @@ fn conversation_metadata(
 fn parse_conversation(
     conversation_dir: &Path,
     excluded_paths: &[PathBuf],
-    allow_sqlite: bool,
+    source: &AntigravitySourceRoot,
 ) -> Option<NormalizedConversation> {
     let transcript = AntigravityConnector::transcript_path(conversation_dir);
     let records = AntigravityConnector::read_transcript_records(&transcript);
@@ -1309,9 +1514,14 @@ fn parse_conversation(
             .unwrap_or(i64::MAX)
     });
 
-    let base = AntigravityConnector::base_of_conversation_dir(conversation_dir);
-    let layout = base.and_then(AntigravityLayout::from_base);
-    let uuid = AntigravityConnector::conversation_uuid(conversation_dir);
+    let base = source.metadata_base(conversation_dir);
+    let layout = source
+        .layout
+        .or_else(|| base.and_then(AntigravityLayout::from_base));
+    let uuid = source
+        .conversation_uuid
+        .clone()
+        .or_else(|| AntigravityConnector::conversation_uuid(conversation_dir));
     let external_id = uuid
         .as_deref()
         .map(|id| layout.unwrap_or(AntigravityLayout::Cli).external_id(id));
@@ -1321,7 +1531,7 @@ fn parse_conversation(
             .and_then(|id| annotation_title(b, id, excluded_paths))
     });
     let summary = base
-        .filter(|_| allow_sqlite)
+        .filter(|_| source.root.origin.is_local())
         .and_then(|b| {
             uuid.as_deref()
                 .map(|id| summary_metadata(b, id, excluded_paths))
@@ -1399,7 +1609,8 @@ fn scan_antigravity_with_callback(
     let roots = AntigravityConnector::source_roots(ctx);
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-    for root in roots {
+    for source in roots {
+        let root = &source.root;
         if path_is_excluded(&root.path, &excluded_paths) {
             continue;
         }
@@ -1410,8 +1621,12 @@ fn scan_antigravity_with_callback(
             {
                 continue;
             }
-            let sidecars =
-                AntigravityConnector::metadata_sidecars(&conversation_dir, &root, &excluded_paths);
+            let sidecars = AntigravityConnector::metadata_sidecars(
+                &conversation_dir,
+                root,
+                source.metadata_base(&conversation_dir),
+                &excluded_paths,
+            );
             // A selected removed sidecar is itself change evidence. Its mtime
             // no longer exists, so refresh the surviving transcript/metadata.
             if root.path.exists()
@@ -1431,7 +1646,7 @@ fn scan_antigravity_with_callback(
             }
             ctx.tick();
             if let Some(mut conversation) =
-                parse_conversation(&conversation_dir, &excluded_paths, root.origin.is_local())
+                parse_conversation(&conversation_dir, &excluded_paths, &source)
             {
                 root.apply_workspace_rewrite(&mut conversation);
                 on_conversation(conversation).with_context(|| {
@@ -1453,7 +1668,8 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-    for root in roots {
+    for source in roots {
+        let root = &source.root;
         if path_is_excluded(&root.path, &excluded_paths) {
             continue;
         }
@@ -1464,8 +1680,13 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
             {
                 continue;
             }
-            let sidecars =
-                AntigravityConnector::metadata_sidecars(&conversation_dir, &root, &excluded_paths);
+            let base = source.metadata_base(&conversation_dir);
+            let sidecars = AntigravityConnector::metadata_sidecars(
+                &conversation_dir,
+                root,
+                base,
+                &excluded_paths,
+            );
             if root.path.exists()
                 && !AntigravityConnector::conversation_modified_since(
                     &conversation_dir,
@@ -1485,7 +1706,7 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
                 out.push(
                     DiscoveredSourceFile::new(
                         AGENT_SLUG,
-                        &root,
+                        root,
                         transcript,
                         DiscoveredSourceRole::PrimarySessionLog,
                         true,
@@ -1503,7 +1724,7 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
                 out.push(
                     DiscoveredSourceFile::new(
                         AGENT_SLUG,
-                        &root,
+                        root,
                         transcript_full,
                         DiscoveredSourceRole::PrimarySessionLog,
                         false,
@@ -1514,12 +1735,12 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
 
             // The durable per-conversation SQLite database — the canonical source
             // of truth worth mirroring, though we read the transcript instead.
-            if let Some(db) = AntigravityConnector::sibling_db_path(&conversation_dir) {
+            if let Some(db) = AntigravityConnector::sibling_db_path(&conversation_dir, base) {
                 if !path_is_excluded(&db, &excluded_paths) && seen.insert(dedupe_path_key(&db)) {
                     out.push(
                         DiscoveredSourceFile::new(
                             AGENT_SLUG,
-                            &root,
+                            root,
                             db,
                             DiscoveredSourceRole::SqliteDatabase,
                             false,

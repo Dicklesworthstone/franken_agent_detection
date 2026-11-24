@@ -464,6 +464,15 @@ file events. A removed optional sidecar also refreshes its owner when selected
 as a scan root; timestamp-only base scans need a full scan or such an event to
 observe metadata deletions.
 
+SSH mirror roots retain both IDE and CLI stores when a copied `.gemini` tree
+contains both. The configured source identity preserves product namespaces and
+conversation UUIDs in basename-preserving and contents-only copies, even when
+the local path omits `.gemini`. Metadata belongs to a copied product base;
+brain-only and conversation-only mirrors cannot inherit unrelated sidecars from
+their transport container. Hosts must retain the original mirror context when
+narrowing events: `ScanRoot::with_path` intentionally clears transport identity,
+so an opaque event path alone cannot recover a missing product namespace.
+
 ### Coverage
 
 | Slug | Agent | Storage read |

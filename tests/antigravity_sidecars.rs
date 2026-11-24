@@ -239,11 +239,19 @@ mod sqlite {
             vec![ScanRoot::local(temp.path().to_path_buf()).with_rewrite("/synthetic", "/mapped")],
             None,
         );
-        // Workspace rewrites are applied only to remote roots by ScanRoot;
-        // local source metadata must remain a local filesystem identity.
+        // Explicit mappings apply to local and remote roots alike, while
+        // preserving the provider's original workspace in metadata.
+        let rewritten_conversation = AntigravityConnector::new()
+            .scan(&rewritten)
+            .unwrap()
+            .remove(0);
         assert_eq!(
-            AntigravityConnector::new().scan(&rewritten).unwrap()[0].workspace,
-            conversations[0].workspace
+            rewritten_conversation.workspace.as_deref(),
+            Some(Path::new("/mapped/work tree"))
+        );
+        assert_eq!(
+            rewritten_conversation.metadata["cass"]["workspace_original"],
+            "/synthetic/work tree"
         );
     }
 
