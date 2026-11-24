@@ -480,6 +480,13 @@ their transport container. Hosts must retain the original mirror context when
 narrowing events: `ScanRoot::with_path` intentionally clears transport identity,
 so an opaque event path alone cannot recover a missing product namespace.
 
+Overlapping roots select one owning source context for each conversation before
+freshness filtering. Qualified mirror identity takes precedence over structural
+fallback; narrower declared provider scope and configured path depth select
+between qualified roots. Broad roots still contribute nonoverlapping histories.
+Metadata file events refresh only conversations whose selected scope owns that
+path, preserving the owner's identity, provenance, and workspace mappings.
+
 ### Coverage
 
 | Slug | Agent | Storage read |

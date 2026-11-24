@@ -66,7 +66,7 @@
 //! best-effort message keyed off `source`, with the raw `type` kept in
 //! `extra.agy_type`. (See the agy version-compatibility guard work.)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -160,6 +160,34 @@ struct AntigravitySourceRoot {
     layout: Option<AntigravityLayout>,
     conversation_uuid: Option<String>,
     metadata: AntigravityMetadataScope,
+    priority: AntigravitySourcePriority,
+}
+
+/// Provider-qualified identity is stronger evidence than a structural fallback.
+/// A narrower original provider subtree wins before configured path depth.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AntigravitySourcePriority {
+    mirror_depth: usize,
+    path_depth: usize,
+}
+
+impl AntigravitySourcePriority {
+    fn new(root: &ScanRoot, mirror_depth: usize) -> Self {
+        let transcript_event = matches!(
+            root.path.file_name().and_then(|name| name.to_str()),
+            Some("transcript.jsonl" | "transcript_full.jsonl")
+        );
+        Self {
+            mirror_depth,
+            // Metadata events contribute change evidence, not a more specific
+            // owner than a directory that actually contains the transcript.
+            path_depth: if root.path.is_dir() || transcript_event {
+                root.path.components().count()
+            } else {
+                0
+            },
+        }
+    }
 }
 
 enum AntigravityMetadataScope {
@@ -177,6 +205,74 @@ impl AntigravitySourceRoot {
             }
             AntigravityMetadataScope::Mirrored(base) => base.as_deref(),
         }
+    }
+
+    /// Missing watcher paths only refresh a source that actually owns them.
+    /// A broad root cannot add metadata dependencies to a selected brain copy.
+    fn owns_source_path(
+        &self,
+        conversation_dir: &Path,
+        path: &Path,
+        excluded_paths: &[PathBuf],
+    ) -> bool {
+        let key = dedupe_path_key(path);
+        let matches = |candidate: &Path| {
+            !path_is_excluded(candidate, excluded_paths) && dedupe_path_key(candidate) == key
+        };
+        if [
+            AntigravityConnector::transcript_path(conversation_dir),
+            AntigravityConnector::transcript_full_path(conversation_dir),
+        ]
+        .iter()
+        .any(|transcript| matches(transcript))
+        {
+            return true;
+        }
+        let Some(base) = self.metadata_base(conversation_dir) else {
+            return false;
+        };
+        if let Some(uuid) = self
+            .conversation_uuid
+            .clone()
+            .or_else(|| AntigravityConnector::conversation_uuid(conversation_dir))
+            && matches(&base.join("annotations").join(format!("{uuid}.pbtxt")))
+        {
+            return true;
+        }
+        let db = base.join("conversation_summaries.db");
+        let wal = db.with_extension("db-wal");
+        !path_is_excluded(&db, excluded_paths)
+            && !path_is_excluded(&wal, excluded_paths)
+            && (matches(&db) || matches(&wal))
+    }
+}
+
+/// Only paths and ownership are collected before parsing. Normalized
+/// conversations remain streamed one at a time.
+struct AntigravityConversationSource<'a> {
+    conversation_dir: PathBuf,
+    transcript: PathBuf,
+    source: &'a AntigravitySourceRoot,
+    removed_paths: Vec<PathBuf>,
+}
+
+impl AntigravityConversationSource<'_> {
+    fn modified_since(
+        &self,
+        since_ts: Option<i64>,
+        sidecars: &[DiscoveredSourceFile],
+        excluded_paths: &[PathBuf],
+    ) -> bool {
+        AntigravityConnector::conversation_modified_since(
+            &self.conversation_dir,
+            &self.transcript,
+            since_ts,
+            sidecars,
+            excluded_paths,
+        ) || self.removed_paths.iter().any(|path| {
+            self.source
+                .owns_source_path(&self.conversation_dir, path, excluded_paths)
+        })
     }
 }
 
@@ -372,14 +468,18 @@ impl AntigravityConnector {
             .flat_map(Self::resolve_source_root)
             .collect();
 
+        // Keep contexts that resolve to the same path: a brain-only selection
+        // and a whole-product selection can have different metadata scopes.
+        // Equal priorities use resolved-path order, then original input order
+        // for an exact tie. Scan and discovery use the same owner.
         resolved.sort_by(|a, b| a.root.path.cmp(&b.root.path));
-        resolved.dedup_by(|a, b| a.root.path == b.root.path);
         resolved
     }
 
     fn resolve_source_root(root: ScanRoot) -> Vec<AntigravitySourceRoot> {
         if root.origin.is_local() || root.mirrored_source_path.is_none() {
             return vec![AntigravitySourceRoot {
+                priority: AntigravitySourcePriority::new(&root, 0),
                 root,
                 layout: None,
                 conversation_uuid: None,
@@ -404,6 +504,10 @@ impl AntigravityConnector {
                     .then(|| root.mirrored_store(&[".gemini", layout.base_dir_name()]))
                     .flatten();
                 resolved.push(AntigravitySourceRoot {
+                    priority: AntigravitySourcePriority::new(
+                        &root,
+                        mirror_source_depth(&parts, layout),
+                    ),
                     root: root.with_path(mirrored),
                     layout: Some(layout),
                     conversation_uuid,
@@ -426,6 +530,7 @@ impl AntigravityConnector {
             // Home/ancestor and unclassified mirrors retain bounded structural
             // discovery. A provider-qualified source must resolve safely above.
             resolved.push(AntigravitySourceRoot {
+                priority: AntigravitySourcePriority::new(&root, 0),
                 root,
                 layout: None,
                 conversation_uuid: None,
@@ -513,6 +618,7 @@ impl AntigravityConnector {
         // deliberately clears it: hosts must retain that context if the local
         // mirror path is opaque and cannot express the product identity itself.
         Some(AntigravitySourceRoot {
+            priority: AntigravitySourcePriority::new(root, mirror_source_depth(parts, layout)),
             root: root.clone(),
             layout: Some(layout),
             conversation_uuid,
@@ -520,6 +626,54 @@ impl AntigravityConnector {
                 owns_base.then(|| base.map(Path::to_path_buf)).flatten(),
             ),
         })
+    }
+
+    /// Choose one owner before freshness. An unchanged narrow source must not
+    /// fall through to a broader root with fresh, unrelated metadata.
+    fn conversation_sources<'a>(
+        roots: &'a [AntigravitySourceRoot],
+        excluded_paths: &[PathBuf],
+    ) -> Vec<AntigravityConversationSource<'a>> {
+        let mut positions: HashMap<PathBuf, usize> = HashMap::new();
+        let mut conversations: Vec<AntigravityConversationSource<'a>> = Vec::new();
+        for source in roots {
+            let root = &source.root;
+            if path_is_excluded(&root.path, excluded_paths) {
+                continue;
+            }
+            let removed_event = !root.path.exists();
+            for conversation_dir in Self::conversation_dirs(&root.path) {
+                let Some(transcript) =
+                    Self::selected_transcript_path(&conversation_dir, excluded_paths)
+                else {
+                    continue;
+                };
+                let key = dedupe_path_key(&conversation_dir);
+                let index = if let Some(&index) = positions.get(&key) {
+                    let selected = &mut conversations[index];
+                    if source.priority > selected.source.priority {
+                        selected.conversation_dir = conversation_dir;
+                        selected.transcript = transcript;
+                        selected.source = source;
+                    }
+                    index
+                } else {
+                    let index = conversations.len();
+                    positions.insert(key, index);
+                    conversations.push(AntigravityConversationSource {
+                        conversation_dir,
+                        transcript,
+                        source,
+                        removed_paths: Vec::new(),
+                    });
+                    index
+                };
+                if removed_event {
+                    conversations[index].removed_paths.push(root.path.clone());
+                }
+            }
+        }
+        conversations
     }
 
     /// Resolve every `brain/<uuid>` conversation directory reachable from a scan
@@ -704,6 +858,13 @@ fn mirror_source_components(source: &str) -> Option<Vec<&str>> {
         .filter(|part| !part.is_empty())
         .collect();
     (!parts.iter().any(|part| matches!(*part, "." | ".."))).then_some(parts)
+}
+
+fn mirror_source_depth(parts: &[&str], layout: AntigravityLayout) -> usize {
+    parts
+        .windows(2)
+        .position(|pair| pair == [".gemini", layout.base_dir_name()])
+        .map_or(1, |index| parts.len() - index)
 }
 
 fn mirror_includes_product_base(parts: &[&str], layout: AntigravityLayout) -> bool {
@@ -1648,55 +1809,34 @@ fn scan_antigravity_with_callback(
 ) -> Result<()> {
     let excluded_paths = excluded_scan_paths_from_env()?;
     let roots = AntigravityConnector::source_roots(ctx);
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-    for source in roots {
+    for selected in AntigravityConnector::conversation_sources(&roots, &excluded_paths) {
+        let source = selected.source;
         let root = &source.root;
-        if path_is_excluded(&root.path, &excluded_paths) {
+        let conversation_dir = &selected.conversation_dir;
+        let sidecars = AntigravityConnector::metadata_sidecars(
+            conversation_dir,
+            root,
+            source.metadata_base(conversation_dir),
+            &excluded_paths,
+        );
+        if !selected.modified_since(ctx.since_ts, &sidecars, &excluded_paths) {
             continue;
         }
-        for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
-            let Some(transcript) =
-                AntigravityConnector::selected_transcript_path(&conversation_dir, &excluded_paths)
-            else {
-                continue;
-            };
-            let sidecars = AntigravityConnector::metadata_sidecars(
-                &conversation_dir,
-                root,
-                source.metadata_base(&conversation_dir),
-                &excluded_paths,
-            );
-            // A selected removed sidecar is itself change evidence. Its mtime
-            // no longer exists, so refresh the surviving transcript/metadata.
-            if root.path.exists()
-                && !AntigravityConnector::conversation_modified_since(
-                    &conversation_dir,
-                    &transcript,
-                    ctx.since_ts,
-                    &sidecars,
-                    &excluded_paths,
+        ctx.tick();
+        if let Some(mut conversation) = parse_conversation(
+            conversation_dir,
+            &selected.transcript,
+            &excluded_paths,
+            source,
+        ) {
+            root.apply_workspace_rewrite(&mut conversation);
+            on_conversation(conversation).with_context(|| {
+                format!(
+                    "emit antigravity conversation {}",
+                    conversation_dir.display()
                 )
-            {
-                continue;
-            }
-            // An unchanged broad root must not hide a later explicit sidecar
-            // deletion event for the same conversation.
-            if !seen.insert(dedupe_path_key(&conversation_dir)) {
-                continue;
-            }
-            ctx.tick();
-            if let Some(mut conversation) =
-                parse_conversation(&conversation_dir, &transcript, &excluded_paths, &source)
-            {
-                root.apply_workspace_rewrite(&mut conversation);
-                on_conversation(conversation).with_context(|| {
-                    format!(
-                        "emit antigravity conversation {}",
-                        conversation_dir.display()
-                    )
-                })?;
-            }
+            })?;
         }
     }
 
@@ -1709,93 +1849,78 @@ fn discover_sources(ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-    for source in roots {
+    for selected in AntigravityConnector::conversation_sources(&roots, &excluded_paths) {
+        let source = selected.source;
         let root = &source.root;
-        if path_is_excluded(&root.path, &excluded_paths) {
+        let conversation_dir = &selected.conversation_dir;
+        let transcript = &selected.transcript;
+        let base = source.metadata_base(conversation_dir);
+        let sidecars = AntigravityConnector::metadata_sidecars(
+            conversation_dir,
+            root,
+            base,
+            &excluded_paths,
+        );
+        if !selected.modified_since(ctx.since_ts, &sidecars, &excluded_paths) {
             continue;
         }
-        for conversation_dir in AntigravityConnector::conversation_dirs(&root.path) {
-            let Some(transcript) =
-                AntigravityConnector::selected_transcript_path(&conversation_dir, &excluded_paths)
-            else {
-                continue;
-            };
-            let base = source.metadata_base(&conversation_dir);
-            let sidecars = AntigravityConnector::metadata_sidecars(
-                &conversation_dir,
-                root,
-                base,
-                &excluded_paths,
-            );
-            if root.path.exists()
-                && !AntigravityConnector::conversation_modified_since(
-                    &conversation_dir,
-                    &transcript,
-                    ctx.since_ts,
-                    &sidecars,
-                    &excluded_paths,
+
+        // The transcript we actually parse — required for reconstruction.
+        if transcript.is_file()
+            && !path_is_excluded(transcript, &excluded_paths)
+            && seen.insert(dedupe_path_key(transcript))
+        {
+            out.push(
+                DiscoveredSourceFile::new(
+                    AGENT_SLUG,
+                    root,
+                    transcript.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
                 )
-            {
-                continue;
-            }
+                .with_fs_metadata(),
+            );
+        }
 
-            // The transcript we actually parse — required for reconstruction.
-            if transcript.is_file()
-                && !path_is_excluded(&transcript, &excluded_paths)
-                && seen.insert(dedupe_path_key(&transcript))
-            {
+        // The fuller transcript variant, if present (optional).
+        let transcript_full = AntigravityConnector::transcript_full_path(conversation_dir);
+        if transcript_full.is_file()
+            && !path_is_excluded(&transcript_full, &excluded_paths)
+            && seen.insert(dedupe_path_key(&transcript_full))
+        {
+            out.push(
+                DiscoveredSourceFile::new(
+                    AGENT_SLUG,
+                    root,
+                    transcript_full,
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    false,
+                )
+                .with_fs_metadata(),
+            );
+        }
+
+        // The durable per-conversation SQLite database — the canonical source
+        // of truth worth mirroring, though we read the transcript instead.
+        if let Some(db) = AntigravityConnector::sibling_db_path(conversation_dir, base) {
+            if !path_is_excluded(&db, &excluded_paths) && seen.insert(dedupe_path_key(&db)) {
                 out.push(
                     DiscoveredSourceFile::new(
                         AGENT_SLUG,
                         root,
-                        transcript,
-                        DiscoveredSourceRole::PrimarySessionLog,
-                        true,
-                    )
-                    .with_fs_metadata(),
-                );
-            }
-
-            // The fuller transcript variant, if present (optional).
-            let transcript_full = AntigravityConnector::transcript_full_path(&conversation_dir);
-            if transcript_full.is_file()
-                && !path_is_excluded(&transcript_full, &excluded_paths)
-                && seen.insert(dedupe_path_key(&transcript_full))
-            {
-                out.push(
-                    DiscoveredSourceFile::new(
-                        AGENT_SLUG,
-                        root,
-                        transcript_full,
-                        DiscoveredSourceRole::PrimarySessionLog,
+                        db,
+                        DiscoveredSourceRole::SqliteDatabase,
                         false,
                     )
                     .with_fs_metadata(),
                 );
             }
+        }
 
-            // The durable per-conversation SQLite database — the canonical source
-            // of truth worth mirroring, though we read the transcript instead.
-            if let Some(db) = AntigravityConnector::sibling_db_path(&conversation_dir, base) {
-                if !path_is_excluded(&db, &excluded_paths) && seen.insert(dedupe_path_key(&db)) {
-                    out.push(
-                        DiscoveredSourceFile::new(
-                            AGENT_SLUG,
-                            root,
-                            db,
-                            DiscoveredSourceRole::SqliteDatabase,
-                            false,
-                        )
-                        .with_fs_metadata(),
-                    );
-                }
-            }
-
-            // Shared summary sources are deduplicated across conversations.
-            for sidecar in sidecars {
-                if seen.insert(dedupe_path_key(&sidecar.source_path)) {
-                    out.push(sidecar);
-                }
+        // Shared summary sources are deduplicated across conversations.
+        for sidecar in sidecars {
+            if seen.insert(dedupe_path_key(&sidecar.source_path)) {
+                out.push(sidecar);
             }
         }
     }
