@@ -1015,6 +1015,9 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".local", "bin", "devin"]);
             maybe_push(&mut out, &[".local", "share", "devin"]);
             maybe_push(&mut out, &[".local", "share", "devin", "cli"]);
+            // The Windows CLI keeps its store in %APPDATA% (cass GH #580).
+            maybe_push(&mut out, &["AppData", "Roaming", "devin"]);
+            maybe_push(&mut out, &["AppData", "Roaming", "devin", "cli"]);
         }
         "factory" => {
             maybe_push(&mut out, &[".factory"]);
@@ -1735,6 +1738,8 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".local", "bin", "devin"]),
                     tilde(&[".local", "share", "devin"]),
                     tilde(&[".local", "share", "devin", "cli"]),
+                    tilde(&["AppData", "Roaming", "devin"]),
+                    tilde(&["AppData", "Roaming", "devin", "cli"]),
                 ],
                 "factory" => vec![
                     tilde(&[".factory"]),

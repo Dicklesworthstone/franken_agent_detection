@@ -107,17 +107,37 @@ impl DevinConnector {
         direct
     }
 
-    /// Default store: `~/.local/share/devin/cli/sessions.db` on every
-    /// platform (the CLI does not use the macOS `Application Support` dir).
+    /// Default store. On Linux and macOS the CLI keeps
+    /// `~/.local/share/devin/cli/sessions.db` (not the macOS
+    /// `Application Support` dir). On Windows it keeps
+    /// `%APPDATA%\devin\cli\sessions.db`, the roaming app-data dir, and
+    /// `~/.local/share/devin` does not exist (cass GH #580).
     #[cfg(feature = "devin")]
     fn default_database_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|home| {
-            home.join(".local")
-                .join("share")
-                .join("devin")
-                .join("cli")
-                .join("sessions.db")
-        })
+        let app_data = if cfg!(windows) {
+            dirs::data_dir()
+        } else {
+            None
+        };
+        Self::default_store_from(app_data.as_deref(), dirs::home_dir().as_deref())
+    }
+
+    /// The first default store that exists, in precedence order: the Windows
+    /// app-data store, then `~/.local/share/devin/cli`. With neither present,
+    /// the platform's own location, so the scan reports that store as absent.
+    #[cfg(feature = "devin")]
+    fn default_store_from(app_data: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+        let store = |base: &Path| base.join("devin").join("cli").join("sessions.db");
+        let candidates: Vec<PathBuf> = app_data
+            .map(store)
+            .into_iter()
+            .chain(home.map(|home| store(&home.join(".local").join("share"))))
+            .collect();
+        candidates
+            .iter()
+            .find(|db| db.is_file())
+            .cloned()
+            .or_else(|| candidates.into_iter().next())
     }
 }
 
@@ -1156,5 +1176,42 @@ mod tests {
             DevinConnector::database_path_from_root(&missing),
             missing.join("sessions.db")
         );
+    }
+
+    /// cass GH #580: the Windows CLI keeps its store under `%APPDATA%`, and
+    /// default detection found no Devin sessions there.
+    #[test]
+    fn default_store_finds_the_windows_app_data_store() {
+        let dir = TempDir::new().unwrap();
+        let app_data = dir.path().join("AppData").join("Roaming");
+        let home = dir.path().join("home");
+        let windows_store = app_data.join("devin").join("cli").join("sessions.db");
+        let home_store = home
+            .join(".local")
+            .join("share")
+            .join("devin")
+            .join("cli")
+            .join("sessions.db");
+        let default_store = |app_data: Option<&Path>| {
+            DevinConnector::default_store_from(app_data, Some(home.as_path()))
+        };
+
+        // Nothing installed yet: the platform's own location.
+        assert_eq!(default_store(Some(&app_data)), Some(windows_store.clone()));
+        assert_eq!(default_store(None), Some(home_store.clone()));
+
+        // Only the app-data store exists, as on the reporter's machine.
+        std::fs::create_dir_all(windows_store.parent().unwrap()).unwrap();
+        std::fs::write(&windows_store, b"").unwrap();
+        assert_eq!(default_store(Some(&app_data)), Some(windows_store.clone()));
+
+        // A home store is still found where the app-data dir holds none, and
+        // the app-data store keeps precedence when both exist.
+        std::fs::create_dir_all(home_store.parent().unwrap()).unwrap();
+        std::fs::write(&home_store, b"").unwrap();
+        let empty_app_data = dir.path().join("EmptyAppData");
+        assert_eq!(default_store(None), Some(home_store.clone()));
+        assert_eq!(default_store(Some(&empty_app_data)), Some(home_store));
+        assert_eq!(default_store(Some(&app_data)), Some(windows_store));
     }
 }
